@@ -730,6 +730,37 @@ TEST(ColumnarStoreFields, SequenceNumberHandlesNonMonotonic) {
     EXPECT_EQ(got, want);
 }
 
+// #198: a quantity of 2^60 - 1 was written as an ordinary Simple8b word, and that word is the
+// codec's fallback marker, so the read took the next word for the value and every quantity after it
+// in the segment moved. The same for a sequence number falling by 2^59 from one row to the next,
+// whose zigzag delta is that value.
+TEST(ColumnarStoreFields, TheCodecsMarkerValueIsPreserved) {
+    TempDir tmp("marker_value");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+
+    const uint64_t marker = (1ULL << 60) - 1;
+    const std::vector<uint64_t> qtys = {marker, 5, 7, marker, 1};
+    const std::vector<uint64_t> seqs = {(1ULL << 59) + 10, 10, 11, 12, 13};
+    for (size_t i = 0; i < qtys.size(); ++i) {
+        auto row = make_row(1000 + static_cast<uint64_t>(i), 10000, qtys[i]);
+        row.sequence_number = seqs[i];
+        store.append(row);
+    }
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_TRUE(meta->has_raw_qty);
+
+    auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), qtys.size());
+    std::sort(rows.begin(), rows.end(), [](const ob::SnapshotRow& a, const ob::SnapshotRow& b) {
+        return a.timestamp_ns < b.timestamp_ns;
+    });
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i].quantity, qtys[i]) << "row " << i;
+        EXPECT_EQ(rows[i].sequence_number, seqs[i]) << "row " << i;
+    }
+}
+
 TEST(ColumnarStoreFields, SegmentWithUnknownFormatVersionIsRejected) {
     // An older segment has no side/level/seq columns. Reading it anyway would
     // hand back zeroed fields, which is exactly the defect being fixed, so the

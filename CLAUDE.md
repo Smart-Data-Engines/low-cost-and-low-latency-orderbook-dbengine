@@ -3956,6 +3956,26 @@ Learned the hard way. Check here before debugging.
      moved the fsync under `std::unique_lock<std::mutex> held_through_the_sync(mtx_)`, and only the
      behavioural test - a write made from between the two holds - caught it. The static half guards the
      spelling the code has; the seam is what guards the property.
+529. **An escape in a packed encoding must be a value the ordinary encoding cannot write - or the
+     encoder must send that value to the escape.** Simple8b's fallback marker is a selector-15 word
+     with an all-ones payload, and 2^60 − 1 fits a selector-15 word: the encoder wrote the marker for
+     an ordinary value, and the decoder took the next word for its raw value (#198). The boundary
+     test used 2^60 − 2 "to avoid the marker" - it knew, and stepped around it. A value a test steps
+     around is one the code has to handle, and a property should draw it by name: a uniform draw
+     over 2^60 values never lands on one.
+530. **GCC 13 does not completely unroll a loop of more than 16 iterations, however constant its bound.**
+     `max-completely-peel-times` is 16, so a `for (k < Count)` over a template constant left
+     Simple8b's 20-, 30- and 60-value selectors rolled with variable shifts; a fold over an index
+     sequence, `((out[K] = (word >> (K * Bits)) & mask), ...)`, makes every shift an immediate and
+     took the 2-bit case from 1.27 to 0.77 ns a value (#49). Count the `shrq` in `g++ -S` before
+     believing a loop unrolled.
+531. **RapidCheck draws an integer 64 × size / 100 bits wide, and 25 cases reach size 100 once.**
+     `arbitrary<uint64_t>()` and `inRange` both scale with the case's size, and the sizes of
+     `max_success=25` are 0, 4, 8 … 100: the top four bits of a 64-bit draw are set in two cases of
+     the 25, the top two in one. The Simple8b decoder's equivalence property drew its words with
+     `arbitrary<uint64_t>()` and so saw almost nothing but selector 0 - 240 zeros - and a mutation
+     dropping a value lived (#49's step 1). Where the whole range matters, draw through
+     `rc::gen::resize(100, …)`.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
