@@ -49,10 +49,14 @@ can be deleted and the tag pushed again.
 Everything but publishing runs on **every pull request**, in `ci.yml`'s required `package` (x86_64)
 and `package-arm64` (aarch64), through `scripts/package_ci.sh`: a native build of the server, the
 tools and the C API library, `--version` equal to `CMakeLists.txt`'s, `cpack`,
-`scripts/verify_package.sh`, the RPM inspected, the wheel and the sdist built and checked, the `.deb`
+`scripts/verify_package.sh`, the RPM inspected, the wheel and the sdist built and checked - and the
+same wheel built from the sdist by the oldest scikit-build-core `pyproject.toml` allows - the `.deb`
 installed with `apt`, and `scripts/release_acceptance.py` - the wheel's client in a fresh venv, run
 outside the repository, writing to the installed server over TCP and finding the installed library in
 local mode by itself. So the first time a package is built for aarch64 is never the day of a release.
+
+On a workstation, `scripts/package_ci.sh build-pkg dist --no-install` runs all of it but the install,
+and accepts the release from the extracted tarball instead.
 
 On a tag, `release.yml`:
 
