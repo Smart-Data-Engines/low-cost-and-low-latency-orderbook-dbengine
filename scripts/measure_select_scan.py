@@ -6,7 +6,8 @@ in segments - then QUERIES full-range SELECTs over one connection, after ten to 
 
   - the engine's time a query, from `ob_query_latency_seconds` - the read and the rows' hand-over,
     without the formatting and the send;
-  - the server's minor page faults a query, from /proc/<pid>/stat;
+  - the server's minor page faults a query, and the CPU time it spent a query, from /proc/<pid>/stat -
+    the whole of answering it, scan, formatting and send, where the engine's time is the first;
   - the client's wall time a query, p50 and min, over a socket read to the reply's blank line - so
     the Python client's parsing is not in it.
 
@@ -40,8 +41,11 @@ METRICS = PORT + 1
 BATCH = 500
 
 
-def minor_faults(pid):
-    return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[7])
+def proc_stat(pid):
+    # The fields after the command's name: minflt is the 10th field of the line, utime and stime
+    # the 14th and 15th.
+    f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    return int(f[7]), int(f[11]) + int(f[12])
 
 
 def histogram(name):
@@ -106,18 +110,20 @@ def main():
         for _ in range(10):
             ask()
         s0, c0 = histogram("ob_query_latency_seconds")
-        f0 = minor_faults(server.pid)
+        f0, cpu0 = proc_stat(server.pid)
         walls = []
         for _ in range(QUERIES):
             t = time.perf_counter()
             ask()
             walls.append(time.perf_counter() - t)
-        f1 = minor_faults(server.pid)
+        f1, cpu1 = proc_stat(server.pid)
         s1, c1 = histogram("ob_query_latency_seconds")
+        ticks = os.sysconf("SC_CLK_TCK")
         print(json.dumps({
             "server": SERVER, "rows": ROWS, "queries": QUERIES,
             "engine_ms_per_query": round((s1 - s0) / (c1 - c0) * 1000, 3),
             "server_minor_faults_per_query": (f1 - f0) / QUERIES,
+            "server_cpu_ms_per_query": round((cpu1 - cpu0) / ticks * 1000 / QUERIES, 3),
             "client_wall_ms_p50": round(statistics.median(walls) * 1000, 3),
             "client_wall_ms_min": round(min(walls) * 1000, 3),
         }, indent=1))
