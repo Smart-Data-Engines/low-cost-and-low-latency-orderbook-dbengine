@@ -42,6 +42,10 @@ Repository = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-ord
 Documentation = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/tree/master/docs"
 
 [tool.scikit-build]
+# The behaviour of the oldest scikit-build-core build-system.requires allows, whichever version builds:
+# the metadata table below is that version's spelling, which 1.x accepts and warns about without
+# this line. scripts/package_ci.sh builds the wheel with that oldest version as well as the newest.
+minimum-version = "build-system.requires"
 # A pure-Python wheel (#42): the client over TCP needs no native code, and a platform wheel would
 # carry its own copies of OpenSSL and curl - whose fixes we would then have to release - with a glibc
 # floor set by whichever runner built it. The engine's library for the client's local mode,

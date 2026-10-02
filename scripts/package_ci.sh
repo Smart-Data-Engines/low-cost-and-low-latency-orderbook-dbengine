@@ -53,8 +53,8 @@ fi
 step "the Python client's wheel and sdist"
 python3 -m venv "$BUILD/venv-dist"
 "$BUILD/venv-dist/bin/pip" install --quiet --upgrade pip build twine
-# Both emptied first: on a workstation a file left by an earlier run would answer the checks below.
-rm -rf "${DIST:?}" "${BUILD:?}/from-sdist"
+# All emptied first: on a workstation a file left by an earlier run would answer the checks below.
+rm -rf "${DIST:?}" "${BUILD:?}/from-sdist" "${BUILD:?}/from-sdist-floor"
 "$BUILD/venv-dist/bin/python" -m build --outdir "$DIST" .
 WHEEL="$DIST/orderbook_dbengine-$VERSION-py3-none-any.whl"
 SDIST="$DIST/orderbook_dbengine-$VERSION.tar.gz"
@@ -64,6 +64,22 @@ SDIST="$DIST/orderbook_dbengine-$VERSION.tar.gz"
 "$BUILD/venv-dist/bin/pip" wheel --quiet --no-deps -w "$BUILD/from-sdist" "$SDIST"
 [ -f "$BUILD/from-sdist/$(basename "$WHEEL")" ] || { echo "FAIL: the sdist does not build $(basename "$WHEEL")"; exit 1; }
 echo "  ok: $(basename "$WHEEL"), and an sdist that builds it"
+
+# The oldest scikit-build-core pyproject.toml allows, building the same wheel from the sdist: a floor
+# in build-system.requires is a promise to whoever builds with their system's version, and nothing
+# else holds it - `python -m build` above took the newest.
+FLOOR=$(python3 - <<'PY'
+import re, tomllib
+requires = tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]
+print(next(m.group(1) for r in requires if (m := re.fullmatch(r"scikit-build-core>=([0-9.]+)", r))))
+PY
+)
+python3 -m venv "$BUILD/venv-floor"
+"$BUILD/venv-floor/bin/pip" install --quiet "scikit-build-core==$FLOOR"
+"$BUILD/venv-floor/bin/pip" wheel --quiet --no-deps --no-build-isolation -w "$BUILD/from-sdist-floor" "$SDIST"
+[ -f "$BUILD/from-sdist-floor/$(basename "$WHEEL")" ] \
+    || { echo "FAIL: scikit-build-core $FLOOR does not build $(basename "$WHEEL") from the sdist"; exit 1; }
+echo "  ok: scikit-build-core $FLOOR, the oldest pyproject.toml allows, builds it from the sdist too"
 
 if [ "$INSTALL" = yes ]; then
     step "installed as a user would, and accepted from the artefacts"
