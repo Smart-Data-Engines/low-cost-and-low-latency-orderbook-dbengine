@@ -633,11 +633,19 @@ std::string execute_command(const Command& cmd,
         // Reject queries during snapshot bootstrap.
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         auto t0_select = std::chrono::steady_clock::now();
-        std::vector<QueryResult> rows;
+        // Each row formatted as the engine hands it over (#49 step 3), not collected first: the
+        // vector of rows this replaced was three quarters of a turned-over heap's page faults. So the
+        // latency observed below includes formatting the reply, which it did not before.
+        //
+        // An aggregate query calls the callback exactly once, with agg_values set and the row
+        // fields left at zero, and the builder answers it as aggregates. Formatting that as a data
+        // row is what made SPREAD, MID_PRICE, IMBALANCE and VWAP return zeros to every network
+        // client while the engine computed them correctly.
         QueryShape shape;
+        QueryResponseBuilder reply(shape);
         try {
             std::string err = engine.execute(cmd.raw_sql, [&](const QueryResult& r) {
-                rows.push_back(r);
+                reply.add(r);
             }, shape);
             if (!err.empty()) {
                 return format_error(err);
@@ -645,6 +653,7 @@ std::string execute_command(const Command& cmd,
         } catch (const std::exception& e) {
             return format_error(e.what());
         }
+        std::string answer = reply.finish();
         if (registry) {
             double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_select).count();
             registry->observe_histogram("ob_query_latency_seconds", secs);
@@ -652,15 +661,7 @@ std::string execute_command(const Command& cmd,
         }
         session.increment_queries();
         stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-
-        // An aggregate query calls the callback exactly once, with agg_values set
-        // and the row fields left at zero. Formatting that as a data row is what
-        // made SPREAD, MID_PRICE, IMBALANCE and VWAP return zeros to every network
-        // client while the engine computed them correctly.
-        if (!rows.empty() && !rows.front().agg_values.empty()) {
-            return format_agg_response(rows.front().agg_values);
-        }
-        return format_query_response(rows, shape.columns);
+        return answer;
     }
 
     case CommandType::BOOK: {
@@ -670,15 +671,21 @@ std::string execute_command(const Command& cmd,
         // across that is an answer about two trees.
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         auto t0_book = std::chrono::steady_clock::now();
-        std::vector<QueryResult> rows;
+        // The canonical seven, deliberately: projection is #139's and belongs to `SELECT`, and a
+        // second column list to keep in step is a second thing to get wrong before anybody asked
+        // for it.
+        QueryShape shape;
+        shape.columns = all_query_columns();
+        QueryResponseBuilder reply(shape);
         try {
             std::string err = engine.read_book(cmd.book_args.symbol, cmd.book_args.exchange,
                                                cmd.book_args.depth,
-                                               [&](const QueryResult& r) { rows.push_back(r); });
+                                               [&](const QueryResult& r) { reply.add(r); });
             if (!err.empty()) return format_error(err);
         } catch (const std::exception& e) {
             return format_error(e.what());
         }
+        std::string answer = reply.finish();
         if (registry) {
             double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_book).count();
@@ -690,10 +697,7 @@ std::string execute_command(const Command& cmd,
         }
         session.increment_queries();
         stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-        // The canonical seven, deliberately: projection is #139's and belongs to `SELECT`, and a
-        // second column list to keep in step is a second thing to get wrong before anybody asked
-        // for it.
-        return format_query_response(rows, all_query_columns());
+        return answer;
     }
     case CommandType::INSERT:
     case CommandType::MINSERT: {

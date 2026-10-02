@@ -483,6 +483,13 @@ ob_add_tcp_test(test_response_formatter
     test_response_formatter.cpp
 )
 
+# A SELECT's reply built as the engine hands rows over (#49 step 3): the same bytes as the reply
+# formatted from collected rows, and the engine's promise that a query's shape is filled before its
+# first row, which building it at the first row relies on.
+ob_add_tcp_test(test_query_response_builder
+    test_query_response_builder.cpp
+)
+
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )

@@ -126,6 +126,41 @@ struct ParsedResponse {
 std::string format_query_response(const std::vector<QueryResult>& rows,
                                   const std::vector<QueryColumn>& columns);
 
+/// A row scan's reply built as the engine hands the rows over, rather than from a vector of them
+/// (#49 step 3). The server collected every row of a `SELECT` before it formatted one - 64 bytes a
+/// row, copied again each time the vector grew - and measured on a server whose heap turned over,
+/// that collection took three quarters of its page faults. The bytes are format_query_response()'s,
+/// and a test holds the two to each other; a first result that carries aggregates makes the reply
+/// format_agg_response()'s, the choice the server made by looking at the first row it collected.
+///
+/// `shape` is read at the first result and at finish(): the engine fills a query's shape before it
+/// hands over a row - a test in `test_query_engine.cpp` holds it to that - and the reply's header is
+/// written from it then.
+class QueryResponseBuilder {
+public:
+    explicit QueryResponseBuilder(const QueryShape& shape) : shape_(shape) {}
+    QueryResponseBuilder(const QueryResponseBuilder&) = delete;
+    QueryResponseBuilder& operator=(const QueryResponseBuilder&) = delete;
+
+    /// One result, formatted now: a row, or the aggregates an aggregate query hands over once.
+    void add(const QueryResult& r);
+
+    /// The reply, header and terminator included; the builder is spent after it.
+    std::string finish();
+
+private:
+    void start(const QueryResult& first);
+    void add_narrow(const QueryResult& r);
+
+    const QueryShape&     shape_;
+    std::string           out_;
+    std::vector<char>     narrow_row_;   // a narrowed row's buffer, sized from the columns
+    std::vector<AggValue> aggregates_;
+    bool started_   = false;
+    bool aggregate_ = false;
+    bool all_seven_ = false;
+};
+
 /// Format aggregate results as TSV: one row per aggregate, three columns.
 ///
 ///     OK
