@@ -1280,7 +1280,7 @@ Of the 2.5 ms, reading the seven files is 0.4, decoding price, quantity and sequ
 before), and handing the rows to one `std::function` 0.8. `BM_TimeRangeQuery`'s process does not
 trim between its scans - the same tunables take its minor faults from 85 500 to 7 200 and its time
 not at all - which is why the benchmark never showed it. Whether a server pays it depends on what
-its heap did before, and a read that allocates nothing does not: step 2 keeps a thread's buffers
+its heap did before, and a read that allocates nothing does not: step 2, below, keeps the buffers
 from one read to the next.
 
 The rewrite is held to the decoder before it, kept in `tests/test_codec.cpp`, on arbitrary words and
@@ -1290,6 +1290,66 @@ makes 64 × size / 100 bits wide, so up to size 94 it set no selector bit and sa
 partly filled word survived the property. It draws at full size now, and the second pass killed
 every decoder mutation but the control - capping the output at what the words hold, which changes no
 value.
+
+**Step 2: a segment read allocates nothing it can keep.** A read of a segment fills eleven buffers -
+seven column files as read, four columns decoded - and allocated them all afresh and freed them at
+the end. They are a set now, taken from a pool and given back: the pool keeps the sets no read is
+using, at most 128 MiB for the process - five reads of the largest segment compaction writes, 23 MB
+- and frees a set that would take it past that. A pool and not a thread's own set, because an
+application embedding the engine queries from as many threads as it has, and what they keep has to
+be bounded by something other than their number; a read inside another's callback takes a second
+set. The decoders write into a vector and keep its capacity (`decode_prices_into()`,
+`decode_simple8b_into()`), and the all-zero selectors write their zeros, since a vector used before
+holds the last decode's values.
+
+Measured on the i3-7100U (GCC 13) and the m9g.xlarge (4 × ARM64, GCC 14), base `971dda2` against
+step 2, each run alternating base, step 1 and step 2 (`evidence/2026-10-02-scan-buffers/`):
+
+| | i3-7100U | m9g.xlarge |
+|---|---|---|
+| a store alone, a scan of one segment of 100 000 rows | 6.56-6.61 → 1.97 ms | 1.67-1.70 → 0.65 ms |
+| the same with the heap never trimmed | 2.67-2.69 → 2.00 ms | 1.79-1.81 → 0.66 ms |
+| a server's `SELECT` of 100 000 rows, the engine's time | 5.75-5.97 or 17.05-17.32 → 5.43-5.74 ms | 5.19-5.24 → 2.46-2.47 ms |
+| its page faults a query | none or 4 477-4 504 → none | 4 837 → none |
+| the client's wall time, p50 | 30.6-31.2 or 44.4-44.6 → 29.7-31.5 ms | 14.8-15.0 → 10.9-11.0 ms |
+| `BM_TimeRangeQuery/100000`, median | 3.35-3.37 → 3.21-3.23 ms | 1.20-1.27 → 1.12-1.17 ms |
+
+Step 1 is within a few percent of base in every row but the i3's server rows, where it drew the
+lottery below the other way round. The server is
+`scripts/measure_select_scan.py`'s, two fresh servers a side a run; `benchmarks/segment_read_cost`
+measures the store's scan from now on. One round of the i3's benchmark gave step 2 3.42 ms.
+
+**Whether a server faulted was a lottery, and that is the finding.** On the i3 the same base binary
+faulted 4 477-4 504 pages a query in both servers of one run and none in both of the next - which is
+the "or" in its row - and step 1 the other way round; on the ARM host base and step 1 faulted 4 837 a
+query in every server. `perf record -e page-faults` on the ARM base put 74% of them in the `SELECT`
+handler's `rows.push_back` - the server collects every row before it formats any - 15% in
+`decode_prices`, 7% in the `memset` of a column read and 3% in `decode_simple8b`: the reads'
+allocations turned the heap over, and the next query's pages came back as faults wherever they were
+first touched. Not one of the eight servers of step 2 faulted, and the rows' vector stopped faulting
+with the rest. `BM_TimeRangeQuery` never showed any of it: its process was never in the faulting
+state.
+
+The returning `decode_simple8b()` and `decode_prices()` are on no engine path any more. The first
+version of step 2 made them `_into` an empty vector, which zeroed twice and slowed every shape; they
+share one loop with `_into` now, a template on whether the vector holds zeros already, and on the i3
+are as fast as step 1's or faster - on the ARM host 1.01-1.05 ns a value for quantities against step
+1's 0.71-0.72, which only the tests call. That loop reads the words through a pointer and a count
+held in locals rather than through the span: into a vector used again, 2.21 against 2.42 ns a value
+for quantities on the i3 and level on the ARM host, at the price of words of one 60-bit value on the
+ARM host (1.22 against 1.04). `__restrict` changed nothing on either.
+
+The mutation table (`evidence/2026-10-02-scan-buffers/mutations/`): every mutation of the pool, its
+budget, the decoders' zeros and the price decoder's clear killed; both controls survived - the
+returning decode writing zeros a new vector holds, and the reads' clearing of the buffers a read
+does not use, which nothing observable reads. A read of a column file that comes back short now keeps
+what it read rather than what it asked for, and no test can make one: segment files do not change
+once written. The first pass showed the budget test's floor too low to see a buffer left out of the
+count; it counts every buffer now.
+
+What is left of a server's `SELECT` is the answer, not the read: the server collects every row in a
+vector, then formats them. The reply's format has no row count in front - `OK`, the columns, the
+rows, a blank line - so a handler could format each row as the scan hands it over.
 
 ### 50. NUMA awareness and thread pinning
 - Per-socket allocation, pinned io threads, `--cpu-affinity` configuration

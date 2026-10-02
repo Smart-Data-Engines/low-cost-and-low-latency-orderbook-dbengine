@@ -281,8 +281,10 @@ rows, whose columns are about 23 MB, so that is five reads of the largest segmen
 that would take it past that is freed.
 
 Freeing every set after its read, as a read did before, is not free: in a process whose heap glibc
-trims after the free, the next read faults every page back in, and a store alone in a process
-scanned a segment of 100 000 rows in 6.3 ms instead of 2.5.
+turns over, the next read faults its pages back in. A store alone in a process scanned a segment of
+100 000 rows in 6.56-6.61 ms on the i3-7100U and 1.97 ms with the sets kept, and a server answering
+`SELECT`s of those rows faulted up to 4 837 pages a query - in some runs, not in others - and none
+with them kept (#49's step 2 in the roadmap).
 
 ### fsync policy per storage device
 
