@@ -9,10 +9,13 @@
 
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
+#include "orderbook/command_parser.hpp"
+#include "orderbook/engine.hpp"
 #include "orderbook/query_columns.hpp"
 #include "orderbook/query_engine.hpp"
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/soa_buffer.hpp"
+#include "orderbook/tcp_server.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
@@ -252,4 +255,57 @@ TEST(QueryShapeBeforeRows, TheBuiltReplyIsTheCollectedOnes) {
                         .empty());
         EXPECT_EQ(reply.finish(), collected) << sql;
     }
+}
+
+// ── On the server ─────────────────────────────────────────────────────────────
+
+// What the server's handler answers a SELECT and a BOOK with, on a real engine, against the rows
+// the engine hands over collected and formatted as the handler did before #49's step 3.
+TEST(QueryResponseOnTheServer, SelectAndBookAnswerWhatTheirCollectedRowsDid) {
+    const fs::path dir = fs::temp_directory_path() /
+                         ("ob_reply_server_" + std::to_string(::getpid()) + "_" +
+                          std::to_string(g_counter.fetch_add(1)));
+    fs::create_directories(dir);
+    {
+        ob::Engine engine(dir.string(), 1'000'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        for (uint64_t u = 0; u < 4; ++u) {
+            ob::DeltaUpdate du{};
+            std::strncpy(du.symbol, "RBS", sizeof(du.symbol) - 1);
+            std::strncpy(du.exchange, "EX", sizeof(du.exchange) - 1);
+            du.sequence_number = u + 1;
+            du.timestamp_ns = 1'790'000'000'000'000'000ULL + u * 1'000;
+            du.side = u % 2 == 0 ? ob::SIDE_BID : ob::SIDE_ASK;
+            du.n_levels = 5;
+            std::vector<ob::Level> levels(5);
+            for (uint16_t i = 0; i < 5; ++i) {
+                levels[i].price = (u % 2 == 0 ? 10'000 - i : 10'010 + i) + static_cast<int64_t>(u);
+                levels[i].qty = 10 + i + u;
+                levels[i].cnt = 1 + i;
+            }
+            ASSERT_EQ(engine.apply_delta(du, levels.data()), ob::OB_OK);
+        }
+        engine.flush_incremental();
+
+        ob::Session session(-1);
+        ob::ServerStats stats;
+
+        const std::string sql = "SELECT * FROM 'RBS'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
+        std::vector<ob::QueryResult> rows;
+        ob::QueryShape shape;
+        ASSERT_TRUE(engine.execute(sql, [&](const ob::QueryResult& r) { rows.push_back(r); }, shape).empty());
+        ASSERT_EQ(rows.size(), 20u);
+        EXPECT_EQ(ob::execute_command(ob::parse_command(sql), engine, session, stats, false),
+                  ob::format_query_response(rows, shape.columns));
+
+        std::vector<ob::QueryResult> book;
+        ASSERT_TRUE(engine.read_book("RBS", "EX", 0, [&](const ob::QueryResult& r) { book.push_back(r); })
+                        .empty());
+        ASSERT_FALSE(book.empty());
+        EXPECT_EQ(ob::execute_command(ob::parse_command("BOOK RBS EX"), engine, session, stats, false),
+                  ob::format_query_response(book, ob::all_query_columns()));
+        engine.close();
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
