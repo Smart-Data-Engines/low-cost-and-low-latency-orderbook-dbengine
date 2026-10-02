@@ -7,9 +7,9 @@
 // and the failure mode is an operator told the wrong build is running, which is worse than being
 // told nothing.
 //
-// The binary now takes it from the build system through a compile definition, so those are gone.
-// The Python package still carries its own, because a wheel's metadata cannot be a C++ macro, and
-// this test is what keeps the two in step.
+// The binary now takes it from the build system through a compile definition, so those are gone,
+// and since #42 the Python package reads it from CMakeLists.txt too; what this file holds is that
+// neither has a copy again.
 #include "orderbook/version.hpp"
 
 #include <gtest/gtest.h>
@@ -76,24 +76,35 @@ TEST(VersionStatic, TheBinaryReportsTheBuildSystemsVersion) {
            "definition is not reaching this translation unit";
 }
 
-TEST(VersionStatic, ThePythonPackageAgreesWithTheBuildSystem) {
+TEST(VersionStatic, ThePythonPackageReadsTheBuildSystemsVersion) {
+    // Since #42 pyproject.toml has no version of its own: scikit-build-core reads CMakeLists.txt's
+    // through the regular expression pyproject.toml names. What can drift now is that expression -
+    // a project() line reformatted until it no longer matches, which fails the wheel's build, or
+    // matches something else - so this applies it to CMakeLists.txt, as the build will.
     const std::string cmake = read_source("CMakeLists.txt");
     const std::string pyproject = read_source("pyproject.toml");
     ASSERT_FALSE(pyproject.empty()) << "cannot read pyproject.toml";
 
     const std::string declared =
         first_match(cmake, std::regex(R"(project\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+))"));
-    const std::string python =
-        // A custom delimiter, because the pattern contains `")` and the default raw-string
-        // terminator would end the literal in the middle of the regex. Anchored on a newline
-        // rather than with `^`, so no locale- or flag-dependent multiline behaviour is involved.
-        first_match(pyproject, std::regex(R"re(\nversion\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)")re"));
-    ASSERT_FALSE(python.empty()) << "no version in pyproject.toml";
+    ASSERT_FALSE(declared.empty()) << "no project(... VERSION) in CMakeLists.txt";
 
-    EXPECT_EQ(python, declared)
-        << "pyproject.toml says " << python << " and CMake says " << declared
-        << ". `pip install orderbook-dbengine` would report a version the binary does not, and a "
-           "bug report citing one of them would point at the wrong build. Bump both.";
+    EXPECT_NE(pyproject.find(R"(dynamic = ["version"])"), std::string::npos)
+        << "pyproject.toml does not take its version from the build";
+    EXPECT_TRUE(first_match(pyproject, std::regex(R"re(\nversion\s*=\s*"([^"]*)")re")).empty())
+        << "pyproject.toml carries a version of its own again, the copy that drifts";
+
+    // The provider's expression, as pyproject.toml spells it - a TOML literal string, so its
+    // backslashes are literal - with Python's named group made a plain one for std::regex.
+    std::string expression = first_match(pyproject, std::regex(R"re(\nregex\s*=\s*'([^']*)')re"));
+    ASSERT_FALSE(expression.empty()) << "no metadata.version regex in pyproject.toml";
+    const std::string named = "(?P<value>";
+    const size_t at = expression.find(named);
+    ASSERT_NE(at, std::string::npos) << "the regex has no (?P<value>...) group: " << expression;
+    expression.replace(at, named.size(), "(");
+    EXPECT_EQ(first_match(cmake, std::regex(expression)), declared)
+        << "pyproject.toml's regex reads " << first_match(cmake, std::regex(expression))
+        << " from CMakeLists.txt, which declares " << declared;
 }
 
 TEST(VersionStatic, TheVersionIsNotRetypedInSources) {

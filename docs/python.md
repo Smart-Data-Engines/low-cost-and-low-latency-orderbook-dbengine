@@ -7,14 +7,20 @@ Zero-dependency Python package with two modes of operation:
 ## Installation
 
 ```bash
-# From the project root — builds the C++ shared library and installs the package
+# From the project root: the client, pure Python - it builds no native code (#42)
 pip install .
 
 # Or with uv
 uv pip install .
 ```
 
-For TCP-only usage, you can also just copy `python/orderbook_engine/` — it has no native dependencies in TCP mode.
+TCP mode needs nothing else. **Local mode needs the engine's C API library**, `liborderbook_shared`:
+
+- the release packages (`.deb`, `.rpm`, `.tar.gz`, see [releasing.md](releasing.md)) install it under
+  `/usr/lib/orderbook-dbengine/`, where the client finds it by itself;
+- from a source tree, `cmake -S . -B build && cmake --build build --target orderbook_shared` puts it
+  in `build/`, which the client also looks in;
+- anywhere else, `OB_LIB_PATH=/path/to/liborderbook_shared.so`.
 
 ## Quick Start
 

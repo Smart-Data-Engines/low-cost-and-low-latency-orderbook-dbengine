@@ -555,17 +555,17 @@ set_target_properties(orderbook_shared PROPERTIES
 #
 # So: relative paths, with CPACK_PACKAGING_INSTALL_PREFIX putting them under `/`. A plain
 # `cmake --install` then places files under `<prefix>/usr/...`, which is odd and acceptable: these
-# rules exist for packaging, and the wheel's rule is guarded by SKBUILD above.
-# `if(NOT SKBUILD)` around all of it, and the asymmetry is what broke the wheel build: guarding the
-# wheel's rule with `if(SKBUILD)` was only half the separation. These rules stayed unconditional, so
-# scikit-build-core's install step ran them too — and the wheel build compiles only
-# `orderbook_shared`, so `install(TARGETS ob_tcp_server)` looked for a binary that build never
-# produced and failed with "cannot find .../ob_tcp_server". Two consumers of one tree need the guard
-# on **both** sides, not one.
-if(NOT SKBUILD)
-
+# rules exist for packaging. (They were guarded by `if(NOT SKBUILD)` while the Python wheel ran this
+# build for `orderbook_shared`; the wheel builds no native code since #42, so nothing else runs them.)
 install(TARGETS ob_tcp_server ob_restore ob_backup
     RUNTIME DESTINATION usr/bin
+    COMPONENT runtime
+)
+# The C API, for the Python client's local mode (#42), in a directory of the package's own rather
+# than beside the system's libraries: it has no SONAME, it is loaded by path, and nothing links it by
+# name - so it needs no ldconfig and claims no name in /usr/lib. The client looks for it here.
+install(TARGETS orderbook_shared
+    LIBRARY DESTINATION usr/lib/orderbook-dbengine
     COMPONENT runtime
 )
 install(DIRECTORY include/orderbook
@@ -590,15 +590,7 @@ install(FILES README.md SECURITY.md LICENSE docs/cli.md
     COMPONENT runtime
 )
 
-endif()  # NOT SKBUILD
-
 # ── CPack ─────────────────────────────────────────────────────────────────────
-#
-# DEB and a plain tarball. **No RPM generator**, and that is a decision rather than an omission:
-# `rpmbuild` is not on the development machine, so its output could not be built or inspected here,
-# and a generator configuration nobody has run is a mechanism that looks present and is not. The
-# packaging CI job installs `rpm` and can add it once there is a job that actually produces and
-# checks one.
 set(CPACK_PACKAGE_NAME "orderbook-dbengine")
 set(CPACK_PACKAGE_VENDOR "Smart Data Engines")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
@@ -619,7 +611,9 @@ find_program(RPMBUILD_EXECUTABLE rpmbuild)
 if(RPMBUILD_EXECUTABLE)
     list(APPEND CPACK_GENERATOR "RPM")
     set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")
-    set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+    # The project's licence: this said MIT, which the repository never was (#42).
+    set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
+    set(CPACK_RPM_FILE_NAME RPM-DEFAULT)   # orderbook-dbengine-X.Y.Z-1.<arch>.rpm
     # /etc/orderbook/ob.conf must survive an upgrade, the same requirement the .deb meets through
     # its conffiles declaration.
     set(CPACK_RPM_USER_FILELIST "%config(noreplace) /etc/orderbook/ob.conf")
@@ -630,13 +624,16 @@ if(RPMBUILD_EXECUTABLE)
 endif()
 # Both generators produce the same relative layout; see the note above the install rules.
 set(CPACK_PACKAGING_INSTALL_PREFIX "/")
+# Every file name carries the architecture (#42): a release has x86_64 and aarch64 builds, and the
+# defaults gave both the same name - `orderbook-dbengine-X.Y.Z-Linux.deb` and `.tar.gz`.
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)   # orderbook-dbengine_X.Y.Z_<arch>.deb
+set(CPACK_SYSTEM_NAME "Linux-${CMAKE_SYSTEM_PROCESSOR}")   # orderbook-dbengine-X.Y.Z-Linux-<arch>.tar.gz
 
 # One package rather than one per component: the headers are a few kilobytes, and splitting them
 # into -dev would create two packages that must be installed together for the common case.
 #
 # CPACK_COMPONENTS_ALL is deliberately **not** set. It only takes effect with component install
 # enabled, and setting it while component install is off reads as a filter that is doing something.
-# What keeps the wheel's library out of the package is the SKBUILD guard above.
 set(CPACK_DEB_COMPONENT_INSTALL OFF)
 set(CPACK_ARCHIVE_COMPONENT_INSTALL OFF)
 
