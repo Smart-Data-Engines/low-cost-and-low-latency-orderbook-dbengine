@@ -2422,6 +2422,46 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 199. A comparison in a `WHERE` answered a different question: `=` was `>=`, `>` and `<` kept their bound, and a second condition on a column replaced the first ✅ **P1**
+
+**Found reading the parser for #44.** The grammar documented `BETWEEN` alone, and the parser
+accepted the five comparisons as well, each as one end of a range at the value itself: `=` and `>`
+set the lower bound, `<` and `<=` the upper. Every condition assigned its end, so a second one on a
+column replaced the first, and a `SNAPSHOT` read neither column's. Measured through the library on
+master (`14d5095`), three rows a microsecond apart at prices 100, 200 and 300:
+
+- `price = 200` answered 200 and 300, and `timestamp = t` every row from `t`;
+- `price > 200` answered 200 and 300, and `price < 200` 100 and 200 - so `timestamp > t`, the way to
+  ask for what came after the last row read, handed that row back on every poll;
+- `price >= 300 AND price >= 100` answered all three, and `price BETWEEN 100 AND 200 AND price
+  BETWEEN 200 AND 300` both 200 and 300;
+- `AT t AND price BETWEEN 100 AND 100` answered the level at 300, and `AT t AND timestamp BETWEEN 0
+  AND 1500` the book at `t`.
+
+All of it `OK`. A subscription's conditions are the same parse, so it pushed what they excluded; and
+`AT`, accepted and dropped there, subscribed to every row. A second `AT` replaced the first, and
+`SELECT SPREAD(*) ... WHERE AT t` answered the book at `t` as rows, because `AT` makes the query a
+snapshot, whose branch never reads the select list.
+
+**Fixed.** Every condition is the inclusive range it allows, intersected with what the conditions
+before it allowed (`narrow()` in the parser): `=` is `[v, v]`, `>` is `[v + 1, ∞)`. Past the end of the
+type - `timestamp > 18446744073709551615`, `price < -9223372036854775808` - there is no step inside
+the bound, and the range is empty: kept as a lower bound above the upper one, which every reader of
+the AST already answers with no rows and `format()` writes back as the same `BETWEEN`. A snapshot
+applies its price condition to the book it rebuilt rather than to the rows before it - filtering
+those would answer a level with an older price of its own whenever its latest is out of range - and
+its `LIMIT` counts what it answers; it refuses a timestamp condition (`SNAPSHOT_TIME_FILTER`) and a
+second `AT`. An aggregate refuses `AT` (`AGG_TIME_FILTER`), and a subscription refuses it as it
+parses. `docs/query-language.md` has the grammar and the rules.
+
+Tests: `tests/test_query_conditions.cpp`, twelve unit tests and a property that draws rows and up
+to four conditions over both columns from a domain small enough for them to land on rows, beside and
+between them, with the ends of both types among the values, and holds the answer to what an oracle
+evaluating each condition on each row allows.
+
+- Effort: S | Impact: rows outside the range a query asked for, answered `OK`: a row repeated on every
+  poll by `timestamp > t`, a superset for `=`, and a snapshot's band ignored
+
 ### 198. A quantity of exactly 2^60 − 1 reads back wrong, and so does every quantity after it in its segment ✅ **P2**
 
 **Found reading the codec for #49.** Simple8b stores a value wider than a word's 60 bits as a

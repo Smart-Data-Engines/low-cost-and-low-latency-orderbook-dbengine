@@ -9,7 +9,9 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -516,8 +518,8 @@ private:
             return parse_price_condition(out);
         }
         if (at(TokKind::KW_AT)) {
-            consume();
-            return parse_snapshot_condition(out);
+            const Token at_tok = consume();
+            return parse_snapshot_condition(out, at_tok);
         }
         return make_error("expected 'timestamp', 'price', or 'AT' condition");
     }
@@ -532,8 +534,9 @@ private:
                 return make_error("expected AND in BETWEEN clause");
             consume();
             if (auto e = parse_uint64(hi); !e.empty()) return e;
-            out.ts_start_ns = lo;
-            out.ts_end_ns   = hi;
+            narrow<uint64_t>(out.ts_start_ns, out.ts_end_ns, lo, hi);
+            OB_LOG_DEBUG("query", "timestamp condition: now [%s, %s]",
+                         bound_text(out.ts_start_ns).c_str(), bound_text(out.ts_end_ns).c_str());
             return {};
         }
         // comparison operator
@@ -543,7 +546,9 @@ private:
         consume();
         uint64_t val = 0;
         if (auto e = parse_uint64(val); !e.empty()) return e;
-        apply_ts_op(out, op, val);
+        apply_comparison<uint64_t>(out.ts_start_ns, out.ts_end_ns, op, val);
+        OB_LOG_DEBUG("query", "timestamp condition: now [%s, %s]",
+                     bound_text(out.ts_start_ns).c_str(), bound_text(out.ts_end_ns).c_str());
         return {};
     }
 
@@ -557,8 +562,9 @@ private:
                 return make_error("expected AND in BETWEEN clause");
             consume();
             if (auto e = parse_int64(hi); !e.empty()) return e;
-            out.price_lo = lo;
-            out.price_hi = hi;
+            narrow<int64_t>(out.price_lo, out.price_hi, lo, hi);
+            OB_LOG_DEBUG("query", "price condition: now [%s, %s]",
+                         bound_text(out.price_lo).c_str(), bound_text(out.price_hi).c_str());
             return {};
         }
         TokKind op = current().kind;
@@ -567,12 +573,25 @@ private:
         consume();
         int64_t val = 0;
         if (auto e = parse_int64(val); !e.empty()) return e;
-        apply_price_op(out, op, val);
+        apply_comparison<int64_t>(out.price_lo, out.price_hi, op, val);
+        OB_LOG_DEBUG("query", "price condition: now [%s, %s]",
+                     bound_text(out.price_lo).c_str(), bound_text(out.price_hi).c_str());
         return {};
     }
 
     // snapshot_condition (after "AT" consumed)
-    std::string parse_snapshot_condition(QueryAST& out) {
+    std::string parse_snapshot_condition(QueryAST& out, const Token& at_tok) {
+        // A subscription is what is written from now on, and `AT` names a moment of the stored
+        // book: there is nothing for it to mean there. It was accepted and dropped, so `SUBSCRIBE
+        // ... WHERE AT t` subscribed to every row (#199).
+        if (out.type == QueryType::SUBSCRIBE) {
+            return make_error_at(at_tok, "AT names a moment of the stored book; a subscription "
+                                         "pushes what is written from now on");
+        }
+        // One book, at one moment: a second `AT` replaced the first without a word (#199).
+        if (out.snapshot_ts_ns.has_value()) {
+            return make_error_at(at_tok, "a second AT; a snapshot is the book at one moment");
+        }
         uint64_t ts = 0;
         if (auto e = parse_uint64(ts); !e.empty()) return e;
         out.snapshot_ts_ns = ts;
@@ -596,24 +615,52 @@ private:
                k == TokKind::GT || k == TokKind::LT || k == TokKind::EQ;
     }
 
-    void apply_ts_op(QueryAST& out, TokKind op, uint64_t val) {
+    /// Narrow a column's range - inclusive at both ends, an absent end unbounded - by one more
+    /// condition's (#199). `AND` is an intersection: a condition on a column narrows what the
+    /// conditions before it allowed, where it used to replace it, so `price >= 300 AND price >= 100`
+    /// answered every price from 100.
+    ///
+    /// A range nothing satisfies stays a lower bound above the upper one. Every reader of the AST
+    /// answers that with no rows - the store's scan and the price filters compare each row with
+    /// both ends - and `format()` writes it back as the same `BETWEEN`.
+    template <typename T>
+    static void narrow(std::optional<T>& lo, std::optional<T>& hi,
+                       std::optional<T> at_least, std::optional<T> at_most) {
+        if (at_least.has_value()) lo = lo.has_value() ? std::max(*lo, *at_least) : *at_least;
+        if (at_most.has_value())  hi = hi.has_value() ? std::min(*hi, *at_most) : *at_most;
+    }
+
+    /// One comparison as the inclusive range it allows, narrowing the column's (#199).
+    ///
+    /// Each comparison used to set one end and nothing else: `=` set the lower bound, so
+    /// `price = 200` answered every price from 200 up, and `>` and `<` set the bound itself, so
+    /// each kept the one value it excludes - `timestamp > t`, the way to ask for what came after
+    /// the last row read, handed that row back again. A strict comparison is the inclusive one a
+    /// step inside; past the end of the type there is no step, and nothing is greater than the
+    /// largest value or less than the smallest, so that is the empty range.
+    template <typename T>
+    static void apply_comparison(std::optional<T>& lo, std::optional<T>& hi, TokKind op, T v) {
+        constexpr T kMin = std::numeric_limits<T>::min();
+        constexpr T kMax = std::numeric_limits<T>::max();
         switch (op) {
-            case TokKind::GE: case TokKind::GT: case TokKind::EQ:
-                out.ts_start_ns = val; break;
-            case TokKind::LE: case TokKind::LT:
-                out.ts_end_ns = val; break;
+            case TokKind::EQ: narrow<T>(lo, hi, v, v); break;
+            case TokKind::GE: narrow<T>(lo, hi, v, std::nullopt); break;
+            case TokKind::LE: narrow<T>(lo, hi, std::nullopt, v); break;
+            case TokKind::GT:
+                if (v == kMax) narrow<T>(lo, hi, kMax, kMax - 1);
+                else           narrow<T>(lo, hi, v + 1, std::nullopt);
+                break;
+            case TokKind::LT:
+                if (v == kMin) narrow<T>(lo, hi, kMin + 1, kMin);
+                else           narrow<T>(lo, hi, std::nullopt, v - 1);
+                break;
             default: break;
         }
     }
 
-    void apply_price_op(QueryAST& out, TokKind op, int64_t val) {
-        switch (op) {
-            case TokKind::GE: case TokKind::GT: case TokKind::EQ:
-                out.price_lo = val; break;
-            case TokKind::LE: case TokKind::LT:
-                out.price_hi = val; break;
-            default: break;
-        }
+    template <typename T>
+    static std::string bound_text(const std::optional<T>& b) {
+        return b.has_value() ? std::to_string(*b) : std::string{"-"};
     }
 
     std::string parse_uint64(uint64_t& out) {
@@ -903,10 +950,28 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
             return "AGG_PRICE_FILTER: aggregates are computed over the whole live book; "
                    "a price filter is not supported (use DEPTH_RANGE(lo, hi))";
         }
+        // `AT` made the query a SNAPSHOT, whose branch below answers rows and never reads the
+        // select list: `SELECT SPREAD(*) ... WHERE AT t` answered the book at t as rows (#199).
+        if (ast.snapshot_ts_ns.has_value()) {
+            OB_LOG_WARN("query", "Rejecting aggregate with AT: symbol=%s exchange=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str());
+            return "AGG_TIME_FILTER: aggregates are computed over the live book; "
+                   "AT is not supported";
+        }
     }
 
     // ── SNAPSHOT query ────────────────────────────────────────────────────────
     if (ast.type == QueryType::SNAPSHOT) {
+        // `AT` names the moment, so a timestamp condition beside it has nothing to mean, and it
+        // was ignored: `AT t AND timestamp BETWEEN ...` answered the book at t whatever the range
+        // said (#199). Refused, as the aggregates refuse theirs.
+        if (ast.ts_start_ns.has_value() || ast.ts_end_ns.has_value()) {
+            OB_LOG_WARN("query",
+                        "Rejecting SNAPSHOT with a timestamp condition: symbol=%s exchange=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str());
+            return "SNAPSHOT_TIME_FILTER: AT names the moment of the book; a timestamp "
+                   "condition beside it is not supported";
+        }
         uint64_t snap_ts = ast.snapshot_ts_ns.value_or(0);
 
         // A SNAPSHOT is a row query, and it answers the columns it names like any other. The shape
@@ -941,10 +1006,20 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
                      ast.symbol.c_str(), ast.exchange.c_str(),
                      static_cast<unsigned long long>(snap_ts), state.size());
 
+        // A price condition keeps the levels of that book priced within it, and was ignored (#199).
+        // It is applied to the book, after the latest row of each level is chosen, not to the rows
+        // before: filtering those would answer a level with an older price of its own whenever its
+        // latest one is out of range.
         uint64_t count = 0;
+        uint64_t priced_out = 0;
         uint64_t lim = ast.limit.value_or(UINT64_MAX);
         for (auto& [k, row] : state) {
             if (count >= lim) break;
+            if ((ast.price_lo.has_value() && row.price < *ast.price_lo) ||
+                (ast.price_hi.has_value() && row.price > *ast.price_hi)) {
+                ++priced_out;
+                continue;
+            }
             QueryResult qr{};
             qr.timestamp_ns    = row.timestamp_ns;
             qr.sequence_number = row.sequence_number;
@@ -955,6 +1030,10 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
             qr.level           = row.level_index;
             cb(qr);
             ++count;
+        }
+        if (priced_out != 0) {
+            OB_LOG_DEBUG("query_engine", "SNAPSHOT: %llu level(s) outside the price condition",
+                         static_cast<unsigned long long>(priced_out));
         }
         return {};
     }
