@@ -1,10 +1,13 @@
 [build-system]
-requires = ["scikit-build-core>=0.8", "cmake>=3.20"]
+# No cmake: the wheel builds no native code (see [tool.scikit-build]).
+requires = ["scikit-build-core>=0.10"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "orderbook-dbengine"
-version = "0.1.0"
+# The version is CMakeLists.txt's `project(... VERSION)` and nowhere else (#42): the binaries report
+# it, and two copies of one number drift. `scripts/release.py check` holds this.
+dynamic = ["version"]
 description = "Low-latency Level 2 orderbook database engine for HFT"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -39,9 +42,20 @@ Repository = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-ord
 Documentation = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/tree/master/docs"
 
 [tool.scikit-build]
-cmake.build-type = "Release"
-# build.targets, not cmake.targets: scikit-build-core >= 0.10 rejects the old
-# name outright, which made `pip install .` fail before it started compiling.
-build.targets = ["orderbook_shared"]
-cmake.define = {"OB_BUILD_TESTS" = "OFF"}
+# A pure-Python wheel (#42): the client over TCP needs no native code, and a platform wheel would
+# carry its own copies of OpenSSL and curl - whose fixes we would then have to release - with a glibc
+# floor set by whichever runner built it. The engine's library for the client's local mode,
+# liborderbook_shared, ships in the .deb, .rpm and .tar.gz instead, against the system's libraries;
+# a developer builds it with CMake (the client says how when it cannot find it).
+wheel.cmake = false
 wheel.packages = ["python/orderbook_engine"]
+# The sdist is the client's, as the wheel is: the package, the metadata, and CMakeLists.txt, which the
+# version is read from. The engine's sources are the repository's and the packages', not a client's.
+sdist.exclude = ["*"]
+sdist.include = ["python/orderbook_engine/*.py", "python/orderbook_engine/py.typed", "pyproject.toml",
+                 "CMakeLists.txt", "README.md", "LICENSE"]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'project\(orderbook-dbengine VERSION (?P<value>[0-9]+\.[0-9]+\.[0-9]+)'

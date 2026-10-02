@@ -236,7 +236,9 @@ QUIT
 ### Use from Python
 
 ```bash
-pip install .
+pip install .     # the client, pure Python
+# local mode needs the engine's C API library: a release package installs it, or build it -
+cmake --build build --target orderbook_shared
 ```
 
 ```python
@@ -379,6 +381,7 @@ See the [docs/](docs/) directory:
 - [Storage Format](docs/storage.md)
 - [Operations](docs/operations.md) - backups, failover, the dashboard and alert rules
 - [Upgrading without stopping](docs/upgrading.md)
+- [Releasing](docs/releasing.md) - what a release contains, how one is cut and verified; [Changelog](CHANGELOG.md)
 - [Benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)
 - [Repository security](docs/github-security.md)

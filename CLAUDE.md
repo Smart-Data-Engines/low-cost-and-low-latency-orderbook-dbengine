@@ -3995,8 +3995,8 @@ because commit messages and specs cite these numbers.
 [docs/roadmap.md](docs/roadmap.md). Both suites run in CI on every pull request, the whole integration
 battery a second time under ThreadSanitizer, with an unexpected skip failing the job. The CLI and
 C++ client harness are built alongside the selected server in both integration jobs. Clang builds
-and tests the tree too. **Thirteen checks are required** on `master`: #38 added `fuzz`, and #147
-took `io-uring-build` away with the transport it built. The exact contexts
+and tests the tree too. **Fourteen checks are required** on `master`: #38 added `fuzz`, #147
+took `io-uring-build` away with the transport it built, and #42 added `package-arm64`. The exact contexts
 live in `.github/rulesets/master.json`, and `check_contexts.py` now derives that number and checks
 **this sentence** against it as well as the one in `docs/github-security.md` — it said "Thirteen"
 for one item, which is pitfall 223 happening in the second document its own mechanism did not

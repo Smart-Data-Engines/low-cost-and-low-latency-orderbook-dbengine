@@ -46,7 +46,15 @@ except ImportError:  # pragma: no cover - depends on the install extras
 
 logger = logging.getLogger("orderbook_engine")
 
-__version__ = "0.2.0"
+# The installed distribution's version, which is CMakeLists.txt's (#42). This said "0.2.0" by hand
+# while the project was 0.1.0: the copy a person retypes is the one that drifts.
+try:
+    from importlib.metadata import PackageNotFoundError as _NotInstalled
+    from importlib.metadata import version as _installed_version
+
+    __version__ = _installed_version("orderbook-dbengine")
+except _NotInstalled:  # imported from a source tree that was never installed
+    __version__ = "unknown"
 __all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError", "OrderbookTlsError",
            "AggValue", "BookUpdate", "BatchOutcome",
            "_murmurhash3_x86_32", "_ConsistentHashRing",
@@ -828,6 +836,8 @@ def _find_library() -> str:
         Path(__file__).parent.parent.parent / "build" / lib_name,
         Path("build") / lib_name,
         Path(lib_name),
+        # Where the .deb, .rpm and .tar.gz put it (#42): the wheel carries no native code.
+        Path("/usr/lib/orderbook-dbengine") / lib_name,
     ]
     env_path = os.environ.get("OB_LIB_PATH")
     if env_path:
@@ -836,8 +846,9 @@ def _find_library() -> str:
         if p.exists():
             return str(p)
     raise FileNotFoundError(
-        f"Cannot find {lib_name}.\n"
-        "Build with: cmake -S . -B build && cmake --build build --target orderbook_shared\n"
+        f"Cannot find {lib_name}, which local mode needs (TCP mode does not).\n"
+        "Install the orderbook-dbengine package for this system (.deb, .rpm or .tar.gz from a\n"
+        "release), or build it: cmake -S . -B build && cmake --build build --target orderbook_shared\n"
         "Or set OB_LIB_PATH=/path/to/liborderbook_shared.so"
     )
 

@@ -9,8 +9,11 @@
 set -euo pipefail
 
 BUILD_DIR="${1:-build-pkg}"
-DEB=$(ls "$BUILD_DIR"/orderbook-dbengine-*-Linux.deb 2>/dev/null | head -1)
-TGZ=$(ls "$BUILD_DIR"/orderbook-dbengine-*-Linux.tar.gz 2>/dev/null | head -1)
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+# The names carry the architecture since #42: orderbook-dbengine_X.Y.Z_<arch>.deb and
+# orderbook-dbengine-X.Y.Z-Linux-<arch>.tar.gz.
+DEB=$(ls "$BUILD_DIR"/orderbook-dbengine_*.deb 2>/dev/null | head -1)
+TGZ=$(ls "$BUILD_DIR"/orderbook-dbengine-*-Linux-*.tar.gz 2>/dev/null | head -1)
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok: $*"; }
@@ -27,10 +30,11 @@ for path in ./usr/bin/ob_tcp_server \
             ./etc/orderbook/ob.conf \
             ./usr/lib/systemd/system/ob_tcp_server.service \
             ./usr/share/man/man1/ob_tcp_server.1 \
-            ./usr/include/orderbook/engine.hpp; do
+            ./usr/include/orderbook/engine.hpp \
+            ./usr/lib/orderbook-dbengine/liborderbook_shared.so; do
     echo "$CONTENTS" | grep -qx -- "$path" || fail "missing from the package: $path"
 done
-ok "server, backup tools, config, unit, man page and headers are all in the package"
+ok "server, backup tools, config, unit, man page, headers and the C API library are all in the package"
 
 # The config must be at /etc, not /usr/etc. `packaging/debian/conffiles` names /etc/orderbook/ob.conf,
 # and a conffile declaration pointing at a path the package does not contain marks nothing — the
@@ -46,10 +50,10 @@ ok "no /usr/etc — the conffile declaration names a path that exists"
 echo "$CONTENTS" | grep -q "obfault" && fail "the fault injector leaked into the package"
 ok "no fault injector"
 
-# The Python wheel's shared library must not be here. It is installed for scikit-build-core into a
-# directory that means nothing on a system, and CPack with component install off takes every rule.
-echo "$CONTENTS" | grep -q "orderbook_engine/" && fail "the wheel's shared library leaked into the package"
-ok "no wheel artefacts"
+# No Python package here: the client is on PyPI, and a copy in the system package would shadow the
+# version an operator installs with pip.
+echo "$CONTENTS" | grep -q "orderbook_engine/" && fail "the Python client's package leaked into the system package"
+ok "no Python package"
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
 META=$(dpkg-deb -I "$DEB")
@@ -87,6 +91,22 @@ ok "the packaged binary accepts the packaged configuration, and the file's value
 "$WORK/usr/bin/ob_restore" --help > /dev/null || fail "the packaged ob_restore does not run"
 "$WORK/usr/bin/ob_backup" --help > /dev/null || fail "the packaged ob_backup does not run"
 ok "the packaged ob_restore and ob_backup run"
+
+# The C API library from the package, under the Python client's local mode: a write, a flush and a
+# query against a data directory of its own (#42). A library missing a symbol or a shared library it
+# links is found here rather than by a user of local mode.
+OB_LIB_PATH="$WORK/usr/lib/orderbook-dbengine/liborderbook_shared.so" PYTHONPATH="$REPO/python" \
+    python3 - "$WORK/local-data" <<'PY' || fail "the packaged C API library does not serve the client's local mode"
+import sys
+from orderbook_engine import OrderbookEngine
+engine = OrderbookEngine(data_dir=sys.argv[1])
+engine.insert("PKG", "TEST", "bid", prices=[100, 99], qtys=[5, 6], counts=[1, 1])
+engine.flush()
+rows = engine.query_all("PKG", "TEST")
+engine.close()
+assert len(rows) == 2, rows
+PY
+ok "the packaged C API library serves the client's local mode: a write, a flush, a query"
 
 # ── The unit ──────────────────────────────────────────────────────────────────
 # systemd-analyze reports the ExecStart binary as missing unless the package is installed, which it

@@ -1168,6 +1168,26 @@ flag rather than a file.
   scikit-build-core is already in place), signed tags
 - Effort: S | Impact: `pip install orderbook-dbengine` is the shortest path to a first user
 
+**The pipeline is in; no release has been cut** (spec `kiro-workspace/specs/engine-release/`,
+`docs/releasing.md`). A tag `vX.Y.Z` is the whole trigger: `release.yml` checks that it names
+`CMakeLists.txt`'s version - the only place the version is written now; `pyproject.toml` reads it and
+the Python client asks its own metadata, where it had said "0.2.0" by hand while the project was
+0.1.0 - that `CHANGELOG.md` has its section and that the commit is on `master`; builds the `.deb`,
+`.rpm` and `.tar.gz` natively for x86_64 and aarch64, with the architecture in every file name, where
+both would have been `orderbook-dbengine-0.1.0-Linux.deb`; installs the `.deb` and runs the wheel's
+client against it over TCP and in local mode; and publishes the GitHub release with attestations and
+the wheel to PyPI by trusted publishing, behind a reviewer. Everything but the publishing runs on
+every pull request, in the required `package` and the new `package-arm64`, through one script the
+release runs too - fourteen required checks now.
+
+The wheel is pure Python now (`py3-none-any`): over TCP the client needs nothing native, and a
+platform wheel would have carried its own OpenSSL and curl. Local mode loads the C API library the
+packages install under `/usr/lib/orderbook-dbengine/`. And the RPM said its licence was MIT; it is
+Apache-2.0.
+
+What is left is the owner's: a pending trusted publisher on PyPI for `orderbook-dbengine` (the name is
+free), the `pypi` environment with a reviewer, a key to sign tags - and then the tag.
+
 ### 43. Worked example: live market data ingestion
 - A runnable Binance (or Coinbase) websocket ingestor writing into the engine, with a Grafana
   dashboard showing it live. `scripts/binance_*.py` is the seed for this

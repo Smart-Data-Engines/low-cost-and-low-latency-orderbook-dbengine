@@ -27,6 +27,11 @@ jobs:
       - name: Check roadmap item ids and cross-references
         run: python3 scripts/check_roadmap.py
 
+      - name: One version, and a release workflow PyPI can trust
+        # The version only in CMakeLists.txt, a changelog section for it or for what is unreleased,
+        # and release.yml under its name, triggered by tags alone, its actions pinned (#42).
+        run: python3 scripts/release.py check
+
       - name: Check every metric written by name is registered
         run: python3 scripts/check_metrics.py
 
@@ -586,6 +591,10 @@ jobs:
   # Runs on tags, and on any pull request that touches packaging. The second half matters: a job
   # first exercised on a tag is a job first exercised at the moment it matters most, and CPack
   # failures are configuration failures that show up only when a generator actually runs.
+  # Everything a release does but publish, on both architectures, on every pull request (#42): the
+  # first time an aarch64 package is built must not be the day of a release. One script for both
+  # jobs and for release.yml's, so the three cannot drift apart. Two jobs rather than a matrix
+  # because the ruleset requires `package` by name and has since long before aarch64.
   package:
     name: package
     runs-on: ubuntu-24.04
@@ -596,39 +605,46 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev rpm
+          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev rpm python3-venv
           # rpm brings rpmbuild, which is what makes the RPM generator appear. Without it CMake
-          # configures DEB and TGZ only — see the note by CPACK_GENERATOR.
+          # configures DEB and TGZ only - see the note by CPACK_GENERATOR.
 
-      - name: Configure and build
-        run: |
-          cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
-          cmake --build build-pkg -j$(nproc) --target ob_tcp_server ob_restore ob_backup
-
-      - name: Build the packages
-        run: cd build-pkg && cpack
-
-      - name: Verify the packages
-        run: ./scripts/verify_package.sh build-pkg
-
-      - name: Inspect the RPM
-        run: |
-          RPM=$(ls build-pkg/orderbook-dbengine-*.rpm | head -1)
-          echo "package: $RPM"
-          rpm -qip "$RPM"
-          rpm -qlp "$RPM"
-          # The same two properties the .deb is held to: the config is at /etc, and it is marked so
-          # an upgrade does not replace an operator's edits.
-          rpm -qlp "$RPM" | grep -qx /etc/orderbook/ob.conf
-          rpm -qcp "$RPM" | grep -qx /etc/orderbook/ob.conf
+      - name: Build, package, check, install and accept
+        run: ./scripts/package_ci.sh build-pkg dist
 
       - name: Upload the packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: packages
+          name: packages-x86_64
           path: |
-            build-pkg/orderbook-dbengine-*.deb
-            build-pkg/orderbook-dbengine-*.tar.gz
+            build-pkg/orderbook-dbengine_*.deb
+            build-pkg/orderbook-dbengine-*-Linux-*.tar.gz
+            build-pkg/orderbook-dbengine-*.rpm
+            dist/*
+          if-no-files-found: error
+
+  package-arm64:
+    name: package-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev rpm python3-venv
+
+      - name: Build, package, check, install and accept
+        run: ./scripts/package_ci.sh build-pkg dist
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages-aarch64
+          path: |
+            build-pkg/orderbook-dbengine_*.deb
+            build-pkg/orderbook-dbengine-*-Linux-*.tar.gz
             build-pkg/orderbook-dbengine-*.rpm
           if-no-files-found: error
 
