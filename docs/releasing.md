@@ -36,6 +36,9 @@ sha256sum -c SHA256SUMS
 3. Tag the merge and push the tag - signed, once the signing key exists:
    `git tag -s vX.Y.Z <merge sha> -m "orderbook-dbengine X.Y.Z" && git push origin vX.Y.Z`.
 4. The workflow runs, and the PyPI job waits for its reviewer's approval in the `pypi` environment.
+5. Once it is out, a pull request that moves `scripts/previous_version.txt` to the tagged commit
+   (`git rev-parse vX.Y.Z^{commit}`) and the matrix in `docs/upgrading.md` with it: from then on
+   `tests/integration/test_mixed_versions.py` measures every tree against the build users run.
 
 A first attempt can fail on something only a tag exercises. PyPI never gives a version back once a
 file is uploaded, so a failure after the upload means the next release is X.Y.Z+1; a GitHub release

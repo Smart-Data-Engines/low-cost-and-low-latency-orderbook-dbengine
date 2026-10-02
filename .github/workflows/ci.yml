@@ -588,13 +588,12 @@ jobs:
   # unreliable, and a flaky required check teaches people to ignore checks.
   # ── Packaging ───────────────────────────────────────────────────────────────
   #
-  # Runs on tags, and on any pull request that touches packaging. The second half matters: a job
-  # first exercised on a tag is a job first exercised at the moment it matters most, and CPack
-  # failures are configuration failures that show up only when a generator actually runs.
-  # Everything a release does but publish, on both architectures, on every pull request (#42): the
-  # first time an aarch64 package is built must not be the day of a release. One script for both
-  # jobs and for release.yml's, so the three cannot drift apart. Two jobs rather than a matrix
-  # because the ruleset requires `package` by name and has since long before aarch64.
+  # Everything a release does but publish, on both architectures, on every pull request (#42). A job
+  # first exercised on a tag is a job first exercised at the moment it matters most: CPack failures
+  # are configuration failures that show up only when a generator actually runs, and the first time
+  # an aarch64 package is built must not be the day of a release. One script, scripts/package_ci.sh,
+  # for both jobs and for release.yml's, so the three cannot drift apart. Two jobs rather than a
+  # matrix because the ruleset requires `package` by name, and has since long before aarch64.
   package:
     name: package
     runs-on: ubuntu-24.04

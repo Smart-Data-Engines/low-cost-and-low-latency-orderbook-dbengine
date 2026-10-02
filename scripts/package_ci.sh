@@ -10,14 +10,21 @@
 #   - install the .deb with apt, as a user would, and accept the release from the artefacts alone
 #     (scripts/release_acceptance.py).
 #
-#   scripts/package_ci.sh [build dir] [dist dir]
+#   scripts/package_ci.sh [build dir] [dist dir] [--no-install]
 #
-# The install needs sudo and changes the system, so this is for a disposable CI runner. On a
-# workstation run verify_package.sh, and release_acceptance.py with --root.
+# The install needs sudo and changes the system, so it is for a disposable CI runner. On a
+# workstation, `--no-install` runs everything else and accepts the release from the extracted
+# tarball instead (release_acceptance.py --root), which tests all of it but where the client looks
+# for the library by itself.
 set -euo pipefail
 
 BUILD=${1:-build-pkg}
 DIST=${2:-dist}
+case "${3:-}" in
+    "")           INSTALL=yes ;;
+    --no-install) INSTALL=no ;;
+    *)            echo "usage: $0 [build dir] [dist dir] [--no-install]" >&2; exit 2 ;;
+esac
 VERSION=$(python3 scripts/release.py version | cut -d= -f2)
 step() { echo; echo "── $*"; }
 
@@ -46,7 +53,8 @@ fi
 step "the Python client's wheel and sdist"
 python3 -m venv "$BUILD/venv-dist"
 "$BUILD/venv-dist/bin/pip" install --quiet --upgrade pip build twine
-rm -rf "$DIST"
+# Both emptied first: on a workstation a file left by an earlier run would answer the checks below.
+rm -rf "${DIST:?}" "${BUILD:?}/from-sdist"
 "$BUILD/venv-dist/bin/python" -m build --outdir "$DIST" .
 WHEEL="$DIST/orderbook_dbengine-$VERSION-py3-none-any.whl"
 SDIST="$DIST/orderbook_dbengine-$VERSION.tar.gz"
@@ -57,6 +65,15 @@ SDIST="$DIST/orderbook_dbengine-$VERSION.tar.gz"
 [ -f "$BUILD/from-sdist/$(basename "$WHEEL")" ] || { echo "FAIL: the sdist does not build $(basename "$WHEEL")"; exit 1; }
 echo "  ok: $(basename "$WHEEL"), and an sdist that builds it"
 
-step "installed as a user would, and accepted from the artefacts"
-sudo apt-get install -y -qq "$PWD/$BUILD/orderbook-dbengine_${VERSION}_$(dpkg --print-architecture).deb"
-python3 scripts/release_acceptance.py "$DIST" "$VERSION"
+if [ "$INSTALL" = yes ]; then
+    step "installed as a user would, and accepted from the artefacts"
+    sudo apt-get install -y -qq "$PWD/$BUILD/orderbook-dbengine_${VERSION}_$(dpkg --print-architecture).deb"
+    python3 scripts/release_acceptance.py "$DIST" "$VERSION"
+else
+    step "accepted from the artefacts, the tarball extracted rather than the .deb installed"
+    rm -rf "${BUILD:?}/extracted"
+    mkdir -p "$BUILD/extracted"
+    tar xzf "$BUILD/orderbook-dbengine-$VERSION-Linux-$(uname -m).tar.gz" -C "$BUILD/extracted" \
+        --strip-components=1
+    python3 scripts/release_acceptance.py "$DIST" "$VERSION" --root "$BUILD/extracted"
+fi

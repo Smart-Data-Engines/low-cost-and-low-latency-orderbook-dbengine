@@ -33,11 +33,11 @@ The first release. What it contains, by area:
 
 ### Replication and availability
 
-- WAL streaming replication with snapshot bootstrap of replicas, replica lag in records, and a new
-  WAL lineage after a snapshot is installed (#197).
+- WAL streaming replication with snapshot bootstrap of replicas, lag in the bytes a replica has yet
+  to acknowledge, and a new WAL lineage after a snapshot is installed (#197).
 - Automatic failover through etcd with epoch fencing, and graceful handover to a named replica.
-- Multi-master replication: per-origin numbering, version vectors sent in parts, catch-up, conflict
-  resolution by hybrid logical clocks and last-writer-wins.
+- Multi-master replication: per-origin numbering, version vectors sent in parts, catch-up, lag in
+  records, conflict resolution by hybrid logical clocks and last-writer-wins.
 - Sharding by symbol on a consistent-hash ring, and moving a symbol between shards with its rows
   (#196).
 - Rolling upgrades: the previous version's server and this one, side by side, in both directions

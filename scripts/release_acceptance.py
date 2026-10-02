@@ -19,6 +19,7 @@ Exit status 0 if every one holds.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import socket
@@ -27,8 +28,14 @@ import sys
 import tempfile
 import time
 
-DIST, VERSION = sys.argv[1], sys.argv[2]
-ROOT = sys.argv[4] if len(sys.argv) > 4 and sys.argv[3] == "--root" else None
+# argparse rather than reading sys.argv by position: a `--root` with its value forgotten must be an
+# error, not an acceptance run quietly against whatever is installed in /usr/bin.
+_parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+_parser.add_argument("dist", help="the directory holding the wheel")
+_parser.add_argument("version", help="the version being released, X.Y.Z")
+_parser.add_argument("--root", help="an extracted .tar.gz to take the server and library from")
+_args = _parser.parse_args()
+DIST, VERSION, ROOT = _args.dist, _args.version, _args.root
 SERVER = os.path.join(ROOT, "usr/bin/ob_tcp_server") if ROOT else "/usr/bin/ob_tcp_server"
 LIB = os.path.join(ROOT, "usr/lib/orderbook-dbengine/liborderbook_shared.so") if ROOT else None
 PORT = 21998  # below the ephemeral range
