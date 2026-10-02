@@ -15,6 +15,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -1227,11 +1229,11 @@ bool read_column_file(const std::string& dir, const char* name, std::vector<T>& 
     return true;
 }
 
-/// The buffers one segment read fills - the column files as read and the columns decoded - kept by
-/// the thread from one read to the next (#49 step 2). A read allocated all eleven afresh and freed
-/// them at the end, and in a process whose heap glibc trims after that free every page came back as
-/// a fault on the next read: a store alone in a process scanned a segment of 100 000 rows in
-/// 6.3 ms, and in 2.5 ms with the heap left untrimmed.
+/// The buffers one segment read fills - the column files as read and the columns decoded - kept
+/// from one read to the next (#49 step 2). A read allocated all eleven afresh and freed them at the
+/// end, and in a process whose heap glibc trims after that free every page came back as a fault on
+/// the next read: a store alone in a process scanned a segment of 100 000 rows in 6.3 ms, and in
+/// 2.5 ms with the heap left untrimmed.
 struct SegmentReadBuffers {
     std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq, qtys, zigzag_seq;
     std::vector<int64_t>  prices, seqs;
@@ -1248,69 +1250,128 @@ struct SegmentReadBuffers {
     }
 };
 
-/// What a thread keeps between reads. A segment has at most `compaction::kMaxRows` rows, 262 144,
-/// and every column of that many is 23 MB, so this holds any segment the engine writes; a read that
-/// left more - a segment from somewhere else - gives it back.
-constexpr size_t kHeldReadBytes = size_t{32} << 20;
-std::atomic<size_t> g_held_read_limit{kHeldReadBytes};
+/// What the process keeps between reads, over every thread: a segment has at most
+/// `compaction::kMaxRows` rows, 262 144, and every column of that many is 23 MB, so this is five
+/// reads of the largest segments at once - four io threads and a merge.
+constexpr size_t kReadBufferBudget = size_t{128} << 20;
 
-struct HeldReadBuffers {
-    SegmentReadBuffers buffers;
-    bool in_use = false;
+/// The sets of buffers no read is using, shared by every thread rather than kept per thread: an
+/// application embedding the engine can query from as many threads as it has, and what those keep
+/// has to be bounded by something other than their number. A read takes a set - the one given back
+/// last, whose pages are the likeliest to be warm - or a new one, and gives it back; a set that
+/// would take the pool past its budget is freed instead. A read inside another's callback simply
+/// takes a second set.
+class ReadBufferPool {
+public:
+    /// Never destroyed: a thread still reading while statics are torn down must not find it gone.
+    static ReadBufferPool& instance() {
+        static ReadBufferPool* pool = new ReadBufferPool();
+        return *pool;
+    }
+
+    std::unique_ptr<SegmentReadBuffers> take() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!free_.empty()) {
+                Kept kept = std::move(free_.back());
+                free_.pop_back();
+                held_ -= kept.bytes;
+                return std::move(kept.buffers);
+            }
+        }
+        return std::make_unique<SegmentReadBuffers>();
+    }
+
+    void give(std::unique_ptr<SegmentReadBuffers> buffers) noexcept {
+        const size_t bytes = buffers->held_bytes();
+        std::unique_ptr<SegmentReadBuffers> freed;
+        size_t held = 0;
+        size_t budget = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            budget = budget_;
+            if (held_ + bytes > budget_) {
+                freed = std::move(buffers);
+                held = held_;
+            } else {
+                try {
+                    free_.push_back(Kept{bytes, std::move(buffers)});
+                    held_ += bytes;
+                } catch (const std::exception&) {
+                    freed = std::move(buffers);   // a list that could not grow keeps nothing new
+                    held = held_;
+                }
+            }
+        }
+        if (freed) {
+            try {
+                OB_LOG_DEBUG("columnar", "freeing %zu bytes of segment-read buffers: the process "
+                                         "keeps %zu of at most %zu between reads", bytes, held, budget);
+            } catch (const std::exception&) {
+                // A read's end is no place to fail from; the line is all that is lost.
+            }
+        }
+    }   // `freed`, if anything, is given back to the allocator here - outside the lock
+
+    size_t held() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return held_;
+    }
+
+    /// A new budget, and the sets it no longer holds freed.
+    size_t set_budget(size_t bytes) {
+        std::vector<Kept> dropped;
+        size_t was = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            was = budget_;
+            budget_ = bytes;
+            while (!free_.empty() && held_ > budget_) {
+                held_ -= free_.front().bytes;
+                dropped.push_back(std::move(free_.front()));
+                free_.erase(free_.begin());
+            }
+        }
+        return was;
+    }
+
+private:
+    ReadBufferPool() = default;
+
+    struct Kept {
+        size_t bytes;
+        std::unique_ptr<SegmentReadBuffers> buffers;
+    };
+    std::mutex        mtx_;
+    std::vector<Kept> free_;
+    size_t            held_ = 0;
+    size_t            budget_ = kReadBufferBudget;
 };
 
-HeldReadBuffers& held_read_buffers() {
-    thread_local HeldReadBuffers held;
-    return held;
-}
-
-/// This thread's buffers for the length of one read - or a set of the read's own, when a read on
-/// this thread already has them: a callback that reads a segment again must not refill the columns
-/// the outer read is handing rows out of.
+/// One read's set of buffers, taken from the pool for the length of the read.
 class ReadBuffersLease {
 public:
-    ReadBuffersLease() : held_(held_read_buffers()) {
-        if (!held_.in_use) {
-            held_.in_use = true;
-            buffers_ = &held_.buffers;
-        } else {
-            OB_LOG_DEBUG("columnar", "a segment read inside another on this thread: it uses buffers "
-                                     "of its own");
-            own_.emplace();
-            buffers_ = &*own_;
-        }
-    }
-    ~ReadBuffersLease() {
-        if (buffers_ != &held_.buffers) return;
-        const size_t bytes = held_.buffers.held_bytes();
-        const size_t limit = g_held_read_limit.load(std::memory_order_relaxed);
-        if (bytes > limit) {
-            OB_LOG_DEBUG("columnar", "giving back %zu bytes of segment-read buffers: this thread "
-                                     "keeps at most %zu between reads", bytes, limit);
-            held_.buffers = SegmentReadBuffers{};
-        }
-        held_.in_use = false;
-    }
+    ReadBuffersLease() : buffers_(ReadBufferPool::instance().take()) {}
+    ~ReadBuffersLease() { ReadBufferPool::instance().give(std::move(buffers_)); }
     ReadBuffersLease(const ReadBuffersLease&) = delete;
     ReadBuffersLease& operator=(const ReadBuffersLease&) = delete;
 
     SegmentReadBuffers& buffers() { return *buffers_; }
 
 private:
-    HeldReadBuffers&                  held_;
-    std::optional<SegmentReadBuffers> own_;
-    SegmentReadBuffers*               buffers_ = nullptr;
+    std::unique_ptr<SegmentReadBuffers> buffers_;
 };
 
 }  // namespace
 
 size_t ColumnarStore::read_buffers_held() {
-    return held_read_buffers().buffers.held_bytes();
+    return ReadBufferPool::instance().held();
 }
 
 void ColumnarStore::set_read_buffers_limit_for_test(size_t bytes) {
-    OB_LOG_INFO("columnar", "segment-read buffers: a thread keeps at most %zu bytes (was %zu)", bytes,
-                g_held_read_limit.exchange(bytes, std::memory_order_relaxed));
+    const size_t was = ReadBufferPool::instance().set_budget(bytes);
+    OB_LOG_INFO("columnar", "segment-read buffers: the process keeps at most %zu bytes (was %zu)",
+                bytes, was);
 }
 
 ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
@@ -1337,9 +1398,9 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         return SegmentRead::kUnreadable;
     }
 
-    // The thread's buffers, which hold an earlier read's columns. Every column this read uses is
-    // read or decoded into its buffer below; one it does not use is emptied here, capacity kept, so
-    // that it is empty by construction as a new vector was.
+    // A set of buffers from the pool, holding an earlier read's columns. Every column this read uses
+    // is read or decoded into its buffer below; one it does not use is emptied here, capacity kept,
+    // so that it is empty by construction as a new vector was.
     ReadBuffersLease lease;
     SegmentReadBuffers& b = lease.buffers();
     std::vector<uint64_t>& timestamps = b.timestamps;
