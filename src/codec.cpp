@@ -205,23 +205,24 @@ inline void unpack(uint64_t word, uint64_t* out) noexcept {
 
 }  // namespace
 
-std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t count) {
-    std::vector<uint64_t> out;
-    decode_simple8b_into(words, count, out);
-    return out;
-}
+namespace {
 
-void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::vector<uint64_t>& out) {
-    // Sized once and trimmed at the end to what the words held. Never larger than they can hold,
-    // 240 values each: the push_back version only reserved `count`, and sizing touches the pages.
-    // A vector used before still holds its last values, so the all-zero selectors write theirs.
-    const size_t want = std::min(count, words.size() * 240);
-    out.resize(want);
-    uint64_t* o = out.data();
+/// The words' values into `o`, which has room for `want`; how many it wrote. `kZeroed`: whether `o`
+/// holds zeros already - a new vector's - so that the two all-zero selectors only move the cursor;
+/// a vector used before holds an earlier decode's values, and they write theirs.
+///
+/// The words are read through a pointer and a count held in locals, not through the span: measured
+/// (#49's step 2), that is the faster loop for words of several values - 2.21 against 2.42 ns a
+/// value on the i3-7100U, level on the ARM host - which is what a column of quantities is made of,
+/// at the price of words holding one 60-bit value each on the ARM host.
+template <bool kZeroed>
+size_t decode_simple8b_words(std::span<const uint64_t> words, size_t want, uint64_t* o) noexcept {
+    const uint64_t* w = words.data();
+    const size_t nw = words.size();
     size_t n = 0;
     size_t wi = 0;
-    while (wi < words.size() && n < want) {
-        const uint64_t word = words[wi++];
+    while (wi < nw && n < want) {
+        const uint64_t word = w[wi++];
         const uint32_t sel  = static_cast<uint32_t>(word >> 60);
         const size_t   room = want - n;
         if (kSelectors[sel].count > room) {
@@ -231,15 +232,14 @@ void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::ve
             if (bits != 0) {
                 const uint64_t mask = (1ULL << bits) - 1;
                 for (size_t k = 0; k < room; ++k) o[n + k] = (word >> (k * bits)) & mask;
-            } else {
+            } else if (!kZeroed) {
                 std::fill_n(o + n, room, uint64_t{0});
             }
-            n = want;
-            break;
+            return want;
         }
         switch (sel) {
-        case 0:  std::fill_n(o + n, 240, uint64_t{0}); n += 240; break;
-        case 1:  std::fill_n(o + n, 120, uint64_t{0}); n += 120; break;
+        case 0:  if (!kZeroed) std::fill_n(o + n, 240, uint64_t{0}); n += 240; break;
+        case 1:  if (!kZeroed) std::fill_n(o + n, 120, uint64_t{0}); n += 120; break;
         case 2:  unpack<1, 60>(word, o + n);  n += 60; break;
         case 3:  unpack<2, 30>(word, o + n);  n += 30; break;
         case 4:  unpack<3, 20>(word, o + n);  n += 20; break;
@@ -257,8 +257,8 @@ void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::ve
             // One 60-bit value - or, with the marker for a payload and a word after it, the
             // fallback, whose value is that word.
             const uint64_t payload = word & kFallbackMarker;
-            if (payload == kFallbackMarker && wi < words.size()) {
-                o[n++] = words[wi++];
+            if (payload == kFallbackMarker && wi < nw) {
+                o[n++] = w[wi++];
             } else {
                 o[n++] = payload;
             }
@@ -266,7 +266,24 @@ void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::ve
         }
         }
     }
-    out.resize(n);
+    return n;
+}
+
+}  // namespace
+
+std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t count) {
+    // Never larger than the words can hold, 240 values each: the push_back version only reserved
+    // `count`, and sizing touches the pages. Trimmed to what the words held.
+    const size_t want = std::min(count, words.size() * 240);
+    std::vector<uint64_t> out(want);
+    out.resize(decode_simple8b_words<true>(words, want, out.data()));
+    return out;
+}
+
+void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::vector<uint64_t>& out) {
+    const size_t want = std::min(count, words.size() * 240);
+    out.resize(want);   // capacity kept; what an earlier decode left is written over or cut off
+    out.resize(decode_simple8b_words<false>(words, want, out.data()));
 }
 
 } // namespace ob
