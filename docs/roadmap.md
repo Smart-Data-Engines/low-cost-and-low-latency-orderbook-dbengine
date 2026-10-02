@@ -1351,6 +1351,33 @@ What is left of a server's `SELECT` is the answer, not the read: the server coll
 vector, then formats them. The reply's format has no row count in front - `OK`, the columns, the
 rows, a blank line - so a handler could format each row as the scan hands it over.
 
+**Step 3: a `SELECT`'s reply is built as the engine hands its rows over.** `QueryResponseBuilder`
+formats each row as it arrives, through the paths `format_query_response()` has - the seven columns
+unrolled into a stack buffer, a narrowing out of line - and writes the same bytes, which a property
+over any rows and any list of columns holds it to. A first result carrying aggregates makes the
+reply the aggregates', the choice the server made from the first row it collected. It writes the
+header at the first row, from the query's shape, which the engine fills before it hands one over;
+tests hold the engine to that for a scan, a snapshot and an aggregate, and the reply built on a real
+engine to the one collected and formatted. `SELECT` and `BOOK` use it, and BOOK has a test through
+the handler, where `test_live_book.py` had been its only one. `ob_query_latency_seconds` includes
+formatting the reply since, which happens inside the scan.
+
+Step 2 against step 3, `scripts/measure_select_scan.py` three rounds each, alternating
+(`evidence/2026-10-02-select-streams/`):
+
+| | i3-7100U | m9g.xlarge |
+|---|---|---|
+| 100 000 rows: the server's CPU a query | 23.6-24.8 → 23.4-28.0 ms | 8.15-8.35 → 7.00-7.05 ms |
+| the client's wall time, p50 | 35.8-37.6 → 36.2-41.3 ms | 11.1-11.5 → 9.5-10.3 ms |
+| 1 000 000 rows: the server's CPU a query | 418-429 → 301-362 ms | 128.5-130.0 → 100.5-105.0 ms |
+| its page faults a query | 34 808 → 19 181 | 34 808 → 19 181 |
+| the client's wall time, p50 | 972-1 036 → 778-947 ms | 273-282 → 245-260 ms |
+
+The i3's rows at 100 000 are its noise - another session's work kept its load averages at 1.8-3.4
+at the run's start and end - and the ARM host's are the measurement. At a million rows both still fault, 19 181 pages a query in step
+3, 75 MB: most likely the reply's own string, which grows by doubling past the 32 MiB above which
+glibc maps an allocation afresh and unmaps it on free - not measured here.
+
 ### 50. NUMA awareness and thread pinning
 - Per-socket allocation, pinned io threads, `--cpu-affinity` configuration
 - Effort: M | Impact: Tail latency on multi-socket servers, which is where clients run
