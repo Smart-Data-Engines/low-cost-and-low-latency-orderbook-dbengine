@@ -201,6 +201,64 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
     return out;
 }
 
+// ── QueryResponseBuilder ──────────────────────────────────────────────────────
+
+void QueryResponseBuilder::start(const QueryResult& first) {
+    started_ = true;
+    if (!first.agg_values.empty()) {
+        aggregate_  = true;
+        aggregates_ = first.agg_values;
+        return;
+    }
+    // Not reserved from a count, as format_query_response() is: no count exists until the scan
+    // ends. A string that doubles copies what it holds about once over in all, where the vector of
+    // rows it replaces copied 64 bytes a row each time it grew and was read once more to format.
+    out_.reserve(4096);
+    out_ += "OK\n";
+    const auto& columns = shape_.columns;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i != 0) out_ += '\t';
+        out_ += column_name(columns[i]);
+    }
+    out_ += '\n';
+    all_seven_ = columns == all_query_columns();
+    if (!all_seven_ && !columns.empty()) narrow_row_.resize(max_row_bytes(columns));
+}
+
+void QueryResponseBuilder::add(const QueryResult& r) {
+    if (!started_) start(r);
+    if (aggregate_) return;   // the one aggregate result is the whole answer
+    if (all_seven_) {
+        // The canonical seven unrolled into a fixed local array, as format_query_response() writes
+        // them, and for the reasons given there.
+        char line[kMaxQueryRowBytes];
+        char* p = put_seven(line, line + sizeof(line), r);
+        out_.append(line, static_cast<size_t>(p - line));
+    } else if (!shape_.columns.empty()) {
+        add_narrow(r);
+    }
+}
+
+// Out of line for the reason format_narrow_rows() is: inlined beside the seven-column path, it would
+// take `to_chars` out of that path's inlining.
+[[gnu::noinline]] void QueryResponseBuilder::add_narrow(const QueryResult& r) {
+    const auto& columns = shape_.columns;
+    char* const buf_end = narrow_row_.data() + narrow_row_.size();
+    char* p = narrow_row_.data();
+    const size_t last = columns.size() - 1;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        p = put_column(p, buf_end, r, columns[i], i == last ? '\n' : '\t');
+    }
+    out_.append(narrow_row_.data(), static_cast<size_t>(p - narrow_row_.data()));
+}
+
+std::string QueryResponseBuilder::finish() {
+    if (aggregate_) return format_agg_response(aggregates_);
+    if (!started_) return format_query_response({}, shape_.columns);
+    out_ += '\n';   // empty line terminator
+    return std::move(out_);
+}
+
 // ── format_agg_response ───────────────────────────────────────────────────────
 
 std::string format_agg_response(const std::vector<AggValue>& values) {

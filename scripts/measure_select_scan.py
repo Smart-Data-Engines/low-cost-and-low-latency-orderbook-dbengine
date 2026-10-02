@@ -5,7 +5,7 @@ One fresh node, one symbol of ROWS rows loaded through the Python client and FLU
 in segments - then QUERIES full-range SELECTs over one connection, after ten to warm up. Printed:
 
   - the engine's time a query, from `ob_query_latency_seconds` - the read and the rows' hand-over,
-    without the formatting and the send;
+    and since #49's step 3 the reply's formatting, which happens as the rows are handed over;
   - the server's minor page faults a query, and the CPU time it spent a query, from /proc/<pid>/stat -
     the whole of answering it, scan, formatting and send, where the engine's time is the first;
   - the client's wall time a query, p50 and min, over a socket read to the reply's blank line - so
