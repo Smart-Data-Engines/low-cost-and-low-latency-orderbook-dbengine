@@ -271,6 +271,21 @@ sudo sysctl --system
 `1` rather than `0`: zero disables swap for the cgroup entirely, which turns memory pressure into
 the OOM killer choosing a victim, and the victim is often the largest process — this one.
 
+### Memory kept after reading a segment
+
+A read of a segment - an io thread answering a query, the compaction thread merging, a move of a
+symbol to another shard - takes a set of buffers to read the segment's columns into and decode them
+into, and gives it back when it is done, and the process keeps the sets given back for the next reads
+(#49's step 2). It keeps at most 128 MiB of them, over every thread: a segment has at most 262 144
+rows, whose columns are about 23 MB, so that is five reads of the largest segments at once. A set
+that would take it past that is freed.
+
+Freeing every set after its read, as a read did before, is not free: in a process whose heap glibc
+turns over, the next read faults its pages back in. A store alone in a process scanned a segment of
+100 000 rows in 6.56-6.61 ms on the i3-7100U and 1.97 ms with the sets kept, and a server answering
+`SELECT`s of those rows faulted up to 4 837 pages a query - in some runs, not in others - and none
+with them kept (#49's step 2 in the roadmap).
+
 ### fsync policy per storage device
 
 `--fsync-policy` (or `fsync-policy` in the configuration file) decides when the WAL is durable, and

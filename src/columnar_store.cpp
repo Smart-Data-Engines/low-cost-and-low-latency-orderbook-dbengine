@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <chrono>
@@ -14,6 +15,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -1220,10 +1223,156 @@ bool read_column_file(const std::string& dir, const char* name, std::vector<T>& 
     f.seekg(0, std::ios::beg);
     out.resize(sz / sizeof(T));
     f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(sz));
+    // What was read, not what was asked for: `out` may be a buffer an earlier read filled, and the
+    // part a short read left would hold that read's values where a new vector held zeros.
+    out.resize(static_cast<size_t>(f.gcount()) / sizeof(T));
     return true;
 }
 
+/// The buffers one segment read fills - the column files as read and the columns decoded - kept
+/// from one read to the next (#49 step 2). A read allocated all eleven afresh and freed them at the
+/// end, and in a process whose heap glibc trims after that free every page came back as a fault on
+/// the next read: a store alone in a process scanned a segment of 100 000 rows in 6.3 ms, and in
+/// 2.5 ms with the heap left untrimmed.
+struct SegmentReadBuffers {
+    std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq, qtys, zigzag_seq;
+    std::vector<int64_t>  prices, seqs;
+    std::vector<uint32_t> counts;
+    std::vector<uint8_t>  sides;
+    std::vector<uint16_t> levels;
+
+    size_t held_bytes() const {
+        return (timestamps.capacity() + enc_prices.capacity() + enc_qtys.capacity() +
+                enc_seq.capacity() + qtys.capacity() + zigzag_seq.capacity()) * sizeof(uint64_t) +
+               (prices.capacity() + seqs.capacity()) * sizeof(int64_t) +
+               counts.capacity() * sizeof(uint32_t) + sides.capacity() * sizeof(uint8_t) +
+               levels.capacity() * sizeof(uint16_t);
+    }
+};
+
+/// What the process keeps between reads, over every thread: a segment has at most
+/// `compaction::kMaxRows` rows, 262 144, and every column of that many is 23 MB, so this is five
+/// reads of the largest segments at once - four io threads and a merge.
+constexpr size_t kReadBufferBudget = size_t{128} << 20;
+
+/// The sets of buffers no read is using, shared by every thread rather than kept per thread: an
+/// application embedding the engine can query from as many threads as it has, and what those keep
+/// has to be bounded by something other than their number. A read takes a set - the one given back
+/// last, whose pages are the likeliest to be warm - or a new one, and gives it back; a set that
+/// would take the pool past its budget is freed instead. A read inside another's callback simply
+/// takes a second set.
+class ReadBufferPool {
+public:
+    /// Never destroyed: a thread still reading while statics are torn down must not find it gone.
+    static ReadBufferPool& instance() {
+        static ReadBufferPool* pool = new ReadBufferPool();
+        return *pool;
+    }
+
+    std::unique_ptr<SegmentReadBuffers> take() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!free_.empty()) {
+                Kept kept = std::move(free_.back());
+                free_.pop_back();
+                held_ -= kept.bytes;
+                return std::move(kept.buffers);
+            }
+        }
+        return std::make_unique<SegmentReadBuffers>();
+    }
+
+    void give(std::unique_ptr<SegmentReadBuffers> buffers) noexcept {
+        const size_t bytes = buffers->held_bytes();
+        std::unique_ptr<SegmentReadBuffers> freed;
+        size_t held = 0;
+        size_t budget = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            budget = budget_;
+            if (held_ + bytes > budget_) {
+                freed = std::move(buffers);
+                held = held_;
+            } else {
+                try {
+                    free_.push_back(Kept{bytes, std::move(buffers)});
+                    held_ += bytes;
+                } catch (const std::exception&) {
+                    freed = std::move(buffers);   // a list that could not grow keeps nothing new
+                    held = held_;
+                }
+            }
+        }
+        if (freed) {
+            try {
+                OB_LOG_DEBUG("columnar", "freeing %zu bytes of segment-read buffers: the process "
+                                         "keeps %zu of at most %zu between reads", bytes, held, budget);
+            } catch (const std::exception&) {
+                // A read's end is no place to fail from; the line is all that is lost.
+            }
+        }
+    }   // `freed`, if anything, is given back to the allocator here - outside the lock
+
+    size_t held() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return held_;
+    }
+
+    /// A new budget, and the sets it no longer holds freed.
+    size_t set_budget(size_t bytes) {
+        std::vector<Kept> dropped;
+        size_t was = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            was = budget_;
+            budget_ = bytes;
+            while (!free_.empty() && held_ > budget_) {
+                held_ -= free_.front().bytes;
+                dropped.push_back(std::move(free_.front()));
+                free_.erase(free_.begin());
+            }
+        }
+        return was;
+    }
+
+private:
+    ReadBufferPool() = default;
+
+    struct Kept {
+        size_t bytes;
+        std::unique_ptr<SegmentReadBuffers> buffers;
+    };
+    std::mutex        mtx_;
+    std::vector<Kept> free_;
+    size_t            held_ = 0;
+    size_t            budget_ = kReadBufferBudget;
+};
+
+/// One read's set of buffers, taken from the pool for the length of the read.
+class ReadBuffersLease {
+public:
+    ReadBuffersLease() : buffers_(ReadBufferPool::instance().take()) {}
+    ~ReadBuffersLease() { ReadBufferPool::instance().give(std::move(buffers_)); }
+    ReadBuffersLease(const ReadBuffersLease&) = delete;
+    ReadBuffersLease& operator=(const ReadBuffersLease&) = delete;
+
+    SegmentReadBuffers& buffers() { return *buffers_; }
+
+private:
+    std::unique_ptr<SegmentReadBuffers> buffers_;
+};
+
 }  // namespace
+
+size_t ColumnarStore::read_buffers_held() {
+    return ReadBufferPool::instance().held();
+}
+
+void ColumnarStore::set_read_buffers_limit_for_test(size_t bytes) {
+    const size_t was = ReadBufferPool::instance().set_budget(bytes);
+    OB_LOG_INFO("columnar", "segment-read buffers: the process keeps at most %zu bytes (was %zu)",
+                bytes, was);
+}
 
 ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
@@ -1249,10 +1398,25 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         return SegmentRead::kUnreadable;
     }
 
-    std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq;
-    std::vector<uint32_t> counts;
-    std::vector<uint8_t>  sides;
-    std::vector<uint16_t> levels;
+    // A set of buffers from the pool, holding an earlier read's columns. Every column this read uses
+    // is read or decoded into its buffer below; one it does not use is emptied here, capacity kept,
+    // so that it is empty by construction as a new vector was.
+    ReadBuffersLease lease;
+    SegmentReadBuffers& b = lease.buffers();
+    std::vector<uint64_t>& timestamps = b.timestamps;
+    std::vector<uint64_t>& enc_prices = b.enc_prices;
+    std::vector<uint64_t>& enc_qtys   = b.enc_qtys;
+    std::vector<uint64_t>& enc_seq    = b.enc_seq;
+    std::vector<uint32_t>& counts     = b.counts;
+    std::vector<uint8_t>&  sides      = b.sides;
+    std::vector<uint16_t>& levels     = b.levels;
+    if (!columns.has(QueryColumn::TimestampNs)) timestamps.clear();
+    if (!want_price) { enc_prices.clear(); b.prices.clear(); }
+    if (!want_qty)   { enc_qtys.clear();   b.qtys.clear(); }
+    if (!want_cnt)   counts.clear();
+    if (!want_side)  sides.clear();
+    if (!want_level) levels.clear();
+    if (!want_seq)   { enc_seq.clear(); b.zigzag_seq.clear(); b.seqs.clear(); }
 
     // A missing file is fatal for the segment only when the query needs that column. Before
     // the read set existed every column was needed, so a segment missing any one of the seven
@@ -1293,14 +1457,14 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
     // Decoding follows the set too, and the sequence number is the expensive one: it is
     // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
     // four decode passes a segment would otherwise cost.
-    std::vector<int64_t>  prices;
-    std::vector<uint64_t> qtys;
-    std::vector<int64_t>  seqs;
-    if (want_price) prices = decode_prices(enc_prices);
-    if (want_qty)   qtys   = decode_simple8b(enc_qtys, meta.row_count);
+    std::vector<int64_t>&  prices = b.prices;
+    std::vector<uint64_t>& qtys   = b.qtys;
+    std::vector<int64_t>&  seqs   = b.seqs;
+    if (want_price) decode_prices_into(enc_prices, prices);
+    if (want_qty)   decode_simple8b_into(enc_qtys, meta.row_count, qtys);
     if (want_seq) {
-        auto zigzag_seq = decode_simple8b(enc_seq, meta.row_count);
-        seqs = decode_prices(zigzag_seq);
+        decode_simple8b_into(enc_seq, meta.row_count, b.zigzag_seq);
+        decode_prices_into(b.zigzag_seq, seqs);
     }
 
     // A short column means a truncated or corrupt segment. Emitting the rows

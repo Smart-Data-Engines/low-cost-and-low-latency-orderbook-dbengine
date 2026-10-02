@@ -83,6 +83,13 @@ target_link_libraries(segment_index_cost PRIVATE orderbook_columnar)
 add_executable(segment_size_cost segment_size_cost.cpp)
 target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)
 
+# ── What reading one segment costs a store, and what of it is the allocator's (#49) ──
+#
+# Compiled, deliberately not run: it prints a table, and it is meant to be run twice - as the
+# process is and with GLIBC_TUNABLES that never trim the heap - on the machine being measured.
+add_executable(segment_read_cost segment_read_cost.cpp)
+target_link_libraries(segment_read_cost PRIVATE orderbook_columnar)
+
 # ── What a version vector costs to send, receive and compare as it grows (#177) ──
 #
 # Compiled, deliberately not run: it prints a table, and the numbers in the roadmap came from it.

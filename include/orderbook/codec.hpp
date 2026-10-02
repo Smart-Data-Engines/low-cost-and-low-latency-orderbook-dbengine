@@ -24,6 +24,11 @@ std::vector<uint64_t> encode_prices(std::span<const int64_t> prices);
 /// Decode a sequence of uint64 zigzag(delta) values back to int64 prices.
 std::vector<int64_t> decode_prices(std::span<const uint64_t> encoded);
 
+/// decode_prices() into `out`, keeping its capacity: a reader decoding segment after segment into
+/// the same vector allocates nothing once it is large enough (#49 step 2). `out` holds exactly the
+/// decoded values afterwards, whatever it held before.
+void decode_prices_into(std::span<const uint64_t> encoded, std::vector<int64_t>& out);
+
 // ── Simple8b volume codec ─────────────────────────────────────────────────────
 //
 // Selector table (4-bit selector, values per word, bits per value):
@@ -60,5 +65,8 @@ Simple8bResult encode_simple8b(std::span<const uint64_t> values);
 /// Decode Simple8b-encoded words back to uint64 values.
 /// count: expected number of output values.
 std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t count);
+
+/// decode_simple8b() into `out`, keeping its capacity, as decode_prices_into() does.
+void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::vector<uint64_t>& out);
 
 } // namespace ob

@@ -530,3 +530,29 @@ TEST(Codec, Simple8bDecodeStopsAtTheCountAndAtTheWords) {
     EXPECT_TRUE(ob::decode_simple8b(r.words, 0).empty());
     EXPECT_TRUE(ob::decode_simple8b({}, 100).empty());
 }
+
+// ── Decoding into a vector used before (#49 step 2) ──────────────────────────
+// The store decodes segment after segment into the same vectors, so what the last decode left must
+// not show through: the all-zero selectors write their zeros, and the size is this decode's.
+TEST(Codec, DecodeIntoAVectorUsedBefore) {
+    // Words of 30 two-bit values (five 3s, then zeros), 240 zeros, 120 zeros, and two 4s.
+    std::vector<uint64_t> vals(5, 3);
+    vals.insert(vals.end(), 25 + 240 + 120, 0);
+    vals.insert(vals.end(), 2, 4);
+    const auto words = ob::encode_simple8b(vals).words;
+    ASSERT_EQ(words.size(), 4u);
+    ASSERT_EQ(words[1] >> 60, 0u);
+    ASSERT_EQ(words[2] >> 60, 1u);
+
+    const auto first = [&](size_t n) { return std::vector<uint64_t>(vals.begin(), vals.begin() + n); };
+    for (const size_t count : {vals.size(), size_t{100}, size_t{270}, size_t{300}, size_t{390}}) {
+        std::vector<uint64_t> out(1000, 7);
+        ob::decode_simple8b_into(words, count, out);
+        EXPECT_EQ(out, first(count)) << "count " << count;   // inside and at the end of each word
+    }
+
+    const std::vector<int64_t> prices = {100, 99, 105, -3, 0};
+    std::vector<int64_t> decoded(50, -1);
+    ob::decode_prices_into(ob::encode_prices(prices), decoded);
+    EXPECT_EQ(decoded, prices);
+}

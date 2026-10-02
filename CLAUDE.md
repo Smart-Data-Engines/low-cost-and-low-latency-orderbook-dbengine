@@ -3976,6 +3976,13 @@ Learned the hard way. Check here before debugging.
      `arbitrary<uint64_t>()` and so saw almost nothing but selector 0 - 240 zeros - and a mutation
      dropping a value lived (#49's step 1). Where the whole range matters, draw through
      `rc::gen::resize(100, …)`.
+532. **A page-fault count that comes and goes between runs of the same binary is the allocator's
+     history, not the code.** A server answering `SELECT`s of 100 000 rows faulted 4 477-4 504 pages
+     a query in both servers of one run and none in both of the next, binary unchanged, and its
+     engine time went 17 ms → 6 ms with them; one run each would have credited the change measured
+     beside it - it nearly credited #49's step 1, whose binary drew the same lottery the other way
+     round. Run several fresh processes a side, alternating, and print the faults beside the time.
+     A benchmark's loop is one process with one history: `BM_TimeRangeQuery` never faulted at all.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
