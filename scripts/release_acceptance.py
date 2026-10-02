@@ -35,7 +35,11 @@ _parser.add_argument("dist", help="the directory holding the wheel")
 _parser.add_argument("version", help="the version being released, X.Y.Z")
 _parser.add_argument("--root", help="an extracted .tar.gz to take the server and library from")
 _args = _parser.parse_args()
-DIST, VERSION, ROOT = _args.dist, _args.version, _args.root
+# Absolute, because the client runs from a directory of its own, outside the repository: a relative
+# --root reached the server, started from here, and not OB_LIB_PATH, resolved from there.
+DIST = os.path.abspath(_args.dist)
+VERSION = _args.version
+ROOT = os.path.abspath(_args.root) if _args.root else None
 SERVER = os.path.join(ROOT, "usr/bin/ob_tcp_server") if ROOT else "/usr/bin/ob_tcp_server"
 LIB = os.path.join(ROOT, "usr/lib/orderbook-dbengine/liborderbook_shared.so") if ROOT else None
 PORT = 21998  # below the ephemeral range
