@@ -318,8 +318,23 @@ void MultiMasterManager::start() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(config_.replication_port);
+    // On every interface unless --mm-bind names one (#203). The server refuses an address that does
+    // not parse before it gets here; this only says so if something else built the config, and goes
+    // on the way a failed bind does - without a listening socket, still dialling its peers.
+    const bool address_ok = config_.bind_address.empty() ||
+        ::inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) == 1;
+    if (address_ok) {
+        OB_LOG_INFO("mm", "mesh port %u listens on %s",
+                    static_cast<unsigned>(config_.replication_port),
+                    config_.bind_address.empty() ? "every interface" : config_.bind_address.c_str());
+    }
 
-    if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr),
+    if (!address_ok) {
+        OB_LOG_ERROR("mm", "invalid --mm-bind address '%s'; the mesh port is not opened",
+                     config_.bind_address.c_str());
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+    } else if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr),
                sizeof(addr)) < 0) {
         OB_LOG_ERROR("mm", "bind() failed on port %u: %s",
                      config_.replication_port, std::strerror(errno));

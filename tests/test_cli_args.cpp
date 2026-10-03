@@ -257,3 +257,31 @@ TEST(CliArgsDeath, AWalRotationThresholdAboveTheCeilingIsRefused) {
     EXPECT_EXIT(parse({"--wal-rotate-bytes", std::to_string(ob::MAX_WAL_ROTATE_THRESHOLD + 1)}),
                 ::testing::ExitedWithCode(1), "2 GiB");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #203: the addresses the client, replication and mesh ports listen on
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(CliArgs, EachListenerTakesTheAddressItsFlagNames) {
+    const auto config = parse({"--bind", "127.0.0.1", "--replication-bind", "10.0.0.7",
+                               "--mm-bind", "192.168.1.2"});
+    EXPECT_EQ(config.bind, "127.0.0.1");
+    EXPECT_EQ(config.replication_bind, "10.0.0.7");
+    EXPECT_EQ(config.mm_bind, "192.168.1.2");
+}
+
+TEST(CliArgs, WithoutTheFlagsEveryListenerTakesEveryInterface) {
+    const auto config = parse({});
+    EXPECT_TRUE(config.bind.empty());
+    EXPECT_TRUE(config.replication_bind.empty());
+    EXPECT_TRUE(config.mm_bind.empty());
+}
+
+TEST(CliArgsDeath, AnAddressThatDoesNotParseIsARefusalNotEveryInterface) {
+    // Listening on 0.0.0.0 because a typed address did not parse is the opposite of what was asked.
+    EXPECT_EXIT(parse({"--bind", "127.0.0.256"}), ::testing::ExitedWithCode(1),
+                "--bind expects an IPv4 address such as 127.0.0.1, got '127.0.0.256'");
+    EXPECT_EXIT(parse({"--replication-bind", "localhost"}), ::testing::ExitedWithCode(1),
+                "--replication-bind expects an IPv4 address");
+    EXPECT_EXIT(parse({"--mm-bind", ""}), ::testing::ExitedWithCode(1), "--mm-bind expects an IPv4 address");
+}

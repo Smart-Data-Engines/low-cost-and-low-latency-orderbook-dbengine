@@ -1080,6 +1080,7 @@ const std::vector<std::string>& known_flags() {
         "coordinator-lease-ttl",
         "auth-secret-file",
         "backup-dir",
+        "bind",
         "cluster-secret-file",
         "compaction",
         "data-dir",
@@ -1101,6 +1102,7 @@ const std::vector<std::string>& known_flags() {
         "metrics-bind",
         "metrics-port",
         "migration-identity",
+        "mm-bind",
         "mm-max-catchup-bytes",
         "mm-max-peer-send-buffer",
         "mm-node-id",
@@ -1112,6 +1114,7 @@ const std::vector<std::string>& known_flags() {
         "primary-port",
         "print-config",
         "read-only",
+        "replication-bind",
         "replication-compress",
         "replication-port",
         "shard-id",
@@ -1183,6 +1186,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"max-subscriber-queue-bytes", {"<N>", "Per-subscriber queue ceiling; past it the session closes"}},
         {"max-subscriptions-per-session", {"<N>", "Subscription limit per session (default: 16)"}},
         {"metrics-bind", {"<ADDR>", "Address the metrics listener binds to (default: every interface)"}},
+        {"bind", {"<ADDR>", "IPv4 address the client port listens on (default: every interface)"}},
+        {"replication-bind", {"<ADDR>", "IPv4 address the replication port listens on (default: every interface)"}},
+        {"mm-bind", {"<ADDR>", "IPv4 address the multi-master port listens on (default: every interface)"}},
         {"metrics-port", {"<PORT>", "Prometheus metrics port; 0 disables the endpoint"}},
         {"mm-max-catchup-bytes", {"<N>", "WAL bytes one catch-up round reads for a peer (default: 8 MiB)"}},
         {"mm-max-peer-send-buffer", {"<N>", "Per-peer send buffer ceiling; past it the peer is dropped"}},
@@ -1567,6 +1573,19 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.metrics_port = cursor.value_as<uint16_t>();
         } else if (arg == "--metrics-bind") {
             config.metrics_bind = std::string{cursor.value()};
+        } else if (arg == "--bind" || arg == "--replication-bind" || arg == "--mm-bind") {
+            // Checked here rather than at the bind (#203): an address that does not parse is a
+            // refusal to start, said with the flag that carried it - not a listener on every
+            // interface, the opposite of what was asked, and not a failure deep in a manager's start.
+            const std::string val{cursor.value()};
+            in_addr parsed{};
+            if (::inet_pton(AF_INET, val.c_str(), &parsed) != 1) {
+                std::fprintf(stderr, "Error: %s expects an IPv4 address such as 127.0.0.1, got '%s'\n",
+                             std::string(arg).c_str(), val.c_str());
+                std::exit(1);
+            }
+            (arg == "--bind" ? config.bind
+                             : arg == "--replication-bind" ? config.replication_bind : config.mm_bind) = val;
         } else if (arg == "--tls-cert-file") {
             config.tls_cert_file = std::string{cursor.value()};
         } else if (arg == "--tls-key-file") {
@@ -1953,6 +1972,9 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("max-subscriber-queue-bytes", std::to_string(c.max_subscriber_queue_bytes));
     line("max-subscriptions-per-session", std::to_string(c.max_subscriptions_per_session));
     line("metrics-bind", c.metrics_bind.empty() ? "(every interface)" : c.metrics_bind);
+    line("bind", c.bind.empty() ? "(every interface)" : c.bind);
+    line("replication-bind", c.replication_bind.empty() ? "(every interface)" : c.replication_bind);
+    line("mm-bind", c.mm_bind.empty() ? "(every interface)" : c.mm_bind);
     line("metrics-port", std::to_string(c.metrics_port));
     line("mm-max-catchup-bytes", std::to_string(c.mm_max_catchup_bytes));
     line("mm-max-peer-send-buffer", std::to_string(c.mm_max_peer_send_buf_bytes));
@@ -2018,6 +2040,7 @@ TcpServer::TcpServer(ServerConfig config)
     ReplicationConfig repl_config{};
     if (!config_.multi_master) {
         repl_config.port = config_.replication_port;
+        repl_config.bind_address = config_.replication_bind;
         repl_config.compress = config_.replication_compress;
         repl_config.cluster_secret = secrets_.cluster;
         repl_config.tls_server = tls_.replication_server;
@@ -2067,6 +2090,7 @@ TcpServer::TcpServer(ServerConfig config)
                                        MultiMasterConfig{
                                            .node_id = config_.mm_node_id,
                                            .replication_port = config_.mm_replication_port,
+                                           .bind_address = config_.mm_bind,
                                            .enabled = config_.multi_master,
                                            .compress = config_.replication_compress,
                                            .max_catchup_bytes = config_.mm_max_catchup_bytes,
@@ -3073,11 +3097,15 @@ void TcpServer::run() {
         throw std::runtime_error(std::string("setsockopt() failed: ") + std::strerror(errno));
     }
 
-    // 3. Bind to 0.0.0.0:port.
+    // 3. Bind to the client port, on every interface unless --bind names one (#203). The address
+    //    parsed when the flag was read; a config built without the parser is checked here.
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(config_.port);
+    if (!config_.bind.empty() && ::inet_pton(AF_INET, config_.bind.c_str(), &addr.sin_addr) != 1) {
+        throw std::runtime_error("invalid --bind address '" + config_.bind + "'");
+    }
 
     if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         throw std::runtime_error(std::string("bind() failed on port ")
@@ -3092,9 +3120,10 @@ void TcpServer::run() {
     // The line that says the server is up, logged *after* the bind and the listen have succeeded,
     // and through the logger so it reaches the operator's file when it happens rather than at exit.
     // The tool's banner says "starting" and cannot know this (#90).
-    OB_LOG_INFO("tcp_server", "listening on port %u, version %s, data-dir: %s",
-                static_cast<unsigned>(config_.port), std::string(version()).c_str(),
-                config_.data_dir.c_str());
+    OB_LOG_INFO("tcp_server", "listening on port %u (%s), version %s, data-dir: %s",
+                static_cast<unsigned>(config_.port),
+                config_.bind.empty() ? "every interface" : config_.bind.c_str(),
+                std::string(version()).c_str(), config_.data_dir.c_str());
 
     ServerStats stats;
     std::vector<Reactor*> dealt_to;

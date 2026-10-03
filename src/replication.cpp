@@ -433,11 +433,22 @@ void ReplicationManager::start() {
     int opt = 1;
     ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // 2. Bind to 0.0.0.0:replication_port.
+    // 2. Bind to the replication port, on every interface unless --replication-bind names one
+    //    (#203).
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(config_.port);
+    if (!config_.bind_address.empty() &&
+        ::inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        throw std::runtime_error("ReplicationManager: invalid bind address '" +
+                                 config_.bind_address + "'");
+    }
+    OB_LOG_INFO("replication", "replication port %u listens on %s",
+                static_cast<unsigned>(config_.port),
+                config_.bind_address.empty() ? "every interface" : config_.bind_address.c_str());
 
     if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::close(listen_fd_);

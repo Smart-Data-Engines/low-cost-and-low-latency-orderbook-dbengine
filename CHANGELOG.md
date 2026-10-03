@@ -54,6 +54,7 @@ The first release. What it contains, by area:
   three, mutual on the node links.
 - Prometheus metrics, a Grafana dashboard and alert rules tested with `promtool`.
 - A configuration file, a systemd unit and a man page; `.deb`, `.rpm` and `.tar.gz` packages.
+- The address each listener binds: `--bind`, `--replication-bind`, `--mm-bind`, `--metrics-bind` (#203).
 
 ### Clients
 

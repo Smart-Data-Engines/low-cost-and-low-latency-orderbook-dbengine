@@ -52,6 +52,14 @@ inline constexpr const char* kDefaultProfile = "boost";
 
 struct ServerConfig {
     uint16_t    port{9090};
+    /// --bind, --replication-bind, --mm-bind: the IPv4 address the client port, the replication
+    /// port and the multi-master port listen on (#203). Empty means every interface, which is what
+    /// all three did before the flags existed - so a deployment that wanted the client port on
+    /// loopback, with TLS and authentication on it or not, needed a firewall rule. Checked as it is
+    /// parsed: an address that does not parse is a refusal to start, not a listener on 0.0.0.0.
+    std::string bind;
+    std::string replication_bind;
+    std::string mm_bind;
     std::string data_dir{"/tmp/ob_data"};
     int         max_sessions{64};
     size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)

@@ -33,6 +33,7 @@ class Engine;
 
 struct ReplicationConfig {
     uint16_t port{0};           // 0 = disabled
+    std::string bind_address;   // --replication-bind; empty = every interface (#203)
     int      max_replicas{4};
     bool     compress{false};   // --replication-compress
 
