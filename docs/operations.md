@@ -755,14 +755,16 @@ integration test holds the names against what a running node serves.
   `ob_writer_admission_delay_us_total` — **writes faster than the device** (#190). A flush tick
   that took twice its interval or longer says how many rows the device took in how long; from then
   on each batch of writes waits, after it is written and outside the engine's lock, for its rows'
-  time at that rate, and the gauge is that rate in rows a second. A tick that is not slow raises it
-  by a tenth, and admission ends once no batch has waited for ten ticks; the gauge is 0 while it is
-  off, which is always on a device that keeps up. It begins with one line - this one from an
-  m9g.xlarge whose volume's writes were capped at 60 MB/s - and ends with another,
+  time at a rate, and the gauge is that rate in rows a second. It begins at half what that tick
+  measured, because the tick counts the WAL's share of the device and not the segments it sealed,
+  whose sync runs behind it (#190, step 7); a slow tick lowers it to what it measured, a tick that
+  is not slow raises it by a tenth, and admission ends once no batch has waited for ten ticks. The
+  gauge is 0 while it is off, which is always on a device that keeps up. It begins with one line -
+  this one from an m9g.xlarge whose volume's writes were capped at 60 MB/s - and ends with another,
   `Writes are taken at full speed again: <n> batch(es) waited for admission, <ms> ms in all`:
 
   ```
-  Writes arrive faster than the device takes them - a flush tick took 1023 ms for 608000 row(s), 594067 rows/s - so each batch now waits after it is written, at that rate, rather than every writer stopping at a full pending queue
+  Writes arrive faster than the device takes them - a flush tick took 461 ms for 676000 row(s), 1466726 rows/s - so each batch now waits after it is written, at 733363 rows/s to begin with, rather than every writer stopping at a full pending queue
   ```
 
   Without it, a device slower than the ingest stops every writer at the full pending queue for as
