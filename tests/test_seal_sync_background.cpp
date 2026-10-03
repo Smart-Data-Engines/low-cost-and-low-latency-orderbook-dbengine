@@ -183,6 +183,33 @@ TEST(SealSyncBackground, NoCheckpointClaimsWhatItsSyncHasNotCovered) {
     engine->close();
 }
 
+TEST(SealSyncBackground, ASyncAskedWhileAnotherWaitsTakesItsPlaceAndCoversTheLaterSeal) {
+    // A's sync runs, held; C is sealed and asks for one; D is sealed and asks again before C's has
+    // started. One sync covers both, and it has to be asked with D's claim - the later one - or D's
+    // segments wait for some later seal to be vouched for.
+    TempDir dir;
+    auto engine = engine_at(dir.path);
+    engine->hold_seal_syncs_from_for_test(1);
+    for (uint64_t i = 1; i <= 7; ++i) insert(*engine, "B", i, 1);   // waiting throughout: epoch form
+    due(*engine, "A");
+    engine->flush_tick_leaving_the_sync_for_test();   // A sealed; its sync held
+    due(*engine, "C", 1000);
+    engine->flush_tick_leaving_the_sync_for_test();   // C's sync asked, not started
+    due(*engine, "D", 5000);
+    engine->flush_tick_leaving_the_sync_for_test();   // D's in its place
+    engine->hold_seal_syncs_from_for_test(UINT64_MAX);
+    ASSERT_TRUE(eventually([&] { return engine->seal_syncs_finished_for_test() >= 2; }));
+    ASSERT_TRUE(eventually([&] { return !engine->seal_sync_busy_for_test(); }));
+    EXPECT_EQ(engine->seal_syncs_finished_for_test(), 2u) << "C's and D's were not one sync";
+    engine->flush_tick_leaving_the_sync_for_test();   // takes the last finished sync in
+    const auto last = last_checkpoint(dir.path);
+    ASSERT_TRUE(last.seal_epoch.has_value());
+    const auto d = epochs_on_disk(dir.path, "D");
+    ASSERT_FALSE(d.empty()) << "D was not sealed";
+    for (uint64_t e : d) EXPECT_LE(e, *last.seal_epoch) << "the sync that covered D did not vouch for it";
+    engine->close();
+}
+
 TEST(SealSyncBackground, AFlushWaitsForTheBackgroundSyncAndItsCheckpointIsTheLast) {
     TempDir dir;
     auto engine = engine_at(dir.path);
