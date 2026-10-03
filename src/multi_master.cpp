@@ -40,6 +40,13 @@ namespace ob {
 
 namespace {
 
+/// A link counts as a peer's once its handshake is done - TLS, then the mesh's own - and not when
+/// its TCP connect returns, which is when `connected` is set. The paths that write to a peer always
+/// asked for both; MM_PEERS, `ob_mm_peers_connected` and ROLE's count asked for the first, so a
+/// peer whose every handshake was refused read as connected for the milliseconds of each attempt
+/// (#206).
+bool link_is_up(const PeerConnection& peer) { return peer.connected && peer.handshake_done; }
+
 /// Set a socket to non-blocking mode.
 bool set_nonblocking(int fd) {
     int flags = ::fcntl(fd, F_GETFL, 0);
@@ -620,7 +627,7 @@ size_t MultiMasterManager::connected_peer_count() const {
     std::lock_guard<std::mutex> lock(mtx_);
     size_t count = 0;
     for (const auto& [nid, peer] : peers_) {
-        if (peer.connected) ++count;
+        if (link_is_up(peer)) ++count;
     }
     return count;
 }
@@ -700,7 +707,7 @@ std::string MultiMasterManager::handle_mm_peers_command() const {
         (void)nid;
         oss << peer.node_id << '\t'
             << peer.address << '\t'
-            << (peer.connected ? "connected" : "disconnected") << '\t'
+            << (link_is_up(peer) ? "connected" : "disconnected") << '\t'
             << peer.last_hlc.to_string() << '\t'
             << peer.send_buf.size() << '\n';
     }
@@ -1562,7 +1569,7 @@ void MultiMasterManager::publish_peer_gauges() {
         // (#84, #96). Counting one would make the gauge disagree with the view an operator reads
         // beside it, and would count a connection that may still be refused.
         (void)nid;
-        if (!p.connected) continue;
+        if (!link_is_up(p)) continue;
         ++connected;
         if (p.tls != nullptr && !p.tls->handshaking()) ++verified;
     }

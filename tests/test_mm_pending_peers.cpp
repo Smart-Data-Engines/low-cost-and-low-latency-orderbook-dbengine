@@ -436,6 +436,66 @@ TEST(PendingPeers, TheHigherNumberedNodeGivesUpTheLinkItDialled) {
     engine.close();
 }
 
+// ── A link is a peer's only once its handshake is done (#206) ───────────────────
+//
+// A dial sets `connected` when the TCP connect returns, and its handshake - TLS, then the mesh's
+// own - comes after it. MM_PEERS, `ob_mm_peers_connected` and ROLE's count read `connected` alone,
+// so a peer whose every handshake was refused read as connected for the milliseconds of each
+// attempt: the integration test of --tls-peer-names read it so once on the m9g.xlarge, its MM_PEERS
+// at 11:49:42.784 between "Connected to peer 3" at .783 and the refusal at .785. Whatever writes to
+// a peer already asked for both.
+
+namespace {
+
+std::string mm_peers_status(const std::string& view, uint16_t node_id) {
+    std::istringstream lines(view);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string id, address, status;
+        if (!std::getline(fields, id, '\t') || !std::getline(fields, address, '\t') ||
+            !std::getline(fields, status, '\t')) {
+            continue;
+        }
+        if (id == std::to_string(node_id)) return status;
+    }
+    return "(no row)";
+}
+
+}  // namespace
+
+TEST(PendingPeers, ALinkWhoseHandshakeIsNotDoneIsNotListedAsConnected) {
+    const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
+    TempDir tmp("mm_pending_handshaking_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
+                      mm_config(1, port));
+    engine.open();
+    auto* mm = engine.multi_master_manager();
+    ASSERT_NE(mm, nullptr);
+
+    int dialling[2] = {-1, -1};
+    int up[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, dialling), 0);
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, up), 0);
+    ob::PeerConnection handshaking = connected_peer_record(5, dialling[1]);
+    handshaking.handshake_done = false;   // connected, and its handshake not answered yet
+    mm->install_peer_for_test(handshaking);
+    mm->install_peer_for_test(connected_peer_record(6, up[1]));   // the control: a link that is up
+
+    const std::string view = mm->handle_mm_peers_command();
+    EXPECT_EQ(mm_peers_status(view, 5), "disconnected") << view;
+    EXPECT_EQ(mm_peers_status(view, 6), "connected") << view;
+    EXPECT_EQ(mm->connected_peer_count(), 1u);
+    // The gauge is recomputed from the table by the io loop on each pass (pitfall 143).
+    EXPECT_TRUE(eventually([&] {
+        return engine.registry().gauge_value("ob_mm_peers_connected") == 1;
+    })) << "ob_mm_peers_connected = " << engine.registry().gauge_value("ob_mm_peers_connected");
+
+    ::close(dialling[0]);
+    ::close(up[0]);
+    engine.close();
+}
+
 TEST(PendingPeers, AConnectionThatClosesBeforeItsHandshakeLeavesNothingBehind) {
     const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
     TempDir tmp("mm_pending_gone_");
