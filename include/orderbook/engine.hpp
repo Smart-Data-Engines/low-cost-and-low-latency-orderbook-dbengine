@@ -299,12 +299,18 @@ public:
                                     uint64_t local_wal_identity);
 
     /// When a store's drained rows are sealed into a segment (#165 part 2a): enough rows, or old
-    /// enough, oldest first, and a tick takes **its share** - at most `kSealsPerTick` stores, and
-    /// after the first no more rows than the tick's share, which is a quarter more than it drained
-    /// or `kSealRows`, whichever is more - so stores that come due together are spread over ticks
-    /// rather than sealed in one; and, while every store's rows together are over the budget, the
-    /// oldest of the rest past both limits until they are not. Constants, not flags: nothing yet
-    /// says an operator has a reason to turn them.
+    /// enough - those due by rows first and then those due by age, each oldest first - and a tick
+    /// takes **its share** - at most `kSealsPerTick` stores, and after the first no more rows than
+    /// the tick's share, which is a quarter more than it drained or `kSealRows`, whichever is more -
+    /// so stores that come due together are spread over ticks rather than sealed in one; and, while
+    /// every store's rows together are over the budget, the largest of them past both limits until
+    /// the rest are not. Constants, not flags: nothing yet says an operator has a reason to turn
+    /// them.
+    ///
+    /// By rows before by age, and the largest over the budget, because both limits are about memory
+    /// and a store of one row holds none: taken oldest first throughout, thousands of one-row stores
+    /// due by age held the stores due by rows behind the per-tick limit until the budget, and the
+    /// budget then sealed them all in one tick to free the few that held the rows (#205).
     ///
     /// A quarter more than it drained, because a share of exactly that keeps any backlog it finds:
     /// what comes due each tick is what was drained, so stores the first wave deferred stayed
@@ -339,8 +345,8 @@ public:
     /// a quarter more rows or `kSealRows`, whichever is more - so a tick that drained little still seals
     /// small stores due by age in bulk. Below the budget a due store after the first is taken only
     /// while the rows picked stay within the share - a younger one that fits after an older one
-    /// that does not, so the share is filled - and the oldest due store is always taken, so none
-    /// waits behind a share it is bigger than.
+    /// that does not, so the share is filled - and the first due store is always taken, the oldest
+    /// due by rows if there is one, so none waits behind a share it is bigger than.
     static std::vector<SealPick> pick_seals(const std::vector<SealCandidate>& candidates,
                                             std::chrono::steady_clock::time_point now,
                                             bool seal_all, size_t drained_rows);
