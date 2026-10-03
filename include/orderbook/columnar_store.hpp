@@ -3,6 +3,7 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/query_columns.hpp"
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -26,6 +27,40 @@ namespace ob {
 /// and sequence_number on read, which lost the order side of every row that made
 /// it past a flush. Version 2 stores all seven columns.
 inline constexpr uint32_t kColumnarFormatVersion = 2;
+
+/// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets
+/// the book at an instant skip a segment none of whose rows can be the latest of its level - the
+/// book is the latest row of each level, so a segment whose every level already has a later row
+/// cannot change it.
+///
+/// A row of another side, or of a level past the book's capacity, is not representable, and a set
+/// that could not hold every row is no set at all: `from_columns()` answers null for it, and a
+/// reader then reads the segment, which is what it does for a segment written before this existed.
+struct LevelSet {
+    static constexpr size_t kLevels = 1000;   ///< SoABuffer::MAX_LEVELS, the book's levels a side
+    static constexpr size_t kWords = (kLevels + 63) / 64;
+    using Bits = std::array<uint64_t, kWords>;   ///< level i is bit i % 64 of word i / 64
+    Bits bid{};
+    Bits ask{};
+
+    const Bits& side(size_t s) const { return s == SIDE_BID ? bid : ask; }
+    bool has(uint8_t s, uint16_t level) const {
+        if (level >= kLevels || (s != SIDE_BID && s != SIDE_ASK)) return false;
+        return (side(s)[level / 64] >> (level % 64)) & 1u;
+    }
+    static size_t count(const Bits& bits);
+    bool operator==(const LevelSet&) const = default;
+
+    /// The set of a segment's rows, from its side and level columns; null when a row is of
+    /// neither side or past `kLevels`.
+    static std::shared_ptr<const LevelSet> from_columns(const std::vector<uint8_t>& sides,
+                                                        const std::vector<uint16_t>& levels);
+    /// One side as `meta.json` holds it: `kLevels / 4` hex digits, the lowest level the lowest bit
+    /// of the last digit.
+    static std::string to_hex(const Bits& bits);
+    /// The reverse; false for a string that is not that, or that names a level past `kLevels`.
+    static bool from_hex(const std::string& hex, Bits& bits);
+};
 
 struct SegmentMeta {
     uint32_t format_version{kColumnarFormatVersion};
@@ -90,6 +125,10 @@ struct SegmentMeta {
     /// start without a vector raises the counter by `max_sequence_number` for such a segment, the
     /// only number that cannot hand one out twice.
     bool     has_received_rows{false};
+    /// The (side, level) pairs this segment holds a row of (#47); null when unknown - a segment
+    /// written before this was recorded, or one with a row no set can hold. Shared: copies of a
+    /// meta are many, and the set does not change once the segment is written.
+    std::shared_ptr<const LevelSet> levels;
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
@@ -461,6 +500,24 @@ public:
                   std::string_view symbol, std::string_view exchange,
                   ColumnSet columns,
                   std::function<void(const SnapshotRow&)> cb) const;
+
+    /// The book of one symbol at `at` (#47): for each (side, level), the row with the latest
+    /// timestamp at or before `at`, a tie going to the row `scan()` delivers later - the answer of
+    /// a `scan()` of [0, `at`] that keeps, for each level, any row whose timestamp is at least the
+    /// one it holds, which is what the book at an instant was until this read it instead.
+    ///
+    /// Read from the newest segment down. A segment whose rows are all at or before some time and
+    /// whose every level already has a row it cannot beat - a later one, or one at that time that
+    /// `scan()` delivers after it - is not read: its `LevelSet` says which levels it has, and a
+    /// segment without one is read always. Rows in the order `scan()` delivers them otherwise:
+    /// bids, then asks, each by level.
+    struct BookAt {
+        std::vector<SnapshotRow> rows;
+        size_t segments_read{0};
+        size_t segments_skipped{0};
+        size_t blocks{0};
+    };
+    BookAt latest_per_level(uint64_t at, std::string_view symbol, std::string_view exchange) const;
 
     /// Called on startup to rebuild segment index from persisted meta.json files.
     void open_existing();

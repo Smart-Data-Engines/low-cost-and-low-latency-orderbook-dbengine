@@ -243,6 +243,11 @@ ob_add_columnar_test(test_segment_index
 )
 target_compile_definitions(test_segment_index PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 
+# ── #47 step 1: the book at an instant reads only the segments that can change it ─
+ob_add_columnar_test(test_book_at_an_instant
+    test_book_at_an_instant.cpp
+)
+
 # ── #165 part 2a: drained rows in published blocks until a seal writes them ───
 ob_add_columnar_test(test_row_blocks
     test_row_blocks.cpp

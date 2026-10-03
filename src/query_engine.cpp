@@ -1285,30 +1285,18 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         shape.columns = ast.projection.empty() ? all_query_columns() : ast.projection;
 
         // The book at snap_ts: for each (side, level_index), the row with the latest timestamp at
-        // or before it. It kept the last row a scan *delivered*, which is that only while rows
-        // arrive in time order: a scan hands out segments by start and each segment's rows in the
-        // order they were appended, so a correction for an earlier instant that arrived later - a
-        // client's own event times (#105), a mesh peer's backlog - replaced the book it came after
-        // (#168). A tie on the timestamp keeps the later one delivered, which is what every row got
-        // before. Ordered by side, then level - bids first, as BOOK answers - where a hash map made
-        // the order, and with it what a LIMIT kept, a property of the hash.
-        // Key: (side << 16) | level_index.
-        std::map<uint32_t, SnapshotRow> state;
-
-        // Every column is read whatever the select list says: the key is the side and the level,
-        // and the choice between two rows is their timestamps.
-        store_.scan(0, snap_ts, ast.symbol, ast.exchange, ColumnSet::all(),
-                    [&](const SnapshotRow& row) {
-                        const uint32_t key = (static_cast<uint32_t>(row.side) << 16) |
-                                             static_cast<uint32_t>(row.level_index);
-                        auto [it, inserted] = state.try_emplace(key, row);
-                        if (!inserted && row.timestamp_ns >= it->second.timestamp_ns) {
-                            it->second = row;
-                        }
-                    });
-        OB_LOG_DEBUG("query_engine", "SNAPSHOT: symbol=%s exchange=%s at=%llu levels=%zu",
+        // or before it - not the last row a scan delivered, which it is only while rows arrive in
+        // time order (#168) - a tie on the timestamp going to the later delivered, ordered by side,
+        // then level, bids first, as BOOK answers. Read from the newest segment down, and only the
+        // segments that can change it (#47): it was a scan of every row from time 0, 107 ms at
+        // 3 M rows on the i3 for an answer of 100 levels, and that scan is the oracle of
+        // tests/test_book_at_an_instant.cpp.
+        const ColumnarStore::BookAt book = store_.latest_per_level(snap_ts, ast.symbol, ast.exchange);
+        OB_LOG_DEBUG("query_engine", "SNAPSHOT: symbol=%s exchange=%s at=%llu levels=%zu "
+                                     "segments read=%zu skipped=%zu blocks=%zu",
                      ast.symbol.c_str(), ast.exchange.c_str(),
-                     static_cast<unsigned long long>(snap_ts), state.size());
+                     static_cast<unsigned long long>(snap_ts), book.rows.size(), book.segments_read,
+                     book.segments_skipped, book.blocks);
 
         // A price condition keeps the levels of that book priced within it, and was ignored (#199).
         // It is applied to the book, after the latest row of each level is chosen, not to the rows
@@ -1317,7 +1305,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         uint64_t count = 0;
         uint64_t priced_out = 0;
         uint64_t lim = ast.limit.value_or(UINT64_MAX);
-        for (auto& [k, row] : state) {
+        for (const SnapshotRow& row : book.rows) {
             if (count >= lim) break;
             // And its side and level conditions the same way (#200): the bids of the book at t.
             if (!row_allowed(ast, row)) {

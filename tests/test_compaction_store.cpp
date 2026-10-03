@@ -672,3 +672,53 @@ TEST(CompactionStore, AChainOfManyGenerationsIsReleasedWithoutRecursion) {
     head.reset();
     EXPECT_TRUE(last.expired()) << "a generation at the end of the chain outlived its release";
 }
+
+TEST(CompactionStore, AMergedSegmentSaysTheLevelsOfItsInputsRows) {
+    // #47: the book at an instant skips a segment by the levels its meta.json says it holds. A
+    // merge writes its segment through the seal's path, so it says the levels of its rows - its
+    // inputs' together - and is skipped on the same proof, before a restart and after it.
+    TempDir dir;
+    const auto at_levels = [&](uint64_t ts, const std::vector<uint16_t>& levels) {
+        ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                                 ob::ColumnarStore::OwnIndex::kNo);
+        writer.set_symbol_exchange("A", "EX");
+        writer.set_wal_position(77, 1, 0);
+        for (const uint16_t level : levels) writer.append(row_at(ts, 100 + level, level));
+        auto meta = writer.flush_segment();
+        EXPECT_TRUE(meta.has_value());
+        return meta.value_or(ob::SegmentMeta{});
+    };
+    std::vector<ob::SnapshotRow> before;
+    {
+        ob::ColumnarStore store(dir.str());
+        const auto a = at_levels(kBase + 1 * kSec, {1, 2});
+        const auto b = at_levels(kBase + 2 * kSec, {2, 7});
+        const auto later = at_levels(kBase + 3 * kSec, {1, 2, 7});
+        store.merge_segments({a, b, later});
+        before = store.latest_per_level(kBase + 10 * kSec, "A", "EX").rows;
+        ASSERT_EQ(before.size(), 3u);
+
+        auto out = merged(store, dir.str(), {a, b});
+        ASSERT_NE(out.levels, nullptr) << "a merged segment says nothing of its levels";
+        EXPECT_EQ(ob::LevelSet::count(out.levels->bid), 0u);
+        EXPECT_EQ(ob::LevelSet::count(out.levels->ask), 3u);
+        for (const uint16_t level : {1, 2, 7}) {
+            EXPECT_TRUE(out.levels->has(ob::SIDE_ASK, level)) << "level " << level;
+        }
+        ASSERT_EQ(store.replace_segments({a, b}, out, rename_to_segment).outcome,
+                  ob::ColumnarStore::Replaced::kYes);
+        const auto after = store.latest_per_level(kBase + 10 * kSec, "A", "EX");
+        EXPECT_TRUE(same_rows(after.rows, before));
+        EXPECT_EQ(after.segments_read, 1u);
+        EXPECT_EQ(after.segments_skipped, 1u)
+            << "every level of the merged segment has a later row in the next, and it was read";
+    }
+    // The inputs are still on the disk, as after a crash before their removal; the rebuild removes
+    // them, and what is left is read from the merged segment's meta.json.
+    ob::ColumnarStore reopened(dir.str());
+    reopened.open_existing();
+    ASSERT_EQ(reopened.last_rebuild_removed().superseded, 2u);
+    const auto read_back = reopened.latest_per_level(kBase + 10 * kSec, "A", "EX");
+    EXPECT_TRUE(same_rows(read_back.rows, before));
+    EXPECT_EQ(read_back.segments_skipped, 1u) << "the merged segment's levels did not survive its meta.json";
+}
