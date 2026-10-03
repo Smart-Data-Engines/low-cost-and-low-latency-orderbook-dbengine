@@ -518,6 +518,10 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
         return Result<QueryResult>::err(
             OB_ERR_PARSE,
             "response holds aggregates, not rows; use query_agg()");
+    if (header.starts_with("bucket_ns"))
+        return Result<QueryResult>::err(
+            OB_ERR_PARSE,
+            "response holds time buckets, not rows; use query_buckets()");
 
     // This client reads a row's fields by position, so a response carrying different columns has
     // to be refused rather than parsed. Since #139 the server answers the columns a query asked
@@ -1047,6 +1051,92 @@ Result<std::vector<AggEntry>> OrderbookClient::parse_agg_response(std::string_vi
     }
 
     return Res::ok(std::move(entries));
+}
+
+Result<std::vector<BucketRow>> OrderbookClient::parse_bucket_response(std::string_view resp) {
+    using Res = Result<std::vector<BucketRow>>;
+
+    if (resp.starts_with("ERR ")) {
+        auto msg = resp.substr(4);
+        if (!msg.empty() && msg.back() == '\n')
+            msg.remove_suffix(1);
+        return Res::err(OB_ERR_INTERNAL, std::string(msg));
+    }
+    if (!resp.starts_with("OK\n"))
+        return Res::err(OB_ERR_PARSE, "unexpected response");
+    resp.remove_prefix(3);
+    if (resp.size() >= 2 && resp.substr(resp.size() - 2) == "\n\n")
+        resp.remove_suffix(2);
+
+    const auto header_end = resp.find('\n');
+    const std::string_view header = resp.substr(0, header_end);
+    if (!header.starts_with("bucket_ns"))
+        return Res::err(OB_ERR_PARSE, "response is not time buckets; GROUP BY TIME_BUCKET(...) in the query?");
+
+    // `<expression>/<scale>` per column after the first, split at the last '/': no expression has one.
+    std::vector<AggEntry> columns;
+    for (std::string_view rest = header.substr(std::string_view("bucket_ns").size()); !rest.empty();) {
+        if (rest.front() != '\t') return Res::err(OB_ERR_PARSE, "malformed time-bucket header");
+        rest.remove_prefix(1);
+        const auto next = rest.find('\t');
+        const std::string_view col = rest.substr(0, next);
+        rest = next == std::string_view::npos ? std::string_view{} : rest.substr(next);
+        const auto slash = col.rfind('/');
+        if (slash == std::string_view::npos) return Res::err(OB_ERR_PARSE, "time-bucket column without a scale");
+        AggEntry e{};
+        e.name = std::string(col.substr(0, slash));
+        const std::string_view scale = col.substr(slash + 1);
+        auto [sp, sec] = std::from_chars(scale.data(), scale.data() + scale.size(), e.scale);
+        if (sec != std::errc{} || sp != scale.data() + scale.size() || e.scale <= 0)
+            return Res::err(OB_ERR_PARSE, "bad time-bucket scale");
+        columns.push_back(std::move(e));
+    }
+
+    std::vector<BucketRow> buckets;
+    std::string_view body = header_end == std::string_view::npos ? std::string_view{} : resp.substr(header_end + 1);
+    while (!body.empty()) {
+        const auto line_end = body.find('\n');
+        const std::string_view line = body.substr(0, line_end);
+        body = line_end == std::string_view::npos ? std::string_view{} : body.substr(line_end + 1);
+        if (line.empty()) continue;
+        BucketRow row{};
+        std::string_view rest = line;
+        const auto first_tab = rest.find('\t');
+        const std::string_view start = rest.substr(0, first_tab);
+        auto [p, ec] = std::from_chars(start.data(), start.data() + start.size(), row.start_ns);
+        if (ec != std::errc{} || p != start.data() + start.size())
+            return Res::err(OB_ERR_PARSE, "bad time-bucket start");
+        rest = first_tab == std::string_view::npos ? std::string_view{} : rest.substr(first_tab);
+        for (const AggEntry& column : columns) {
+            if (rest.empty() || rest.front() != '\t') return Res::err(OB_ERR_PARSE, "time-bucket row short of its columns");
+            rest.remove_prefix(1);
+            const auto next = rest.find('\t');
+            const std::string_view field = rest.substr(0, next);
+            rest = next == std::string_view::npos ? std::string_view{} : rest.substr(next);
+            AggEntry v = column;
+            if (field == "NULL") {
+                v.empty = true;   // nothing to compute it from, which a 0 would hide
+            } else {
+                auto [vp, vec] = std::from_chars(field.data(), field.data() + field.size(), v.value);
+                if (vec != std::errc{} || vp != field.data() + field.size())
+                    return Res::err(OB_ERR_PARSE, "bad time-bucket value");
+            }
+            row.values.push_back(std::move(v));
+        }
+        if (!rest.empty()) return Res::err(OB_ERR_PARSE, "time-bucket row longer than its header");
+        buckets.push_back(std::move(row));
+    }
+    return Res::ok(std::move(buckets));
+}
+
+Result<std::vector<BucketRow>> OrderbookClient::query_buckets(std::string_view sql) {
+    using Res = Result<std::vector<BucketRow>>;
+    size_t len = format_query(sql);
+    auto sr = send_all(len);
+    if (!sr) return Res::err(sr.error_code(), sr.error_message());
+    auto rr = recv_response();
+    if (!rr) return Res::err(rr.error_code(), rr.error_message());
+    return parse_bucket_response(rr.value());
 }
 
 Result<std::vector<AggEntry>> OrderbookClient::query_agg(std::string_view sql) {

@@ -1096,6 +1096,7 @@ const std::vector<std::string>& known_flags() {
         "io-threads",
         "handover-grace-seconds",
         "log-level",
+        "max-query-buckets",
         "max-sessions",
         "max-subscriber-queue-bytes",
         "max-subscriptions-per-session",
@@ -1182,6 +1183,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"handover-cooldown-seconds", {"<N>", "How long a node that handed the role over abstains"}},
         {"handover-grace-seconds", {"<N>", "Grace period granted to a handover target"}},
         {"log-level", {"<LEVEL>", "ERROR, WARN, INFO or DEBUG (upper case; default: INFO)"}},
+        {"max-query-buckets", {"<N>", "The most buckets one GROUP BY TIME_BUCKET answer may have; past it the query is refused, not cut short (default: 100000)"}},
         {"max-sessions", {"<N>", "Maximum concurrent client sessions (default: 64)"}},
         {"max-subscriber-queue-bytes", {"<N>", "Per-subscriber queue ceiling; past it the session closes"}},
         {"max-subscriptions-per-session", {"<N>", "Subscription limit per session (default: 16)"}},
@@ -1479,6 +1481,14 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.advertise_host = std::string{cursor.value()};
         } else if (arg == "--data-dir") {
             config.data_dir = std::string{cursor.value()};
+        } else if (arg == "--max-query-buckets") {
+            config.max_query_buckets = cursor.value_as<uint64_t>();
+            if (config.max_query_buckets == 0) {
+                // Zero would refuse every bucket query, which is a way to turn them off nobody
+                // asked for and a typo would reach.
+                std::fprintf(stderr, "Error: --max-query-buckets expects at least 1\n");
+                std::exit(1);
+            }
         } else if (arg == "--max-sessions") {
             config.max_sessions = cursor.value_as<int>();
         } else if (arg == "--max-subscriber-queue-bytes") {
@@ -1968,6 +1978,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("handover-cooldown-seconds", std::to_string(c.handover_cooldown_seconds));
     line("handover-grace-seconds", std::to_string(c.handover_grace_seconds));
     line("log-level", c.log_level);
+    line("max-query-buckets", std::to_string(c.max_query_buckets));
     line("max-sessions", std::to_string(c.max_sessions));
     line("max-subscriber-queue-bytes", std::to_string(c.max_subscriber_queue_bytes));
     line("max-subscriptions-per-session", std::to_string(c.max_subscriptions_per_session));
@@ -3033,6 +3044,9 @@ void TcpServer::run() {
     engine_->set_read_only_flag(&read_only_);
     engine_->set_compaction_enabled(config_.compaction);
     engine_->set_write_admission_enabled(config_.write_admission);
+    static_assert(ServerConfig{}.max_query_buckets == QueryEngine::kDefaultMaxQueryBuckets,
+                  "the server's default bucket ceiling is the query engine's");
+    engine_->query_engine().set_max_query_buckets(static_cast<size_t>(config_.max_query_buckets));
 
     // Open the engine (replay WAL, start flush thread).
     engine_->open();

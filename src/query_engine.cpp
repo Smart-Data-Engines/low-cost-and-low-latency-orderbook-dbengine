@@ -29,8 +29,10 @@ enum class TokKind {
     // Keywords
     KW_SELECT, KW_SUBSCRIBE, KW_FROM, KW_WHERE, KW_LIMIT,
     KW_AND, KW_BETWEEN, KW_AT,
+    KW_GROUP, KW_BY, KW_TIME_BUCKET,
     // Aggregation function names
     KW_SUM, KW_AVG, KW_MIN, KW_MAX, KW_VWAP,
+    KW_COUNT, KW_FIRST, KW_LAST,
     KW_SPREAD, KW_MID_PRICE,
     KW_IMBALANCE, KW_DEPTH, KW_DEPTH_RANGE, KW_CUMULATIVE_VOLUME,
     // Column names
@@ -71,6 +73,15 @@ static const KwEntry KEYWORDS[] = {
     {"AND",               TokKind::KW_AND},
     {"BETWEEN",           TokKind::KW_BETWEEN},
     {"AT",                TokKind::KW_AT},
+    // A time bucket's (#44). Nothing unquoted could have been spelled so before - symbols and
+    // exchanges are string literals and no column has these names - so nothing that parsed before
+    // changes its meaning.
+    {"GROUP",             TokKind::KW_GROUP},
+    {"BY",                TokKind::KW_BY},
+    {"TIME_BUCKET",       TokKind::KW_TIME_BUCKET},
+    {"COUNT",             TokKind::KW_COUNT},
+    {"FIRST",             TokKind::KW_FIRST},
+    {"LAST",              TokKind::KW_LAST},
     {"SUM",               TokKind::KW_SUM},
     {"AVG",               TokKind::KW_AVG},
     {"MIN",               TokKind::KW_MIN},
@@ -286,9 +297,136 @@ private:
             consume();
             if (auto e = parse_where_clause(out); !e.empty()) return e;
         }
+        if (at(TokKind::KW_GROUP)) {
+            const Token group_tok = consume();
+            if (auto e = parse_group_by(out, group_tok); !e.empty()) return e;
+        }
         if (at(TokKind::KW_LIMIT)) {
             consume();
             if (auto e = parse_limit(out); !e.empty()) return e;
+        }
+        return {};
+    }
+
+    // ── GROUP BY TIME_BUCKET (#44) ────────────────────────────────────────────
+
+    // group_by ::= "GROUP" "BY" "TIME_BUCKET" "(" integer unit ")", unit one of ns us ms s m h d.
+    // The lexer gives `1m` as an integer and a word, so `1m` and `1 m` read the same.
+    std::string parse_group_by(QueryAST& out, const Token& group_tok) {
+        if (!at(TokKind::KW_BY)) return make_error("expected BY after GROUP");
+        consume();
+        if (!at(TokKind::KW_TIME_BUCKET)) return make_error("expected TIME_BUCKET(...) after GROUP BY");
+        consume();
+        if (!at(TokKind::LPAREN)) return make_error("expected '(' after TIME_BUCKET");
+        consume();
+        if (!at(TokKind::INT_LIT)) return make_error("expected the interval, e.g. TIME_BUCKET(1m)");
+        const Token n_tok = consume();
+        uint64_t n = 0;
+        if (n_tok.text.empty() || n_tok.text[0] == '-' || !parse_decimal_u64(n_tok.text, n) || n == 0) {
+            return make_error_at(n_tok, "a bucket's interval is a positive integer and a unit, got '" +
+                                            n_tok.text + "'");
+        }
+        if (!at(TokKind::UNKNOWN)) {
+            return make_error("expected the interval's unit - ns, us, ms, s, m, h or d - after " +
+                              n_tok.text);
+        }
+        const Token unit_tok = consume();
+        const uint64_t unit_ns = bucket_unit_ns(unit_tok.text);
+        if (unit_ns == 0) {
+            return make_error_at(unit_tok, "unknown unit '" + unit_tok.text +
+                                               "' - a bucket's is ns, us, ms, s, m, h or d");
+        }
+        if (n > kMaxBucketNs / unit_ns) {
+            return make_error_at(n_tok, "a bucket is at most 366 d, got " + n_tok.text + unit_tok.text);
+        }
+        if (!at(TokKind::RPAREN)) return make_error("expected ')' after the interval");
+        consume();
+        out.bucket_ns = n * unit_ns;
+        if (out.snapshot_ts_ns.has_value()) {
+            return make_error_at(group_tok, "AT reads the book at one moment and GROUP BY a stretch "
+                                            "of rows - not both in one query");
+        }
+
+        // What the select list means is decided now that GROUP BY is known: the same function name
+        // reads the live book without it (#200) and a bucket's rows with it.
+        if (auto e = build_bucket_aggs(out, group_tok); !e.empty()) return e;
+        OB_LOG_DEBUG("query", "GROUP BY time_bucket: %llu ns, %zu aggregate(s)",
+                     static_cast<unsigned long long>(*out.bucket_ns), out.bucket_aggs.size());
+        return {};
+    }
+
+    static uint64_t bucket_unit_ns(const std::string& unit) {
+        static constexpr struct { const char* name; uint64_t ns; } kUnits[] = {
+            {"ns", 1ULL}, {"us", 1'000ULL}, {"ms", 1'000'000ULL}, {"s", 1'000'000'000ULL},
+            {"m", 60ULL * 1'000'000'000ULL}, {"h", 3'600ULL * 1'000'000'000ULL},
+            {"d", 86'400ULL * 1'000'000'000ULL},
+        };
+        for (const auto& u : kUnits) {
+            if (unit == u.name) return u.ns;   // exact: `M` is not minutes, and `S` is no unit
+        }
+        return 0;
+    }
+
+    static bool parse_decimal_u64(const std::string& text, uint64_t& out) {
+        uint64_t v = 0;
+        for (char c : text) {
+            if (c < '0' || c > '9') return false;
+            const uint64_t d = static_cast<uint64_t>(c - '0');
+            if (v > (UINT64_MAX - d) / 10) return false;
+            v = v * 10 + d;
+        }
+        out = v;
+        return true;
+    }
+
+    /// The select list of a bucket query, as bucket aggregates: each item a function of the rows
+    /// and the column it reads, and nothing else - a column, `*`, or a function of the live book is
+    /// refused with its name (#44, requirement 1.3).
+    std::string build_bucket_aggs(QueryAST& out, const Token& group_tok) {
+        out.bucket_aggs.clear();
+        for (const std::string& expr : out.select_exprs) {
+            const std::string fn = expr.substr(0, expr.find('('));
+            const std::string arg = expr.find('(') == std::string::npos
+                ? std::string{}
+                : expr.substr(expr.find('(') + 1, expr.size() - expr.find('(') - 2);
+            if (expr.find('(') == std::string::npos) {
+                return make_error_at(group_tok, "a GROUP BY query answers with aggregates of each "
+                                                "bucket's rows, and '" + expr + "' is not one");
+            }
+            BucketAgg agg{BucketFn::Count, QueryColumn::TimestampNs, expr};
+            if (fn == "COUNT") {
+                if (arg != "*") return make_error_at(group_tok, "COUNT takes '*', got '" + expr + "'");
+                agg.fn = BucketFn::Count;
+            } else {
+                static constexpr struct { const char* name; BucketFn fn; bool price, quantity; } kFns[] = {
+                    {"FIRST", BucketFn::First, true, true}, {"LAST", BucketFn::Last, true, true},
+                    {"MIN", BucketFn::Min, true, true},     {"MAX", BucketFn::Max, true, true},
+                    {"SUM", BucketFn::Sum, false, true},    {"AVG", BucketFn::Avg, true, true},
+                    {"VWAP", BucketFn::Vwap, true, false},
+                };
+                const auto* entry = std::find_if(std::begin(kFns), std::end(kFns),
+                                                 [&](const auto& f) { return fn == f.name; });
+                if (entry == std::end(kFns)) {
+                    return make_error_at(group_tok, "'" + expr + "' aggregates the live book, not a "
+                                                    "bucket's rows - a GROUP BY query takes COUNT, "
+                                                    "FIRST, LAST, MIN, MAX, SUM, AVG and VWAP");
+                }
+                if (arg == "bid" || arg == "ask") {
+                    return make_error_at(group_tok, "'" + expr + "' names a side, which a bucket's "
+                                                    "rows are narrowed to with WHERE side = " +
+                                                    std::string(arg == "bid" ? "0" : "1"));
+                }
+                const bool price = arg == "price", quantity = arg == "quantity";
+                if (!(price && entry->price) && !(quantity && entry->quantity)) {
+                    const std::string takes = entry->price && entry->quantity ? "price or quantity"
+                                             : entry->price ? "price" : "quantity";
+                    return make_error_at(group_tok, fn + " of a bucket takes " + takes + ", got '" +
+                                                    expr + "'");
+                }
+                agg.fn = entry->fn;
+                agg.column = price ? QueryColumn::Price : QueryColumn::Quantity;
+            }
+            out.bucket_aggs.push_back(std::move(agg));
         }
         return {};
     }
@@ -419,7 +557,8 @@ private:
     }
 
     bool is_agg_func(TokKind k) const {
-        return k == TokKind::KW_SUM || k == TokKind::KW_AVG ||
+        return k == TokKind::KW_COUNT || k == TokKind::KW_FIRST || k == TokKind::KW_LAST ||
+               k == TokKind::KW_SUM || k == TokKind::KW_AVG ||
                k == TokKind::KW_MIN || k == TokKind::KW_MAX ||
                k == TokKind::KW_VWAP || k == TokKind::KW_SPREAD ||
                k == TokKind::KW_MID_PRICE || k == TokKind::KW_IMBALANCE ||
@@ -982,6 +1121,12 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
                "' exchange '" + ast.exchange + "' not found";
     }
 
+    // ── GROUP BY TIME_BUCKET (#44) ────────────────────────────────────────────
+    // Before the live book's checks: these aggregates read rows, so a condition on time, price,
+    // side or level narrows what they read rather than being refused as it is beside a function
+    // of the book.
+    if (ast.bucket_ns.has_value()) return execute_buckets(ast, cb, shape);
+
     // ── Determine if any select_expr is an aggregation call ──────────────────
     bool has_agg = false;
     for (const auto& expr : ast.select_exprs) {
@@ -1004,6 +1149,13 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
                 if (fname == *p) { known = true; break; }
             }
             if (!known) {
+                if (fname == "COUNT" || fname == "FIRST" || fname == "LAST") {
+                    // Functions of a time bucket's rows (#44): the live book has no rows to count.
+                    OB_LOG_WARN("query", "Rejecting %s: it aggregates a time bucket and the query "
+                                         "has no GROUP BY", expr.c_str());
+                    return "AGG_NEEDS_BUCKET: " + fname + " aggregates the rows of a time bucket; "
+                           "add GROUP BY TIME_BUCKET(<interval>) to '" + expr + "'";
+                }
                 return "OB_ERR_PARSE: undefined aggregation function '" +
                        fname + "' at position " + std::to_string(i);
             }
@@ -1331,6 +1483,216 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     return {};
 }
 
+namespace {
+
+/// What one bucket has seen (#44): enough for every bucket aggregate at once, so the row loop does
+/// not branch per function. A tie on the event time is broken by the order the scan delivered the
+/// rows in, as SNAPSHOT's is (#168): FIRST keeps the earlier delivered, LAST the later - which is
+/// what taking a strictly earlier time for one and an equal or later one for the other does.
+///
+/// The sums cannot overflow but one: a quantity is below 2^64 and a price's magnitude at most 2^63,
+/// so 2^64 rows of either stay inside 128 bits, and so does one row's price times quantity - but a
+/// sum of those products can leave them, and then `px_qty_overflow` says so and VWAP is refused.
+struct BucketState {
+    uint64_t count{0};
+    uint64_t first_ts{0}, last_ts{0};
+    int64_t  first_price{0}, last_price{0};
+    uint64_t first_qty{0}, last_qty{0};
+    int64_t  min_price{0}, max_price{0};
+    uint64_t min_qty{0}, max_qty{0};
+    unsigned __int128 sum_qty{0};
+    __int128 sum_price{0};
+    __int128 sum_px_qty{0};
+    bool     px_qty_overflow{false};
+
+    void add(const SnapshotRow& row) {
+        const int64_t  px  = row.price;
+        const uint64_t qty = row.quantity;
+        if (count == 0) {
+            first_ts = last_ts = row.timestamp_ns;
+            first_price = last_price = min_price = max_price = px;
+            first_qty = last_qty = min_qty = max_qty = qty;
+        } else {
+            if (row.timestamp_ns < first_ts) {
+                first_ts = row.timestamp_ns; first_price = px; first_qty = qty;
+            }
+            if (row.timestamp_ns >= last_ts) {
+                last_ts = row.timestamp_ns; last_price = px; last_qty = qty;
+            }
+            min_price = std::min(min_price, px);   max_price = std::max(max_price, px);
+            min_qty   = std::min(min_qty, qty);    max_qty   = std::max(max_qty, qty);
+        }
+        ++count;
+        sum_qty   += qty;
+        sum_price += px;
+        const __int128 product = static_cast<__int128>(px) * static_cast<__int128>(qty);
+        if (__builtin_add_overflow(sum_px_qty, product, &sum_px_qty)) px_qty_overflow = true;
+    }
+};
+
+constexpr int64_t kBucketScale = 1'000'000;   // AVG and VWAP, as the live book's VWAP
+
+int64_t bucket_scale(BucketFn fn) {
+    return fn == BucketFn::Avg || fn == BucketFn::Vwap ? kBucketScale : 1;
+}
+
+/// `sum * kBucketScale / divisor`, truncated toward zero, without multiplying before dividing:
+/// the whole part and the remainder are scaled apart. `divisor` is positive. False when the
+/// remainder's product leaves 128 bits, which a divisor past 2^107 could make it.
+bool scaled_quotient(__int128 sum, __int128 divisor, __int128& out) {
+    const __int128 whole = sum / divisor;
+    __int128 rem = 0;
+    if (__builtin_mul_overflow(sum % divisor, static_cast<__int128>(kBucketScale), &rem)) return false;
+    __int128 scaled = 0;
+    if (__builtin_mul_overflow(whole, static_cast<__int128>(kBucketScale), &scaled)) return false;
+    out = scaled + rem / divisor;
+    return true;
+}
+
+/// One aggregate of one bucket: its value, whether there was anything to compute it from, or false
+/// when it does not fit an int64 - which the caller refuses, naming both.
+bool bucket_value(const BucketAgg& agg, const BucketState& b, AggValue& out) {
+    out.name  = agg.text;
+    out.scale = bucket_scale(agg.fn);
+    out.empty = false;
+    out.value = 0;
+    const bool price = agg.column == QueryColumn::Price;
+    const auto from_u64 = [&](uint64_t v) {
+        if (v > static_cast<uint64_t>(INT64_MAX)) return false;
+        out.value = static_cast<int64_t>(v);
+        return true;
+    };
+    const auto from_i128 = [&](__int128 v) {
+        if (v > static_cast<__int128>(INT64_MAX) || v < static_cast<__int128>(INT64_MIN)) return false;
+        out.value = static_cast<int64_t>(v);
+        return true;
+    };
+    constexpr unsigned __int128 kI128Max = (static_cast<unsigned __int128>(1) << 127) - 1;
+    switch (agg.fn) {
+    case BucketFn::Count: return from_u64(b.count);
+    case BucketFn::First: if (price) { out.value = b.first_price; return true; } return from_u64(b.first_qty);
+    case BucketFn::Last:  if (price) { out.value = b.last_price; return true; }  return from_u64(b.last_qty);
+    case BucketFn::Min:   if (price) { out.value = b.min_price; return true; }   return from_u64(b.min_qty);
+    case BucketFn::Max:   if (price) { out.value = b.max_price; return true; }   return from_u64(b.max_qty);
+    case BucketFn::Sum:
+        if (b.sum_qty > static_cast<unsigned __int128>(INT64_MAX)) return false;
+        out.value = static_cast<int64_t>(b.sum_qty);
+        return true;
+    case BucketFn::Avg: {
+        // count < 2^64 and the sums inside 128 bits, so only the result can fail to fit.
+        if (!price && b.sum_qty > kI128Max) return false;
+        const __int128 sum = price ? b.sum_price : static_cast<__int128>(b.sum_qty);
+        __int128 v = 0;
+        return scaled_quotient(sum, static_cast<__int128>(b.count), v) && from_i128(v);
+    }
+    case BucketFn::Vwap: {
+        if (b.sum_qty == 0) {   // every row of the bucket at quantity zero: nothing to weigh by
+            out.empty = true;
+            return true;
+        }
+        if (b.px_qty_overflow || b.sum_qty > kI128Max) return false;
+        __int128 v = 0;
+        return scaled_quotient(b.sum_px_qty, static_cast<__int128>(b.sum_qty), v) && from_i128(v);
+    }
+    }
+    return false;
+}
+
+}  // namespace
+
+std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback& cb,
+                                         QueryShape& shape) {
+    const uint64_t width = *ast.bucket_ns;
+    shape.is_buckets = true;
+    shape.bucket_columns.clear();
+    for (const BucketAgg& agg : ast.bucket_aggs) {
+        shape.bucket_columns.push_back({agg.text, bucket_scale(agg.fn)});
+    }
+
+    // The time, the columns the aggregates read, and the ones the conditions are on.
+    ColumnSet to_read;
+    to_read.add(QueryColumn::TimestampNs);
+    for (const BucketAgg& agg : ast.bucket_aggs) {
+        if (agg.fn != BucketFn::Count) to_read.add(agg.column);
+        // VWAP(price) weighs each price by its row's quantity: a column it reads without naming.
+        if (agg.fn == BucketFn::Vwap) to_read.add(QueryColumn::Quantity);
+    }
+    if (ast.price_lo.has_value() || ast.price_hi.has_value()) to_read.add(QueryColumn::Price);
+    if (ast.side_lo.has_value() || ast.side_hi.has_value()) to_read.add(QueryColumn::Side);
+    if (ast.level_lo.has_value() || ast.level_hi.has_value()) to_read.add(QueryColumn::Level);
+
+    const size_t ceiling = max_query_buckets();
+    std::unordered_map<uint64_t, BucketState> buckets;
+    uint64_t rows = 0;
+    bool too_many = false;
+    // The bucket the last row went to: a segment's rows are appended in about their time order, so
+    // the next row is nearly always in it, and the map is asked only when it is not. References to
+    // an unordered_map's elements survive its rehashing.
+    BucketState* last = nullptr;
+    uint64_t last_start = 0;
+    store_.scan(ast.ts_start_ns.value_or(0), ast.ts_end_ns.value_or(UINT64_MAX), ast.symbol,
+                ast.exchange, to_read, [&](const SnapshotRow& row) {
+                    if (too_many || !row_allowed(ast, row)) return;
+                    const uint64_t start = row.timestamp_ns - row.timestamp_ns % width;
+                    if (last == nullptr || start != last_start) {
+                        auto it = buckets.find(start);
+                        if (it == buckets.end()) {
+                            // Rows do not arrive in time order - segments by their start, a
+                            // segment's rows as appended, and a client's own event times anywhere
+                            // (#105) - so neither LIMIT nor the ceiling can end the scan early;
+                            // past the ceiling the rest of it only counts.
+                            if (buckets.size() >= ceiling) { too_many = true; return; }
+                            it = buckets.emplace(start, BucketState{}).first;
+                        }
+                        last = &it->second;
+                        last_start = start;
+                    }
+                    last->add(row);
+                    ++rows;
+                });
+    if (too_many) {
+        OB_LOG_WARN("query", "Rejecting GROUP BY %s.%s: more than %zu buckets of %llu ns",
+                    ast.symbol.c_str(), ast.exchange.c_str(), ceiling,
+                    static_cast<unsigned long long>(width));
+        return "BUCKETS_TOO_MANY: more than " + std::to_string(ceiling) +
+               " buckets; narrow the time range or widen the interval";
+    }
+
+    std::vector<uint64_t> starts;
+    starts.reserve(buckets.size());
+    for (const auto& [start, state] : buckets) starts.push_back(start);
+    std::sort(starts.begin(), starts.end());
+    if (ast.limit.has_value() && *ast.limit < starts.size()) starts.resize(*ast.limit);
+
+    // Every value before the first row: one that does not fit is the answer, not a row of it.
+    std::vector<QueryResult> answer;
+    answer.reserve(starts.size());
+    for (uint64_t start : starts) {
+        const BucketState& b = buckets.at(start);
+        QueryResult qr{};
+        qr.timestamp_ns = start;
+        qr.agg_values.reserve(ast.bucket_aggs.size());
+        for (const BucketAgg& agg : ast.bucket_aggs) {
+            AggValue v;
+            if (!bucket_value(agg, b, v)) {
+                OB_LOG_WARN("query", "Rejecting GROUP BY %s.%s: %s of the bucket at %llu does not "
+                                     "fit a 64-bit integer",
+                            ast.symbol.c_str(), ast.exchange.c_str(), agg.text.c_str(),
+                            static_cast<unsigned long long>(start));
+                return "BUCKET_OVERFLOW: " + agg.text + " of the bucket at " +
+                       std::to_string(start) + " does not fit a 64-bit integer";
+            }
+            qr.agg_values.push_back(std::move(v));
+        }
+        answer.push_back(std::move(qr));
+    }
+    OB_LOG_DEBUG("query", "GROUP BY %s.%s: %llu row(s) in %zu bucket(s) of %llu ns, %zu answered",
+                 ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(rows),
+                 buckets.size(), static_cast<unsigned long long>(width), answer.size());
+    for (const QueryResult& qr : answer) cb(qr);
+    return {};
+}
+
 std::string QueryEngine::format(const QueryAST& ast) {
     std::ostringstream os;
 
@@ -1387,7 +1749,24 @@ std::string QueryEngine::format(const QueryAST& ast) {
     write_range("side", ast.side_lo, ast.side_hi);
     write_range("level", ast.level_lo, ast.level_hi);
 
-    // 5. LIMIT (SELECT only)
+    // 5. GROUP BY TIME_BUCKET (#44), in the largest unit that divides the interval, which the parser
+    //    reads back to the same nanoseconds.
+    if (ast.bucket_ns.has_value()) {
+        static constexpr struct { const char* name; uint64_t ns; } kUnits[] = {
+            {"d", 86'400ULL * 1'000'000'000ULL}, {"h", 3'600ULL * 1'000'000'000ULL},
+            {"m", 60ULL * 1'000'000'000ULL}, {"s", 1'000'000'000ULL}, {"ms", 1'000'000ULL},
+            {"us", 1'000ULL}, {"ns", 1ULL},
+        };
+        const uint64_t ns = *ast.bucket_ns;
+        for (const auto& u : kUnits) {
+            if (ns % u.ns == 0) {
+                os << " GROUP BY TIME_BUCKET(" << ns / u.ns << u.name << ")";
+                break;
+            }
+        }
+    }
+
+    // 6. LIMIT (SELECT only)
     if (ast.type != QueryType::SUBSCRIBE && ast.limit.has_value()) {
         os << " LIMIT " << ast.limit.value();
     }

@@ -94,6 +94,13 @@ def test_cpp_aggregates_with_scales(binary, cluster):
     assert "scale=1000000" in result["message"], result
 
 
+def test_cpp_time_buckets_with_scales(binary, cluster):
+    """Covers query_buckets() end to end (#44), including the row API refusing that shape."""
+    result = run_cpp_test(binary, cluster.primary().tcp_port, "query_buckets")
+    assert result["status"] == "pass", result["message"]
+    assert "VWAP=175000000 and NULL" in result["message"], result
+
+
 def test_cpp_client_reports_failure_against_a_dead_port(binary, cluster):
     """A test binary that passes when the server is absent would prove nothing."""
     dead_port = cluster.find_free_port()

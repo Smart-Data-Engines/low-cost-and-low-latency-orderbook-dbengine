@@ -235,6 +235,16 @@ extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
 extern "C" ob_result_t* ob_query(ob_engine_t* engine, const char* sql) {
     if (!engine || !sql) return nullptr;
     try {
+        // A GROUP BY answer is buckets of aggregates (#44), which this result cannot carry - its rows
+        // are the seven columns - so it is refused rather than answered as rows of zeros.
+        {
+            ob::QueryAST ast;
+            if (engine->query_engine->parse(sql, ast).empty() && ast.bucket_ns.has_value()) {
+                OB_LOG_WARN("c_api", "GROUP BY TIME_BUCKET is not answered by the local library; "
+                                     "query a server, whose clients read time buckets");
+                return nullptr;
+            }
+        }
         auto* result = new ob_result{};
         std::string err = engine->query_engine->execute(
             sql,

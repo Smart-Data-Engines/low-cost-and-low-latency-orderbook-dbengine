@@ -150,7 +150,9 @@ public:
 
 private:
     void start(const QueryResult& first);
+    void start_buckets();
     void add_narrow(const QueryResult& r);
+    void add_bucket(const QueryResult& r);
 
     const QueryShape&     shape_;
     std::string           out_;
@@ -159,7 +161,17 @@ private:
     bool started_   = false;
     bool aggregate_ = false;
     bool all_seven_ = false;
+    bool buckets_   = false;   ///< a GROUP BY answer (#44), told by the shape, not by a row
 };
+
+/// The header of a `GROUP BY TIME_BUCKET(...)` answer (#44), without its line end:
+///
+///     bucket_ns	COUNT(*)/1	FIRST(price)/1	VWAP(price)/1000000
+///
+/// Each aggregate's scale follows its expression after a `/`, divide by it for the natural value:
+/// the scale depends on the function alone, and the header is written before the first row. No
+/// expression contains a `/`, so a client splits each name at its last one.
+std::string format_bucket_header(const QueryShape& shape);
 
 /// Format aggregate results as TSV: one row per aggregate, three columns.
 ///

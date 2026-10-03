@@ -227,8 +227,30 @@ timestamp, price, side or level filter rather than accepting one and ignoring it
 `VWAP(*)` and the other spellings that read the bids without saying so are refused with
 `AGG_NEEDS_SIDE`, raised here as an `OrderbookError` that names the spelling to use.
 
+#### engine.query_buckets(sql) → List[Bucket]
+
+Run a `SELECT ... GROUP BY TIME_BUCKET(...)` (#44): aggregates over the stored rows of each
+interval, the buckets that hold a row in time order. TCP and pool mode only.
+
+```python
+bars = engine.query_buckets(
+    "SELECT FIRST(price), MAX(price), MIN(price), LAST(price) FROM 'BTC-USD'.'BINANCE' "
+    "WHERE side = 0 AND level = 0 GROUP BY TIME_BUCKET(1m)")
+
+bars[0].start_ns                       # where the bucket begins, on the epoch, in UTC
+bars[0].values["LAST(price)"].value    # 6500000
+bars[0].values["VWAP(price)"].real     # AVG and VWAP arrive scaled by 10^6; .real divides
+bars[0].values["VWAP(price)"].is_empty # True when every row of the bucket had quantity 0
+```
+
+The conditions narrow the rows the aggregates read; the functions and their refusals are in
+`docs/query-language.md` ("Time buckets"). An answer with more buckets than the server allows
+(`--max-query-buckets`) raises `OrderbookError` with `BUCKETS_TOO_MANY` rather than coming back cut
+short.
+
 `query()` raises `OrderbookError` if the query turns out to return aggregates, because the row parser
-would silently discard all three columns and hand back an empty list.
+would silently discard all three columns and hand back an empty list - and on time buckets, naming
+`query_buckets()`.
 
 It raises for the same reason on a **narrowed** response. Since #139 the server answers the columns
 a query names — `SELECT price, quantity FROM ...` returns two — and this client reads a row by

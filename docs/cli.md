@@ -586,6 +586,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |
 | `--log-level` | `<LEVEL>` | ERROR, WARN, INFO or DEBUG (upper case; default: INFO) |
+| `--max-query-buckets` | `<N>` | The most buckets one `GROUP BY TIME_BUCKET(...)` answer may have (default: 100000); past it the query is refused with `BUCKETS_TOO_MANY` rather than cut short. What a query holds is proportional to its buckets, not its rows (#44) |
 | `--max-sessions` | `<N>` | Maximum concurrent client sessions (default: 64) |
 | `--max-subscriber-queue-bytes` | `<N>` | Per-subscriber queue ceiling; past it the session closes |
 | `--max-subscriptions-per-session` | `<N>` | Subscription limit per session (default: 16) |

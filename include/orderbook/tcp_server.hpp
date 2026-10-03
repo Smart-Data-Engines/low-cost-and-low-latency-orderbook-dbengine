@@ -62,6 +62,10 @@ struct ServerConfig {
     std::string mm_bind;
     std::string data_dir{"/tmp/ob_data"};
     int         max_sessions{64};
+    /// The most buckets one `GROUP BY TIME_BUCKET(...)` answer may have (#44); past it the query is
+    /// refused. `--max-query-buckets`; QueryEngine::kDefaultMaxQueryBuckets, which a static_assert
+    /// in tcp_server.cpp holds this to.
+    uint64_t    max_query_buckets{100'000};
     size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)
     /// Ceiling on what one session may hold that is not yet a command (#143).
     ///
