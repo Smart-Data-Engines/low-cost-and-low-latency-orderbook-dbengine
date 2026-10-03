@@ -250,6 +250,23 @@ TEST(BookAtAnInstant, ATieGoesToTheRowDeliveredLaterAcrossSegments) {
     EXPECT_EQ(with_block.blocks, 1u);
 }
 
+TEST(BookAtAnInstant, ASegmentEndingWhenAnEarlierOnesRowIsCanStillWinItsTie) {
+    // The wide segment is read first - it ends later - and holds the level at 5 s; the narrow one
+    // ends at 5 s, holds the level then, and starts later, so a scan delivers it after the wide
+    // one: its row is the book's, and it may not be skipped for ending no later than what the
+    // book already holds.
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    segment(store, {row(kBase, ob::SIDE_BID, 9, 1), row(kBase + 5 * kSec, ob::SIDE_BID, 0, 2),
+                    row(kBase + 10 * kSec, ob::SIDE_BID, 9, 3)});
+    segment(store, {row(kBase + 5 * kSec, ob::SIDE_BID, 0, 4)});
+    const auto book = store.latest_per_level(kBase + 20 * kSec, "SYM", "EX");
+    EXPECT_TRUE(same(book.rows, book_by_scan(store, kBase + 20 * kSec))) << describe(book.rows);
+    ASSERT_EQ(book.rows.size(), 2u);
+    EXPECT_EQ(book.rows[0].price, 4) << "level 0 is the narrow segment's, delivered later";
+    EXPECT_EQ(book.segments_read, 2u);
+}
+
 TEST(BookAtAnInstant, ARowAfterTheInstantIsNotTheBooksAndDoesNotHideAnEarlierOne) {
     TempDir dir;
     ob::ColumnarStore store(dir.str());
