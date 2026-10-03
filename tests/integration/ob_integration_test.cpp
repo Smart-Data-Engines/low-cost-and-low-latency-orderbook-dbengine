@@ -265,6 +265,68 @@ static int run_query_agg(const std::string& host, uint16_t port) {
     return 0;
 }
 
+// ── Test: query_buckets (#44) ────────────────────────────────────────────────
+// A time-bucket answer over a real socket: the header's scales, the values, NULL for a bucket with
+// nothing to weigh by, and the row API refusing a shape it cannot represent.
+
+static int run_query_buckets(const std::string& host, uint16_t port) {
+    ob::ClientConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+    apply_auth_from_env(cfg);
+
+    ob::OrderbookClient client(cfg);
+    auto conn = client.connect();
+    if (!conn) {
+        print_result("query_buckets", "fail", "connect failed: " + conn.error_message());
+        return 1;
+    }
+    // Two rows in the first second of a whole minute, one at quantity zero in the next second.
+    constexpr uint64_t kMinute = 29'834'000ULL * 60ULL * 1'000'000'000ULL;
+    const bool written =
+        client.insert("CPP-BKT", "TEST-EX", ob::Side::BID, 100, 1, 1, kMinute + 1) &&
+        client.insert("CPP-BKT", "TEST-EX", ob::Side::BID, 200, 3, 1, kMinute + 2) &&
+        client.insert("CPP-BKT", "TEST-EX", ob::Side::BID, 300, 0, 1, kMinute + 1'000'000'001ULL) &&
+        client.flush();
+    if (!written) {
+        print_result("query_buckets", "fail", "insert or flush failed");
+        return 1;
+    }
+    const std::string sql =
+        "SELECT COUNT(*), VWAP(price) FROM 'CPP-BKT'.'TEST-EX' GROUP BY TIME_BUCKET(1s)";
+    auto buckets = client.query_buckets(sql);
+    if (!buckets) {
+        print_result("query_buckets", "fail", "query_buckets failed: " + buckets.error_message());
+        return 1;
+    }
+    const auto& b = buckets.value();
+    if (b.size() != 2 || b[0].start_ns != kMinute || b[1].start_ns != kMinute + 1'000'000'000ULL) {
+        print_result("query_buckets", "fail", "expected buckets at the minute and a second after it");
+        return 1;
+    }
+    // (100x1 + 200x3) / 4 = 175, scaled by 10^6; the second bucket weighs by nothing.
+    if (b[0].values.size() != 2 || b[0].values[0].name != "COUNT(*)" || b[0].values[0].value != 2 ||
+        b[0].values[1].name != "VWAP(price)" || b[0].values[1].scale != 1'000'000 ||
+        b[0].values[1].value != 175'000'000 || b[0].values[1].empty) {
+        print_result("query_buckets", "fail", "first bucket wrong: VWAP=" +
+                     std::to_string(b[0].values.size() > 1 ? b[0].values[1].value : -1));
+        return 1;
+    }
+    if (b[1].values.size() != 2 || b[1].values[0].value != 1 || !b[1].values[1].empty) {
+        print_result("query_buckets", "fail", "second bucket's VWAP is not NULL");
+        return 1;
+    }
+    auto as_rows = client.query(sql);
+    if (as_rows || as_rows.error_message().find("query_buckets") == std::string::npos) {
+        print_result("query_buckets", "fail",
+                     "query() did not refuse a time-bucket answer by name: " +
+                     (as_rows ? std::string("it returned rows") : as_rows.error_message()));
+        return 1;
+    }
+    print_result("query_buckets", "pass", "2 buckets, VWAP=175000000 and NULL");
+    return 0;
+}
+
 // ── shard_pool (#175): a pool that finds its shards in etcd ──────────────────
 
 /// One `ask` row of each symbol, through a pool built from coordinator endpoints alone: the shard
@@ -384,6 +446,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "insert_query") return run_insert_query(host, port);
     if (test_name == "minsert")      return run_minsert(host, port);
     if (test_name == "query_agg")    return run_query_agg(host, port);
+    if (test_name == "query_buckets") return run_query_buckets(host, port);
     if (test_name == "shard_pool")   return run_shard_pool(coordinator, symbols);
     if (test_name == "shard_writer") return run_shard_writer(coordinator, symbols, until, out);
 

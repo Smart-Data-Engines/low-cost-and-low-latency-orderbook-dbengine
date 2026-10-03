@@ -131,6 +131,14 @@ struct AggEntry {
     }
 };
 
+/// One time bucket of a `SELECT ... GROUP BY TIME_BUCKET(...)` answer (#44): where it starts, on the
+/// Unix epoch in UTC, and one value per aggregate in the order the query listed them, each with its
+/// name and scale - AVG and VWAP arrive multiplied by 10^6.
+struct BucketRow {
+    uint64_t              start_ns{0};
+    std::vector<AggEntry> values;
+};
+
 /// Node role in the cluster.
 enum class NodeRole : uint8_t {
     STANDALONE = 0,
@@ -225,6 +233,10 @@ public:
     /// accepting one and ignoring it.
     Result<std::vector<AggEntry>> query_agg(std::string_view sql);
 
+    /// Run a time-bucket query (`SELECT COUNT(*), VWAP(price) FROM ... GROUP BY TIME_BUCKET(1m)`),
+    /// whose answer has a shape of its own: the buckets that hold a row, in time order (#44).
+    Result<std::vector<BucketRow>> query_buckets(std::string_view sql);
+
     // ── Diagnostics ──────────────────────────────────────────────────
     Result<bool>     ping();
     Result<RoleInfo> role();
@@ -249,6 +261,7 @@ public:
     Result<void>        parse_ok_response(std::string_view resp);
     Result<QueryResult> parse_query_response(std::string_view resp);
     Result<std::vector<AggEntry>> parse_agg_response(std::string_view resp);
+    Result<std::vector<BucketRow>> parse_bucket_response(std::string_view resp);
     RoleInfo            parse_role_response(std::string_view resp);
 
     /// Access to the send buffer (for testing).

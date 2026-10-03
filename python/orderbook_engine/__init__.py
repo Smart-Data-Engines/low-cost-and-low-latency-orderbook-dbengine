@@ -56,7 +56,7 @@ try:
 except _NotInstalled:  # imported from a source tree that was never installed
     __version__ = "unknown"
 __all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError", "OrderbookTlsError",
-           "AggValue", "BookUpdate", "BatchOutcome",
+           "AggValue", "Bucket", "BookUpdate", "BatchOutcome",
            "_murmurhash3_x86_32", "_ConsistentHashRing",
            "_parse_shard_map_response", "_parse_shard_info_response",
            "_parse_shard_error"]
@@ -187,6 +187,19 @@ class AggValue:
     @property
     def is_empty(self) -> bool:
         return self.value is None
+
+
+@dataclass
+class Bucket:
+    """One time bucket of a `SELECT ... GROUP BY TIME_BUCKET(...)` answer (#44).
+
+    `start_ns` is where the bucket begins - its rows' event times are at or after it and before the
+    next - on the Unix epoch, in UTC. `values` maps each aggregate, as the query wrote it
+    (`"VWAP(price)"`), to its `AggValue`: read `.real` for the natural value, since AVG and VWAP
+    arrive scaled by 10^6.
+    """
+    start_ns: int
+    values: Dict[str, "AggValue"]
 
 
 class OrderbookError(Exception):
@@ -1714,6 +1727,37 @@ def _parse_agg_rows(data_rows: List[List[str]]) -> Dict[str, "AggValue"]:
     return out
 
 
+#: The first column of a time-bucket answer (#44); the rest are `<aggregate>/<scale>`.
+_BUCKET_START = "bucket_ns"
+
+
+def _is_bucket_response(header: List[str]) -> bool:
+    return bool(header) and header[0] == _BUCKET_START
+
+
+def _parse_bucket_rows(header: List[str], data_rows: List[List[str]]) -> List["Bucket"]:
+    """Turn a time-bucket TSV into Buckets.
+
+    Each column after the first names its aggregate and its scale, split at the last `/`: no
+    aggregate's expression contains one.
+    """
+    columns = []
+    for col in header[1:]:
+        name, sep, scale = col.rpartition("/")
+        if not sep or not scale.isdigit():
+            raise OrderbookError(-1, f"a time-bucket column without its scale: {col!r}")
+        columns.append((name, int(scale)))
+    out: List[Bucket] = []
+    for r in data_rows:
+        if len(r) != len(columns) + 1:
+            raise OrderbookError(-1, f"a time-bucket row of {len(r)} fields under {len(columns) + 1} columns")
+        values = {}
+        for (name, scale), raw in zip(columns, r[1:]):
+            values[name] = AggValue(name=name, value=None if raw == "NULL" else int(raw), scale=scale)
+        out.append(Bucket(start_ns=int(r[0]), values=values))
+    return out
+
+
 def _parse_status_fields(raw: str) -> dict:
     """Collect the top-level `key: value` lines of a STATUS response.
 
@@ -2189,6 +2233,11 @@ class OrderbookEngine:
                 -1,
                 "this query returned aggregates, not rows; use query_agg() "
                 f"(columns: {header})")
+        if _is_bucket_response(header):
+            raise OrderbookError(
+                -1,
+                "this query returned time buckets, not rows; use query_buckets() "
+                f"(columns: {header})")
         # This client reads rows **by position**, so a response whose columns are not the ones
         # it expects has to be refused rather than parsed. Since #139 the server answers the
         # columns a query asked for, and `SELECT price` returns one - which this loop would have
@@ -2380,6 +2429,36 @@ class OrderbookEngine:
             raise OrderbookError(
                 -1, f"expected an aggregate response, got columns {header}")
         return _parse_agg_rows(data_rows)
+
+    def query_buckets(self, sql: str) -> List["Bucket"]:
+        """Run a `SELECT ... GROUP BY TIME_BUCKET(...)` and return its buckets, in time order (#44).
+
+        Example:
+            bars = engine.query_buckets(
+                "SELECT FIRST(price), MAX(price), MIN(price), LAST(price) FROM 'BTC-USD'.'BINANCE' "
+                "WHERE side = 0 AND level = 0 GROUP BY TIME_BUCKET(1m)")
+            bars[0].values["LAST(price)"].real
+
+        Only buckets that hold a row are answered. A query whose answer would have more buckets
+        than the server allows (`--max-query-buckets`) is refused, not cut short. TCP and pool mode
+        only: the local library does not answer GROUP BY.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if self._mode == "local":
+            raise OrderbookError(-1, "query_buckets is TCP/pool mode only")
+        if self._mode == "pool":
+            raw = self._pool._route_query(sql) if self._pool.is_sharded else self._pool.execute_read(sql)
+        else:
+            raw = self._tcp.execute(sql)
+        is_err, msg, header, data_rows = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"query_buckets error: {msg}")
+        if not _is_bucket_response(header):
+            raise OrderbookError(
+                -1, f"expected a time-bucket response, got columns {header}; "
+                    "is there a GROUP BY TIME_BUCKET(...) in the query?")
+        return _parse_bucket_rows(header, data_rows)
 
     def ping(self) -> str:
         """Send PING, expect PONG. Works in all modes."""
