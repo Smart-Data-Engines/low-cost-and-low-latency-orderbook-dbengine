@@ -22,8 +22,13 @@ namespace ob {
 /// 7.7 M levels/s the queue passes half between two ticks of a fast device. A slow tick is the
 /// device being behind; a full queue can be the ingest being fast.
 ///
-/// The rate is a control loop, AIMD-shaped. A slow tick sets it to what that tick measured, if that
-/// is lower; a tick that fits its interval raises it by a step, because the device had room; and
+/// The rate is a control loop, AIMD-shaped. Admission begins at half what the first slow tick
+/// measured (#190, step 7): that tick's rate counts the WAL's share of the device and not the
+/// segments it sealed, whose sync runs behind it, so on the m9g.xlarge it measured 1.5-2 times what
+/// the device then sustained, and the queue filled again before the next tick drained it - the
+/// worst batch of every overload. A later slow tick sets the rate to what it measured, if that is
+/// lower; a tick that fits its interval raises it by a step, because the device had room, so from
+/// half the rate climbs to what the device takes rather than the queue finding it from above; and
 /// admission ends only once it has stopped delaying anyone - a whole run of ticks in which no batch
 /// waited - since ending it while writers are still being paced would let them refill the queue and
 /// cost the stall it exists to remove.
@@ -47,6 +52,8 @@ public:
         Clock::duration burst{std::chrono::milliseconds(100)};
         /// The rate's step up after a tick that was not slow.
         double raise{1.1};
+        /// What admission begins at, as a share of the rate the first slow tick measured.
+        double begin_at{0.5};
         /// Ticks in a row with no batch delayed after which admission ends.
         uint32_t idle_ticks_to_end{10};
         /// Rows a second the rate never goes below, so that one bad measurement cannot stop writes.

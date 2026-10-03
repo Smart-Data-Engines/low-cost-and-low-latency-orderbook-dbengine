@@ -637,6 +637,18 @@ TEST(CliConfigStatic, EveryValuelessBooleanDefaultsToFalse) {
     }
 }
 
+// `--print-config` exists to be pasted into a ticket, and a flag it leaves out is a setting the ticket
+// cannot show. It printed every one on 3 October 2026, with nothing holding it there.
+TEST(CliConfig, PrintConfigShowsEveryFlagButTheTwoAboutItself) {
+    const std::string printed = ob::format_config(resolve({}));
+    for (const std::string& flag : ob::known_flags()) {
+        if (flag == "config" || flag == "print-config") continue;
+        EXPECT_NE(printed.find("\n  " + flag + " "), std::string::npos)
+            << flag << " is a setting the parser accepts and --print-config does not show:\n"
+            << printed;
+    }
+}
+
 // `--help` was six hardcoded lines in `tools/ob_tcp_server.cpp` while the parser accepted forty
 // flags. The omissions that matter most: `--config` and `--print-config`, which exist so that forty
 // flags are manageable at all, and `--fsync-policy`, the durability setting in a database - which

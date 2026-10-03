@@ -36,7 +36,8 @@ AdmissionController::Change AdmissionController::on_tick(uint64_t rows, Clock::d
         idle_ticks_ = 0;
         delayed_since_tick_ = 0;
         if (!active_.load(std::memory_order_relaxed)) {
-            rate_ = measured;
+            // Below what the tick measured, which leaves out the segments it sealed (see the class).
+            rate_ = std::max(config_.floor_rows_per_s, measured * config_.begin_at);
             next_free_ = Clock::time_point{};
             delayed_batches_ = 0;
             delayed_total_ = Clock::duration::zero();

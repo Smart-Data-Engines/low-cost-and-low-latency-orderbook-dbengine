@@ -1921,6 +1921,7 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
 std::string format_config(const ResolvedConfig& resolved) {
     const ServerConfig& c = resolved.config;
 
+    // Where a key's value came from: the file, the command line, the profile, or none of them.
     auto where = [&resolved](const char* key) -> const char* {
         const auto it = resolved.origin.find(key);
         if (it == resolved.origin.end()) return "default";
@@ -1934,6 +1935,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     };
 
     std::string out;
+    // One line a key, the value padded to a column so that the provenance after it lines up.
     auto line = [&out, &where](const char* key, const std::string& value) {
         std::string padded = key;
         padded.resize(std::max<size_t>(padded.size(), 32), ' ');
@@ -1944,6 +1946,8 @@ std::string format_config(const ResolvedConfig& resolved) {
     out += "# of them you chose, and that is the question this flag exists to answer.\n";
     out += "# machine: " + resolved.machine.reason + "\n";
     if (!resolved.profile_choice.empty()) out += "# profile " + resolved.profile_choice + "\n";
+    // Every flag the parser knows but `--config` and `--print-config`, which are about this output
+    // rather than settings in it - held by CliConfig.PrintConfigShowsEveryFlagButTheTwoAboutItself.
     line("advertise-host", c.advertise_host);
     line("anti-entropy-interval-seconds", std::to_string(c.anti_entropy_interval_sec));
     {
@@ -1982,6 +1986,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("max-sessions", std::to_string(c.max_sessions));
     line("max-subscriber-queue-bytes", std::to_string(c.max_subscriber_queue_bytes));
     line("max-subscriptions-per-session", std::to_string(c.max_subscriptions_per_session));
+    // The address each listener binds (#203): empty is every interface, which says so.
     line("metrics-bind", c.metrics_bind.empty() ? "(every interface)" : c.metrics_bind);
     line("bind", c.bind.empty() ? "(every interface)" : c.bind);
     line("replication-bind", c.replication_bind.empty() ? "(every interface)" : c.replication_bind);

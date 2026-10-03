@@ -917,8 +917,8 @@ echo "MM_CONFLICTS" | nc localhost 5555
 
 `MM_PEERS` answers a header line and then one line per peer: `node_id`, `address`, `status`,
 `hlc_timestamp`, `send_queue_bytes`. Two of those are worth reading carefully. `status` is
-`connected` or `disconnected` — the state of the link, not the `status` a node publishes about
-itself in the peer registry. That registry field only ever holds **`active`**: `register_self()` is
+`connected` or `disconnected` — the state of the link, connected once its handshake is done (#206),
+not the `status` a node publishes about itself in the peer registry. That registry field only ever holds **`active`**: `register_self()` is
 its only writer and is called with that one string. Earlier revisions of this page named
 `joining` and `leaving` beside it; nothing has ever written either, and since the two stub methods
 that looked as though they might were deleted (#134), nothing can. And `send_queue_bytes` is what this node has queued to

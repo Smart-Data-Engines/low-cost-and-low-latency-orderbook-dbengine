@@ -473,7 +473,9 @@ for peer in peers:
 Returns a list of dicts with keys:
 - `node_id` (int) — peer node identifier
 - `address` (str) — replication address (host:port)
-- `status` (str) — `"connected"` or `"disconnected"`, the state of the link to that peer. Earlier
+- `status` (str) — `"connected"` or `"disconnected"`, the state of the link to that peer:
+  connected once its handshake is done, so a link still in its handshake - or one being refused -
+  reads as disconnected (#206). Earlier
   releases of this page documented `"active"`, `"joining"` and `"leaving"` here; those belong to the
   peer registry in etcd and this column has never carried them, so a test for `"active"` is a test
   for a value the server does not send (#118). And of those three the registry only ever holds

@@ -3424,10 +3424,10 @@ void Engine::flush_tick() {
                 const auto m = admission_.last_slow_tick();
                 OB_LOG_WARN("engine", "Writes arrive faster than the device takes them - a flush tick "
                                       "took %.0f ms for %llu row(s), %.0f rows/s - so each batch now "
-                                      "waits after it is written, at that rate, rather than every writer "
-                                      "stopping at a full pending queue",
+                                      "waits after it is written, at %.0f rows/s to begin with, rather "
+                                      "than every writer stopping at a full pending queue",
                             std::chrono::duration<double, std::milli>(m.took).count(),
-                            static_cast<unsigned long long>(m.rows), m.rows_per_s);
+                            static_cast<unsigned long long>(m.rows), m.rows_per_s, admission_.rate());
                 break;
             }
             case AdmissionController::Change::Ended:
