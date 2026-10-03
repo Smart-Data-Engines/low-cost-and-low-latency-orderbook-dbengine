@@ -10,6 +10,10 @@ it nothing was.
 
 Over the raw protocol, for the same reason as `test_column_projection.py`: the shape of the answer
 is the thing being asked about, and our clients read a row by position.
+
+Since #47 the book is read from the newest segment down, a segment none of whose rows can be its
+level's latest not read at all; the last test asks it over many segments, with levels the newest
+ones do not hold.
 """
 from __future__ import annotations
 
@@ -67,3 +71,46 @@ def test_a_snapshot_answers_the_columns_it_names(cluster, book):
     lines = raw_query(cluster.primary().tcp_port,
                       f"SELECT price, level FROM '{book}'.'{EXCHANGE}' WHERE AT {BASE + 10 * SEC}")
     assert lines == ["OK", "price\tlevel", "100\t0"], lines
+
+
+@pytest.fixture
+def history(cluster, primary_client: OrderbookEngine, request) -> str:
+    """A book over 25 flushes, each sealing a segment, whose levels are not all in the newest.
+
+    The first flush writes ten bid levels at 0 s; flushes 1 to 23 five each, at their own second,
+    the seventh four ask levels too; the last two bid levels at 30 s, after every instant asked
+    about. A row's price says which flush wrote it: 1000 * flush + level.
+    """
+    symbol = f"SNAP-{hashlib.sha1(request.node.name.encode()).hexdigest()[:8]}"
+
+    def write(flush: int, side: str, levels: int, at_s: int) -> None:
+        primary_client.insert(symbol, EXCHANGE, side, [1000 * flush + lv for lv in range(levels)],
+                              [flush + 1] * levels, [1] * levels, timestamp_ns=BASE + at_s * SEC)
+
+    write(0, "bid", 10, 0)
+    primary_client.flush()
+    for flush in range(1, 24):
+        write(flush, "bid", 5, flush)
+        if flush == 7:
+            write(flush, "ask", 4, flush)
+        primary_client.flush()
+    write(24, "bid", 2, 30)
+    primary_client.flush()
+    return symbol
+
+
+def test_a_snapshot_over_many_segments_answers_each_levels_latest(cluster, history):
+    port = cluster.primary().tcp_port
+    for at_ns in (BASE + SEC // 2, BASE + 3 * SEC + SEC // 2, BASE + 7 * SEC, BASE + 12 * SEC + 1,
+                  BASE + 29 * SEC):
+        lines = raw_query(port, f"SELECT * FROM '{history}'.'{EXCHANGE}' WHERE AT {at_ns}")
+        assert lines[:2] == ["OK", "\t".join(HEADER)], lines
+        rows = [dict(zip(HEADER, line.split("\t"))) for line in lines[2:]]
+        book = {(int(r["side"]), int(r["level"])): int(r["price"]) for r in rows}
+        assert len(book) == len(rows), f"a level answered twice at {at_ns}: {lines}"
+        newest = min((at_ns - BASE) // SEC, 23)
+        expected = {(0, lv): 1000 * (newest if lv < 5 else 0) + lv for lv in range(10)}
+        if at_ns >= BASE + 7 * SEC:
+            expected.update({(1, lv): 7000 + lv for lv in range(4)})
+        assert book == expected, (
+            f"at {(at_ns - BASE) / SEC} s the book is not each level's latest row: {sorted(book.items())}")
