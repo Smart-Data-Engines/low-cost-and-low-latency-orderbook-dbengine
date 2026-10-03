@@ -279,6 +279,11 @@ bids first, then asks, each by level — the order `BOOK` answers in — so `LIM
 `n` of them. It answers the columns it names, like any row query (`SELECT price, quantity … WHERE
 AT …`), and reads the columnar store, so a row the flush tick has not yet written is not in it.
 
+It reads the store from the newest segment down, and a segment none of whose rows can still be the
+latest of its level is not read (#47): the cost follows the segments holding levels the newer ones
+do not, not the length of the history. A segment written by a build before #47 does not say which
+levels it holds, and is read always.
+
 A price condition keeps the levels of that book priced within it - `WHERE AT t AND price BETWEEN lo
 AND hi` is the book at `t` inside a band - and it is applied to the book, so a level whose latest
 price is outside the band is left out even when an earlier row of it was inside. Side and level
