@@ -303,6 +303,11 @@ ob_add_query_test(test_snapshot_query
     test_snapshot_query.cpp
 )
 
+# ── #199: what a WHERE condition answers ──────────────────────────────────────
+ob_add_query_test(test_query_conditions
+    test_query_conditions.cpp
+)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

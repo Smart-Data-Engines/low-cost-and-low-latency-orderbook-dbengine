@@ -19,9 +19,12 @@ agg_call    = identifier "(" [ identifier ] ")" ;
 symbol_ref  = "'" symbol_name "'" "." "'" exchange_name "'" ;
 
 where_clause = condition { "AND" condition } ;
-condition    = "timestamp" "BETWEEN" integer "AND" integer
-             | "price" "BETWEEN" integer "AND" integer
+condition    = "timestamp" range
+             | "price" range
              | "AT" integer ;
+range        = "BETWEEN" integer "AND" integer
+             | comparison integer ;
+comparison   = "=" | "<" | "<=" | ">" | ">=" ;
 ```
 
 ## SELECT Queries
@@ -47,6 +50,25 @@ SELECT * FROM 'BTC-USD'.'BINANCE'
   WHERE timestamp BETWEEN 0 AND 9999999999999999999
   AND price BETWEEN 6490000 AND 6510000
 ```
+
+### Conditions
+
+`BETWEEN` includes both of its ends, and the comparisons mean what they mean in SQL: `price = 200`
+is one price, and `timestamp > t` leaves `t` out - which is how to ask for what came after the last
+row read. Conditions joined by `AND` narrow each other, on one column as on two: `price >= 100 AND
+price <= 200` is `price BETWEEN 100 AND 200`. A range nothing satisfies - `price BETWEEN 300 AND 100`,
+`price = 1 AND price = 2`, `timestamp > 18446744073709551615` - answers no rows.
+
+```sql
+SELECT * FROM 'BTC-USD'.'BINANCE'
+  WHERE timestamp > 1700000000000000000
+  AND price >= 6490000 AND price < 6510000
+```
+
+Before #199 in the roadmap every comparison set one end of the range and nothing else: `=` meant
+`>=`, `>` and `<` kept the value they exclude, and a second condition on a column replaced the
+first instead of narrowing it - all of it answered `OK`. A subscription's conditions are read the
+same way, so the same was true of what it pushed.
 
 ### With LIMIT
 
@@ -77,7 +99,7 @@ the stored segments. That has two consequences worth stating plainly, because bo
 silently ignored:
 
 - **A timestamp filter is refused**, not applied. There is nothing to filter: the aggregate reads
-  the book as it is now. Aggregation over a time range is a separate feature (roadmap #43).
+  the book as it is now. Aggregation over a time range is a separate feature (roadmap #44).
 - **A price filter is refused.** Use `DEPTH_RANGE(lo, hi)`, which does what a price filter on an
   aggregate would be expected to do.
 
@@ -140,7 +162,7 @@ aggs["SPREAD(*)"].is_empty    # False
 | Error | Meaning |
 |-------|---------|
 | `AGG_WITH_COLUMNS` | Aggregates mixed with plain columns (`SELECT price, SPREAD(*)`). There is no `GROUP BY`, so the column would have to be dropped |
-| `AGG_TIME_FILTER` | A timestamp predicate combined with an aggregate |
+| `AGG_TIME_FILTER` | A timestamp predicate, or `AT`, combined with an aggregate |
 | `AGG_PRICE_FILTER` | A price predicate combined with an aggregate; use `DEPTH_RANGE(lo, hi)` |
 | `OB_ERR_PARSE: undefined aggregation function` | Unknown function name |
 
@@ -158,6 +180,13 @@ bids first, then asks, each by level — the order `BOOK` answers in — so `LIM
 `n` of them. It answers the columns it names, like any row query (`SELECT price, quantity … WHERE
 AT …`), and reads the columnar store, so a row the flush tick has not yet written is not in it.
 
+A price condition keeps the levels of that book priced within it - `WHERE AT t AND price BETWEEN lo
+AND hi` is the book at `t` inside a band - and it is applied to the book, so a level whose latest
+price is outside the band is left out even when an earlier row of it was inside. `LIMIT` counts the
+levels answered. A timestamp condition beside `AT` is refused with `SNAPSHOT_TIME_FILTER`, since `AT`
+names the moment, and a second `AT` does not parse. Before #199 the price and the timestamp
+conditions were accepted and ignored, and a second `AT` replaced the first.
+
 Two things this answered differently before, and both are fixed (#167, #168 in the roadmap): over
 the wire, from #139 on, it answered `OK` with an empty header and empty rows; and it kept the last
 row a scan *delivered* for each level rather than the latest, so a correction for an earlier
@@ -172,6 +201,10 @@ Register a streaming callback that fires on every matching delta update:
 SUBSCRIBE price FROM 'BTC-USD'.'BINANCE'
   WHERE price BETWEEN 6490000 AND 6510000
 ```
+
+A subscription takes timestamp and price conditions as a `SELECT` does (see Conditions above).
+`AT` is refused: it names a moment of the stored book, and a subscription is what is written from
+now on. It used to be accepted and dropped, which subscribed to every row.
 
 ### Over the wire
 

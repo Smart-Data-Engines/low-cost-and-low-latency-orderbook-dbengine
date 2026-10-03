@@ -26,9 +26,10 @@ The first release. What it contains, by area:
 
 ### Queries
 
-- A SQL-like language: time ranges, price filters, `LIMIT`, `SELECT` lists that read only the column
-  files they need (#139), snapshots of the book at a time (`AT`), and aggregates - VWAP, spread,
-  mid-price, imbalance - carrying their scale and telling an empty aggregate from a zero.
+- A SQL-like language: conditions on time and price with `=`, `<`, `<=`, `>`, `>=` and `BETWEEN`
+  that narrow each other (#199), `LIMIT`, `SELECT` lists that read only the column files they need
+  (#139), snapshots of the book at a time (`AT`), and aggregates - VWAP, spread, mid-price,
+  imbalance - carrying their scale and telling an empty aggregate from a zero.
 - `BOOK` for the live book over the wire, and `SUBSCRIBE` for rows pushed as they are written.
 
 ### Replication and availability

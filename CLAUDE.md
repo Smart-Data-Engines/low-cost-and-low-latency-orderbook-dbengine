@@ -3983,6 +3983,13 @@ Learned the hard way. Check here before debugging.
      beside it - it nearly credited #49's step 1, whose binary drew the same lottery the other way
      round. Run several fresh processes a side, alternating, and print the faults beside the time.
      A benchmark's loop is one process with one history: `BM_TimeRangeQuery` never faulted at all.
+533. **A grammar that documents one form of a clause while the parser accepts five: the four
+     undocumented ones are the ones nothing tests.** The query language documented `BETWEEN`, and
+     the parser took `=`, `<`, `<=`, `>` and `>=` too, each as one end of a range at the value itself
+     and each assigned rather than intersected - so `price = 200` was `price >= 200`, `timestamp > t`
+     kept `t`, and a second condition replaced the first (#199). Nobody had asked the server either
+     question, because the page that would have prompted it did not mention them. Reading a parser,
+     list what it accepts beyond the documentation, and ask the running server each one.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
