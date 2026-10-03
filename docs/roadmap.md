@@ -2473,7 +2473,7 @@ pass; the other two predate #82 and #70 and are #202's.
   acknowledged writes and stopped writes for ten seconds; a failover of a primary that lost its lease
   lost what it took while its stream was being stopped
 
-### 202. `tests/test_etcd_integration.cpp` runs nowhere - not in ctest, not in CI - and six of its twenty-six tests failed on master **P2**
+### 202. `tests/test_etcd_integration.cpp` ran nowhere - not in ctest, not in CI - and six of its twenty-six tests failed on master ✅ **P2**
 
 The failover manager's tests against a real etcd are gated behind `OB_ETCD_TESTS`, registered with
 no `gtest_discover_tests()`, and named by no CI job, so nothing ran them. Run by hand on master
@@ -2488,7 +2488,11 @@ pass.** Two are expectations older than the code:
   to a dead target expires; since #70 the election prefers the further published position, which is
   the node that handed over, back after its cooldown.
 
-Open until the two are settled and the binary runs in CI with etcd.
+**Fixed.** Both expectations now say what the code does: `LeaseExpiry` waits the election wait and
+three seconds more, and the target-gone test wants exactly one primary, whichever node it is, within
+the grace window, the election wait, the deference window and a margin. The binary runs in CI as
+its own step of `build-and-test` - a required check - and starts its own etcd; with `CI=true`, an
+etcd it cannot start, or a step without `OB_ETCD_TESTS`, fails rather than skips (#85's rule).
 
 - Effort: S | Impact: the one suite that drives the failover manager against etcd regressed
   unnoticed, and #204's defect sat in it
@@ -13066,7 +13070,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #202.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

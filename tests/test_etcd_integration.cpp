@@ -5,8 +5,14 @@
 //
 // Requires the `etcd` binary on PATH, or OB_ETCD_BINARY pointing at one.
 //
-// Gated behind OB_ETCD_TESTS env var.  NOT registered with gtest_discover_tests.
-// Run manually:  OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+// Gated behind OB_ETCD_TESTS env var, and not registered with gtest_discover_tests: it starts an
+// etcd of its own, which is a step of the CI job that runs it (build-and-test, "Test against etcd")
+// rather than something every ctest should do. Until #202 nothing ran it at all, and six of its tests
+// had failed for a while - four of them on a real defect (#204).
+// Run locally:  OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+//
+// In CI (`CI=true`) an etcd it cannot start is a failure, not a skip: a skip in the job that should
+// run these would read as a pass (#85).
 
 #include "orderbook/command_parser.hpp"
 #include "orderbook/coordinator.hpp"
@@ -78,6 +84,7 @@ public:
             std::fprintf(stderr,
                 "[etcd-test] OB_ETCD_TESTS not set — skipping etcd tests\n");
             available_ = false;
+            fail_in_ci("OB_ETCD_TESTS is not set");
             return;
         }
 
@@ -92,6 +99,7 @@ public:
                     "[etcd-test] Install natively: see docs/cli.md\n",
                     etcd_binary_.c_str());
                 available_ = false;
+                fail_in_ci("the etcd binary is not runnable");
                 return;
             }
         }
@@ -146,6 +154,7 @@ public:
                 "[etcd-test] failed to start etcd after %d attempts\n",
                 MAX_PORT_RETRIES);
             available_ = false;
+            fail_in_ci("etcd did not start");
             return;
         }
 
@@ -158,6 +167,14 @@ public:
     void TearDown() override { stop_etcd(); }
 
 private:
+    /// In CI, a reason to skip is a failure (#85): the job that runs this binary exists to run it.
+    static void fail_in_ci(const char* why) {
+        const char* ci = std::getenv("CI");
+        if (ci && std::string(ci) == "true") {
+            ADD_FAILURE() << "[etcd-test] " << why << " - in CI the etcd tests must run, not skip";
+        }
+    }
+
     /// Kill the etcd process recorded in the pid file and remove its data dir.
     /// Safe to call when nothing was started.
     void stop_etcd() {
@@ -804,8 +821,8 @@ TEST_F(EtcdTestFixture, GracefulFailoverUnknownTargetIsRejected) {
 
 TEST_F(EtcdTestFixture, GracefulFailoverTargetGoneFallsBackToElection) {
     // Intent names a node that is not running. After the grace window the
-    // remaining replica must take over, so an unreachable target cannot leave
-    // the cluster without a primary.
+    // cluster must elect somebody, so an unreachable target cannot leave it
+    // without a primary.
     HandoverPair p;
     p.engine_a = make_engine("node_A", p.dir_a.path);
     p.engine_b = make_engine("node_B", p.dir_b.path);
@@ -833,10 +850,21 @@ TEST_F(EtcdTestFixture, GracefulFailoverTargetGoneFallsBackToElection) {
     ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_ghost"),
               ob::FailoverManager::HandoverResult::OK);
 
-    // node_B defers while the intent is live, then wins the ordinary election.
-    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY,
-                              std::chrono::seconds(cfg_a.handover_grace_seconds + 8)))
-        << "cluster left without a primary after the target failed to appear";
+    // Everyone defers while the intent is live; once it expires the cluster holds an ordinary
+    // election. Which node wins it is not this test's business: since #70 the election prefers the
+    // further published position, and that is the node that handed over - its own epoch record is
+    // in its log, and its cooldown is shorter than the wait. What matters is that a primary emerges,
+    // within the grace window, the election wait (#82), the deference window (#70) and a margin.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(cfg_a.handover_grace_seconds + TEST_LEASE_TTL + 3 + 5);
+    int primaries = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        primaries = (p.fm_a->role() == ob::NodeRole::PRIMARY ? 1 : 0) +
+                    (p.fm_b->role() == ob::NodeRole::PRIMARY ? 1 : 0);
+        if (primaries > 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(primaries, 1) << "cluster left without a primary after the target failed to appear";
 }
 
 TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
@@ -1361,8 +1389,10 @@ TEST_F(EtcdTestFixture, LeaseExpiry) {
     }
     EXPECT_TRUE(key_deleted) << "Leader key should be deleted after lease expiry";
 
-    // B should promote within ≤2s of key deletion.
-    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // B promotes once its election wait is over: since #82 a candidate waits the lease TTL from
+    // the moment it sees the key gone, so the previous holder has certainly stopped taking writes.
+    // This said "within 2 s of the key's deletion" and waited 5, which the wait alone outlasts.
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(TEST_LEASE_TTL + 3);
     while (fm_b.role() != ob::NodeRole::PRIMARY &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
