@@ -3145,6 +3145,33 @@ in every round it is the start of the overload: the tick after the first slow on
 0.77-0.91 M rows/s at 30 MB/s, 1.46-1.83 M at 60 - is above what the device then sustains, so the
 queue fills again before the next tick drains it. That is what is left of this item.
 
+**Step 7: admission begins at half what the first slow tick measured.** That tick's rate counts the
+WAL's share of the device and not the segments it sealed, whose sync runs behind it since step 6:
+it measured 1.46-1.83 M rows/s at 60 MB/s and 0.77-0.91 M at 30, against 0.93-1.02 M and 0.44-0.48 M
+sustained. From half, a tick that fits its interval raises the rate by a tenth, as before. Against
+#205 (`fbf1f29`), the same run, 8 rounds a side (`evidence/2026-10-03-admission-half/`):
+
+| m9g.xlarge, XFS, 8 rounds a side | #205 | step 7 |
+|---|---|---|
+| 60 MB/s, 12 M levels: levels/s, batch max | 0.961-1.018 M, 371-595 ms | 0.974-1.015 M, **372-405 ms** |
+| 60 MB/s, 36 M: levels/s, batch max | 0.925-0.937 M, 568-585 ms | 0.927-0.938 M, **377-398 ms** |
+| 30 MB/s, 12 M: levels/s, batch max | 0.434-0.486 M, 953-1063 ms | 0.452-0.486 M, **655-769 ms** |
+| 30 MB/s, 36 M: levels/s, batch max | 0.463-0.469 M, 908-1176 ms | 0.461-0.469 M, 678-1167 ms |
+| no limit, 90 M: levels/s, batch max | 7.577-7.777 M, 14-35 ms | 7.611-7.697 M, 13-30 ms |
+
+Batch p99 within each other's range; no write refused; with no limit admission began in no round.
+What it changes is the wait for room after admission begins, which every round on both sides has,
+in the tick after the first slow one: at 30 MB/s 881-1069 ms with #205 and 463-903 ms with step 7,
+at 60 MB/s 371-595 ms and 170-404 ms. It stays because the queue is already about two-thirds full
+when admission begins - the first slow tick drains only the rows its WAL sync covered, and the
+writers it lets go write at full speed for the 36 ms before the tick ends.
+
+What is left of this item is the first slow tick and that refill. With step 7 the longest wait at
+30 MB/s is, in fifteen rounds of sixteen, the one before admission begins - from 0.15 s, the pending
+queue's million rows filled at full speed in a tenth of a second and waiting for a tick that took
+0.67-0.86 s. It grows as the device slows, so a device several times slower than this one would meet
+the five-second deadline there - not measured.
+
 - Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
   with the WAL, and a slower device than this one would refuse them
 
