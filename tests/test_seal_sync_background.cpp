@@ -120,11 +120,21 @@ std::unique_ptr<ob::Engine> engine_at(const std::string& dir) {
     return engine;
 }
 
+/// Lets every held sync go when it leaves scope - declared after the engine, so before the engine
+/// is destroyed. Without it a test that stops at a failed ASSERT with a sync held hangs in the
+/// engine's close(), which waits for that sync: a regression would read as a stuck job, not a red
+/// test - which is how the first mutation run of these tests found it.
+struct ReleaseHolds {
+    ob::Engine& engine;
+    ~ReleaseHolds() { engine.hold_seal_syncs_from_for_test(UINT64_MAX); }
+};
+
 }  // namespace
 
 TEST(SealSyncBackground, ATickDrainsTheQueueWhileTheLastSealsSyncRuns) {
     TempDir dir;
     auto engine = engine_at(dir.path);
+    const ReleaseHolds release{*engine};
     engine->hold_seal_syncs_from_for_test(1);   // the device takes its time over every one
     due(*engine, "A");
     engine->flush_tick_leaving_the_sync_for_test();
@@ -149,6 +159,7 @@ TEST(SealSyncBackground, ATickDrainsTheQueueWhileTheLastSealsSyncRuns) {
 TEST(SealSyncBackground, NoCheckpointClaimsWhatItsSyncHasNotCovered) {
     TempDir dir;
     auto engine = engine_at(dir.path);
+    const ReleaseHolds release{*engine};
     engine->hold_seal_syncs_from_for_test(1);
     for (uint64_t i = 1; i <= 7; ++i) insert(*engine, "B", i, 1);   // waiting throughout: epoch form
     due(*engine, "A");
@@ -189,6 +200,7 @@ TEST(SealSyncBackground, ASyncAskedWhileAnotherWaitsTakesItsPlaceAndCoversTheLat
     // segments wait for some later seal to be vouched for.
     TempDir dir;
     auto engine = engine_at(dir.path);
+    const ReleaseHolds release{*engine};
     engine->hold_seal_syncs_from_for_test(1);
     for (uint64_t i = 1; i <= 7; ++i) insert(*engine, "B", i, 1);   // waiting throughout: epoch form
     due(*engine, "A");
@@ -213,6 +225,7 @@ TEST(SealSyncBackground, ASyncAskedWhileAnotherWaitsTakesItsPlaceAndCoversTheLat
 TEST(SealSyncBackground, AFlushWaitsForTheBackgroundSyncAndItsCheckpointIsTheLast) {
     TempDir dir;
     auto engine = engine_at(dir.path);
+    const ReleaseHolds release{*engine};
     engine->hold_seal_syncs_from_for_test(1);
     for (uint64_t i = 1; i <= 7; ++i) insert(*engine, "B", i, 1);
     due(*engine, "A");
@@ -237,6 +250,7 @@ TEST(SealSyncBackground, ARestartBeforeTheSyncCameKeepsEveryRowOnce) {
     TempDir copy;
     {
         auto engine = engine_at(dir.path);
+        const ReleaseHolds release{*engine};
         engine->hold_seal_syncs_from_for_test(1);
         for (uint64_t i = 1; i <= 7; ++i) insert(*engine, "B", i, 1);
         due(*engine, "A");
