@@ -5,8 +5,14 @@
 //
 // Requires the `etcd` binary on PATH, or OB_ETCD_BINARY pointing at one.
 //
-// Gated behind OB_ETCD_TESTS env var.  NOT registered with gtest_discover_tests.
-// Run manually:  OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+// Gated behind OB_ETCD_TESTS env var, and not registered with gtest_discover_tests: it starts an
+// etcd of its own, which is a step of the CI job that runs it (build-and-test, "Test against etcd")
+// rather than something every ctest should do. Until #202 nothing ran it at all, and six of its tests
+// had failed for a while - four of them on a real defect (#204).
+// Run locally:  OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+//
+// In CI (`CI=true`) an etcd it cannot start is a failure, not a skip: a skip in the job that should
+// run these would read as a pass (#85).
 
 #include "orderbook/command_parser.hpp"
 #include "orderbook/coordinator.hpp"
@@ -78,6 +84,7 @@ public:
             std::fprintf(stderr,
                 "[etcd-test] OB_ETCD_TESTS not set — skipping etcd tests\n");
             available_ = false;
+            fail_in_ci("OB_ETCD_TESTS is not set");
             return;
         }
 
@@ -92,6 +99,7 @@ public:
                     "[etcd-test] Install natively: see docs/cli.md\n",
                     etcd_binary_.c_str());
                 available_ = false;
+                fail_in_ci("the etcd binary is not runnable");
                 return;
             }
         }
@@ -146,6 +154,7 @@ public:
                 "[etcd-test] failed to start etcd after %d attempts\n",
                 MAX_PORT_RETRIES);
             available_ = false;
+            fail_in_ci("etcd did not start");
             return;
         }
 
@@ -158,6 +167,14 @@ public:
     void TearDown() override { stop_etcd(); }
 
 private:
+    /// In CI, a reason to skip is a failure (#85): the job that runs this binary exists to run it.
+    static void fail_in_ci(const char* why) {
+        const char* ci = std::getenv("CI");
+        if (ci && std::string(ci) == "true") {
+            ADD_FAILURE() << "[etcd-test] " << why << " - in CI the etcd tests must run, not skip";
+        }
+    }
+
     /// Kill the etcd process recorded in the pid file and remove its data dir.
     /// Safe to call when nothing was started.
     void stop_etcd() {
@@ -804,8 +821,8 @@ TEST_F(EtcdTestFixture, GracefulFailoverUnknownTargetIsRejected) {
 
 TEST_F(EtcdTestFixture, GracefulFailoverTargetGoneFallsBackToElection) {
     // Intent names a node that is not running. After the grace window the
-    // remaining replica must take over, so an unreachable target cannot leave
-    // the cluster without a primary.
+    // cluster must elect somebody, so an unreachable target cannot leave it
+    // without a primary.
     HandoverPair p;
     p.engine_a = make_engine("node_A", p.dir_a.path);
     p.engine_b = make_engine("node_B", p.dir_b.path);
@@ -833,10 +850,21 @@ TEST_F(EtcdTestFixture, GracefulFailoverTargetGoneFallsBackToElection) {
     ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_ghost"),
               ob::FailoverManager::HandoverResult::OK);
 
-    // node_B defers while the intent is live, then wins the ordinary election.
-    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY,
-                              std::chrono::seconds(cfg_a.handover_grace_seconds + 8)))
-        << "cluster left without a primary after the target failed to appear";
+    // Everyone defers while the intent is live; once it expires the cluster holds an ordinary
+    // election. Which node wins it is not this test's business: since #70 the election prefers the
+    // further published position, and that is the node that handed over - its own epoch record is
+    // in its log, and its cooldown is shorter than the wait. What matters is that a primary emerges,
+    // within the grace window, the election wait (#82), the deference window (#70) and a margin.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(cfg_a.handover_grace_seconds + TEST_LEASE_TTL + 3 + 5);
+    int primaries = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        primaries = (p.fm_a->role() == ob::NodeRole::PRIMARY ? 1 : 0) +
+                    (p.fm_b->role() == ob::NodeRole::PRIMARY ? 1 : 0);
+        if (primaries > 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(primaries, 1) << "cluster left without a primary after the target failed to appear";
 }
 
 TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
@@ -867,9 +895,173 @@ TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
 
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - killed_at);
-    EXPECT_LT(took.count(), 6000)
-        << "promotion took " << took.count()
+    // What a failover costs since #82: up to a monitor tick to see the key go, the election wait
+    // (the lease TTL), and a tick to stand. The bound was 6000 ms against a 5 s wait, which leaves
+    // a second for both ticks: the first CI run of this binary took 6116 ms - 1 s to notice, 5 s,
+    // 0.1 s to promote (#202). A handover's grace window on top (3 s here) still lands past this.
+    const int64_t bound_ms = TEST_LEASE_TTL * 1000 + 2000;
+    EXPECT_LT(took.count(), bound_ms)
+        << "promotion took " << took.count() << " ms against a bound of " << bound_ms
         << " ms; ungraceful failover must not wait out a handover grace window";
+}
+
+// ── #204: a handover's target stands without the election wait ───────────────
+
+TEST_F(EtcdTestFixture, AHandoversTargetStandsWithoutTheElectionWait) {
+    // Every candidate waits the lease TTL from the moment the leader key goes (#82), so that the
+    // previous holder has certainly stopped taking writes - and the named target of a handover
+    // waited it too: a whole TTL without a primary after every planned FAILOVER. The outgoing node
+    // now says, before its lease goes, that it has stepped down; these engines serve no stream, so
+    // there is nothing else for the target to wait for.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    p.fm_a = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_A", "127.0.0.1:19041"), *p.engine_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19042"), *p.engine_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+    const auto handed_at = std::chrono::steady_clock::now();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(10)));
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - handed_at);
+    // Half the TTL: one monitor tick to see the empty key, one round trip to take it.
+    EXPECT_LT(took.count(), TEST_LEASE_TTL * 1000 / 2)
+        << "the target took " << took.count() << " ms - the election wait of "
+        << TEST_LEASE_TTL * 1000 << " ms, which a target with the outgoing node's word has no "
+        << "reason to wait";
+    EXPECT_EQ(p.fm_a->role(), ob::NodeRole::REPLICA);
+}
+
+TEST_F(EtcdTestFixture, AHandoverDoesNotTakeTheRoleBackBeforeItsLeaseIsRevoked) {
+    // The step-down comes before the revoke now (#204), so for a moment the leader key names a node
+    // that is a REPLICA - which is what the REPLICA branch reads, since #130, as a promotion it won
+    // and has to finish. Here that moment is held open for two and a half monitor ticks.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    // A grace window longer than the hold below, so the intent is still live when the key goes.
+    auto cfg_a = make_failover_config("node_A", "127.0.0.1:19043");
+    cfg_a.handover_grace_seconds = 10;
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19044"), *p.engine_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    std::string holder_in_window;
+    ob::NodeRole role_in_window = ob::NodeRole::STANDALONE;
+    ob::NodeRole engine_role_in_window = ob::NodeRole::STANDALONE;
+    p.fm_a->hold_before_revoke_for_test([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        auto observer = make_client("observer");
+        if (observer->connect()) {
+            const auto state = observer->get_cluster_state();
+            holder_in_window = state.has_value() ? state->leader_node_id : std::string{};
+            observer->disconnect();
+        }
+        role_in_window = p.fm_a->role();
+        engine_role_in_window = p.engine_a->node_role();
+    });
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+    ASSERT_EQ(holder_in_window, "node_A") << "the window this test holds open did not happen";
+    EXPECT_EQ(role_in_window, ob::NodeRole::REPLICA)
+        << "the node took back the role it had handed over, while its lease still stood";
+    EXPECT_EQ(engine_role_in_window, ob::NodeRole::REPLICA)
+        << "the engine took writes again while the handover was under way";
+    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(8)));
+    EXPECT_EQ(p.fm_a->role(), ob::NodeRole::REPLICA);
+}
+
+/// The engine's role transitions, with a step-down that takes `delay` - as one does when it waits
+/// for the engine's lock behind a write on a slow device (#190).
+struct SlowStepDown : ob::RoleTransitionHandler {
+    ob::Engine& engine;
+    std::chrono::milliseconds delay;
+    SlowStepDown(ob::Engine& e, std::chrono::milliseconds d) : engine(e), delay(d) {}
+    void promote_to_primary(const ob::EpochValue& epoch) override { engine.promote_to_primary(epoch); }
+    void demote_to_replica(const std::string& address) override { engine.demote_to_replica(address); }
+    std::pair<uint32_t, size_t> get_wal_position() const override { return engine.get_wal_position(); }
+    ob::EpochValue get_current_epoch() const override { return engine.get_current_epoch(); }
+    void truncate_and_rebootstrap(const ob::EpochValue& epoch, const std::string& address) override {
+        engine.truncate_and_rebootstrap(epoch, address);
+    }
+    std::optional<ob::StreamPosition> step_down_for_handover() override {
+        std::this_thread::sleep_for(delay);
+        return engine.step_down_for_handover();
+    }
+    std::optional<ob::StreamPosition> replicated_position() override {
+        return engine.replicated_position();
+    }
+};
+
+TEST_F(EtcdTestFixture, AHandoverWhoseStepDownTakesLongerThanTheGraceWindowStillLandsOnItsTarget) {
+    // The intent's deadline is how long everyone else defers to the target once the key goes. It
+    // was set when the first intent was written; a step-down slower than the grace window then
+    // revoked the lease with the intent already expired, and the handover became an ordinary
+    // election - the target waiting the election delay, and maybe losing it to the node it was
+    // meant to replace. The second intent, written as the key is about to go, starts it again.
+    std::unique_ptr<SlowStepDown> slow_a;   // before `p`, so it outlives the manager that calls it
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    const auto cfg_a = make_failover_config("node_A", "127.0.0.1:19045");
+    slow_a = std::make_unique<SlowStepDown>(
+        *p.engine_a, std::chrono::milliseconds(cfg_a.handover_grace_seconds * 1000 + 1000));
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *slow_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19046"), *p.engine_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+    const auto revoked_at = std::chrono::steady_clock::now();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(15)));
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - revoked_at);
+    EXPECT_LT(took.count(), TEST_LEASE_TTL * 1000 / 2)
+        << "the target took " << took.count() << " ms after the revoke: the intent had expired "
+        << "during the step-down, and the handover became an ordinary election";
 }
 
 // ── Task 5.2: GracefulFailover ───────────────────────────────────────────────
@@ -1202,8 +1394,10 @@ TEST_F(EtcdTestFixture, LeaseExpiry) {
     }
     EXPECT_TRUE(key_deleted) << "Leader key should be deleted after lease expiry";
 
-    // B should promote within ≤2s of key deletion.
-    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // B promotes once its election wait is over: since #82 a candidate waits the lease TTL from
+    // the moment it sees the key gone, so the previous holder has certainly stopped taking writes.
+    // This said "within 2 s of the key's deletion" and waited 5, which the wait alone outlasts.
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(TEST_LEASE_TTL + 3);
     while (fm_b.role() != ob::NodeRole::PRIMARY &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

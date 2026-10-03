@@ -408,7 +408,12 @@ ReplicationManager::ReplicationManager(ReplicationConfig config, WALWriter& wal)
     // No notification: run_loop() already comes back every 100 ms and polls. See
     // poll_snapshot_preparation() in the header for why that is enough here.
     , snapshot_builder_([] {})
-{}
+{
+    // What was written before this manager existed is part of the stream it serves.
+    last_broadcast_end_ = wal_.current_position();
+    OB_LOG_DEBUG("repl_mgr", "the stream starts out ending at %u:%u, the WAL's position",
+                 last_broadcast_end_.file_index, last_broadcast_end_.offset);
+}
 
 ReplicationManager::~ReplicationManager() {
     stop();
@@ -541,6 +546,10 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
     }
 
     std::lock_guard<std::mutex> lock(mtx_);
+    // Whether or not any replica is here to take it: the record is in the stream, and a replica
+    // that connects later is sent it by its catch-up.
+    last_broadcast_end_ = WalPosition{record_pos.file_index,
+                                      static_cast<uint32_t>(record_pos.offset + total_len)};
     for (auto it = replicas_.begin(); it != replicas_.end(); ) {
         if (live_record_action(*it, record_pos) == LiveRecordAction::Drop) {
             OB_LOG_DEBUG("repl_mgr",
@@ -580,6 +589,11 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
             ++it;
         }
     }
+}
+
+WalPosition ReplicationManager::last_broadcast_end() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return last_broadcast_end_;
 }
 
 std::vector<ReplicaInfo> ReplicationManager::replica_states() const {
@@ -2007,6 +2021,42 @@ void ReplicationClient::close_socket() {
     tls_.reset();
 }
 
+StreamPosition ReplicationClient::stream_position() const {
+    // The reader of a sequence lock: a reading taken while the sequence was even and unchanged is
+    // one the writer was not in the middle of. A few attempts and then "unknown", because a caller
+    // deciding on this would rather wait a tick than spin against a stream at full rate.
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const uint64_t before = position_seq_.load(std::memory_order_acquire);
+        if ((before & 1U) != 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        // Acquire, each: a field written by a write still under way synchronises with its
+        // release store, so the odd sequence before it is visible to the load below.
+        const StreamPosition reading{stream_id_.load(std::memory_order_acquire),
+                                     confirmed_file_.load(std::memory_order_acquire),
+                                     static_cast<uint64_t>(
+                                         confirmed_offset_.load(std::memory_order_acquire))};
+        if (position_seq_.load(std::memory_order_relaxed) == before) return reading;
+    }
+    OB_LOG_DEBUG("repl_client", "no consistent reading of the stream position in 64 attempts - "
+                                "reporting it as unknown");
+    return {};
+}
+
+void ReplicationClient::set_position(uint32_t file_index, size_t byte_offset) {
+    const PositionWrite write{position_seq_};
+    confirmed_file_.store(file_index, std::memory_order_release);
+    confirmed_offset_.store(byte_offset, std::memory_order_release);
+}
+
+void ReplicationClient::set_stream(uint64_t stream_id, uint32_t file_index, size_t byte_offset) {
+    const PositionWrite write{position_seq_};
+    stream_id_.store(stream_id, std::memory_order_release);
+    confirmed_file_.store(file_index, std::memory_order_release);
+    confirmed_offset_.store(byte_offset, std::memory_order_release);
+}
+
 ReplicationClient::State ReplicationClient::state() const {
     return State{confirmed_file_.load(std::memory_order_relaxed),
                  confirmed_offset_.load(std::memory_order_relaxed),
@@ -2258,9 +2308,7 @@ void ReplicationClient::resolve_stream_identity() {
     }
 
     engine_.discard_local_data_for_resync();
-    confirmed_file_.store(0, std::memory_order_relaxed);
-    confirmed_offset_.store(0, std::memory_order_relaxed);
-    stream_id_.store(announced, std::memory_order_relaxed);
+    set_stream(announced, 0, 0);
     // Written before the position is asked for, so a crash between the two leaves a file naming an
     // empty store at zero rather than the deleted stream's offset.
     save_state();
@@ -2457,8 +2505,7 @@ void ReplicationClient::receive_and_replay() {
                     }
                 }
 
-                confirmed_file_.store(file_index, std::memory_order_relaxed);
-                confirmed_offset_.store(byte_offset + total_len, std::memory_order_relaxed);
+                set_position(file_index, byte_offset + total_len);
                 records_replayed_.fetch_add(1, std::memory_order_relaxed);
                 send_ack();
                 continue;
@@ -2575,8 +2622,7 @@ void ReplicationClient::receive_and_replay() {
             }
 
             // Update confirmed position.
-            confirmed_file_.store(file_index, std::memory_order_relaxed);
-            confirmed_offset_.store(byte_offset + total_len, std::memory_order_relaxed);
+            set_position(file_index, byte_offset + total_len);
             records_replayed_.fetch_add(1, std::memory_order_relaxed);
 
             // Send ACK (Requirement 2.4).
@@ -2686,11 +2732,13 @@ void ReplicationClient::load_state() {
     std::FILE* f = std::fopen(config_.state_file.c_str(), "r");
     if (!f) {
         // No state file — start from beginning.
-        confirmed_file_.store(0, std::memory_order_relaxed);
-        confirmed_offset_.store(0, std::memory_order_relaxed);
-        stream_id_.store(0, std::memory_order_relaxed);
+        set_stream(0, 0, 0);
         return;
     }
+    // The fields below are stored one line at a time, so the whole reading is one write of the
+    // sequence lock: the engine can be asked for this client's position between its construction
+    // and `start()` (`demote_to_replica()` makes it under the engine lock and starts it after).
+    const PositionWrite position_write{position_seq_};
 
     uint32_t file_index = 0;
     size_t byte_offset = 0;
@@ -2701,18 +2749,18 @@ void ReplicationClient::load_state() {
     // Not left at whatever a previous connection resolved: `start()` may follow a `stop()` on the
     // same object, and an identity that outlived the file it came from would let a position resume
     // against a stream this file never named.
-    stream_id_.store(0, std::memory_order_relaxed);
+    stream_id_.store(0, std::memory_order_release);
 
     // A file written before #101 has no `stream_id` line, and this loop ignores what it does not
     // recognise, so it reads as 0 - "we do not know whose position this is" - which is the answer
     // that makes the replica start over rather than resume against a stream it cannot identify.
     while (std::fgets(line, sizeof(line), f)) {
         if (std::sscanf(line, "file_index=%u", &file_index) == 1) {
-            confirmed_file_.store(file_index, std::memory_order_relaxed);
+            confirmed_file_.store(file_index, std::memory_order_release);
         } else if (std::sscanf(line, "byte_offset=%zu", &byte_offset) == 1) {
-            confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
+            confirmed_offset_.store(byte_offset, std::memory_order_release);
         } else if (std::sscanf(line, "stream_id=%" SCNu64, &stream_id) == 1) {
-            stream_id_.store(stream_id, std::memory_order_relaxed);
+            stream_id_.store(stream_id, std::memory_order_release);
         } else if (std::sscanf(line, "epoch=%" SCNu64, &saved_epoch) == 1) {
             // Raised into the engine rather than kept here, which is what makes it survive the next
             // role change: `demote_to_replica()` builds a new client and this object goes away.
@@ -2997,8 +3045,7 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
     }
 
     // Update confirmed WAL position.
-    confirmed_file_.store(manifest.wal_file_index, std::memory_order_relaxed);
-    confirmed_offset_.store(manifest.wal_byte_offset, std::memory_order_relaxed);
+    set_position(manifest.wal_file_index, manifest.wal_byte_offset);
     save_state();
 
     // Clean up staging directory.

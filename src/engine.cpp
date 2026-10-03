@@ -1172,6 +1172,18 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     std::unique_lock<std::mutex> lock(mtx_);
     timing.held = WriteTiming::Clock::now();
 
+    // 0. Closed by a demotion (#204) after these passed the server's read-only check. Under this
+    //    lock, so a demotion either finds the batch already in the WAL and the stream, or the
+    //    batch finds writes closed - never a write answered OK that no replica was sent.
+    if (policy == DuplicatePolicy::Apply && writes_closed_.load(std::memory_order_relaxed)) {
+        for (size_t i = 0; i < n; ++i) {
+            outcomes[i].status = OB_ERR_READ_ONLY;
+            s.state[i] = WriteState::Final;
+        }
+        OB_LOG_DEBUG("engine", "Refusing a batch of %zu write(s): this node has stepped down", n);
+        return;
+    }
+
     // 1. What a single write checked before it waited for room, per write and in order.
     size_t admitted = 0;
     try {
@@ -2725,6 +2737,8 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     if (read_only_flag_) {
         read_only_flag_->store(false, std::memory_order_release);
     }
+    // The only place writes open again (#204): last, once this node is primary in every answer.
+    writes_closed_.store(false, std::memory_order_relaxed);
 
     // Update metrics registry node role.
     registry_.set_node_role("primary");
@@ -2732,9 +2746,75 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     OB_LOG_INFO("engine", "promoted to PRIMARY, epoch=%" PRIu64, new_epoch.term);
 }
 
+void Engine::close_writes_locked() {
+    writes_closed_.store(true, std::memory_order_relaxed);
+    node_role_.store(NodeRole::REPLICA, std::memory_order_release);
+
+    // Toggle dynamic read-only flag: REPLICA rejects writes.
+    if (read_only_flag_) {
+        read_only_flag_->store(true, std::memory_order_release);
+    }
+
+    // Update metrics registry node role and epoch gauge.
+    registry_.set_node_role("replica");
+    registry_.set_gauge("ob_current_epoch",
+                        static_cast<int64_t>(current_epoch_.load(std::memory_order_relaxed)));
+}
+
+std::optional<StreamPosition> Engine::step_down_for_handover() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    close_writes_locked();
+    if (!repl_mgr_) {
+        OB_LOG_INFO("engine", "stepped down for a handover: writes are closed, and this node serves "
+                              "no replication stream");
+        return std::nullopt;
+    }
+    // Every write answered OK was appended and broadcast under this lock before it was taken, so
+    // nothing acknowledged lies past this point - and nothing can be appended after it.
+    const WalPosition end = repl_mgr_->last_broadcast_end();
+    OB_LOG_INFO("engine", "stepped down for a handover: writes are closed, and the replication "
+                          "stream ends at %u:%u and stays up until a successor is followed",
+                end.file_index, end.offset);
+    return StreamPosition{wal_identity(), end.file_index, end.offset};
+}
+
+std::optional<StreamPosition> Engine::replicated_position() {
+    // Under the lock that replaces `repl_client_`, so the client cannot be moved out and destroyed
+    // while it is asked. The reading itself takes no lock.
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!repl_client_) return std::nullopt;
+    return repl_client_->stream_position();
+}
+
 void Engine::demote_to_replica(const std::string& new_primary_address) {
     std::unique_lock<std::mutex> lock(mtx_);
 
+    // Writes close first, under the lock every write holds from its WAL append to its broadcast
+    // (#204). This used to come after the replication manager was stopped below, and `stop()` joins
+    // its thread - 106 ms in one measured FAILOVER, during which writes reached the WAL and an OK
+    // but no replica, because the manager they would have been broadcast through was already gone:
+    // 4308 acknowledged writes the new primary never had.
+    close_writes_locked();
+
+    if (new_primary_address.empty()) {
+        // Nobody to follow yet - a lease lost, or a handover whose successor has not stood. The
+        // stream stays up: this node takes no more writes, and its replicas - the successor among
+        // them - can still take the end of its log from it. It ends when this node follows
+        // somebody, below, which the REPLICA branch of the failover monitor does as soon as a
+        // leader is published (#201). Stopping it here is what made the end of every handover's
+        // log something no replica could still receive.
+        OB_LOG_INFO("engine", "demoted to REPLICA, primary=");
+        if (repl_mgr_) {
+            const WalPosition end = repl_mgr_->last_broadcast_end();
+            OB_LOG_INFO("engine", "the replication stream this node serves stays up until it follows "
+                                  "a primary; it ends at %u:%u", end.file_index, end.offset);
+        }
+        return;
+    }
+
+    // Following somebody, so the stream this node served ends: a node never serves one stream while
+    // it replays another.
+    //
     // Ownership is taken **under the lock**, so a second demotion sees nullptr rather than an object
     // the first one is in the middle of destroying.
     //
@@ -2749,26 +2829,17 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
     // mutex before joining. The release of `mtx_` is still needed: `stop()` joins a thread that can
     // be waiting on this very lock.
     if (std::unique_ptr<ReplicationManager> mgr = std::move(repl_mgr_)) {
+        const WalPosition end = mgr->last_broadcast_end();
+        OB_LOG_INFO("engine", "the replication stream this node served ends at %u:%u - it follows %s "
+                              "from here", end.file_index, end.offset, new_primary_address.c_str());
         lock.unlock();
         mgr->stop();
         mgr.reset();
         lock.lock();
     }
 
-    node_role_.store(NodeRole::REPLICA, std::memory_order_release);
-
-    // Toggle dynamic read-only flag: REPLICA rejects writes.
-    if (read_only_flag_) {
-        read_only_flag_->store(true, std::memory_order_release);
-    }
-
-    // Update metrics registry node role and epoch gauge.
-    registry_.set_node_role("replica");
-    registry_.set_gauge("ob_current_epoch",
-                        static_cast<int64_t>(current_epoch_.load(std::memory_order_relaxed)));
-
     // Start ReplicationClient to new primary.
-    if (!new_primary_address.empty()) {
+    {
         // Stop existing ReplicationClient if running (may have been started
         // from static --primary-host config or a previous demote).
         // Ownership taken under the lock, for the reason above.

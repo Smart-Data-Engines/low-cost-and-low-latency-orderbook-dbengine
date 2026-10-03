@@ -333,13 +333,10 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
             std::chrono::seconds(config_.handover_cooldown_seconds);
     }
 
-    // 4. Revoke the lease; the leader key is held under it, so it disappears and
-    //    the target sees an empty leader with an intent naming it.
-    const int64_t lease = lease_id_.load();
     // From here until the role is recorded, the leader key's absence is expected rather than a
-    // fault. Scoped so that every one of this function's seven exits clears it, including the
-    // revoke-failure path below which keeps the role: a flag that suppresses a safety check must be
-    // impossible to leave set.
+    // fault. Scoped so that every one of this function's exits clears it, including the
+    // revoke-failure path below which takes the role back: a flag that suppresses a safety check
+    // must be impossible to leave set.
     struct HandoverScope {
         std::atomic<bool>& flag;
         explicit HandoverScope(std::atomic<bool>& f) : flag(f) {
@@ -348,92 +345,212 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
         ~HandoverScope() { flag.store(false, std::memory_order_release); }
     } handover_scope{handing_over_};
 
-    if (!coordinator_->revoke_lease(lease)) {
-        // We are still primary as far as etcd is concerned. Undo the block and
-        // clear the intent so the cluster is not left in a half-handed-over
-        // state.
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            election_blocked_until_ = {};
+    // 4. Step down BEFORE the lease goes (#204). The other order - revoke, then demote - left the
+    //    key gone while this node still took writes, which is the window every candidate waits a
+    //    whole lease TTL for (#82), the target included: ten seconds without a primary after every
+    //    planned FAILOVER. And the demotion stopped the replication stream first, so the writes it
+    //    took meanwhile, and whatever the target had not received yet, were lost to it - measured,
+    //    0 to 4308 acknowledged writes per handover.
+    //
+    //    The term is recorded first: between the step-down and the revoke the key still names this
+    //    node while it is a REPLICA, which the REPLICA branch's #130 arm would otherwise finish as a
+    //    promotion it had won.
+    uint64_t term = 0;
+    uint64_t previous_stepped_down = 0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        term = epoch_.term;
+        previous_stepped_down = stepped_down_term_;
+        stepped_down_term_ = term;
+        primary_address_.clear();
+        // A fresh election starts with a fresh window, or the next one inherits a deferral clock
+        // from this handover and promotes sooner than it should.
+        deferring_since_ = {};
+    }
+    role_.store(NodeRole::REPLICA);
+    const std::optional<StreamPosition> stream_end = handler_.step_down_for_handover();
+    note_following({});
+
+    // 5. Say so, now that it is true. A successor stands without the election wait on this alone -
+    //    this node takes no writes at `term` - and once it holds the stream to its end. The grace
+    //    window starts again here: it is how long the others defer to the target once the key
+    //    goes, and the key goes next, not when the first intent was written.
+    intent.stepped_down_term = term;
+    intent.deadline_ns = wall_clock_ns() +
+        static_cast<uint64_t>(config_.handover_grace_seconds) * 1'000'000'000ULL;
+    if (stream_end.has_value()) {
+        intent.stream_id     = stream_end->stream_id;
+        intent.stream_file   = stream_end->file_index;
+        intent.stream_offset = stream_end->offset;
+    }
+    if (coordinator_->publish_handover_intent(intent)) {
+        if (stream_end.has_value()) {
+            OB_LOG_INFO("failover",
+                        "Graceful failover: stepped down at epoch %llu, writes closed; the stream "
+                        "ends at %u:%llu, and %s may stand as soon as it holds that much",
+                        static_cast<unsigned long long>(term), stream_end->file_index,
+                        static_cast<unsigned long long>(stream_end->offset),
+                        target_node_id.c_str());
+        } else {
+            OB_LOG_INFO("failover",
+                        "Graceful failover: stepped down at epoch %llu, writes closed; this node "
+                        "serves no stream, so %s may stand at once",
+                        static_cast<unsigned long long>(term), target_node_id.c_str());
         }
-        coordinator_->clear_handover_intent();
-        OB_LOG_ERROR("failover",
-                     "Graceful failover aborted: lease revoke failed, "
-                     "staying primary (lease=%ld)", static_cast<long>(lease));
-        return HandoverResult::COORDINATOR_ERROR;
+    } else {
+        OB_LOG_WARN("failover",
+                    "Graceful failover: stepped down at epoch %llu, but could not say so in the "
+                    "intent - %s will wait the election delay (%lld ms) before standing, as it "
+                    "did before",
+                    static_cast<unsigned long long>(term), target_node_id.c_str(),
+                    static_cast<long long>(lease_wait_ms()));
+    }
+
+    if (before_revoke_hook_for_test_) before_revoke_hook_for_test_();
+
+    // 6. Revoke the lease; the leader key is held under it, so it disappears and the target sees an
+    //    empty leader with an intent naming it.
+    const int64_t lease = lease_id_.load();
+    if (!coordinator_->revoke_lease(lease)) {
+        // The key still names this node, which takes no writes. Two ways out, and which one is
+        // decided by whether the statement above can be withdrawn: while it might still be read, a
+        // successor may stand on it the moment the key goes, so this node must not take the role
+        // back at this term.
+        if (coordinator_->clear_handover_intent()) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                stepped_down_term_ = previous_stepped_down;
+                election_blocked_until_ = {};
+            }
+            OB_LOG_ERROR("failover",
+                         "Graceful failover aborted: lease revoke failed (lease=%ld), and the "
+                         "intent is withdrawn - this node takes the role back on the next tick, at "
+                         "epoch %llu (#130)",
+                         static_cast<long>(lease), static_cast<unsigned long long>(term));
+            return HandoverResult::COORDINATOR_ERROR;
+        }
+        lease_id_.store(0);
+        OB_LOG_WARN("failover",
+                    "Graceful failover: lease revoke failed (lease=%ld) and the intent could not "
+                    "be withdrawn - this node stays a REPLICA and does not take epoch %llu back; "
+                    "its lease is no longer refreshed, so the role moves when it expires, within "
+                    "%lld s",
+                    static_cast<long>(lease), static_cast<unsigned long long>(term),
+                    static_cast<long long>(config_.coordinator.lease_ttl_seconds));
+        return HandoverResult::OK;
     }
 
     lease_id_.store(0);
-    role_.store(NodeRole::REPLICA);
-    {
-        // A fresh election starts with a fresh window, or the next one inherits a deferral clock
-        // from this handover and promotes sooner than it should.
-        std::lock_guard<std::mutex> lk(mtx_);
-        deferring_since_ = {};
-    }
-
     OB_LOG_INFO("failover",
-                "Graceful failover: lease %ld revoked, now REPLICA, waiting for %s",
+                "Graceful failover: lease %ld revoked, now REPLICA, waiting for %s - the stream "
+                "stays up until this node follows it (#201)",
                 static_cast<long>(lease), target_node_id.c_str());
-
-    // 5. If the target was quick, adopt it as our primary right away. Otherwise
-    //    monitor_loop() will pick it up on its next pass.
-    // The lease is gone, so this node is not primary any more whatever the target does next. Tell
-    // the engine now: it owns the ROLE answer and the read-only flag, and this call used to happen
-    // only if the target had already promoted by this instant — which it has not, because it first
-    // has to notice the empty leader key. So a node that had just handed the role away kept
-    // answering ROLE with PRIMARY and kept accepting writes. The empty-address case is handled:
-    // Engine::demote_to_replica() only starts a replication client when it can parse host:port.
-    auto state = coordinator_->get_cluster_state();
-    const std::string new_primary =
-        (state.has_value() && !state->leader_address.empty()) ? state->leader_address
-                                                             : std::string{};
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        primary_address_ = new_primary;
-    }
-    handler_.demote_to_replica(new_primary);
-    // Nobody, usually: the target has not promoted yet. The REPLICA branch of monitor_tick() starts
-    // following it when it does (#201) - which it did not, so the outgoing primary of every
-    // handover replicated nothing from then on while ROLE named its successor.
-    note_following(new_primary);
-
-    OB_LOG_INFO("failover", "Graceful failover: demoted locally, primary=%s",
-                new_primary.empty() ? "(not elected yet)" : new_primary.c_str());
-
     return HandoverResult::OK;
 }
 
-/// Whether this node should stand aside because a graceful handover named
-/// someone else.
-///
-/// Returns true only while an intent is live and points at another node. An
-/// absent, unparsable or expired intent means ordinary election, which is what
-/// keeps an unreachable target from deadlocking the cluster: the deadline passes
-/// and everyone competes again.
-bool FailoverManager::should_defer_to_handover_target() {
-    if (!coordinator_) return false;
+void FailoverManager::hold_before_revoke_for_test(std::function<void()> hook) {
+    before_revoke_hook_for_test_ = std::move(hook);
+}
+
+uint64_t FailoverManager::known_leader_term() const {
+    const uint64_t engine_term = handler_.get_current_epoch().term;
+    std::lock_guard<std::mutex> lk(mtx_);
+    return std::max(epoch_.term, engine_term);
+}
+
+VacantLeaderAction decide_on_vacant_leader(const std::optional<HandoverIntent>& intent,
+                                           const std::string& self_node_id, uint64_t now_ns,
+                                           uint64_t known_term,
+                                           const std::optional<StreamPosition>& replicated,
+                                           bool wait_elapsed) {
+    // An absent, unparsable or expired intent is an ordinary election: that is what keeps an
+    // unreachable target from deadlocking the cluster - the deadline passes and everyone competes.
+    const bool live = intent.has_value() && intent->is_active(now_ns);
+    if (live && intent->target_node_id != self_node_id) return VacantLeaderAction::Defer;
+
+    // The target of a live handover whose sender says it stepped down, at the term this node knows
+    // a leader at. Anything less is no statement about the holder whose key went.
+    if (live && intent->stepped_down_term != 0 && intent->stepped_down_term == known_term) {
+        if (!intent->has_stream_end()) return VacantLeaderAction::StandForHandover;
+        const StreamPosition end{intent->stream_id, intent->stream_file, intent->stream_offset};
+        if (replicated.has_value() && stream_covers(*replicated, end)) {
+            return VacantLeaderAction::StandForHandover;
+        }
+        // The rest of the stream is still on its way - the sender keeps serving it. Not for longer
+        // than the election wait: past it this node stands with what it has, which is what it did
+        // before #204, so waiting can make a handover no worse than it was.
+        return wait_elapsed ? VacantLeaderAction::Stand : VacantLeaderAction::AwaitStream;
+    }
+    return wait_elapsed ? VacantLeaderAction::Stand : VacantLeaderAction::Wait;
+}
+
+void FailoverManager::act_on_vacant_leader() {
+    note_leader_absent();
 
     const auto intent = coordinator_->get_handover_intent();
-    if (!intent.has_value()) return false;
-    if (!intent->is_active(wall_clock_ns())) {
-        OB_LOG_DEBUG("failover",
-                     "Handover intent for %s has expired, resuming normal election",
-                     intent->target_node_id.c_str());
-        return false;
+    const auto replicated = handler_.replicated_position();
+    const VacantLeaderAction action =
+        decide_on_vacant_leader(intent, config_.coordinator.node_id, wall_clock_ns(),
+                                known_leader_term(), replicated, leader_absence_settled());
+
+    if (action != VacantLeaderAction::AwaitStream) {
+        if (const uint64_t ticks = awaiting_stream_episode_.end()) {
+            OB_LOG_INFO("failover", "stopped waiting for the rest of the handover's stream after "
+                                    "%llu tick(s)", static_cast<unsigned long long>(ticks));
+        }
     }
 
-    if (intent->target_node_id == config_.coordinator.node_id) {
+    switch (action) {
+    case VacantLeaderAction::Wait:
+        // Wait out the previous holder's step-down bound before competing (#82). Without this, the
+        // vacated key can be claimed while the old holder still believes it is primary - and both
+        // accept writes while both believe it.
+        OB_LOG_DEBUG("failover", "leader key absent but the election wait has not elapsed — "
+                                 "not campaigning yet");
+        return;
+    case VacantLeaderAction::Defer:
+        // A graceful handover with a named successor: only that node should campaign, so the role
+        // goes where the operator sent it rather than to whoever is quickest.
+        OB_LOG_DEBUG("failover", "Deferring election: handover intent targets %s (from=%s)",
+                     intent->target_node_id.c_str(), intent->from_node_id.c_str());
+        return;
+    case VacantLeaderAction::AwaitStream: {
+        const StreamPosition have = replicated.value_or(StreamPosition{});
+        if (awaiting_stream_episode_.begin()) {
+            OB_LOG_INFO("failover",
+                        "the handover from %s names this node, and %s stepped down at epoch %llu, "
+                        "but this node holds %u:%llu of a stream that ends at %u:%llu - waiting "
+                        "for the rest, at most until the election wait ends",
+                        intent->from_node_id.c_str(), intent->from_node_id.c_str(),
+                        static_cast<unsigned long long>(intent->stepped_down_term),
+                        have.file_index, static_cast<unsigned long long>(have.offset),
+                        intent->stream_file, static_cast<unsigned long long>(intent->stream_offset));
+        } else {
+            OB_LOG_DEBUG("failover", "still waiting for the handover's stream: %u:%llu of %u:%llu",
+                         have.file_index, static_cast<unsigned long long>(have.offset),
+                         intent->stream_file,
+                         static_cast<unsigned long long>(intent->stream_offset));
+        }
+        return;
+    }
+    case VacantLeaderAction::Stand:
+        if (intent.has_value() && intent->is_active(wall_clock_ns())) {
+            OB_LOG_INFO("failover", "Handover intent targets us (from=%s), promoting",
+                        intent->from_node_id.c_str());
+        }
+        handle_lease_expiry();
+        return;
+    case VacantLeaderAction::StandForHandover:
         OB_LOG_INFO("failover",
-                    "Handover intent targets us (from=%s), promoting",
-                    intent->from_node_id.c_str());
-        return false;
+                    "the handover from %s names this node, and %s stepped down at epoch %llu "
+                    "holding no writes past %u:%llu, which this node has - standing now, without "
+                    "the election wait",
+                    intent->from_node_id.c_str(), intent->from_node_id.c_str(),
+                    static_cast<unsigned long long>(intent->stepped_down_term),
+                    intent->stream_file, static_cast<unsigned long long>(intent->stream_offset));
+        if (config_.failover_enabled) attempt_promotion(PromotionBasis::Handover);
+        return;
     }
-
-    OB_LOG_DEBUG("failover",
-                 "Deferring election: handover intent targets %s (from=%s)",
-                 intent->target_node_id.c_str(), intent->from_node_id.c_str());
-    return true;
 }
 
 // ── monitor_loop() ──────────────────────────────────────────────────────────
@@ -715,7 +832,40 @@ void FailoverManager::monitor_tick() {
                 }
             }
 
-            if (leader_present && state.leader_node_id == config_.coordinator.node_id) {
+            // The key names us at a term this node handed over at (#204): a handover between its
+            // step-down and its revoke, or one whose revoke failed. Its second intent says this
+            // node takes no writes at that term, and a successor may stand on that the moment the
+            // key goes - so the #130 arm below must not read this as a promotion to finish.
+            uint64_t handed_over_at = 0;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                handed_over_at = stepped_down_term_;
+            }
+            const bool handed_key = leader_present &&
+                                    state.leader_node_id == config_.coordinator.node_id &&
+                                    handed_over_at != 0 && state.epoch.term <= handed_over_at;
+            if (!handed_key) {
+                if (const uint64_t ticks = handed_key_episode_.end()) {
+                    OB_LOG_INFO("failover", "the leader key no longer names this node at the epoch "
+                                            "it handed over, after %llu tick(s)",
+                                static_cast<unsigned long long>(ticks));
+                }
+            }
+
+            if (handed_key) {
+                note_leader_present();
+                if (handed_key_episode_.begin()) {
+                    OB_LOG_INFO("failover",
+                                "the leader key still names this node at epoch %llu, the term it "
+                                "handed over at - not taking the role back; the key goes when "
+                                "its lease does",
+                                static_cast<unsigned long long>(state.epoch.term));
+                } else {
+                    OB_LOG_DEBUG("failover", "the leader key still names this node at the epoch it "
+                                             "handed over (%llu tick(s))",
+                                 static_cast<unsigned long long>(handed_key_episode_.ticks()));
+                }
+            } else if (leader_present && state.leader_node_id == config_.coordinator.node_id) {
                 // The key names us and we are not PRIMARY, so a promotion got as far as the CAS
                 // and no further (#130). Finish it, with the epoch **from the key** rather than a
                 // fresh one: that epoch is already in this node's WAL header and in
@@ -828,22 +978,9 @@ void FailoverManager::monitor_tick() {
                                  "campaigning on a read that failed");
                 }
             } else if (config_.failover_enabled) {
-                note_leader_absent();
-
-                // Wait out the previous holder's step-down bound before competing (#82).
-                // Without this, the vacated key can be claimed while the old holder still
-                // believes it is primary — and both accept writes while both believe it.
-                if (!leader_absence_settled()) {
-                    OB_LOG_DEBUG("failover",
-                                 "leader key absent but the election wait has not elapsed — "
-                                 "not campaigning yet");
-                } else if (!should_defer_to_handover_target()) {
-                    // A graceful handover with a named successor: only that node should
-                    // campaign, so the role goes where the operator sent it rather than to
-                    // whoever is quickest.
-                    handle_lease_expiry();
-                }
-                // Otherwise: not our turn, re-check on the next pass.
+                // Wait, defer to a handover's target, or stand - and a handover's target that
+                // holds the outgoing stream stands without the wait (#204).
+                act_on_vacant_leader();
             }
         }
     } else if (current == NodeRole::STANDALONE) {
@@ -1064,7 +1201,7 @@ bool FailoverManager::should_promote_now() {
     return true;
 }
 
-void FailoverManager::attempt_promotion() {
+void FailoverManager::attempt_promotion(PromotionBasis basis) {
     if (!coordinator_) return;
 
     // A node that has just handed the role away must not win the election it
@@ -1087,7 +1224,11 @@ void FailoverManager::attempt_promotion() {
     // Prefer the replica that lost the least. Until #70 this was a pure CAS race, so the role went
     // to whoever polled first — elect_winner() existed, with unit tests, and had no callers.
     // Checked before granting a lease: no point taking one out only to stand down.
-    if (!should_promote_now()) return;
+    //
+    // Not for a handover's successor that holds the outgoing stream (#204): the further position
+    // it would wait for is the outgoing node's own, which cannot stand, and no replica holds more of
+    // that log than the node streamed.
+    if (basis == PromotionBasis::Election && !should_promote_now()) return;
 
     // Grant a new lease and try to acquire leadership via CAS.
     // If the leader key doesn't exist, CAS succeeds and we become primary.

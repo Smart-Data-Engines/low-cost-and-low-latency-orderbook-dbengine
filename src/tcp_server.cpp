@@ -563,6 +563,10 @@ void execute_writes(std::span<const Command> cmds,
             if (shard_coord) shard_coord->increment_routing_errors();
             answer = format_error(std::string("NOT_OWNER ") + s.deltas[k].symbol + "." +
                                   s.deltas[k].exchange);
+        } else if (o.status == OB_ERR_READ_ONLY) {
+            // The node stepped down after this write passed the check above the engine (#204):
+            // the answer that check gives, so a client sees one refusal whichever side it fell on.
+            answer = format_error("read-only replica");
         } else if (o.status != OB_OK) {
             answer = format_error("apply_delta failed with code " + std::to_string(o.status));
         } else {

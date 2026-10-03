@@ -11,6 +11,7 @@
 #include "orderbook/metrics.hpp"
 #include "orderbook/coordinator.hpp"
 #include "orderbook/epoch.hpp"
+#include "orderbook/stream_position.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -96,8 +97,26 @@ struct RoleTransitionHandler {
     virtual void promote_to_primary(const EpochValue& new_epoch) = 0;
 
     /// Called when this node should become replica.
-    /// Must: stop ReplicationManager, start ReplicationClient, enable read-only.
+    /// Must: close writes first, then - when there is a primary to follow - stop the
+    /// ReplicationManager and start a ReplicationClient. With nobody to follow, the stream this
+    /// node serves stays up (#204).
     virtual void demote_to_replica(const std::string& new_primary_address) = 0;
+
+    /// Called by a graceful handover before it says anything to the coordinator: close writes,
+    /// become a replica following nobody, and keep serving the replication stream, so the successor
+    /// can take the rest of this node's log before it stands (#204). Returns where that stream ends,
+    /// or nullopt when this node serves none.
+    ///
+    /// The default demotes, which is everything a handler without a stream can do.
+    virtual std::optional<StreamPosition> step_down_for_handover() {
+        demote_to_replica({});
+        return std::nullopt;
+    }
+
+    /// How far this node is into the stream it replicates, and whose stream that is; nullopt when
+    /// it follows none. What a handover's successor compares with the announced end.
+    /// Not const: the engine answers it under the lock that replaces its replication client.
+    virtual std::optional<StreamPosition> replicated_position() { return std::nullopt; }
 
     /// Called to get current WAL position for election comparison.
     virtual std::pair<uint32_t, size_t> get_wal_position() const = 0;
@@ -152,23 +171,30 @@ public:
     /// usually means a typo in a node id, while "coordinator error" means the
     /// node is still primary and the handover never started.
     enum class HandoverResult {
-        OK,                 ///< intent published, lease revoked, role given up
+        OK,                 ///< stepped down and said so; the lease revoked, or left to expire
         NOT_PRIMARY,        ///< this node is not the primary
         NOT_CONFIGURED,     ///< no coordinator, or no lease held
         INVALID_TARGET,     ///< target empty, or naming this node itself
         UNKNOWN_TARGET,     ///< target not known to the coordinator
-        COORDINATOR_ERROR,  ///< could not publish the intent; still primary
+        COORDINATOR_ERROR,  ///< could not publish the intent, or revoke and withdraw it; still
+                            ///< primary, or primary again on the next tick
     };
 
     /// Hand the primary role to a named node.
     ///
     /// Publishes a handover intent, blocks itself from standing for election for
-    /// handover_cooldown_seconds, then revokes its lease so the target can take
-    /// over. Only works if we are PRIMARY.
+    /// handover_cooldown_seconds, steps down - writes closed, the replication stream left up -
+    /// publishes the intent again with the term it stepped down from and where its stream ends,
+    /// and only then revokes its lease (#204). Only works if we are PRIMARY.
     ///
-    /// On anything other than OK the node keeps its role and its lease, so a
-    /// rejected handover is not a partial one.
+    /// A rejected handover is not a partial one: before the step-down nothing has changed, and a
+    /// revoke that fails after it is undone when the intent can be withdrawn. When it cannot, the
+    /// node stays a REPLICA and the role moves once its lease expires - and this answers OK.
     HandoverResult initiate_graceful_failover(const std::string& target_node_id);
+
+    /// Test seam: called on the handover's thread after the step-down and the second intent, before
+    /// the lease is revoked - the window in which the leader key names a node that takes no writes.
+    void hold_before_revoke_for_test(std::function<void()> hook);
 
     /// Get the current primary address (from coordinator).
     std::string primary_address() const;
@@ -211,6 +237,25 @@ private:
     /// recorded from the coordinator on every tick whether or not anything follows it - which is how
     /// a node that replicated nothing named its successor.
     std::string             following_;
+
+    /// The term this node last handed the role over at, under `mtx_`; 0 when it never has (#204).
+    ///
+    /// A handover now steps down **before** it revokes the lease, so for a moment the leader key
+    /// still names this node while it is a REPLICA - which is exactly what the REPLICA branch's
+    /// #130 arm reads as a promotion it won and has to finish. That arm does not finish one at a
+    /// term this node stepped down from: the handover's second intent says it takes no writes at
+    /// that term, and a successor may already be standing on the strength of it. Recorded before
+    /// the step-down, because this node's own monitor thread can read the key in between. Never
+    /// reset on the way up: terms only increase, so the first real promotion is past it.
+    uint64_t                stepped_down_term_{0};
+
+    /// The REPLICA branch's #204 arm declining, once per episode (it repeats every tick until the
+    /// lease goes).
+    LogEpisode              handed_key_episode_{};
+    /// A handover's successor waiting for the rest of the outgoing stream, once per episode.
+    LogEpisode              awaiting_stream_episode_{};
+    /// See `hold_before_revoke_for_test()`. Set before the handover starts, read on its thread.
+    std::function<void()>   before_revoke_hook_for_test_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 
     /// When this node last *confirmed* that the leader key names it.
@@ -358,12 +403,21 @@ private:
     /// gone on publishing under a lease that no longer existed.
     int64_t ensure_position_lease();
     void handle_lease_expiry();
-    void attempt_promotion();
+
+    /// Why this node is standing. A handover's successor that holds the whole outgoing stream does
+    /// not defer to a further-published position (#70): that position belongs to the node that
+    /// handed over, which takes no writes and cannot stand, and nobody has more of its log than
+    /// it streamed.
+    enum class PromotionBasis { Election, Handover };
+    void attempt_promotion(PromotionBasis basis = PromotionBasis::Election);
     void handle_primary_lease_lost();
 
-    /// True while a graceful handover intent names another node, so this node
-    /// should not compete for the leader key yet.
-    bool should_defer_to_handover_target();
+    /// The highest term this node knows a leader at: the coordinator's, as reconciled, or the
+    /// engine's, raised by the stream it replicates. What a handover's statement is checked against.
+    uint64_t known_leader_term() const;
+
+    /// The REPLICA branch with the leader key vacant: wait, defer, or stand (#82, #204).
+    void act_on_vacant_leader();
     void reconcile_epoch(const ClusterState& state);
 };
 
@@ -433,5 +487,33 @@ enum class AbsentKeyAction {
 /// flight* is the flag's case; a handover that started and finished inside that gap has already
 /// cleared the flag, and only the role says so.
 AbsentKeyAction decide_on_absent_key(NodeRole role_now, bool handing_over);
+
+// ── Vacant leader key ─────────────────────────────────────────────────────────
+
+/// What a REPLICA does while the leader key is vacant.
+enum class VacantLeaderAction {
+    Wait,              ///< the election wait (#82) has not elapsed, and nothing lets this node skip it
+    Defer,             ///< a live handover names another node
+    AwaitStream,       ///< a handover names this node, which lacks part of the outgoing stream
+    Stand,             ///< an ordinary election: the wait has elapsed
+    StandForHandover,  ///< a handover names this node, its sender stepped down at the term this
+                       ///< node knows, and this node holds all of its stream (#204)
+};
+
+/// Decide, from the intent and what this node knows, whether it stands now.
+///
+/// Pure for the reason `decide_on_absent_key()` is: the case that matters - a successor standing
+/// without the election wait - is safe only under a conjunction (the intent live, naming us, its
+/// sender's statement at the term we know, our position at the end of its stream), and each
+/// conjunct is one assertion here rather than a cluster arranged to break it.
+///
+/// `known_term` is the highest term this node knows a leader at. A statement at another term says
+/// nothing about the leader that term had - an intent that outlived its handover, say. Without a
+/// statement, or once the wait has elapsed, this is the election it was before #204.
+VacantLeaderAction decide_on_vacant_leader(const std::optional<HandoverIntent>& intent,
+                                           const std::string& self_node_id, uint64_t now_ns,
+                                           uint64_t known_term,
+                                           const std::optional<StreamPosition>& replicated,
+                                           bool wait_elapsed);
 
 } // namespace ob

@@ -61,9 +61,12 @@ struct PublishedPosition {
 ///
 /// The outgoing primary cannot install the successor itself: the leader key is
 /// held under the successor's lease, and a lease belongs to its own session. So
-/// it publishes this intent, then revokes its lease and steps aside. Replicas
-/// read it while the leader key is empty: the named target campaigns
-/// immediately, everyone else waits until the deadline passes.
+/// it publishes this intent, steps down, publishes it again with what it stepped
+/// down from, and only then revokes its lease. Replicas read it while the leader
+/// key is empty: everyone but the named target waits until the deadline passes,
+/// and the target stands without the election wait (#82) once the second
+/// publication says the outgoing primary takes no writes and the target holds
+/// all of its stream (#204). Without that statement it waits, as it did before.
 ///
 /// Stored without a lease, so that it survives the revocation that follows it.
 /// After `deadline_ns` it is ignored, so an unreachable target cannot deadlock
@@ -72,6 +75,18 @@ struct HandoverIntent {
     std::string target_node_id;   // node that should take over
     std::string from_node_id;     // node handing the role away
     uint64_t    deadline_ns{0};   // wall clock; intent is void afterwards
+
+    /// What the outgoing primary says about itself once writes are closed (#204), in its second
+    /// publication. Zero in the first, and in every intent from a node older than that; serialized
+    /// only when set, so the first publication is the JSON every version reads.
+    uint64_t    stepped_down_term{0};   // the term it stepped down from; 0 = no statement
+    uint64_t    stream_id{0};           // where its stream ends: whose (#101) ...
+    uint32_t    stream_file{0};         // ... and at which position (#98)
+    uint64_t    stream_offset{0};
+
+    /// The statement's stream end, when it has one. A primary that serves no stream steps down
+    /// with a term and no end: there is nothing for a successor to wait for.
+    bool has_stream_end() const { return stream_id != 0; }
 
     /// Serialize to JSON string (deterministic alphabetical field ordering).
     std::string to_json() const;

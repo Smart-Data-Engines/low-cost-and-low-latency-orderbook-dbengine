@@ -38,7 +38,9 @@ The first release. What it contains, by area:
 - WAL streaming replication with snapshot bootstrap of replicas, lag in the bytes a replica has yet
   to acknowledge, and a new WAL lineage after a snapshot is installed (#197).
 - Automatic failover through etcd with epoch fencing, and graceful handover to a named replica;
-  a primary that gives the role up replicates from whoever takes it (#201).
+  a primary that gives the role up replicates from whoever takes it (#201). A handover loses no
+  acknowledged write and takes a monitor tick rather than a lease TTL: the outgoing primary closes
+  writes and keeps streaming, and its target stands once it holds the stream (#204).
 - Multi-master replication: per-origin numbering, version vectors sent in parts, catch-up, lag in
   records, conflict resolution by hybrid logical clocks and last-writer-wins.
 - Sharding by symbol on a consistent-hash ring, and moving a symbol between shards with its rows

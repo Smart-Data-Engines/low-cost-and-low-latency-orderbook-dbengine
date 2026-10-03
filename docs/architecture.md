@@ -646,6 +646,32 @@ which after a revoke does not exist yet — so the Engine was never told, and a 
 writes while the failover component privately considered it a replica. Not knowing where to point the
 replication client is a reason to start no client, not a reason to keep the role.
 
+**A demotion closes writes before anything else, and keeps the stream up while there is nobody to
+follow** (#204). The engine refuses client writes from that moment under the lock a write holds from
+its WAL append to its broadcast, so every write answered `OK` is in the replication stream. The node
+goes on serving that stream to its replicas until it follows a primary itself. Before this order, the
+demotion stopped the stream first, and writes taken during `stop()` went to no replica.
+
+**A planned handover does not need the wait**, because the holder can end the window it guards
+before the key goes:
+
+```
+FAILOVER node_B
+  │
+  ├─ intent: node_B is the target                     (first publication, as before #204)
+  ├─ step down: writes closed, REPLICA, stream stays up
+  ├─ intent again: stepped down at epoch e, stream ends at f:o
+  ├─ revoke the lease: the key goes
+  │
+  └─ node_B: key vacant, intent live and naming it, statement at the epoch it knows,
+             its own position at f:o  →  stands now, without the wait or position deference
+```
+
+A target short of `f:o` waits for the rest - the outgoing node is still streaming - and stands with
+what it has once the election wait is over, as it always did. Between the step-down and the revoke
+the key names a node that is a REPLICA; the arm that finishes a promotion it had won (#130) does not
+finish one at a term the node handed over.
+
 ## Key Design Decisions
 
 **Append-only storage** — No in-place updates or deletes. This simplifies crash recovery and enables lock-free reads. Orderbook data is naturally time-series: you rarely need to modify historical snapshots.

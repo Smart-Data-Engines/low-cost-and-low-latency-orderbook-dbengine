@@ -188,7 +188,22 @@ std::string HandoverIntent::to_json() const {
     out += std::to_string(deadline_ns);
     out += ",\"from_node_id\":\"";
     out += from_node_id;
-    out += "\",\"target_node_id\":\"";
+    out += '"';
+    // Only in the second publication (#204), so the first is byte for byte what every version
+    // wrote before - and reads.
+    if (stepped_down_term != 0) {
+        out += ",\"stepped_down_term\":";
+        out += std::to_string(stepped_down_term);
+        if (has_stream_end()) {
+            out += ",\"stream_file\":";
+            out += std::to_string(stream_file);
+            out += ",\"stream_id\":";
+            out += std::to_string(stream_id);
+            out += ",\"stream_offset\":";
+            out += std::to_string(stream_offset);
+        }
+    }
+    out += ",\"target_node_id\":\"";
     out += target_node_id;
     out += "\"}";
 
@@ -231,6 +246,24 @@ bool HandoverIntent::from_json(std::string_view json, HandoverIntent& out) {
     out.target_node_id = extract_string("target_node_id");
     out.from_node_id   = extract_string("from_node_id");
     out.deadline_ns    = extract_uint64("deadline_ns", deadline_found);
+
+    // Optional (#204): an intent without them is a first publication, or one from an older node,
+    // and says nothing about whether its sender still takes writes. The stream's end counts only
+    // whole - a partial one is no end a successor could reach.
+    bool term_found = false;
+    const uint64_t term = extract_uint64("stepped_down_term", term_found);
+    if (term_found && term != 0) {
+        out.stepped_down_term = term;
+        bool id_found = false, file_found = false, offset_found = false;
+        const uint64_t id     = extract_uint64("stream_id", id_found);
+        const uint64_t file   = extract_uint64("stream_file", file_found);
+        const uint64_t offset = extract_uint64("stream_offset", offset_found);
+        if (id_found && file_found && offset_found && id != 0 && file <= UINT32_MAX) {
+            out.stream_id     = id;
+            out.stream_file   = static_cast<uint32_t>(file);
+            out.stream_offset = offset;
+        }
+    }
 
     // All three fields are required. An intent without a target says nothing,
     // and one without a deadline would never expire.

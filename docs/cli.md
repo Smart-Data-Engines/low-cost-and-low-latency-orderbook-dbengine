@@ -955,11 +955,24 @@ echo "FAILOVER node_B" | nc localhost 5555
 1. The primary validates that `node_B` is a node the coordinator knows about
 2. It publishes a **handover intent** naming `node_B`, with a deadline
 3. It blocks itself from standing for election for the cooldown period
-4. It revokes its lease, so the leader key disappears
+4. It **steps down**: writes are closed - a write after this answers `ERR read-only replica` - and
+   it is a REPLICA, but its replication stream stays up
+5. It publishes the intent again, saying it stepped down at its epoch and where its stream ends
+6. It revokes its lease, so the leader key disappears
 
 While the intent is live, only `node_B` campaigns for the leader key; the other replicas stand
 aside. This is what makes the role land where you sent it rather than with whichever replica polls
-first.
+first. `node_B` stands **as soon as it holds the outgoing stream to the end the intent names** - a
+tick after the key goes, in the usual case - rather than after the election wait every other
+candidate observes (#82): the outgoing node has said it takes no writes, so there is nothing to wait
+out, and every write it acknowledged is in the stream `node_B` has. Until #204 the target waited a
+whole lease TTL, and the outgoing node stopped its stream before it stopped taking writes, so a
+handover under load lost the last acknowledged writes (measured: 0 to 4308 per handover).
+
+The outgoing node keeps serving its stream until it sees `node_B` as the primary, then follows it.
+A target that lacks part of the stream waits for the rest, at most until the election wait ends, and
+then stands with what it has - which is what it always did. A target of an older version, or an
+intent from one, waits the election wait as before (`docs/upgrading.md`).
 
 If `node_B` never takes over, the intent expires at its deadline and the cluster falls back to an
 ordinary election, so an unreachable target cannot leave you without a primary.
@@ -973,7 +986,7 @@ ordinary election, so an unreachable target cannot leave you without a primary.
 | `ERR failover_not_configured` | No coordinator configured |
 | `ERR invalid_target <id>` | Target was empty, or named this node itself |
 | `ERR unknown_target <id>` | Target is not known to the coordinator, usually a typo in a node id |
-| `ERR failover_failed` | Coordinator error; the node kept its role and its lease |
+| `ERR failover_failed` | Coordinator error: the intent could not be published - the node kept its role - or the lease could not be revoked and the intent was withdrawn, and the node takes its role back on its next monitor tick |
 
 **The connection may close without any reply, and that is not in the table above because it is not
 an answer.** The outgoing node is tearing down its primary machinery while your session is open, and
@@ -1004,14 +1017,17 @@ follow a primary behind it, saying so with both numbers. `docs/operations.md` co
 has two readings (#103). Until #103 a replica answered `0` here no matter whose stream it was
 replaying.
 
-Anything other than `OK` leaves the node primary with its lease intact, so a rejected handover is
-never a partial one.
+Anything other than `OK` leaves the node primary with its lease intact, or primary again a tick
+later, so a rejected handover is never a partial one. One `OK` is not an initiated revoke: when the
+lease cannot be revoked **and** the intent cannot be withdrawn, the node stays a replica - the
+intent may already have been read, and it says the node takes no writes - and the role moves when
+the unrefreshed lease expires, within the TTL. The log says so at WARN.
 
 ### Parameters
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--handover-grace-seconds` | 5 | How long the named target gets before the cluster falls back to an ordinary election. Keep it below the lease TTL, so a handover completes faster than a failure is detected |
+| `--handover-grace-seconds` | 5 | How long the named target gets before the cluster falls back to an ordinary election, counted from the step-down - the moment before the lease goes - since #204. Keep it below the lease TTL, so a handover completes faster than a failure is detected |
 | `--handover-cooldown-seconds` | 15 | How long the outgoing primary refrains from standing for election. Must be >= the grace window, otherwise it could win the race it just announced. Keep it above the lease TTL, so it does not return before the new primary settles |
 | `--election-deference-ms` | 3000 | How long a candidate waits when another node has published a further WAL position, so the most advanced replica gets first refusal. Bounded on purpose: unbounded deference would leave the cluster with no primary at all if the node it waits for never comes back. `0` disables deference and restores the pre-#70 race. Since #72 the positions carry a per-node lease, so a dead node drops off the list on its own and this window is a **backstop** — it now fires only for a node that is alive, refreshing its lease, and still not promoting |
 

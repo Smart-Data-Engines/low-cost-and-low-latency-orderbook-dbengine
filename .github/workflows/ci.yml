@@ -130,6 +130,13 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure -j1
 
+      # The failover manager against a real etcd (#202). Not in ctest: the binary starts and stops
+      # an etcd of its own, beside the one this job started for ctest's coordinator tests. Until
+      # #202 nothing ran it at all, and six of its tests had failed unnoticed, four of them on a
+      # real defect (#204). CI=true makes an etcd it cannot start a failure rather than a skip.
+      - name: Test against etcd
+        run: OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+
 
   # The whole pytest suite against a plain build, on every pull request.
   #
