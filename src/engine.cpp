@@ -3702,6 +3702,10 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
                                                  std::chrono::steady_clock::time_point now,
                                                  bool seal_all, size_t drained_rows) {
     std::vector<SealPick> picks;
+    if (seal_all) {
+        for (size_t i = 0; i < candidates.size(); ++i) picks.push_back(SealPick{i, SealReason::kAll});
+        return picks;
+    }
     size_t left = 0;
     for (const auto& c : candidates) left += c.rows;
     // A quarter more than it drained, so a backlog drains rather than lasting (see kSealRows);
@@ -3709,30 +3713,57 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     const size_t share = drained_rows > kNoRowLimit / 2
                              ? kNoRowLimit
                              : std::max(kSealRows, drained_rows + drained_rows / 4);
+    std::vector<bool> taken(candidates.size(), false);
     size_t picked_rows = 0;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        const SealCandidate& c = candidates[i];
-        SealReason why;
-        if (seal_all) {
-            why = SealReason::kAll;
-        } else if (left > kUnsealedRowsBudget) {
-            // Oldest first and past the per-tick limit: memory is what this bounds.
-            why = c.rows >= kSealRows ? SealReason::kRows
-                : now - c.oldest >= kSealAge ? SealReason::kAge
-                : SealReason::kBudget;
-        } else if (c.rows >= kSealRows || now - c.oldest >= kSealAge) {
-            if (picks.size() >= kSealsPerTick) continue;
+    const auto take = [&](size_t i, SealReason why) {
+        picks.push_back(SealPick{i, why});
+        taken[i] = true;
+        left -= std::min(left, candidates[i].rows);
+        picked_rows += candidates[i].rows;
+    };
+
+    // Over the budget: the stores holding the most rows first, oldest first among equals, past the
+    // per-tick limit, until the rest are under it - memory is what the budget bounds. Taken oldest
+    // first, as this was, a node of a few hot stores and thousands of one-row ones sealed 2 977
+    // stores in one tick to free 573 156 rows, 2 976 of them a row each: eight files a segment,
+    // nearly twenty-four thousand for the device to take at once, and a WAL sync of 4.3 s behind
+    // them (#205).
+    if (left > kUnsealedRowsBudget) {
+        std::vector<size_t> by_size(candidates.size());
+        for (size_t i = 0; i < by_size.size(); ++i) by_size[i] = i;
+        std::stable_sort(by_size.begin(), by_size.end(),
+                         [&](size_t a, size_t b) { return candidates[a].rows > candidates[b].rows; });
+        for (const size_t i : by_size) {
+            if (left <= kUnsealedRowsBudget) break;
+            const SealCandidate& c = candidates[i];
+            take(i, c.rows >= kSealRows ? SealReason::kRows
+                    : now - c.oldest >= kSealAge ? SealReason::kAge
+                    : SealReason::kBudget);
+        }
+    }
+
+    // Then what is due, within the tick's share: the stores due by rows first, which hold the
+    // memory, and then those due by age, each oldest first. Oldest first across both, the stores
+    // due by age took the per-tick limit whenever there were enough of them - 64 stores of a row
+    // each, tick after tick - while the stores due by rows waited behind it and the unsealed rows
+    // grew to the budget (#205).
+    for (const bool due_by_rows : {true, false}) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (picks.size() >= kSealsPerTick) break;
+            if (taken[i]) continue;
+            const SealCandidate& c = candidates[i];
+            const bool due = due_by_rows ? c.rows >= kSealRows
+                                         : c.rows < kSealRows && now - c.oldest >= kSealAge;
+            if (!due) continue;
             // The tick's share (see kSealRows): a due store after the first waits for a later tick
             // if it would take the rows picked past it.
             if (!picks.empty() && picked_rows + c.rows > share) continue;
-            why = c.rows >= kSealRows ? SealReason::kRows : SealReason::kAge;
-        } else {
-            continue;
+            take(i, due_by_rows ? SealReason::kRows : SealReason::kAge);
         }
-        picks.push_back(SealPick{i, why});
-        left -= std::min(left, c.rows);
-        picked_rows += c.rows;
     }
+    // In the candidates' order, oldest first, as the seals are made.
+    std::sort(picks.begin(), picks.end(),
+              [](const SealPick& a, const SealPick& b) { return a.index < b.index; });
     return picks;
 }
 
@@ -3770,11 +3801,18 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
 
     if (!seal_all && only == nullptr) {
         const size_t total = unsealed_rows_.load(std::memory_order_relaxed);
-        if (by_budget > 0) {
+        size_t candidate_rows = 0;
+        for (const SealCandidate& c : candidates) candidate_rows += c.rows;
+        // Over the budget whatever made the stores due: this line used to wait for a store sealed
+        // only because of it, and so said nothing of the tick that sealed 2 977 stores past the
+        // per-tick limit, every one of them due by age (#205).
+        if (candidate_rows > kUnsealedRowsBudget) {
             if (unsealed_budget_episode_.begin()) {
-                OB_LOG_INFO("engine", "%zu unsealed row(s) are over the budget of %zu, so the oldest "
-                                      "stores are sealed before they are due: %zu this tick",
-                            total, kUnsealedRowsBudget, by_budget);
+                OB_LOG_INFO("engine", "%zu unsealed row(s) are over the budget of %zu, so the largest "
+                                      "stores are sealed past the per-tick limit until the rest are "
+                                      "under it: %zu store(s), %zu row(s) this tick, %zu of them not "
+                                      "yet due",
+                            candidate_rows, kUnsealedRowsBudget, seals.size(), sealed_rows, by_budget);
             }
         } else if (const uint64_t ticks = unsealed_budget_episode_.end()) {
             OB_LOG_INFO("engine", "unsealed rows back under the budget after %llu tick(s)",

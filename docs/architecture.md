@@ -119,15 +119,22 @@ only for bookkeeping (#164):
    waits for a chunk rather than for the tick. A store the drain creates takes `mtx_` for the
    insertion.
 4. **Without it**: the stores that are **due** sealed — 65 536 rows in blocks, or an oldest block
-   ten seconds old, or every block together over four million rows — oldest first, and below that
-   budget the tick takes **its share**: at most 64 stores, and after the first no more rows than a
-   quarter more than it drained, or 65 536 if it drained fewer. So stores that come due together are
-   spread over ticks rather than sealed in one: at four pipelining connections that had made every
-   other tick last about as long as the writers take to fill the pending queue. Each store's blocks
-   go into one segment, stamped with the tick's **seal epoch**; then one `syncfs()` on the data
-   directory (#160). A tick that seals nothing writes nothing.
+   ten seconds old — those due by rows first and then those due by age, each oldest first, and the
+   tick takes **its share**: at most 64 stores, and after the first no more rows than a quarter more
+   than it drained, or 65 536 if it drained fewer. So stores that come due together are spread over
+   ticks rather than sealed in one: at four pipelining connections that had made every other tick
+   last about as long as the writers take to fill the pending queue. While every block together is
+   over four million rows, the largest stores are sealed past both limits until the rest are under
+   it (#205): taken oldest first, thousands of one-row stores due by age had held the stores that
+   held the rows behind the limit, and the budget then sealed 2 977 of them in one tick. Each
+   store's blocks go into one segment, stamped with the tick's **seal epoch**; then one `syncfs()`
+   on the data directory (#160), which a thread of its own runs while the next tick drains, with
+   the claim its checkpoint will make frozen when the tick asks for it (#190, step 6). A tick that
+   seals nothing writes nothing.
 5. **Under `mtx_`**: each sealed store's blocks swapped for its segment in the query index in one
-   step, so a query sees one or the other and never both; the checkpoint appended (#159) — the eight
+   step, so a query sees one or the other and never both; the checkpoint appended (#159) - for a
+   seal whose sync ran in the background, by the next tick that finds it done, before that tick's
+   own WAL sync - the eight
    bytes it always was when nothing waits, and when blocks still wait, sixteen: where replay starts
    (the oldest record a waiting block needs) and the seal epoch the sync covered, because a position
    cannot say which segments are durable once a segment holds several drains; and the WAL files

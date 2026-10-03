@@ -137,8 +137,9 @@ TEST(SealPolicy, AtMostTheLimitATickOldestFirst) {
 }
 
 TEST(SealPolicy, OverTheBudgetTheOldestAreSealedPastTheLimit) {
-    // Neither due by rows nor by age, and together over the budget: sealed oldest first until they
-    // are under it, however many that is - memory is what the budget bounds.
+    // Neither due by rows nor by age, and together over the budget: sealed until they are under it,
+    // however many that is - memory is what the budget bounds. The largest first, and these are all
+    // one size, so the oldest.
     const auto now = Clock::now();
     constexpr size_t kEach = 30'000;
     const size_t stores = ob::Engine::kUnsealedRowsBudget / kEach * 3 / 2;
@@ -195,6 +196,81 @@ TEST(SealPolicy, AYoungerStoreThatFitsTheShareIsTakenPastAnOlderOneThatDoesNot) 
         {candidate(700'000, 3s, now), candidate(700'000, 2s, now), candidate(500'000, 1s, now)}, now,
         false, 1'000'000);
     ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 2}));
+}
+
+TEST(SealPolicy, AStoreDueByRowsIsNotHeldBehindTheLimitByStoresDueByAge) {
+    // Three limits' worth of one-row stores due by age, every one older than the store due by rows:
+    // taken oldest first, they had the limit tick after tick while the store that held the rows
+    // waited, and the unsealed rows grew to the budget (#205). The limit's rest still goes to them,
+    // oldest first.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 3 * ob::Engine::kSealsPerTick; ++i) {
+        c.push_back(candidate(1, ob::Engine::kSealAge + std::chrono::milliseconds(1000 - i), now));
+    }
+    const size_t hot = c.size();
+    c.push_back(candidate(300'000, 1s, now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 280'000);
+    ASSERT_EQ(picks.size(), ob::Engine::kSealsPerTick);
+    EXPECT_EQ(picks.back().index, hot) << "the store due by rows waited behind stores due by age";
+    EXPECT_EQ(picks.back().why, ob::Engine::SealReason::kRows);
+    for (size_t i = 0; i + 1 < picks.size(); ++i) {
+        EXPECT_EQ(picks[i].index, i);
+        EXPECT_EQ(picks[i].why, ob::Engine::SealReason::kAge);
+    }
+}
+
+TEST(SealPolicy, OverTheBudgetTheStoresHoldingTheRowsAreSealedNotTheOldest) {
+    // The shape measured at 30 MB/s on the m9g.xlarge: 2 976 one-row stores older than the store that
+    // held the rows, over the budget together. Oldest first, the budget sealed all 2 977 in one tick -
+    // nearly twenty-four thousand files to free one store's rows (#205). The largest first frees it
+    // with one seal, and the one-row stores wait for the per-tick limit like any due by age.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    constexpr size_t kOneRowStores = 2'976;
+    for (size_t i = 0; i < kOneRowStores; ++i) {
+        c.push_back(candidate(1, ob::Engine::kSealAge + std::chrono::milliseconds(5000 - i), now));
+    }
+    c.push_back(candidate(ob::Engine::kUnsealedRowsBudget, 2s, now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 280'000);
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{kOneRowStores}));
+    EXPECT_EQ(picks[0].why, ob::Engine::SealReason::kRows);
+}
+
+TEST(SealPolicy, OverTheBudgetAsFewStoresAreSealedAsBringTheRestUnderIt) {
+    // None due: eighty stores of 30 000 rows, older than forty of 60 000, 4.8 M together. The
+    // largest bring the rest under the budget with fourteen seals; oldest first took twenty-seven.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 80; ++i) c.push_back(candidate(30'000, std::chrono::milliseconds(5000 - i), now));
+    for (size_t i = 0; i < 40; ++i) c.push_back(candidate(60'000, std::chrono::milliseconds(1000 - i), now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 0);
+    std::vector<size_t> largest;
+    for (size_t i = 80; i < 94; ++i) largest.push_back(i);
+    ASSERT_EQ(indices(picks), largest);
+    for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kBudget);
+}
+
+TEST(SealPolicy, OverTheBudgetSealingStopsAtTheBudget) {
+    // A hundred and one stores of 40 000 rows, none due: one seal leaves exactly the budget, which
+    // is not over it.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 101; ++i) c.push_back(candidate(40'000, std::chrono::milliseconds(2000 - i), now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 0);
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{0}));
+}
+
+TEST(SealPolicy, AStoreIsTakenOnceWhateverMadeItDue) {
+    // Fifty stores due by rows and over the budget together, in a tick whose share holds them all:
+    // the budget takes ten, the share the other forty, and none twice.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 50; ++i) c.push_back(candidate(100'000, std::chrono::milliseconds(2000 - i), now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 4'000'000);
+    std::vector<size_t> all;
+    for (size_t i = 0; i < 50; ++i) all.push_back(i);
+    ASSERT_EQ(indices(picks), all);
 }
 
 TEST(SealPolicy, SealAllTakesEveryOne) {
