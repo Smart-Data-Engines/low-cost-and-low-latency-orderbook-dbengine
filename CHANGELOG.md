@@ -20,6 +20,9 @@ The first release. What it contains, by area:
   quantities and sequence numbers in Simple8b; sealed without the engine's lock and merged in the
   background into segments of up to 262 144 rows (#165).
 - TTL retention, and segments that survive a power cut (#160).
+- On a device slower than the ingest, writes admitted at the rate it takes rather than refused when
+  the pending queue stays full (`--write-admission`, #190), the seal's sync in the background, and
+  seals that bring what waits in memory under its budget a few large stores at a time (#205).
 - Backup into a server's `--backup-dir` (`BACKUP`, `ob_backup` for cron) and restore into an empty
   directory with `ob_restore`, which checks a backup whole before it writes anything (#34). No
   restore to a moment between two backups yet.

@@ -2445,6 +2445,72 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 205. Thousands of one-row stores due by age held the stores due by rows behind the per-tick seal limit, and the budget then sealed them all in one tick ✅ **P2**
+
+**Found reading where #190 step 6's worst batch at 30 MB/s came from** (pitfall 537): in every round
+the worst wait began 14-15 s into the ingest, in a tick whose WAL sync took 3.9-5.1 s. A scratch
+build of the measured tree with four of the tick's DEBUG lines at INFO - its phases, what it sealed,
+each background seal sync, the checkpoint after it - and `Dirty`, `Writeback` and the device's
+counters sampled every 100 ms said why, the same in both rounds
+(`evidence/2026-10-03-seal-policy/diag-step6/`):
+
+- the harness writes one row to each of 4 000 symbols and then the ingest to a few others, so a
+  handful of hot stores come due by rows every tick and 4 000 one-row stores come due by age
+  together, 8 s into the ingest;
+- `pick_seals()` took due stores oldest first, so from then on the one-row stores had the per-tick
+  limit - 64 stores, 64 rows a tick - while the hot stores waited behind it, and the unsealed rows
+  grew from 0.6 M to 3.9 M in 5.1 s;
+- at the budget, 4 M rows, it sealed oldest first past the limit until the rest were under it:
+  **2 977 stores in one tick**, 2 976 of them a row each, to free 573 156 rows - eight files a
+  segment, nearly 24 000. `Writeback` went to 121 MB, no tick finished for 4 s, the next WAL sync
+  took **4.3 s**, and a writer waited 3.1 s for room. The second round: 2 849 stores, a WAL sync of
+  4.0 s, a wait of 2.3 s.
+
+The same levels over 400 symbols on the same build: a worst batch of 0.90-1.03 s, from the start of
+the overload, and 19% more throughput - the one-row stores' files, not the rows.
+
+Both limits are about memory, and a store of a row holds none. Over the budget the largest stores
+are sealed now, oldest first among equals, until the rest are under it; within the per-tick limit
+the stores due by rows go before those due by age, each oldest first, so the age wave takes what
+the limit and the share leave. And the budget's INFO line says so whenever the unsealed rows are
+over it: it waited for a store sealed only because of the budget, and said nothing of the tick that
+sealed 2 977 stores, every one due by age.
+
+Measured against master (`c6201cf`, #190 step 6), Release builds of the fix's commit (`23cd1a5`; the
+budget's line and the rebase after it change no behaviour) and of master, the m9g.xlarge, XFS on EBS with the volume's writes capped as in #190, 8 rounds a side alternating
+(`evidence/2026-10-03-seal-policy/`):
+
+| m9g.xlarge, XFS, 8 rounds a side | master | #205 |
+|---|---|---|
+| no limit, 12 M levels: levels/s, batch max | 7.35-7.67 M, 11-16 ms | 7.59-7.73 M, 12-18 ms |
+| no limit, 90 M levels: levels/s | 6.43-7.12 M | **7.53-7.71 M** |
+| no limit, 90 M: batch p99, max | 0.69-1.72 ms, 270-348 ms | 0.35-0.51 ms, **13-21 ms** |
+| 60 MB/s, 12 M: levels/s, batch max | 1.112-1.151 M, 560-584 ms | 0.975-1.020 M, 559-588 ms |
+| 60 MB/s, 36 M: levels/s | 0.879-0.893 M | **0.926-0.939 M** |
+| 60 MB/s, 36 M: batch p99, max | 7.9-11.1 ms, 1.58-2.24 s | 2.4-3.3 ms, **0.43-0.59 s** |
+| 30 MB/s, 12 M: levels/s | 0.404-0.429 M | 0.436-0.484 M |
+| 30 MB/s, 12 M: batch p99, max | 12.5-27.7 ms, 2.65-4.69 s | 4.7-6.2 ms, **0.95-1.08 s** |
+| 30 MB/s, 36 M: levels/s | 0.446-0.463 M | 0.457-0.469 M |
+| 30 MB/s, 36 M: batch p99, max | 12.1-18.5 ms, 2.97-4.72 s | 5.3-9.4 ms, **0.92-1.13 s** |
+
+No write was refused in any round. Master's worst batch is the budget's tick in every round that
+reaches it - 14.2-15.8 s into the ingest at 30 MB/s, 12.5-13.2 s at 60 MB/s, 8.4-8.7 s with no
+limit, where it is the tick that begins admission; with the fix admission began in no round without
+a limit, and at 30 and 60 MB/s the worst batch is the start of the overload, 0.08-0.35 s after
+admission begins (`worst-batch.py` in the evidence).
+
+The 12 M-level run of #190's steps ends at 60 MB/s about 10.6 s in, before master's budget tick,
+so what master deferred is sealed after the measurement, and it reads 11% faster; the long runs are
+the steady state, where master pays the budget's tick and the fix does not. The mutation table -
+verdicts written before the run, nine killed by the tests named, the equivalent and the control
+survived - is in the evidence; writing its verdicts found two mutations nothing killed (a budget
+pass that goes on at the budget, and one that leaves what it took for the share to take again), and
+each got a test first.
+
+- Effort: S | Impact: a node of a few hot symbols and many quiet ones - the shape of a market -
+  stalled every writer at the budget's tick: 0.3 s on a device that keeps up, seconds on one that
+  does not
+
 ### 204. A planned `FAILOVER` lost acknowledged writes, and left the cluster without a primary for a whole lease TTL ✅ **P1**
 
 **Measured through the server** (`evidence/2026-10-03-handover-before/`, the m9g.xlarge at #201's
@@ -3055,6 +3121,13 @@ sustained, so the queue, still full, waits once more for the next tick: the 560-
 it is not the stall before the first slow tick: admission has paced writers since 0.85-0.96 s into
 the ingest, and at 14.0-15.4 s one tick's WAL sync takes 3.9-5.1 s. Step 5's worst batches at
 30 MB/s begin at the same point, 14.5-15.6 s. What makes that sync long is what is left of this item.
+
+**What made it long was the seal policy, #205**: at the budget it sealed 2 977 stores in one tick,
+nearly 24 000 files, because 4 000 one-row stores due by age had held the hot stores behind the
+per-tick limit. With #205 the worst batch at 30 MB/s is 0.92-1.13 s and at 60 MB/s 0.43-0.59 s, and
+in every round it is the start of the overload: the tick after the first slow one, whose rate -
+0.77-0.91 M rows/s at 30 MB/s, 1.46-1.83 M at 60 - is above what the device then sustains, so the
+queue fills again before the next tick drains it. That is what is left of this item.
 
 - Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
   with the WAL, and a slower device than this one would refuse them

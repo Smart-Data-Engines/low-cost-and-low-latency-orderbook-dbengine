@@ -4022,6 +4022,18 @@ Learned the hard way. Check here before debugging.
      aggregates name - so with no quantity aggregate beside it every bucket's VWAP was `NULL` (#44).
      The oracle property passed: its select list always held one. A unit test found it, and the
      property found it once it drew its list at random. Generate the request, not only the data.
+539. **A queue taken oldest first under a count limit gives the limit to the most numerous, not to
+     what costs.** The seal policy took due stores oldest first, 64 a tick, and both its limits are
+     about memory - so 4 000 one-row stores due by age had the limit, 64 rows a tick, while the hot
+     stores that held the rows waited, and at the budget it sealed the one-row stores too, oldest
+     first, 2 977 in one tick to free 573 156 rows (#205). When a limit bounds a resource, take the
+     candidates in the order of the resource they free, and test the shape of many cheap ones beside
+     a few expensive ones.
+540. **A run that ends before the deferred work is due credits the deferral.** At 60 MB/s the 12 M-level
+     ingest of #190's measurements ends about 10.6 s in, and master's budget tick comes at 12.5-13.2 s:
+     what master deferred was sealed after the measurement, and it read 11% faster than the fix that
+     sealed as it went. Three times the levels reversed it, 4-7% the other way and the worst batch a
+     quarter. Before reading a difference, check that both sides did all their work inside the window.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
