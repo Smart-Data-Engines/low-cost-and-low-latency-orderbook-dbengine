@@ -2445,6 +2445,22 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 206. A mesh peer whose every handshake was refused read as connected for the milliseconds of each attempt ✅ **P3**
+
+**Found by #205's battery on the m9g.xlarge**: `test_tls_cluster.py::test_a_peer_outside_the_name_allowlist_cannot_join_the_mesh`
+read node-1 connected to peers 3 and 1, where node-2 - peer 3 - is outside `--tls-peer-names` and
+every one of its handshakes was refused, as node-1's log said each time. Its `MM_PEERS` came at
+11:49:42.784, between `Connected to peer 3` at .783 and the refusal at .785. A dial sets
+`connected` when the TCP connect returns, and its handshake - TLS, then the mesh's own - comes after
+it. The paths that write to a peer always asked for `connected && handshake_done`; `MM_PEERS`,
+`ob_mm_peers_connected` and `ROLE`'s peer count asked for the first alone. One predicate now,
+`link_is_up()`, in all three, and a unit test installs a dialled link whose handshake is not done
+beside one that is up and reads the view, the count and the gauge - failing in all three before the
+change. #84 was the same shape for a connection the node accepted.
+
+- Effort: S | Impact: a refused peer, or one slow to finish its handshake, read as connected - in a
+  battery once, and to an operator reading `MM_PEERS` at the wrong moment
+
 ### 205. Thousands of one-row stores due by age held the stores due by rows behind the per-tick seal limit, and the budget then sealed them all in one tick ✅ **P2**
 
 **Found reading where #190 step 6's worst batch at 30 MB/s came from** (pitfall 537): in every round

@@ -1950,7 +1950,7 @@ off `STATUS` cannot be alerted on.
 | Metric | Read it as |
 |---|---|
 | `ob_replicas_tls_verified` vs `ob_replicas_connected` | equal means every replication link is mutually authenticated; a gap means a replica is connected in plaintext |
-| `ob_mm_peers_tls_verified` vs `ob_mm_peers_connected` | the same for the mesh; the peer count excludes inbound connections still in their handshake, which is what `MM_PEERS` lists too |
+| `ob_mm_peers_tls_verified` vs `ob_mm_peers_connected` | the same for the mesh; the peer count excludes every link still in its handshake - an inbound one is not yet a peer, an outbound one not yet up (#206) - which is what `MM_PEERS` lists too |
 
 Alert on the difference, not on either number: both drop to zero when a link goes away, and both
 are recomputed from the connection table on every pass of the loop that owns it, so neither can be
