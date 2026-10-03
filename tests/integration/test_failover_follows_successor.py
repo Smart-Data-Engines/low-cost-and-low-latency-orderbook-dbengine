@@ -25,8 +25,8 @@ import time
 
 import pytest
 
-from conftest import (ClusterManager, node_log_since, node_log_size, patience, raw_query, role_of,
-                      send_command, wait_for_role)
+from conftest import (ClusterManager, node_log_since, patience, raw_query, role_of, send_command,
+                      wait_for_role)
 
 pytestmark = pytest.mark.failover
 
@@ -137,9 +137,13 @@ def test_a_replica_of_an_unchanged_leader_does_not_restart_replication(cluster2)
     mgr = cluster2
     primary = primary_index(mgr, timeout=patience(60))
     replica = mgr.nodes[1 - primary]
-    offset = node_log_size(replica)
     write_rows(mgr.nodes[primary].tcp_port, "FOLLOW-STEADY", 5)
     time.sleep(patience(5))   # five monitor ticks
-    log = node_log_since(replica, offset)
+    # The whole log, from the node's start: a restart for the leader it already follows comes on
+    # the first REPLICA tick after it began following, which is during the cluster's own start - a
+    # log read from when this test began would not see it (the first version of this test did not).
+    log = node_log_since(replica, 0)
+    assert "starting as REPLICA" in log or "following" in log, (
+        "the replica's log never says it began following anyone, so this proves nothing")
     assert "this replica followed" not in log, (
         "the replica restarted replication for the leader it already follows:\n" + log[-2000:])

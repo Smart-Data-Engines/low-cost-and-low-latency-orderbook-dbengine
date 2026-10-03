@@ -2422,6 +2422,49 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 201. A primary that gave the role up before anyone took it never replicated again - after every planned `FAILOVER`, and after a lease lost to the coordinator - while `ROLE` named its successor ✅ **P0**
+
+**Found in the integration battery, under load.** Another session's test suite kept the
+development machine busy, etcd timed out (`etcdserver: request timed out`), and the session
+cluster's primary lost its lease: `lease lost, demoting to REPLICA`, then `no new primary is
+published yet — demoting anyway and starting no replication client`. The replica was elected ten
+seconds later, and the old primary - a REPLICA from then on - received nothing for the fifteen
+minutes left of the battery: not one `repl_client` line in its log. Every test after that which
+read the replica failed, eleven of them, the same eleven in two runs; on a quiet machine the
+battery passed.
+
+The cause is a transition with nobody to adopt. A primary that demotes reads the leader key for
+its successor, and when nobody has been elected it starts no replication client - correctly: not
+knowing where to point it is a reason to start none. But from then on its monitor loop takes the
+REPLICA branch, which records the leader's address when one appears and does **nothing else**, on
+purpose: an unchanged leader must not restart replication every second (#104), and adoption was
+left to the transitions - the STANDALONE branch and a lost CAS - which this node no longer makes.
+`ROLE` answers that recorded address, so the node said `REPLICA <successor>` while it replicated
+nothing.
+
+**A planned `FAILOVER` takes the same path every time.** The outgoing primary revokes its lease
+and demotes before the target can have noticed the empty key - the code says so - so it demotes to
+follow nobody, under a comment saying `monitor_loop()` would pick the target up on its next pass.
+Reproduced on master through the server (`tests/integration/test_failover_follows_successor.py`):
+20 rows written to the new primary, **0 of them on the old one 30 s later**, after a handover and
+after a lease lost with nobody elected; `ROLE` on it said `REPLICA 127.0.0.1:44769 1`, the
+successor's address, and its `STATUS` had no replication section.
+
+P0 by consequence: the cluster has one copy of every write made after the handover, reads from
+the old primary are stale for ever, and if the new primary fails the old one - its log the
+longer, its data the older - is the candidate an election finds.
+
+**Fixed.** The manager remembers whom its replication client follows (`following_`, written at
+every demotion and promotion), and the REPLICA branch follows the leader in the coordinator when it
+is not that one - once per leader change, so an unchanged leader still restarts nothing, and a
+leader that changed while a node was its replica's is the same case with a stale address instead of
+none. `primary_address_` could not serve: it is what `ROLE` answers, recorded every tick whether
+anything follows it or not.
+
+- Effort: S | Impact: after every planned failover, and after a coordinator outage that cost the
+  primary its lease, the old primary is a replica that replicates nothing - one copy of every write
+  from then on, stale reads, and the stale node next in line
+
 ### 199. A comparison in a `WHERE` answered a different question: `=` was `>=`, `>` and `<` kept their bound, and a second condition on a column replaced the first ✅ **P1**
 
 **Found reading the parser for #44.** The grammar documented `BETWEEN` alone, and the parser
