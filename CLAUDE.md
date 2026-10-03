@@ -4010,6 +4010,13 @@ Learned the hard way. Check here before debugging.
      in between went to no replica (#204: up to 4308 lost). When a wait exists for a state, ask
      whether the party that knows the state can end it and say so - a statement written once it is
      true, at a term, with what the waiter needs to check.
+537. **An explanation of a worst case carried over from the previous step was measured on another
+     tree.** Step 5 of #190 read its node logs and said where its worst batches came from; step 6,
+     measured the same way, said its worst batch at 30 MB/s "does not move: it is the stall before
+     the first slow tick" without reading its own - and in every one of its rounds admission had
+     paced writers since the first second, and the worst wait began 14 s later, in a tick whose WAL
+     sync took 4-5 s. The numbers were the step's; the sentence beside them was not. Derive the
+     explanation from the run that produced the numbers, with a script kept beside its logs.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

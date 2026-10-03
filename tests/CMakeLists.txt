@@ -901,6 +901,11 @@ target_link_libraries(test_shard_coordinator
 )
 gtest_discover_tests(test_shard_coordinator PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
+# ── The seal's sync in the background (#190) ─────────────────────────────────
+add_executable(test_seal_sync_background test_seal_sync_background.cpp)
+target_link_libraries(test_seal_sync_background PRIVATE orderbook_engine GTest::gtest_main)
+gtest_discover_tests(test_seal_sync_background PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── A symbol moved to another shard with its rows (#196) ──────────────────────
 add_executable(test_symbol_migration test_symbol_migration.cpp)
 target_link_libraries(test_symbol_migration
