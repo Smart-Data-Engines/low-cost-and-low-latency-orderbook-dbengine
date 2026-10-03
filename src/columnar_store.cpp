@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <bit>
 #include <cerrno>
@@ -392,6 +393,55 @@ void write_file_checked(const std::string& path, const void* data, size_t bytes)
 
 }  // namespace
 
+size_t LevelSet::count(const Bits& bits) {
+    size_t n = 0;
+    for (const uint64_t w : bits) n += static_cast<size_t>(__builtin_popcountll(w));
+    return n;
+}
+
+std::shared_ptr<const LevelSet> LevelSet::from_columns(const std::vector<uint8_t>& sides,
+                                                       const std::vector<uint16_t>& levels) {
+    auto set = std::make_shared<LevelSet>();
+    const size_t n = std::min(sides.size(), levels.size());
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t level = levels[i];
+        if (level >= kLevels) return nullptr;
+        Bits* bits = sides[i] == SIDE_BID ? &set->bid : sides[i] == SIDE_ASK ? &set->ask : nullptr;
+        if (bits == nullptr) return nullptr;
+        (*bits)[level / 64] |= uint64_t{1} << (level % 64);
+    }
+    return set;
+}
+
+std::string LevelSet::to_hex(const Bits& bits) {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string out(kLevels / 4, '0');
+    for (size_t d = 0; d < kLevels / 4; ++d) {
+        const unsigned nibble = static_cast<unsigned>((bits[(4 * d) / 64] >> ((4 * d) % 64)) & 0xF);
+        out[kLevels / 4 - 1 - d] = kDigits[nibble];
+    }
+    return out;
+}
+
+bool LevelSet::from_hex(const std::string& hex, Bits& bits) {
+    static_assert(kLevels % 4 == 0, "a digit is four levels");
+    if (hex.size() != kLevels / 4) return false;
+    bits.fill(0);
+    for (size_t d = 0; d < kLevels / 4; ++d) {
+        const char c = hex[kLevels / 4 - 1 - d];
+        uint64_t nibble = 0;
+        if (c >= '0' && c <= '9') {
+            nibble = static_cast<uint64_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            nibble = static_cast<uint64_t>(c - 'a' + 10);
+        } else {
+            return false;
+        }
+        bits[(4 * d) / 64] |= nibble << ((4 * d) % 64);
+    }
+    return true;
+}
+
 void ColumnarStore::write_meta_json(const std::string& dir, const SegmentMeta& meta,
                                     const std::vector<SegmentInput>* inputs) const {
     const std::string content = meta_json(meta, inputs);
@@ -427,6 +477,12 @@ std::string ColumnarStore::meta_json(const SegmentMeta& meta,
         f << ",\"own_origin\":" << meta.own_origin
           << ",\"own_max_sequence\":" << meta.own_max_sequence;
         if (meta.has_received_rows) f << ",\"received_rows\":true";
+    }
+    // #47's, in keys no older reader searches for either; absent is unknown, and a reader then
+    // reads the segment whatever the book already holds.
+    if (meta.levels != nullptr) {
+        f << ",\"bid_levels\":\"" << LevelSet::to_hex(meta.levels->bid) << "\""
+          << ",\"ask_levels\":\"" << LevelSet::to_hex(meta.levels->ask) << "\"";
     }
     if (inputs != nullptr && !inputs->empty()) {
         f << ",\"compacted_from\":[";
@@ -531,6 +587,17 @@ bool ColumnarStore::parse_meta_json(const std::string& path, SegmentMeta& out,
     out.last_row_ts_ns     = find_uint64("last_row_ts_ns").value_or(out.end_ts_ns);
     // Absent unless a merge wrote the segment (#165 part 2b).
     out.merge_level = static_cast<uint32_t>(extract_uint64("merge_level"));
+    // Absent before #47, and then unknown: the book at an instant reads such a segment always. A
+    // pair that does not parse is unknown too, never an empty set - an empty set would skip it.
+    {
+        auto set = std::make_shared<LevelSet>();
+        if (LevelSet::from_hex(extract_string("bid_levels"), set->bid) &&
+            LevelSet::from_hex(extract_string("ask_levels"), set->ask)) {
+            out.levels = std::move(set);
+        } else {
+            out.levels = nullptr;
+        }
+    }
     if (inputs != nullptr) {
         inputs->clear();
         const std::string list = "\"compacted_from\":[";
@@ -1160,6 +1227,17 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     meta.symbol      = symbol_;
     meta.exchange    = exchange_;
     meta.dir_path    = dir;
+    // The levels its rows are of (#47), from the columns just written - a seal's, a rollover's and a
+    // merge's alike, since all three write through here.
+    meta.levels = LevelSet::from_columns(side_buf_, level_buf_);
+    if (meta.levels != nullptr) {
+        OB_LOG_DEBUG("columnar", "Segment %s holds %zu bid and %zu ask level(s)", dir.c_str(),
+                     LevelSet::count(meta.levels->bid), LevelSet::count(meta.levels->ask));
+    } else {
+        OB_LOG_DEBUG("columnar", "Segment %s has a row no level set can hold; its levels are "
+                                 "unknown, and the book at an instant reads it always",
+                     dir.c_str());
+    }
     meta.wal_identity    = wal_identity_;
     meta.wal_file_index  = wal_file_index_;
     meta.wal_byte_offset = wal_byte_offset_;
@@ -1612,6 +1690,143 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
         }
     }
     return cost;
+}
+
+ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_view symbol,
+                                                      std::string_view exchange) const {
+    BookAt out;
+    // What a scan of [0, at] would read, in the order it would deliver it: the segments by
+    // `segment_order_less`, then the blocks. That order is each candidate's rank, which decides a
+    // tie on the timestamp as the scan's delivery decided it.
+    std::vector<SegmentMeta> segments;
+    std::vector<std::shared_ptr<const RowBlock>> blocks;
+    std::shared_ptr<const void> reading;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        reading = reader_generation_;
+        const auto it = by_symbol_.find(index_key(symbol, exchange));
+        if (it == by_symbol_.end()) return out;
+        for (const auto& b : it->second.blocks) {
+            if (b->min_ts_ns <= at) blocks.push_back(b);
+        }
+        for (const WidthTier& tier : it->second.tiers) {
+            const size_t before = segments.size();
+            for (const SegmentMeta& m : tier.segments) {
+                if (m.start_ts_ns > at) break;   // sorted by start
+                segments.push_back(m);
+            }
+            if (before != 0 && before != segments.size()) {
+                std::inplace_merge(segments.begin(),
+                                   segments.begin() + static_cast<std::ptrdiff_t>(before),
+                                   segments.end(), segment_order_less);
+            }
+        }
+    }
+
+    struct Candidate {
+        uint64_t latest;   // no row of it is later than this, nor than `at`
+        size_t rank;
+        const SegmentMeta* segment;
+        const RowBlock* block;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(segments.size() + blocks.size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        candidates.push_back({std::min(segments[i].end_ts_ns, at), i, &segments[i], nullptr});
+    }
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        candidates.push_back({std::min(blocks[i]->max_ts_ns, at), segments.size() + i, nullptr,
+                              blocks[i].get()});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        return a.latest != b.latest ? a.latest > b.latest : a.rank > b.rank;
+    });
+
+    // The row each level holds so far, and how to compare: later timestamp, then later rank, then
+    // later in its candidate. A flat array for the levels a LevelSet can name - the ones a skip
+    // asks about - and a map for any other, which no LevelSet holds and so no skip asks about.
+    struct Best {
+        bool found{false};
+        uint64_t ts{0};
+        size_t rank{0};
+        size_t index{0};
+        SnapshotRow row{};
+    };
+    constexpr size_t kLevels = LevelSet::kLevels;
+    std::vector<Best> flat(2 * kLevels);
+    std::map<uint32_t, Best> other;
+    const auto slot = [&](const SnapshotRow& row) -> Best& {
+        if ((row.side == SIDE_BID || row.side == SIDE_ASK) && row.level_index < kLevels) {
+            return flat[static_cast<size_t>(row.side) * kLevels + row.level_index];
+        }
+        return other[(static_cast<uint32_t>(row.side) << 16) | static_cast<uint32_t>(row.level_index)];
+    };
+    // Whether a row of this candidate at its latest could still win a level it has.
+    const auto beats = [](const Best& b, const Candidate& c) {
+        return !b.found || b.ts < c.latest || (b.ts == c.latest && b.rank < c.rank);
+    };
+    const auto can_change = [&](const Candidate& c) {
+        const LevelSet& set = *c.segment->levels;
+        for (size_t side = 0; side < 2; ++side) {
+            const LevelSet::Bits& bits = set.side(side);
+            for (size_t w = 0; w < LevelSet::kWords; ++w) {
+                for (uint64_t x = bits[w]; x != 0; x &= x - 1) {
+                    const size_t level = w * 64 + static_cast<size_t>(__builtin_ctzll(x));
+                    if (beats(flat[side * kLevels + level], c)) return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    for (const Candidate& c : candidates) {
+        // Skipped only on what its meta.json proves: its levels, and a range that is its rows'
+        // (#166) - a segment written before that recorded its last row's time as its end.
+        if (c.segment != nullptr && c.segment->levels != nullptr && c.segment->time_range_is_rows &&
+            !can_change(c)) {
+            ++out.segments_skipped;
+            continue;
+        }
+        size_t index = 0;
+        const auto consider = [&](const SnapshotRow& row) {
+            const size_t i = index++;
+            if (row.timestamp_ns > at) return;
+            Best& b = slot(row);
+            if (!b.found || row.timestamp_ns > b.ts ||
+                (row.timestamp_ns == b.ts && (c.rank > b.rank || (c.rank == b.rank && i > b.index)))) {
+                b = Best{true, row.timestamp_ns, c.rank, i, row};
+            }
+        };
+        if (c.segment != nullptr) {
+            read_segment_rows(*c.segment, ColumnSet::all(), 0, at, consider, ReadMode::kQuery);
+            ++out.segments_read;
+        } else {
+            for (const SnapshotRow& r : c.block->rows) consider(r);
+            ++out.blocks;
+        }
+    }
+
+    // In the order the book was always answered in: by (side << 16) | level.
+    for (size_t side = 0; side < 2; ++side) {
+        const uint32_t base = static_cast<uint32_t>(side) << 16;
+        // The other levels of this side - past kLevels - come after its flat ones, in order.
+        for (size_t level = 0; level < kLevels; ++level) {
+            const Best& b = flat[side * kLevels + level];
+            if (b.found) out.rows.push_back(b.row);
+        }
+        for (auto it = other.lower_bound(base); it != other.end() && (it->first >> 16) == side; ++it) {
+            out.rows.push_back(it->second.row);
+        }
+    }
+    for (auto it = other.lower_bound(2u << 16); it != other.end(); ++it) out.rows.push_back(it->second.row);
+
+    OB_LOG_DEBUG("columnar", "book of %.*s.%.*s at %llu: %zu level(s); %zu segment(s) read, %zu "
+                             "skipped, %zu block(s)",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(at), out.rows.size(), out.segments_read,
+                 out.segments_skipped, out.blocks);
+    return out;
 }
 
 // ── open_existing ─────────────────────────────────────────────────────────────
