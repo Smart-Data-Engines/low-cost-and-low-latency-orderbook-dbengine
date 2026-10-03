@@ -34,6 +34,8 @@ AdmissionController::Config config() {
     c.raise = 1.1;
     c.idle_ticks_to_end = 10;
     c.floor_rows_per_s = 1000.0;
+    // These tests pace at a rate they name; where admission begins is the engine's default's, below.
+    c.begin_at = 1.0;
     return c;
 }
 
@@ -56,7 +58,7 @@ TEST(Admission, ATickThatTookNoRowsIsNotSlowHoweverLong) {
     EXPECT_FALSE(a.active());
 }
 
-TEST(Admission, ASlowTickBeginsAtTheRateItMeasured) {
+TEST(Admission, ASlowTickBeginsAtItsShareOfTheRateItMeasured) {
     AdmissionController a(config());
     EXPECT_EQ(a.on_tick(600'000, seconds(2)), AdmissionController::Change::Began);
     EXPECT_TRUE(a.active());
@@ -65,6 +67,33 @@ TEST(Admission, ASlowTickBeginsAtTheRateItMeasured) {
     EXPECT_EQ(m.rows, 600'000u);
     EXPECT_EQ(m.took, seconds(2));
     EXPECT_DOUBLE_EQ(m.rows_per_s, 300'000.0);
+}
+
+TEST(Admission, TheEngineBeginsAtHalfWhatTheFirstSlowTickMeasured) {
+    // That tick's rate leaves out the segments it sealed, whose sync runs behind it: on the
+    // m9g.xlarge it measured 1.5-2 times what the device then sustained (#190, step 7).
+    AdmissionController a(AdmissionController::for_interval(milliseconds(100)));
+    EXPECT_EQ(a.on_tick(600'000, seconds(2)), AdmissionController::Change::Began);
+    EXPECT_DOUBLE_EQ(a.rate(), 150'000.0);
+    EXPECT_DOUBLE_EQ(a.last_slow_tick().rows_per_s, 300'000.0) << "the measurement is what it measured";
+}
+
+TEST(Admission, FromHalfTheRateClimbsWhileTicksFitAndFallsToASlowerMeasurement) {
+    AdmissionController a(AdmissionController::for_interval(milliseconds(100)));
+    a.on_tick(1'000'000, seconds(1));
+    ASSERT_DOUBLE_EQ(a.rate(), 500'000.0);
+    a.on_tick(40'000, milliseconds(60));   // fits its interval: the device had room
+    EXPECT_DOUBLE_EQ(a.rate(), 550'000.0);
+    a.on_tick(400'000, seconds(1));         // slow, and slower than the rate
+    EXPECT_DOUBLE_EQ(a.rate(), 400'000.0);
+    a.on_tick(900'000, seconds(1));         // slow, and faster: a slow tick never raises it
+    EXPECT_DOUBLE_EQ(a.rate(), 400'000.0);
+}
+
+TEST(Admission, HalfOfASlowMeasurementIsHeldUpByTheFloor) {
+    AdmissionController a(AdmissionController::for_interval(milliseconds(100)));
+    a.on_tick(1'500, seconds(1));   // 1 500 rows a second, half of it under the floor
+    EXPECT_DOUBLE_EQ(a.rate(), 1000.0);
 }
 
 TEST(Admission, AnotherSlowTickLowersTheRateAndNeverRaisesIt) {
