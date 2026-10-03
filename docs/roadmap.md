@@ -1218,7 +1218,9 @@ and getting data into their existing Python stack without a copy.
   alternating (`scripts/measure_time_buckets.py`): **44-51 ms of the server's CPU a query and
   8.6 KB of reply**, where `SELECT *` of the same rows with the bars computed by the client took
   293-312 ms of the server's CPU, 3.44-3.52 s at the client (p50) and 42.6 MB. Asking the map only
-  when a row leaves the last bucket took the query from 65-67 to 44 ms.
+  when a row leaves the last bucket took the query from 65-67 to 44 ms. On the m9g.xlarge (ARM64),
+  the same run: **10-11 ms** of the server's CPU against 92-94 ms, and 10.6-10.7 ms at the client
+  against 0.94-0.95 s. Raw rounds in `evidence/2026-10-03-time-buckets/`, with SHA-256 sums.
   Steps 2 (series of the book: open, high, low, close and time-weighted values of the best bid and
   ask) and 3 (rolling windows) are not built.
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
