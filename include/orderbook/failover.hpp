@@ -202,6 +202,15 @@ private:
     /// revoking, the guard clears on unwind and the next pass demotes, so the net is still there.
     std::atomic<bool>       handing_over_{false};
     std::string             primary_address_;
+
+    /// The primary this node's replication client was started towards, empty when it follows
+    /// nobody - a primary, or a node that demoted before anyone was elected (#201). Written at
+    /// every `demote_to_replica()` and promotion, under `mtx_`, through `note_following()`; read by
+    /// the REPLICA branch of `monitor_tick()`, which follows the leader in the coordinator when it
+    /// is not this one. `primary_address_` cannot stand in for it: that is what `ROLE` answers,
+    /// recorded from the coordinator on every tick whether or not anything follows it - which is how
+    /// a node that replicated nothing named its successor.
+    std::string             following_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 
     /// When this node last *confirmed* that the leader key names it.
@@ -305,21 +314,24 @@ private:
     /// Must be called without `mtx_` held: it calls `reconcile_epoch()` and the role-transition
     /// handler, both of which take locks of their own.
     ///
-    /// **Adoption happens once per leader change, and that comes from where this is called rather
-    /// than from any remembered address** (roadmap #104). This is reached only from transitions -
-    /// the STANDALONE branch and `handle_primary_lease_lost()` - and it stores `REPLICA` into
-    /// `role_` before returning, so the next pass of `monitor_loop()` takes the REPLICA branch,
-    /// which updates `primary_address_` and deliberately does **not** call `demote_to_replica()`.
-    /// A replica watching an unchanged leader therefore restarts nothing. There used to be an
-    /// `adopted_primary_address_` field whose docstring claimed to provide this; it was assigned at
-    /// one site and read at none, so it provided nothing. `FieldUsage.NoMemberIsWrittenAndNeverRead`
-    /// is what makes the seventh instance of that shape fail rather than be noticed by accident.
+    /// **Adoption happens once per leader change** (roadmap #104): this is reached from the
+    /// STANDALONE branch and after a lost CAS, and it stores `REPLICA` into `role_` before
+    /// returning, so the next pass of `monitor_loop()` takes the REPLICA branch - which restarts
+    /// replication only for a leader that is not the one in `following_`. A replica watching an
+    /// unchanged leader therefore restarts nothing. That branch restarted nothing in any case until
+    /// #201, and a primary that demoted before anyone was elected, which follows nobody, never
+    /// followed the node elected after it. (There used to be an `adopted_primary_address_` field
+    /// assigned at one site and read at none; `following_` is read by that branch, and
+    /// `FieldUsage.NoMemberIsWrittenAndNeverRead` is what keeps that so.)
     ///
     /// Exists because losing a race is not a role. `attempt_promotion()` used to return on a lost
     /// CAS without touching `role_`, which left a node at STANDALONE — a state `monitor_loop()`
     /// had no branch for, so the node never campaigned, never replicated, and never took over
     /// (roadmap #73).
     bool adopt_leader_if_present();
+
+    /// Record what this node's replication client now follows (#201); see `following_`.
+    void note_following(const std::string& address);
 
     /// Whether this node is currently holding a leader key it won and could not act on — the
     /// state #130 is about. Loud once and then quiet, because the condition repeats at the tick
