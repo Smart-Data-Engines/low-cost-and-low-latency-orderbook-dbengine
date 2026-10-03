@@ -1004,16 +1004,24 @@ TEST_F(EtcdTestFixture, APrimaryDemotedBeforeAnElectionFollowsTheWinner) {
     ASSERT_TRUE(wait_for_role(fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
     EXPECT_TRUE(engine_b->stats().is_replica) << "B does not follow A from its start";
 
-    // A's lease goes, and the leader key with it: A demotes with nobody elected yet.
+    // A loses the role with nobody elected to follow: the leader key is taken from it - put again
+    // naming a holder that publishes no address, under a lease of the observer's own - and then
+    // goes, with that lease. A steps down on the first and has no successor to follow; B is
+    // elected on the second.
     {
         auto observer = make_client("observer_201");
         ASSERT_TRUE(observer->connect());
-        const auto state = observer->get_cluster_state();
-        ASSERT_TRUE(state.has_value() && state->lease_id != 0);
-        ASSERT_TRUE(observer->revoke_lease(state->lease_id));
+        const int64_t lease = observer->grant_lease();
+        ASSERT_NE(lease, 0);
+        ob::ClusterState nobody{};
+        nobody.leader_node_id = "node_gone";
+        nobody.epoch = fm_a.epoch();
+        ASSERT_TRUE(observer->put(ob::coordinator_leader_key(ETCD_KEY_PREFIX), nobody.to_json(), lease));
+        ASSERT_TRUE(wait_for_role(fm_a, ob::NodeRole::REPLICA, std::chrono::seconds(TEST_LEASE_TTL + 5)));
+        EXPECT_FALSE(engine_a->stats().is_replica) << "A had a successor to follow after all";
+        ASSERT_TRUE(observer->revoke_lease(lease));
         observer->disconnect();
     }
-    ASSERT_TRUE(wait_for_role(fm_a, ob::NodeRole::REPLICA, std::chrono::seconds(TEST_LEASE_TTL + 5)));
     ASSERT_TRUE(wait_for_role(fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(TEST_LEASE_TTL + 15)));
 
     // A follows B: its engine has a replication client, towards the address B published.
