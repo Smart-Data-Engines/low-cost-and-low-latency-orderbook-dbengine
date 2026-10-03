@@ -96,6 +96,41 @@ TEST(Admission, HalfOfASlowMeasurementIsHeldUpByTheFloor) {
     EXPECT_DOUBLE_EQ(a.rate(), 1000.0);
 }
 
+TEST(Admission, ASlowSyncBeginsAdmissionBeforeItsTickEnds) {
+    // Before the drain lets the writers that waited for room go (#190, step 8): the tick's own
+    // end, which follows, does not begin it a second time or raise what the sync set.
+    AdmissionController a(AdmissionController::for_interval(milliseconds(100)));
+    EXPECT_EQ(a.on_slow_sync(600'000, milliseconds(750)), AdmissionController::Change::Began);
+    EXPECT_TRUE(a.active());
+    EXPECT_DOUBLE_EQ(a.rate(), 400'000.0);   // half of 800 000 rows a second
+    EXPECT_EQ(a.last_slow_tick().took, milliseconds(750));
+    EXPECT_EQ(a.on_tick(600'000, milliseconds(783)), AdmissionController::Change::None);
+    EXPECT_DOUBLE_EQ(a.rate(), 400'000.0);
+}
+
+TEST(Admission, ASyncThatFitsSaysNothing) {
+    AdmissionController a(AdmissionController::for_interval(milliseconds(100)));
+    EXPECT_EQ(a.on_slow_sync(600'000, milliseconds(150)), AdmissionController::Change::None);
+    EXPECT_FALSE(a.active());
+    EXPECT_EQ(a.on_slow_sync(0, seconds(3)), AdmissionController::Change::None)
+        << "a sync of no rows is not the device behind";
+    EXPECT_FALSE(a.active());
+    // And the tick it was in, slow for what came after its sync, still begins it.
+    EXPECT_EQ(a.on_tick(600'000, seconds(2)), AdmissionController::Change::Began);
+}
+
+TEST(Admission, ASlowSyncLowersARateItFindsHigherAndOffIgnoresIt) {
+    AdmissionController a(AdmissionController::for_interval(milliseconds(100)));
+    a.on_tick(2'000'000, seconds(1));   // begins at 1 M rows a second
+    a.on_slow_sync(300'000, seconds(1));
+    EXPECT_DOUBLE_EQ(a.rate(), 300'000.0);
+
+    AdmissionController b(AdmissionController::for_interval(milliseconds(100)));
+    b.set_enabled(false);
+    EXPECT_EQ(b.on_slow_sync(600'000, seconds(2)), AdmissionController::Change::None);
+    EXPECT_FALSE(b.active());
+}
+
 TEST(Admission, AnotherSlowTickLowersTheRateAndNeverRaisesIt) {
     AdmissionController a(config());
     a.on_tick(1'000'000, seconds(1));

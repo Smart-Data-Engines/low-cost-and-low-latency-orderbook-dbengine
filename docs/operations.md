@@ -753,7 +753,8 @@ integration test holds the names against what a running node serves.
   are: the flush cannot make progress.
 - `ob_writer_admission_rate`, `ob_writer_admission_delays_total`,
   `ob_writer_admission_delay_us_total` — **writes faster than the device** (#190). A flush tick
-  that took twice its interval or longer says how many rows the device took in how long; from then
+  that took twice its interval or longer - or its WAL sync alone, which says so before the tick's
+  drain lets waiting writers go - says how many rows the device took in how long; from then
   on each batch of writes waits, after it is written and outside the engine's lock, for its rows'
   time at a rate, and the gauge is that rate in rows a second. It begins at half what that tick
   measured, because the tick counts the WAL's share of the device and not the segments it sealed,

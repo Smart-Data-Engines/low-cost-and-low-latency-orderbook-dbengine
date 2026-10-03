@@ -22,31 +22,43 @@ void AdmissionController::set_enabled(bool enabled) {
     idle_ticks_ = 0;
 }
 
+bool AdmissionController::slow(uint64_t rows, Clock::duration took) const {
+    return rows > 0 && Seconds(took) >= Seconds(config_.interval) * config_.slow_factor;
+}
+
+AdmissionController::Change AdmissionController::slow_locked(uint64_t rows, Clock::duration took) {
+    // What the device took: the rows a tick took from the queue, in the time it took to sync them -
+    // and, at the tick's end, to drain and seal them too. The floor keeps one bad tick from
+    // stopping writes.
+    const double measured =
+        std::max(config_.floor_rows_per_s, static_cast<double>(rows) / Seconds(took).count());
+    last_slow_ = Measurement{rows, took, measured};
+    idle_ticks_ = 0;
+    delayed_since_tick_ = 0;
+    if (!active_.load(std::memory_order_relaxed)) {
+        // Below what the tick measured, which leaves out the segments it sealed (see the class).
+        rate_ = std::max(config_.floor_rows_per_s, measured * config_.begin_at);
+        next_free_ = Clock::time_point{};
+        delayed_batches_ = 0;
+        delayed_total_ = Clock::duration::zero();
+        active_.store(true, std::memory_order_relaxed);
+        return Change::Began;
+    }
+    rate_ = std::min(rate_, measured);
+    return Change::None;
+}
+
+AdmissionController::Change AdmissionController::on_slow_sync(uint64_t rows, Clock::duration took) {
+    if (!enabled() || !slow(rows, took)) return Change::None;
+    std::lock_guard<std::mutex> lock(mtx_);
+    return slow_locked(rows, took);
+}
+
 AdmissionController::Change AdmissionController::on_tick(uint64_t rows, Clock::duration took) {
     if (!enabled()) return Change::None;
     std::lock_guard<std::mutex> lock(mtx_);
 
-    const bool slow = rows > 0 && Seconds(took) >= Seconds(config_.interval) * config_.slow_factor;
-    if (slow) {
-        // What the device took, this tick: the rows it drained, in the time it took to sync, drain
-        // and seal them. The floor keeps one bad tick from stopping writes.
-        const double measured =
-            std::max(config_.floor_rows_per_s, static_cast<double>(rows) / Seconds(took).count());
-        last_slow_ = Measurement{rows, took, measured};
-        idle_ticks_ = 0;
-        delayed_since_tick_ = 0;
-        if (!active_.load(std::memory_order_relaxed)) {
-            // Below what the tick measured, which leaves out the segments it sealed (see the class).
-            rate_ = std::max(config_.floor_rows_per_s, measured * config_.begin_at);
-            next_free_ = Clock::time_point{};
-            delayed_batches_ = 0;
-            delayed_total_ = Clock::duration::zero();
-            active_.store(true, std::memory_order_relaxed);
-            return Change::Began;
-        }
-        rate_ = std::min(rate_, measured);
-        return Change::None;
-    }
+    if (slow(rows, took)) return slow_locked(rows, took);
     if (!active_.load(std::memory_order_relaxed)) return Change::None;
 
     // Not slow: the device had room for more than it was given, so give it more.
