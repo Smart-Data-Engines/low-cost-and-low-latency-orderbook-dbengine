@@ -4263,7 +4263,9 @@ void Engine::receive_seal_sync(bool wait) {
     TimedLock timed(mtx_, "flush tick: the checkpoint a background sync was for");
     if (err != 0) {
         registry_.increment_counter("ob_segment_sync_errors_total");
-        freeze_checkpoints(std::string("A background seal sync failed (") + std::strerror(err) + ")");
+        // Worded as the tick's own sync says it: the same failure, and an operator's alert on that
+        // line should not depend on which thread ran the sync.
+        freeze_checkpoints(std::string("A flush's segment sync failed (") + std::strerror(err) + ")");
         return;
     }
     // What this node holds before the checkpoint, as the synchronous path writes it (#179).
