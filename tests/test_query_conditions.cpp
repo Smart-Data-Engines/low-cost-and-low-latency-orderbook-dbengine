@@ -286,6 +286,19 @@ TEST(QueryConditions, SideAndLevelNarrowRowsAsTheOtherColumnsDo) {
     EXPECT_TRUE(f.prices("side > 255").empty());
 }
 
+TEST(QueryConditions, ANarrowedSelectStillReadsTheColumnsItsConditionsAreOn) {
+    // `SELECT price` answers one column and its side condition needs another: a scan that read only
+    // what it answers would see every row's side as 0 and keep none of the asks.
+    Fixture f;
+    f.segment({row_at(kBase + 1000, 100, kBid, 0), row_at(kBase + 1000, 99, kBid, 1),
+               row_at(kBase + 1000, 101, kAsk, 0), row_at(kBase + 1000, 102, kAsk, 1)});
+    Prices got;
+    const std::string err = f.engine.execute("SELECT price FROM 'CND'.'EX' WHERE side = 1 AND level = 1",
+                                             [&](const ob::QueryResult& r) { got.push_back(r.price); });
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(got, (Prices{102}));
+}
+
 TEST(QueryConditions, ASnapshotKeepsTheSideAndTheLevelsItIsAskedFor) {
     Fixture f;
     f.segment({row_at(kBase + 1000, 100, kBid, 0), row_at(kBase + 1000, 99, kBid, 1),
