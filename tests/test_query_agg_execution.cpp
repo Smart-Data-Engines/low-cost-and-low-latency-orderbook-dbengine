@@ -434,6 +434,7 @@ TEST(QueryAggSides, OneQueryAnswersBothSidesAndTheSpread) {
     EXPECT_EQ(result.agg_values[1].name, "VWAP(ask)");
     EXPECT_EQ(result.agg_values[2].name, "SPREAD(*)");
     EXPECT_EQ(result.agg_values[0].value, (100LL * 5 + 99LL * 6) * 1'000'000LL / 11);
+    EXPECT_EQ(result.agg_values[1].value, (101LL * 7 + 102LL * 8) * 1'000'000LL / 15);
     EXPECT_EQ(result.agg_values[2].value, 1);
 }
 
