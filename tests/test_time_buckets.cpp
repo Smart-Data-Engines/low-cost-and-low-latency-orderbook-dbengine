@@ -239,6 +239,17 @@ TEST(TimeBuckets, EachBucketAnswersItsOwnRows) {
     EXPECT_EQ(b.at(kBase + 10 * kSec), (std::vector<int64_t>{1, 109, 109, 10, 10, 10, 109'000'000, 109'000'000}));
 }
 
+TEST(TimeBuckets, ARowWithinOneIntervalOfTheEpochIsInTheFirstBucket) {
+    // Before any row has a bucket the last one is none, though its start reads 0 - and a row within
+    // one interval of the epoch is that far from 0: asked about first, it must find no bucket.
+    Fixture f;
+    f.segment({row(1 * kSec, 100, 1), row(2 * kSec, 101, 1), row(70 * kSec, 102, 1)});
+    const auto b = f.buckets("SELECT COUNT(*), LAST(price) FROM 'BK'.'EX' GROUP BY TIME_BUCKET(1m)");
+    ASSERT_EQ(b.size(), 2u);
+    EXPECT_EQ(b.at(0), (std::vector<int64_t>{2, 101}));
+    EXPECT_EQ(b.at(60 * kSec), (std::vector<int64_t>{1, 102}));
+}
+
 TEST(TimeBuckets, TheAnswerSaysEachColumnsScaleBeforeAnyRow) {
     Fixture f;
     f.segment({row(kBase, 100, 1)});

@@ -20,6 +20,7 @@ column      = identifier | agg_call ;
 agg_call    = identifier "(" [ agg_args ] ")" ;
 agg_args    = side | "*" | identifier | [ side "," ] integer [ "," integer ] ;
 side        = "bid" | "ask" ;
+series      = "bid" | "ask" | "mid" | "spread" ;   (* of OPEN, HIGH, LOW, CLOSE, TWAP *)
 
 symbol_ref  = "'" symbol_name "'" "." "'" exchange_name "'" ;
 
@@ -193,7 +194,7 @@ aggs["SPREAD(*)"].is_empty    # False
 | `AGG_PRICE_FILTER` | A price predicate combined with an aggregate; use `DEPTH_RANGE(lo, hi)` |
 | `AGG_SIDE_FILTER`, `AGG_LEVEL_FILTER` | A side or level condition combined with an aggregate: name the side in the function, `VWAP(bid)` |
 | `AGG_NEEDS_SIDE` | A function of one side that names none - `SUM(quantity)`, `VWAP(*)`, `CUMULATIVE_VOLUME(5)`: write `SUM(bid)`, `VWAP(ask)`, `CUMULATIVE_VOLUME(bid, 5)` |
-| `AGG_NEEDS_BUCKET` | `COUNT`, `FIRST` or `LAST` without `GROUP BY`: they aggregate a time bucket's rows, and the live book has none |
+| `AGG_NEEDS_BUCKET` | `COUNT`, `FIRST` or `LAST` without `GROUP BY`: they aggregate a time bucket's rows, and the live book has none. And `OPEN`, `HIGH`, `LOW`, `CLOSE`, `TWAP`, which read a series through a bucket |
 | `OB_ERR_PARSE: undefined aggregation function` | Unknown function name |
 
 ## Time buckets
@@ -217,7 +218,8 @@ GROUP BY TIME_BUCKET(1s)
   86 400 s), at most 366 d. `1m` and `1 m` read the same; units are lower case.
 - **A bucket** is `t - (t mod interval)` of each row's event time: on the Unix epoch, in UTC, the
   same for every query of that interval. Only buckets holding a row that meets the conditions are
-  answered, in time order; `LIMIT n` answers the first `n`.
+  answered, in time order - unless the query asks for a series, which answers every bucket of its
+  range ([below](#series-of-the-book)); `LIMIT n` answers the first `n`.
 - **The conditions narrow the rows** - time, price, side, level - instead of being refused as they
   are beside a function of the live book. `AT` and `GROUP BY` are not one query.
 - Rows are what a `SELECT` reads, so a row is in a bucket once it has been flushed, as it is in a
@@ -235,6 +237,47 @@ GROUP BY TIME_BUCKET(1s)
 The same function names mean something else without `GROUP BY` - `SUM(bid)` is the live book's -
 and a side is chosen with `WHERE side = 0`, not in the argument. Sums are kept in 128 bits; a value
 that does not fit a 64-bit integer once scaled is refused, not wrapped.
+
+### Series of the book
+
+`OPEN`, `HIGH`, `LOW`, `CLOSE` and `TWAP` read a **series** - a value of the book at every instant -
+rather than the rows of the bucket (#44, step 2):
+
+```sql
+-- One-minute bars of the mid, and the time-weighted spread, over an hour
+SELECT OPEN(mid), HIGH(mid), LOW(mid), CLOSE(mid), TWAP(spread)
+FROM 'BTC-USD'.'BINANCE'
+WHERE timestamp BETWEEN 1700000000000000000 AND 1700003599999999999
+GROUP BY TIME_BUCKET(1m)
+```
+
+- **The series** are read from level 0 of each side of the book at each instant - the book
+  `WHERE AT` answers. `bid` and `ask` are their prices, `mid` is (bid + ask) / 2 at `MID_PRICE`'s
+  scale of 10^6, `spread` is ask - bid. A series changes only at an instant holding a row of level 0,
+  once every row of that instant is applied, so a row that loses a tie on the time is in force at no
+  instant. `mid` and `spread` have a value once both sides have a row.
+- **Every bucket of the range is answered**, one without rows carrying what was in force. The range
+  is the time conditions'; an end without one is the symbol's first or last stored row. The first and
+  the last bucket's windows are cut to the range, so `OPEN` of the first is the value at the range's
+  start - from the book before it, when its rows are older.
+- **Values.** `OPEN` is the value in force at the window's first instant and `CLOSE` at its last;
+  `HIGH` and `LOW` are the highest and the lowest in force at any instant of it; `TWAP` is the
+  time-weighted average over the part of the window in which the series has a value, scaled by
+  10^6. `NULL` where there is none: at that instant for `OPEN` and `CLOSE`, through the whole window
+  for the other three.
+- **Beside a series** the rows' aggregates are answered for every bucket too: `COUNT(*)` is 0 in a
+  bucket without rows, and the others are `NULL`. A condition on price, side or level beside a series
+  is refused (`SERIES_FILTER`): a series reads level 0 of both sides whatever it says. `LIMIT n`
+  answers the first `n` buckets and stops reading there.
+- **What it reads**: the level-0 rows of the range in time order, each segment's sorted and merged as
+  the segments come - so what is held at once follows how segments overlap in time, not the length
+  of the range - and the book before the range from the newest segments holding level 0 (#47).
+
+| Function | Value | Scale |
+|---|---|---|
+| `OPEN(s)`, `CLOSE(s)` | in force at the window's first, its last instant | the series': 10^6 for `mid`, 1 for the others |
+| `HIGH(s)`, `LOW(s)` | the highest, the lowest in force at any instant of the window | the series' |
+| `TWAP(s)` | Σ value × time it held / Σ time with a value | 10^6 |
 
 ### Response format
 
@@ -262,7 +305,9 @@ an `AggValue` per aggregate (`.real` divides by the scale), the C++ client's `qu
 | `Parse error ... is not one` | A column or `*` in the list of a `GROUP BY` query, which answers aggregates of each bucket |
 | `Parse error ... aggregates the live book` | `SPREAD`, `DEPTH` and the other functions of the live book under `GROUP BY` |
 | `Parse error ... takes` | A function given a column it does not aggregate - `COUNT(price)`, `SUM(price)`, `VWAP(quantity)` - or a side, `SUM(bid)`, which a bucket takes from `WHERE side = …` |
-| `BUCKETS_TOO_MANY` | The answer would have more buckets than the server allows (`--max-query-buckets`, 100 000 by default): narrow the time range or widen the interval. Refused rather than cut short |
+| `Parse error ... bid, ask, mid or spread` | A series function given anything else - `OPEN(price)`, `TWAP(*)` |
+| `SERIES_FILTER` | A condition on price, side or level beside a series, which reads level 0 of both sides whatever it says: ask the rows' aggregates it would narrow in a query of their own |
+| `BUCKETS_TOO_MANY` | The answer would have more buckets than the server allows (`--max-query-buckets`, 100 000 by default): narrow the time range or widen the interval. Refused rather than cut short. Beside a series every bucket of the range counts, so it is known - and refused - before anything is read |
 | `BUCKET_OVERFLOW` | An aggregate of one bucket that does not fit a 64-bit integer, named with the bucket |
 
 ## SNAPSHOT Queries

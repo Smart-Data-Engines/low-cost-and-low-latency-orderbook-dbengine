@@ -57,15 +57,24 @@ enum class QueryType { SELECT, SUBSCRIBE, SNAPSHOT };
 
 // ── Time buckets (#44) ────────────────────────────────────────────────────────
 
-/// An aggregate over the rows of a time bucket, as opposed to one over the live book (#44).
-enum class BucketFn : uint8_t { Count, First, Last, Min, Max, Sum, Avg, Vwap };
+/// An aggregate over the rows of a time bucket, as opposed to one over the live book (#44) - or,
+/// from `Open` on, over a series of the book through the bucket (#44 step 2).
+enum class BucketFn : uint8_t { Count, First, Last, Min, Max, Sum, Avg, Vwap,
+                                Open, High, Low, Close, Twap };
+
+/// What a series function reads (#44 step 2): a value of the book at each instant - the book `AT`
+/// answers - from the price of level 0 of each side. `Mid` is (bid + ask) / 2 in the scale of
+/// MID_PRICE, `Spread` is ask - bid as SPREAD is.
+enum class Series : uint8_t { None, Bid, Ask, Mid, Spread };
 
 /// One aggregate of a `GROUP BY TIME_BUCKET(...)` query: the function, the row column it reads, and
-/// the expression as the answer names it.
+/// the expression as the answer names it - and for a series function the series, its column then
+/// unused.
 struct BucketAgg {
     BucketFn    fn;
     QueryColumn column;   ///< what it reads; `COUNT(*)` reads nothing and says TimestampNs
     std::string text;     ///< e.g. "VWAP(price)", the canonical spelling the parser wrote
+    Series      series;   ///< `None` but for OPEN, HIGH, LOW, CLOSE and TWAP
     bool operator==(const BucketAgg&) const = default;
 };
 
@@ -266,6 +275,12 @@ private:
     /// first row is handed out - an aggregate that does not fit is a refusal, and a refusal after
     /// rows would be an answer and an error at once.
     std::string execute_buckets(const QueryAST& ast, const RowCallback& cb, QueryShape& shape);
+
+    /// One with a series function (#44 step 2): every bucket of the range answered, the series
+    /// swept through them in time order from the book just before it - `latest_per_level()` of the
+    /// best levels, then `scan_by_time()` of their rows - and the row aggregates beside it from
+    /// the scan above.
+    std::string execute_series(const QueryAST& ast, const RowCallback& cb);
 
     // ── Subscription tracking ────────────────────────────────────────────────────────────────
     //
