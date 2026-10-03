@@ -31,6 +31,9 @@ The first release. What it contains, by area:
   (#139), conditions on the side and the level (#200), snapshots of the book at a time (`AT`), and
   aggregates - VWAP, spread, mid-price, imbalance, depth - each function of one side naming it
   (`VWAP(bid)`, #200), carrying their scale and telling an empty aggregate from a zero.
+- Aggregates over time buckets of the stored rows - `GROUP BY TIME_BUCKET(1m)` with `COUNT`, `FIRST`,
+  `LAST`, `MIN`, `MAX`, `SUM`, `AVG` and `VWAP`, the conditions narrowing the rows they read, read by
+  `query_buckets()` in the Python and C++ clients (#44, step 1).
 - `BOOK` for the live book over the wire, and `SUBSCRIBE` for rows pushed as they are written.
 
 ### Replication and availability

@@ -75,6 +75,26 @@ TEST_F(CApiTest, ApplyDeltaAndQueryRoundTrip) {
     EXPECT_EQ(got_prices[2], 10100LL);
 }
 
+// ── GROUP BY (#44): refused, not answered as rows ─────────────────────────────
+
+TEST_F(CApiTest, AGroupByQueryIsRefusedRatherThanAnsweredAsRowsOfZeros) {
+    // A time-bucket answer is buckets of aggregates, and this result's rows are the seven columns:
+    // answered, it would be one row a bucket with the start as its time and zeros for the rest.
+    int64_t  prices[] = {10300};
+    uint64_t qtys[]   = {100};
+    uint32_t cnts[]   = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "AAPL", "NYSE", 1, 1000000000ULL, prices, qtys, cnts, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+
+    EXPECT_EQ(ob_query(engine, "SELECT COUNT(*) FROM 'AAPL'.'NYSE' GROUP BY TIME_BUCKET(1s)"), nullptr);
+    // And the same rows, as rows, still are.
+    ob_result_t* rows = ob_query(engine, "SELECT * FROM 'AAPL'.'NYSE'");
+    ASSERT_NE(rows, nullptr);
+    ob_result_free(rows);
+}
+
 // ── Test 2: ob_subscribe callback receives JSON row ───────────────────────────
 
 TEST_F(CApiTest, SubscribeCallbackReceivesJsonRow) {

@@ -8,7 +8,10 @@ The engine supports a SQL-like query language for scanning, aggregating, and sub
 query       = select_query | subscribe_query ;
 select_query = "SELECT" select_list "FROM" symbol_ref
                [ "WHERE" where_clause ]
+               [ "GROUP" "BY" bucket ]
                [ "LIMIT" integer ] ;
+bucket      = "TIME_BUCKET" "(" integer unit ")" ;
+unit        = "ns" | "us" | "ms" | "s" | "m" | "h" | "d" ;
 subscribe_query = "SUBSCRIBE" select_list "FROM" symbol_ref
                   [ "WHERE" where_clause ] ;
 
@@ -185,12 +188,82 @@ aggs["SPREAD(*)"].is_empty    # False
 
 | Error | Meaning |
 |-------|---------|
-| `AGG_WITH_COLUMNS` | Aggregates mixed with plain columns (`SELECT price, SPREAD(*)`). There is no `GROUP BY`, so the column would have to be dropped |
+| `AGG_WITH_COLUMNS` | Aggregates mixed with plain columns (`SELECT price, SPREAD(*)`): the column would have to be dropped. For aggregates of rows over time, see [Time buckets](#time-buckets) |
 | `AGG_TIME_FILTER` | A timestamp predicate, or `AT`, combined with an aggregate |
 | `AGG_PRICE_FILTER` | A price predicate combined with an aggregate; use `DEPTH_RANGE(lo, hi)` |
 | `AGG_SIDE_FILTER`, `AGG_LEVEL_FILTER` | A side or level condition combined with an aggregate: name the side in the function, `VWAP(bid)` |
 | `AGG_NEEDS_SIDE` | A function of one side that names none - `SUM(quantity)`, `VWAP(*)`, `CUMULATIVE_VOLUME(5)`: write `SUM(bid)`, `VWAP(ask)`, `CUMULATIVE_VOLUME(bid, 5)` |
+| `AGG_NEEDS_BUCKET` | `COUNT`, `FIRST` or `LAST` without `GROUP BY`: they aggregate a time bucket's rows, and the live book has none |
 | `OB_ERR_PARSE: undefined aggregation function` | Unknown function name |
+
+## Time buckets
+
+Aggregates over the **stored rows** of each interval, rather than over the live book (#44):
+
+```sql
+-- One-minute bars of the best bid
+SELECT FIRST(price), MAX(price), MIN(price), LAST(price), COUNT(*)
+FROM 'BTC-USD'.'BINANCE'
+WHERE side = 0 AND level = 0
+GROUP BY TIME_BUCKET(1m)
+
+-- Updates a second, and the volume-weighted price of each, over an hour
+SELECT COUNT(*), VWAP(price) FROM 'BTC-USD'.'BINANCE'
+WHERE timestamp BETWEEN 1700000000000000000 AND 1700003600000000000
+GROUP BY TIME_BUCKET(1s)
+```
+
+- **The interval** is a positive integer and a unit, `ns`, `us`, `ms`, `s`, `m`, `h` or `d` (a day is
+  86 400 s), at most 366 d. `1m` and `1 m` read the same; units are lower case.
+- **A bucket** is `t - (t mod interval)` of each row's event time: on the Unix epoch, in UTC, the
+  same for every query of that interval. Only buckets holding a row that meets the conditions are
+  answered, in time order; `LIMIT n` answers the first `n`.
+- **The conditions narrow the rows** - time, price, side, level - instead of being refused as they
+  are beside a function of the live book. `AT` and `GROUP BY` are not one query.
+- Rows are what a `SELECT` reads, so a row is in a bucket once it has been flushed, as it is in a
+  `SELECT`.
+
+| Function | Of | Value |
+|---|---|---|
+| `COUNT(*)` | - | the rows in the bucket |
+| `FIRST(c)`, `LAST(c)` | `price`, `quantity` | of the row with the earliest, the latest event time; a tie goes to the row stored first for `FIRST` and last for `LAST`, as in a snapshot |
+| `MIN(c)`, `MAX(c)` | `price`, `quantity` | |
+| `SUM(quantity)` | `quantity` | |
+| `AVG(c)` | `price`, `quantity` | scaled by 10^6 |
+| `VWAP(price)` | `price`, weighted by `quantity` | Σ(price × quantity) / Σ quantity, scaled by 10^6; `NULL` when every row of the bucket has quantity 0 |
+
+The same function names mean something else without `GROUP BY` - `SUM(bid)` is the live book's -
+and a side is chosen with `WHERE side = 0`, not in the argument. Sums are kept in 128 bits; a value
+that does not fit a 64-bit integer once scaled is refused, not wrapped.
+
+### Response format
+
+```
+OK
+bucket_ns	COUNT(*)/1	FIRST(price)/1	VWAP(price)/1000000
+1700000040000000000	42	100	100454545
+1700000100000000000	17	101	NULL
+
+```
+
+The first column is each bucket's start. Every other column names its aggregate as the query wrote
+it and, after the last `/`, its scale: divide by it for the natural value. The scale depends only on
+the function, so it is in the header, written before the first row; a query with no bucket answers
+the header alone. The Python client's `query_buckets(sql)` returns `Bucket(start_ns, values)` with
+an `AggValue` per aggregate (`.real` divides by the scale), the C++ client's `query_buckets(sql)`
+`BucketRow`s; `query()` refuses this shape by name. The local library (`ob_query`) refuses
+`GROUP BY`: its rows are the seven columns.
+
+### Refusals
+
+| Error | Meaning |
+|-------|---------|
+| `Parse error ... interval` | An interval that is zero, negative, without a unit, in a unit not listed, or past 366 d - said where it stands |
+| `Parse error ... is not one` | A column or `*` in the list of a `GROUP BY` query, which answers aggregates of each bucket |
+| `Parse error ... aggregates the live book` | `SPREAD`, `DEPTH` and the other functions of the live book under `GROUP BY` |
+| `Parse error ... takes` | A function given a column it does not aggregate - `COUNT(price)`, `SUM(price)`, `VWAP(quantity)` - or a side, `SUM(bid)`, which a bucket takes from `WHERE side = …` |
+| `BUCKETS_TOO_MANY` | The answer would have more buckets than the server allows (`--max-query-buckets`, 100 000 by default): narrow the time range or widen the interval. Refused rather than cut short |
+| `BUCKET_OVERFLOW` | An aggregate of one bucket that does not fit a 64-bit integer, named with the bucket |
 
 ## SNAPSHOT Queries
 
