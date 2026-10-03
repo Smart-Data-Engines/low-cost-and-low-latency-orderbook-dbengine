@@ -3990,6 +3990,14 @@ Learned the hard way. Check here before debugging.
      kept `t`, and a second condition replaced the first (#199). Nobody had asked the server either
      question, because the page that would have prompted it did not mention them. Reading a parser,
      list what it accepts beyond the documentation, and ask the running server each one.
+534. **A transition with nobody to adopt is still a transition, and what follows it has to look for
+     the leader that comes later.** A primary that demoted before anyone was elected started no
+     replication client, and its REPLICA loop recorded the new leader's address and restarted
+     nothing - "an unchanged leader restarts nothing" (#104) was true of a node that followed
+     somebody, and this one followed nobody (#201). `ROLE` answered the recorded address, so the
+     node named its successor while replicating nothing, after every planned `FAILOVER`. Keep what a
+     component *does* (whom the client follows) apart from what it *reports* (the leader's address),
+     and compare the leader against the first.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
