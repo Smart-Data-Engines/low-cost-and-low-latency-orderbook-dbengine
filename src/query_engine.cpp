@@ -1694,11 +1694,18 @@ bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from,
     bool too_many = false;
     // The bucket the last row went to: a segment's rows are appended in about their time order, so
     // the next row is nearly always in it, and the map is asked only when it is not. References to
-    // an unordered_map's elements survive its rehashing.
+    // an unordered_map's elements survive its rehashing. Whether a row is in it is asked first, in
+    // two comparisons - `ts - start < width`, unsigned, is false below the start too - because a
+    // bucket's start is a 64-bit division, tens of cycles a row on the i3-7100U.
     BucketState* last = nullptr;
     uint64_t last_start = 0;
     store.scan(from, to, ast.symbol, ast.exchange, to_read, [&](const SnapshotRow& row) {
         if (too_many || !row_allowed(ast, row)) return;
+        if (last != nullptr && row.timestamp_ns - last_start < width) {
+            last->add(row);
+            ++rows;
+            return;
+        }
         const uint64_t start = row.timestamp_ns - row.timestamp_ns % width;
         if (last == nullptr || start != last_start) {
             auto it = buckets.find(start);
