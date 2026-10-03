@@ -230,7 +230,9 @@ timestamp, price, side or level filter rather than accepting one and ignoring it
 #### engine.query_buckets(sql) → List[Bucket]
 
 Run a `SELECT ... GROUP BY TIME_BUCKET(...)` (#44): aggregates over the stored rows of each
-interval, the buckets that hold a row in time order. TCP and pool mode only.
+interval, the buckets that hold a row in time order - or, with a series of the book (`OPEN`, `HIGH`,
+`LOW`, `CLOSE`, `TWAP` of `bid`, `ask`, `mid` or `spread`), every bucket of the range. TCP and pool
+mode only.
 
 ```python
 bars = engine.query_buckets(
@@ -241,6 +243,11 @@ bars[0].start_ns                       # where the bucket begins, on the epoch, 
 bars[0].values["LAST(price)"].value    # 6500000
 bars[0].values["VWAP(price)"].real     # AVG and VWAP arrive scaled by 10^6; .real divides
 bars[0].values["VWAP(price)"].is_empty # True when every row of the bucket had quantity 0
+
+mids = engine.query_buckets(
+    "SELECT OPEN(mid), HIGH(mid), LOW(mid), CLOSE(mid), TWAP(spread) FROM 'BTC-USD'.'BINANCE' "
+    "GROUP BY TIME_BUCKET(1m)")
+mids[0].values["CLOSE(mid)"].real      # the mid at the bucket's last instant, MID_PRICE's 10^6 divided
 ```
 
 The conditions narrow the rows the aggregates read; the functions and their refusals are in

@@ -1693,7 +1693,8 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
 }
 
 ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_view symbol,
-                                                      std::string_view exchange) const {
+                                                      std::string_view exchange,
+                                                      const LevelSet* wanted) const {
     BookAt out;
     // What a scan of [0, at] would read, in the order it would deliver it: the segments by
     // `segment_order_less`, then the blocks. That order is each candidate's rank, which decides a
@@ -1765,12 +1766,15 @@ ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_v
     const auto beats = [](const Best& b, const Candidate& c) {
         return !b.found || b.ts < c.latest || (b.ts == c.latest && b.rank < c.rank);
     };
+    // Only the levels asked for, when some are: a candidate none of whose wanted levels can change
+    // is not read, whatever else it holds.
     const auto can_change = [&](const Candidate& c) {
         const LevelSet& set = *c.segment->levels;
         for (size_t side = 0; side < 2; ++side) {
             const LevelSet::Bits& bits = set.side(side);
             for (size_t w = 0; w < LevelSet::kWords; ++w) {
-                for (uint64_t x = bits[w]; x != 0; x &= x - 1) {
+                const uint64_t asked = wanted != nullptr ? wanted->side(side)[w] : ~uint64_t{0};
+                for (uint64_t x = bits[w] & asked; x != 0; x &= x - 1) {
                     const size_t level = w * 64 + static_cast<size_t>(__builtin_ctzll(x));
                     if (beats(flat[side * kLevels + level], c)) return true;
                 }
@@ -1791,6 +1795,7 @@ ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_v
         const auto consider = [&](const SnapshotRow& row) {
             const size_t i = index++;
             if (row.timestamp_ns > at) return;
+            if (wanted != nullptr && !wanted->has(row.side, row.level_index)) return;
             Best& b = slot(row);
             if (!b.found || row.timestamp_ns > b.ts ||
                 (row.timestamp_ns == b.ts && (c.rank > b.rank || (c.rank == b.rank && i > b.index)))) {
@@ -1820,13 +1825,199 @@ ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_v
     }
     for (auto it = other.lower_bound(2u << 16); it != other.end(); ++it) out.rows.push_back(it->second.row);
 
-    OB_LOG_DEBUG("columnar", "book of %.*s.%.*s at %llu: %zu level(s); %zu segment(s) read, %zu "
+    OB_LOG_DEBUG("columnar", "book of %.*s.%.*s at %llu%s: %zu level(s); %zu segment(s) read, %zu "
                              "skipped, %zu block(s)",
                  static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
-                 static_cast<unsigned long long>(at), out.rows.size(), out.segments_read,
-                 out.segments_skipped, out.blocks);
+                 static_cast<unsigned long long>(at),
+                 wanted != nullptr ? ", of the levels asked for" : "", out.rows.size(),
+                 out.segments_read, out.segments_skipped, out.blocks);
     return out;
+}
+
+ColumnarStore::TimeOrderedCost ColumnarStore::scan_by_time(
+        uint64_t start_ns, uint64_t end_ns, std::string_view symbol, std::string_view exchange,
+        ColumnSet columns, const std::function<bool(const SnapshotRow&)>& keep,
+        const std::function<bool(const SnapshotRow&)>& cb) const {
+    columns.add(QueryColumn::TimestampNs);
+    TimeOrderedCost cost;
+    // The candidates scan() would read, in the order it delivers them - that order is each one's
+    // rank, which decides a tie on the timestamp - copied under the shared lock, the generation
+    // held until the files are read (#165 part 2b).
+    std::vector<SegmentMeta> segments;
+    std::vector<std::shared_ptr<const RowBlock>> blocks;
+    std::shared_ptr<const void> reading;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        reading = reader_generation_;
+        const auto it = by_symbol_.find(index_key(symbol, exchange));
+        if (it == by_symbol_.end()) return cost;
+        for (const auto& b : it->second.blocks) {
+            if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) blocks.push_back(b);
+        }
+        for (const WidthTier& tier : it->second.tiers) {
+            const auto& v = tier.segments;
+            const size_t before = segments.size();
+            const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
+            auto first = std::lower_bound(
+                v.begin(), v.end(), from,
+                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+            for (auto i = first; i != v.end() && i->start_ts_ns <= end_ns; ++i) {
+                if (i->end_ts_ns >= start_ns) segments.push_back(*i);
+            }
+            if (before != 0 && before != segments.size()) {
+                std::inplace_merge(segments.begin(),
+                                   segments.begin() + static_cast<std::ptrdiff_t>(before),
+                                   segments.end(), segment_order_less);
+            }
+        }
+    }
+    cost.candidates = segments.size();
+    cost.blocks = blocks.size();
+
+    // A run: one candidate's kept rows, by time, a tie in the order it holds them.
+    struct Run {
+        std::vector<SnapshotRow> rows;
+        size_t pos{0};
+        size_t rank{0};
+    };
+    std::vector<std::unique_ptr<Run>> runs;
+    // The head of each run with rows left: the earliest time first, and at one time the lower
+    // rank - the candidate scan() delivers first.
+    struct Head {
+        uint64_t ts;
+        size_t rank;
+        Run* run;
+    };
+    const auto later = [](const Head& a, const Head& b) {
+        return a.ts != b.ts ? a.ts > b.ts : a.rank > b.rank;
+    };
+    std::vector<Head> heap;
+    uint64_t held = 0;
+    const auto add_run = [&](std::unique_ptr<Run> run) {
+        if (run->rows.empty()) return;
+        std::stable_sort(run->rows.begin(), run->rows.end(),
+                         [](const SnapshotRow& a, const SnapshotRow& b) {
+                             return a.timestamp_ns < b.timestamp_ns;
+                         });
+        cost.kept += run->rows.size();
+        held += run->rows.size();
+        cost.max_held = std::max(cost.max_held, held);
+        heap.push_back({run->rows.front().timestamp_ns, run->rank, run.get()});
+        std::push_heap(heap.begin(), heap.end(), later);
+        runs.push_back(std::move(run));
+    };
+    // Hands over every held row before `until`; false once `cb` has said to stop.
+    const auto hand_over = [&](uint64_t until, bool all) {
+        while (!heap.empty() && (all || heap.front().ts < until)) {
+            std::pop_heap(heap.begin(), heap.end(), later);
+            Head head = heap.back();
+            heap.pop_back();
+            Run& run = *head.run;
+            const SnapshotRow& row = run.rows[run.pos++];
+            --held;
+            ++cost.delivered;
+            if (!cb(row)) {
+                cost.stopped = true;
+                return false;
+            }
+            if (run.pos < run.rows.size()) {
+                heap.push_back({run.rows[run.pos].timestamp_ns, run.rank, &run});
+                std::push_heap(heap.begin(), heap.end(), later);
+            } else {
+                run.rows = {};   // its memory, now - the run itself goes with the read
+            }
+        }
+        return true;
+    };
+    const auto read_segment_run = [&](size_t i) {
+        auto run = std::make_unique<Run>();
+        run->rank = i;
+        read_segment_rows(segments[i], columns, start_ns, end_ns,
+                          [&](const SnapshotRow& row) {
+                              if (keep(row)) run->rows.push_back(row);
+                          },
+                          ReadMode::kQuery);
+        add_run(std::move(run));
+    };
+
+    // First what has no start to wait for: the blocks, delivered after every segment, and any
+    // segment whose recorded range is not its rows' (#166) - none after open_existing() repaired
+    // them, but a row of one could be anywhere in time.
+    const bool want_price = columns.has(QueryColumn::Price);
+    const bool want_qty   = columns.has(QueryColumn::Quantity);
+    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
+    const bool want_side  = columns.has(QueryColumn::Side);
+    const bool want_level = columns.has(QueryColumn::Level);
+    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
+    for (size_t b = 0; b < blocks.size(); ++b) {
+        auto run = std::make_unique<Run>();
+        run->rank = segments.size() + b;
+        for (const SnapshotRow& r : blocks[b]->rows) {
+            if (r.timestamp_ns < start_ns || r.timestamp_ns > end_ns) continue;
+            SnapshotRow row{};
+            row.timestamp_ns = r.timestamp_ns;
+            if (want_seq)   row.sequence_number = r.sequence_number;
+            if (want_side)  row.side            = r.side;
+            if (want_level) row.level_index     = r.level_index;
+            if (want_price) row.price           = r.price;
+            if (want_qty)   row.quantity        = r.quantity;
+            if (want_cnt)   row.order_count     = r.order_count;
+            if (keep(row)) run->rows.push_back(row);
+        }
+        add_run(std::move(run));
+    }
+    size_t unbounded = 0;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (!segments[i].time_range_is_rows) {
+            read_segment_run(i);
+            ++unbounded;
+        }
+    }
+
+    // Then the segments by their start: none read later holds a row before it.
+    bool going = true;
+    for (size_t i = 0; i < segments.size() && going; ++i) {
+        if (!segments[i].time_range_is_rows) continue;
+        going = hand_over(segments[i].start_ts_ns, false);
+        if (going) read_segment_run(i);
+    }
+    if (going) hand_over(0, true);
+
+    OB_LOG_DEBUG("columnar", "scan by time of %.*s.%.*s [%llu, %llu]: %zu segment(s), %zu read "
+                             "first for a range that is not their rows', %zu block(s); %llu row(s) "
+                             "kept, %llu handed over, at most %llu held%s",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(start_ns), static_cast<unsigned long long>(end_ns),
+                 cost.candidates, unbounded, cost.blocks, static_cast<unsigned long long>(cost.kept),
+                 static_cast<unsigned long long>(cost.delivered),
+                 static_cast<unsigned long long>(cost.max_held),
+                 cost.stopped ? ", ended by its reader" : "");
+    return cost;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> ColumnarStore::time_span(
+        std::string_view symbol, std::string_view exchange) const {
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    const auto it = by_symbol_.find(index_key(symbol, exchange));
+    if (it == by_symbol_.end()) return std::nullopt;
+    bool any = false;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (const auto& b : it->second.blocks) {
+        any = true;
+        lo = std::min(lo, b->min_ts_ns);
+        hi = std::max(hi, b->max_ts_ns);
+    }
+    for (const WidthTier& tier : it->second.tiers) {
+        for (const SegmentMeta& m : tier.segments) {
+            any = true;
+            lo = std::min(lo, m.start_ts_ns);
+            hi = std::max(hi, m.end_ts_ns);
+        }
+    }
+    if (!any) return std::nullopt;
+    return std::make_pair(lo, hi);
 }
 
 // ── open_existing ─────────────────────────────────────────────────────────────

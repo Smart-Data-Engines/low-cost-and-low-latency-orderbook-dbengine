@@ -320,6 +320,11 @@ ob_add_query_test(test_time_buckets
 )
 target_link_libraries(test_time_buckets PRIVATE orderbook_tcp_server_lib)
 
+# ── #44 step 2: series of the book through time buckets, and the reads under them ─
+ob_add_query_test(test_series_of_the_book
+    test_series_of_the_book.cpp
+)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

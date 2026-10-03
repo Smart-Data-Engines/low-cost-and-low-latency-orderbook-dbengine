@@ -2439,9 +2439,11 @@ class OrderbookEngine:
                 "WHERE side = 0 AND level = 0 GROUP BY TIME_BUCKET(1m)")
             bars[0].values["LAST(price)"].real
 
-        Only buckets that hold a row are answered. A query whose answer would have more buckets
-        than the server allows (`--max-query-buckets`) is refused, not cut short. TCP and pool mode
-        only: the local library does not answer GROUP BY.
+        Only buckets that hold a row are answered - unless the query asks for a series of the book
+        (OPEN, HIGH, LOW, CLOSE, TWAP of bid, ask, mid or spread), which answers every bucket of
+        its range. A query whose answer would have more buckets than the server allows
+        (`--max-query-buckets`) is refused, not cut short. TCP and pool mode only: the local
+        library does not answer GROUP BY.
         """
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")

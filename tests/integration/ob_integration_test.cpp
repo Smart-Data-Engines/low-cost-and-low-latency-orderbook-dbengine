@@ -323,7 +323,42 @@ static int run_query_buckets(const std::string& host, uint16_t port) {
                      (as_rows ? std::string("it returned rows") : as_rows.error_message()));
         return 1;
     }
-    print_result("query_buckets", "pass", "2 buckets, VWAP=175000000 and NULL");
+
+    // A series of the book (#44 step 2): bid 100 and ask 104 at the minute, the bid 102 at 1.5 s.
+    // Every bucket of the range is answered - [the minute, 1.5 s] - the mid at MID_PRICE's scale,
+    // the bid's close at its own, and the spread's TWAP over the second bucket's window: 4 for
+    // 0.5 s, 2 for its last nanosecond, truncated.
+    const bool book =
+        client.insert("CPP-SER", "TEST-EX", ob::Side::BID, 100, 1, 1, kMinute) &&
+        client.insert("CPP-SER", "TEST-EX", ob::Side::ASK, 104, 1, 1, kMinute) &&
+        client.insert("CPP-SER", "TEST-EX", ob::Side::BID, 102, 1, 1, kMinute + 1'500'000'000ULL) &&
+        client.flush();
+    if (!book) {
+        print_result("query_buckets", "fail", "the series' insert or flush failed");
+        return 1;
+    }
+    auto series = client.query_buckets(
+        "SELECT OPEN(mid), CLOSE(bid), TWAP(spread) FROM 'CPP-SER'.'TEST-EX' GROUP BY TIME_BUCKET(1s)");
+    if (!series) {
+        print_result("query_buckets", "fail", "the series failed: " + series.error_message());
+        return 1;
+    }
+    const auto& s = series.value();
+    const auto is = [](const auto& v, const char* name, int64_t scale, int64_t value) {
+        return v.name == name && v.scale == scale && v.value == value && !v.empty;
+    };
+    if (s.size() != 2 || s[0].values.size() != 3 || s[1].values.size() != 3 ||
+        !is(s[0].values[0], "OPEN(mid)", 1'000'000, 102'000'000) ||
+        !is(s[0].values[1], "CLOSE(bid)", 1, 100) ||
+        !is(s[0].values[2], "TWAP(spread)", 1'000'000, 4'000'000) ||
+        !is(s[1].values[0], "OPEN(mid)", 1'000'000, 102'000'000) ||
+        !is(s[1].values[1], "CLOSE(bid)", 1, 102) ||
+        !is(s[1].values[2], "TWAP(spread)", 1'000'000, 3'999'999)) {
+        print_result("query_buckets", "fail", "the series' buckets are wrong: " +
+                     std::to_string(s.size()) + " bucket(s)");
+        return 1;
+    }
+    print_result("query_buckets", "pass", "2 buckets, VWAP=175000000 and NULL; a series of 2 buckets");
     return 0;
 }
 
