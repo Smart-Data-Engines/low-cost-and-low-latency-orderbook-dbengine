@@ -592,6 +592,12 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
     }
     const std::size_t drain = tick.find("drain_batch(batch, covered, /*mtx_held=*/false)");
     ASSERT_NE(drain, std::string::npos) << "the tick does not drain its batch without the lock";
+    // A slow sync begins admission before the drain lets the writers it held go (#190, step 8).
+    const std::size_t slow_sync = tick.find("admission_.on_slow_sync(");
+    ASSERT_NE(slow_sync, std::string::npos) << "the tick no longer tells admission of a slow sync";
+    EXPECT_LT(slow_sync, drain)
+        << "admission hears of a slow sync after the drain, so the writers it let go write at full "
+           "speed until the tick ends (36 ms, a third of the queue, measured at 30 MB/s)";
     EXPECT_FALSE(locked(tick, drain))
         << "the flush tick drains with the engine's lock held, so every writer waits for ~640k rows "
            "to reach their stores (11 ms at p99.9 with only the sync outside, measured)";

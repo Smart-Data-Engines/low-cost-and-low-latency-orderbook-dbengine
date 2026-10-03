@@ -81,6 +81,14 @@ public:
     /// After a flush tick that took `rows` from the pending queue in `took`.
     Change on_tick(uint64_t rows, Clock::duration took);
 
+    /// After a tick's WAL sync, before its drain: the rows the tick took and how long their sync
+    /// took. A sync that already took a slow tick's time begins admission, or lowers its rate, as a
+    /// slow tick does - before the drain lets the writers that waited for the queue go, which from
+    /// there to the tick's end wrote at full speed: 36 ms on the m9g.xlarge at 30 MB/s, and the
+    /// queue about two-thirds full when admission began (#190, step 8). A sync that fits says
+    /// nothing; the tick's own on_tick() follows at its end either way.
+    Change on_slow_sync(uint64_t rows, Clock::duration took);
+
     /// How long a batch of `rows` just written waits before its writer goes on. Zero when admission
     /// is off.
     Clock::duration admit(uint64_t rows, Clock::time_point now);
@@ -103,6 +111,11 @@ public:
     Measurement last_slow_tick() const;
 
 private:
+    /// Whether `took` for `rows` is a slow tick's time.
+    bool slow(uint64_t rows, Clock::duration took) const;
+    /// What a slow tick, or a slow sync, does to the rate. Caller holds `mtx_`.
+    Change slow_locked(uint64_t rows, Clock::duration took);
+
     const Config config_;
     std::atomic<bool> enabled_{true};
     std::atomic<bool> active_{false};

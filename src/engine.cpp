@@ -3308,6 +3308,23 @@ void Engine::flush_tick() {
             "flush tick", "Engine: WAL sync failed during the flush tick", covered);
         taken = batch.rows();
         const auto synced = TickClock::now();
+        // Said once, whichever of the two below begins it.
+        const auto say_admission_began = [this](const char* what) {
+            const auto m = admission_.last_slow_tick();
+            OB_LOG_WARN("engine", "Writes arrive faster than the device takes them - %s took %.0f ms "
+                                  "for %llu row(s), %.0f rows/s - so each batch now waits after it "
+                                  "is written, at %.0f rows/s to begin with, rather than every "
+                                  "writer stopping at a full pending queue",
+                        what, std::chrono::duration<double, std::milli>(m.took).count(),
+                        static_cast<unsigned long long>(m.rows), m.rows_per_s, admission_.rate());
+        };
+        // A sync that already took a slow tick's time says so now, before the drain lets go the
+        // writers that waited for room (#190, step 8): from the drain to the tick's end they wrote
+        // at full speed, and admission began against a queue about two-thirds full.
+        if (admission_.on_slow_sync(taken, synced - tick_started) ==
+            AdmissionController::Change::Began) {
+            say_admission_began("a flush tick's WAL sync");
+        }
         drain_batch(batch, covered, /*mtx_held=*/false);
         const auto drained = TickClock::now();
 
@@ -3420,16 +3437,9 @@ void Engine::flush_tick() {
         // What this tick says about the device, for admission (#190 step 5): the rows it took from
         // the queue and how long taking them did - the sync, the drain and the seals.
         switch (admission_.on_tick(taken, TickClock::now() - tick_started)) {
-            case AdmissionController::Change::Began: {
-                const auto m = admission_.last_slow_tick();
-                OB_LOG_WARN("engine", "Writes arrive faster than the device takes them - a flush tick "
-                                      "took %.0f ms for %llu row(s), %.0f rows/s - so each batch now "
-                                      "waits after it is written, at %.0f rows/s to begin with, rather "
-                                      "than every writer stopping at a full pending queue",
-                            std::chrono::duration<double, std::milli>(m.took).count(),
-                            static_cast<unsigned long long>(m.rows), m.rows_per_s, admission_.rate());
+            case AdmissionController::Change::Began:
+                say_admission_began("a flush tick");
                 break;
-            }
             case AdmissionController::Change::Ended:
                 OB_LOG_INFO("engine", "Writes are taken at full speed again: %llu batch(es) waited for "
                                       "admission, %.1f ms in all",
