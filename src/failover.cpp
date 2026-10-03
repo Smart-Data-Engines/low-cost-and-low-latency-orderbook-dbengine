@@ -95,6 +95,7 @@ void FailoverManager::start() {
             OB_LOG_INFO("failover", "starting as REPLICA, primary=%s (from etcd)",
                         state->leader_address.c_str());
             handler_.demote_to_replica(state->leader_address);
+            note_following(state->leader_address);
         }
     } else if (config_.failover_enabled) {
         // Could not read cluster state — try to become primary.
@@ -392,6 +393,10 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
         primary_address_ = new_primary;
     }
     handler_.demote_to_replica(new_primary);
+    // Nobody, usually: the target has not promoted yet. The REPLICA branch of monitor_tick() starts
+    // following it when it does (#201) - which it did not, so the outgoing primary of every
+    // handover replicated nothing from then on while ROLE named its successor.
+    note_following(new_primary);
 
     OB_LOG_INFO("failover", "Graceful failover: demoted locally, primary=%s",
                 new_primary.empty() ? "(not elected yet)" : new_primary.c_str());
@@ -733,6 +738,7 @@ void FailoverManager::monitor_tick() {
                 }
                 try {
                     handler_.promote_to_primary(state.epoch);
+                    note_following({});
                     {
                         std::lock_guard<std::mutex> lk(mtx_);
                         primary_address_ = config_.replication_address;
@@ -771,15 +777,31 @@ void FailoverManager::monitor_tick() {
                 }
             } else if (leader_present) {
                 note_leader_present();
-                // The address is recorded and **nothing else happens**, which is the whole of
-                // "an unchanged leader does not restart replication every second" (#104). No
-                // comparison against a remembered address is needed to get that, and the field
-                // that claimed to provide it was written once and read nowhere. Adoption -
-                // `demote_to_replica()`, a fresh replication client, and since #101 a
-                // `STREAMID?` round trip - happens in `adopt_leader_if_present()`, which this
-                // branch is not.
-                std::lock_guard<std::mutex> lk(mtx_);
-                primary_address_ = state.leader_address;
+                // The address is recorded, and replication restarts only when the leader is not
+                // the one this node follows - so an unchanged leader restarts nothing (#104).
+                //
+                // It used to restart nothing in any case, on the reasoning that adoption happens on
+                // a transition. One transition has no leader to adopt: a primary that loses its
+                // lease, or hands the role over, before anyone is elected demotes to follow nobody,
+                // and the election that follows is no transition of its own. So it never
+                // replicated again, while ROLE named the new primary from the address recorded
+                // here (#201) - after every planned FAILOVER, and after a coordinator outage long
+                // enough to cost the primary its lease. Following a leader that changed while this
+                // node was a replica is the same case with a stale address instead of none.
+                std::string followed;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    primary_address_ = state.leader_address;
+                    followed = following_;
+                }
+                if (!state.leader_address.empty() && state.leader_address != followed) {
+                    OB_LOG_INFO("failover", "following %s at %s - this replica followed %s",
+                                state.leader_node_id.c_str(), state.leader_address.c_str(),
+                                followed.empty() ? "nobody, having demoted before anyone was elected"
+                                                 : followed.c_str());
+                    handler_.demote_to_replica(state.leader_address);
+                    note_following(state.leader_address);
+                }
             } else if (verdict == CoordinatorClient::LeaderRead::Unavailable) {
                 // No information. Standing for election here is what this branch used to do,
                 // because get_cluster_state() reported an unreachable coordinator and a vacant
@@ -934,6 +956,7 @@ bool FailoverManager::adopt_leader_if_present() {
     OB_LOG_INFO("failover", "following %s at %s — this node is a REPLICA",
                 state->leader_node_id.c_str(), state->leader_address.c_str());
     handler_.demote_to_replica(state->leader_address);
+    note_following(state->leader_address);
     return true;
 }
 
@@ -1132,6 +1155,7 @@ void FailoverManager::attempt_promotion() {
     // promotion on a later tick, with the same epoch. Rolling back here instead would put failover
     // semantics inside a `catch`, which is where the least-reviewed code in any subsystem lives.
     handler_.promote_to_primary(new_epoch);
+    note_following({});
     {
         std::lock_guard<std::mutex> lk(mtx_);
         primary_address_ = config_.replication_address;
@@ -1189,9 +1213,16 @@ void FailoverManager::handle_primary_lease_lost() {
     if (new_primary.empty()) {
         OB_LOG_WARN("failover",
                     "no new primary is published yet — demoting anyway and starting no replication "
-                    "client; this node must stop answering as PRIMARY either way");
+                    "client; this node must stop answering as PRIMARY either way, and follows "
+                    "whoever is elected once the coordinator names them");
     }
     handler_.demote_to_replica(new_primary);
+    note_following(new_primary);
+}
+
+void FailoverManager::note_following(const std::string& address) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    following_ = address;
 }
 
 // ── reconcile_epoch() ───────────────────────────────────────────────────────

@@ -966,6 +966,80 @@ TEST_F(EtcdTestFixture, GracefulFailover) {
 // ── Task 5.3: SplitBrainRecovery ────────────────────────────────────────────
 // Validates: Requirements 4.1, 4.2, 4.3, 4.4
 
+// ── #201: a primary that demoted before anyone was elected follows the node elected after it ───
+//
+// It demotes with nobody to follow - "Not knowing where to point the replication client is a reason
+// to start no client" - and the election that follows is no transition of its own. Its REPLICA
+// branch recorded the winner's address, which ROLE answers, and started nothing, so it never
+// replicated again. Measured on the integration battery's cluster, and reproduced through the
+// server in `tests/integration/test_failover_follows_successor.py`; here, the manager on its own.
+TEST_F(EtcdTestFixture, APrimaryDemotedBeforeAnElectionFollowsTheWinner) {
+    TempDir dir_a("follow_a");
+    TempDir dir_b("follow_b");
+    auto engine_a = make_engine("node_A", dir_a.path);
+    auto engine_b = make_engine("node_B", dir_b.path);
+    engine_a->open();
+    engine_b->open();
+
+    ob::FailoverConfig fc_a{};
+    fc_a.coordinator.endpoints = {EtcdTestEnvironment::endpoint()};
+    fc_a.coordinator.lease_ttl_seconds = TEST_LEASE_TTL;
+    fc_a.coordinator.node_id = "node_A";
+    fc_a.coordinator.cluster_prefix = ETCD_KEY_PREFIX;
+    fc_a.failover_enabled = true;
+    fc_a.replication_address = "127.0.0.1:19011";
+    // A waits a minute before standing again and B half a second, so that B is the one elected:
+    // the order in which two election waits elapse must not decide the test.
+    fc_a.election_lease_wait_ms = 60'000;
+    ob::FailoverConfig fc_b = fc_a;
+    fc_b.coordinator.node_id = "node_B";
+    fc_b.replication_address = "127.0.0.1:19012";
+    fc_b.election_lease_wait_ms = 500;
+
+    ob::FailoverManager fm_a(fc_a, *engine_a, engine_a->registry());
+    fm_a.start();
+    ASSERT_TRUE(wait_for_role(fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    ob::FailoverManager fm_b(fc_b, *engine_b, engine_b->registry());
+    fm_b.start();
+    ASSERT_TRUE(wait_for_role(fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    EXPECT_TRUE(engine_b->stats().is_replica) << "B does not follow A from its start";
+
+    // A loses the role with nobody elected to follow: the leader key is taken from it - put again
+    // naming a holder that publishes no address, under a lease of the observer's own - and then
+    // goes, with that lease. A steps down on the first and has no successor to follow; B is
+    // elected on the second.
+    {
+        auto observer = make_client("observer_201");
+        ASSERT_TRUE(observer->connect());
+        const int64_t lease = observer->grant_lease();
+        ASSERT_NE(lease, 0);
+        ob::ClusterState nobody{};
+        nobody.leader_node_id = "node_gone";
+        nobody.epoch = fm_a.epoch();
+        ASSERT_TRUE(observer->put(ob::coordinator_leader_key(ETCD_KEY_PREFIX), nobody.to_json(), lease));
+        ASSERT_TRUE(wait_for_role(fm_a, ob::NodeRole::REPLICA, std::chrono::seconds(TEST_LEASE_TTL + 5)));
+        EXPECT_FALSE(engine_a->stats().is_replica) << "A had a successor to follow after all";
+        ASSERT_TRUE(observer->revoke_lease(lease));
+        observer->disconnect();
+    }
+    ASSERT_TRUE(wait_for_role(fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(TEST_LEASE_TTL + 15)));
+
+    // A follows B: its engine has a replication client, towards the address B published.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!engine_a->stats().is_replica && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_TRUE(engine_a->stats().is_replica)
+        << "A is a REPLICA with no replication client: it demoted before B was elected and "
+           "never followed B - while ROLE names " << fm_a.primary_address();
+    EXPECT_EQ(fm_a.primary_address(), fc_b.replication_address);
+
+    fm_a.stop();
+    fm_b.stop();
+    engine_a->close();
+    engine_b->close();
+}
+
 TEST_F(EtcdTestFixture, SplitBrainRecovery) {
     TempDir dir_a("sb_a");
     TempDir dir_b("sb_b");
