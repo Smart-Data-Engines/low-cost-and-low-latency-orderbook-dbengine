@@ -2464,10 +2464,12 @@ for exactly that reason.
   intent cannot be withdrawn either, the node stays a replica and the role moves when its lease
   expires.
 
-After the fix, through the server: `tests/integration/test_handover.py` - three handovers under a
-writer that never pauses lose nothing, and the target is primary well within half the TTL; against
-the server before it, the same module lost an acknowledged write in its first round and waited
-10.74 s. Of `tests/test_etcd_integration.cpp`'s six failures on master, the four that are handovers
+After the fix, measured the same way on the same host (`evidence/2026-10-03-handover-after/`): **no
+acknowledged write lost in any of the ten runs, and the target primary 0.65 s after the `OK`** in
+every one, Debug and Release; the first refusal comes 2 ms after the `FAILOVER`. And through
+`tests/integration/test_handover.py`: three handovers under a writer that never pauses lose
+nothing, and the target is primary well within half the TTL; against the server before the fix, the
+same module lost an acknowledged write in its first round and waited 10.74 s. Of `tests/test_etcd_integration.cpp`'s six failures on master, the four that are handovers
 pass; the other two predate #82 and #70 and are #202's.
 
 - Effort: M | Impact: every planned handover - maintenance, an upgrade - lost the tail of the
