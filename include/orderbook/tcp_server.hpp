@@ -195,6 +195,10 @@ struct ServerConfig {
     /// a process that rewrites what is stored, not a tuning knob.
     bool compaction{true};
 
+    /// --write-admission on|off: whether writes are paced at the rate the device takes once a flush
+    /// tick shows it behind (#190 step 5), rather than every writer stopping at a full queue.
+    bool write_admission{true};
+
     // ── Authentication (#30) ──────────────────────────────────────────────────
     //
     // Paths, never secrets. `--print-config` renders every value in this struct, so a secret held

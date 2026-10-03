@@ -141,6 +141,11 @@ MetricsRegistry::MetricsRegistry() {
                                      "writes that waited for room in the pending queue"));
     counters_.push_back(make_counter("ob_writer_backpressure_refusals_total",
                                      "writes refused because the pending queue never freed room"));
+    // Admission (#190 step 5): batches paced at the rate the device takes, and how long in all.
+    counters_.push_back(make_counter("ob_writer_admission_delays_total",
+                                     "Batches of writes that waited for admission at the device's rate"));
+    counters_.push_back(make_counter("ob_writer_admission_delay_us_total",
+                                     "Microseconds batches of writes waited for admission, in all"));
     // Mesh events whose handling threw and which the io loop abandoned (#112). Registered in the
     // same change that writes it: measured, an ENOSPC on a peer's delta used to end that thread
     // outright, and every outside signal - PING, MM_PEERS, the peer's `connected` row - stayed
@@ -214,6 +219,9 @@ MetricsRegistry::MetricsRegistry() {
                                  "Push bytes queued across subscribers (a consumer that stopped "
                                  "reading shows up here before it is disconnected)"));
     gauges_.push_back(make_gauge("ob_pending_rows",    "Number of rows pending flush"));
+    gauges_.push_back(make_gauge("ob_writer_admission_rate",
+                                 "Rows a second writes are admitted at while the device is behind; "
+                                 "0 while admission is off (#190)"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
     // #165 part 2a: rows drained into blocks that no seal has written yet, and how many seals ran.

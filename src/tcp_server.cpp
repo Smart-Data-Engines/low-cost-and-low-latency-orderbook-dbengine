@@ -1129,6 +1129,7 @@ const std::vector<std::string>& known_flags() {
         "ttl-scan-interval-seconds",
         "wal-dir",
         "wal-rotate-bytes",
+        "write-admission",
     };
     return flags;
 }
@@ -1166,6 +1167,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "
                                   "(default: on)"}},
+        {"write-admission", {"on|off", "Whether writes are taken at the rate the device takes them once "
+                                       "a flush tick shows it behind, rather than every writer stopping "
+                                       "at a full pending queue (default: on)"}},
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
@@ -1607,6 +1611,18 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                              val.c_str());
                 std::exit(1);
             }
+        } else if (arg == "--write-admission") {
+            const std::string val{cursor.value()};
+            if (val == "on") {
+                config.write_admission = true;
+            } else if (val == "off") {
+                config.write_admission = false;
+            } else {
+                // Refused rather than defaulted, as --compaction is.
+                std::fprintf(stderr, "Error: --write-admission expects on or off, got '%s'\n",
+                             val.c_str());
+                std::exit(1);
+            }
         } else if (arg == "--drain-timeout-ms") {
             config.drain_timeout_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--io-spin-us") {
@@ -1926,6 +1942,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("migration-identity", c.migration_identity.empty() ? "(none)" : c.migration_identity);
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
     line("compaction", c.compaction ? "on" : "off");
+    line("write-admission", c.write_admission ? "on" : "off");
     line("fsync-policy",
          c.fsync_policy == FsyncPolicy::EVERY ? "every"
              : c.fsync_policy == FsyncPolicy::NONE ? "none" : "interval");
@@ -2991,6 +3008,7 @@ void TcpServer::run() {
     // Wire up the dynamic read-only flag so failover transitions toggle it.
     engine_->set_read_only_flag(&read_only_);
     engine_->set_compaction_enabled(config_.compaction);
+    engine_->set_write_admission_enabled(config_.write_admission);
 
     // Open the engine (replay WAL, start flush thread).
     engine_->open();

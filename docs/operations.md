@@ -748,6 +748,23 @@ integration test holds the names against what a running node serves.
   room. Waits are not an error — a writer faster than a flush cycle meets the ceiling once a cycle,
   which one pipelining connection on an m9g.xlarge does at 6.6 M levels a second — and refusals
   are: the flush cannot make progress.
+- `ob_writer_admission_rate`, `ob_writer_admission_delays_total`,
+  `ob_writer_admission_delay_us_total` — **writes faster than the device** (#190). A flush tick
+  that took twice its interval or longer says how many rows the device took in how long; from then
+  on each batch of writes waits, after it is written and outside the engine's lock, for its rows'
+  time at that rate, and the gauge is that rate in rows a second. A tick that is not slow raises it
+  by a tenth, and admission ends once no batch has waited for ten ticks; the gauge is 0 while it is
+  off, which is always on a device that keeps up. It begins with one line - this one from an
+  m9g.xlarge whose volume's writes were capped at 60 MB/s - and ends with another,
+  `Writes are taken at full speed again: <n> batch(es) waited for admission, <ms> ms in all`:
+
+  ```
+  Writes arrive faster than the device takes them - a flush tick took 1023 ms for 608000 row(s), 594067 rows/s - so each batch now waits after it is written, at that rate, rather than every writer stopping at a full pending queue
+  ```
+
+  Without it, a device slower than the ingest stops every writer at the full pending queue for as
+  long as a tick takes and refuses the writes past five seconds: measured with the volume's writes
+  capped at 30 MB/s, every round refused. `--write-admission off` restores that behaviour.
 - `ob_unsealed_rows` — rows drained, readable, and waiting in memory for their store's seal (#165
   part 2a): a store is sealed at 65 536 rows or when its oldest are ten seconds old, and every store
   together is held under four million rows. These are the rows a crash replays from the WAL, and
