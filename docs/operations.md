@@ -503,7 +503,10 @@ adopted (#114).
 
 A flush writes its segment files and then makes them durable with **one `syncfs()` on the data
 directory**, before the checkpoint that claims them is appended; and startup **removes any segment
-no surviving checkpoint vouches for**, rebuilding its rows from the WAL (#160). So under `every` an
+no surviving checkpoint vouches for**, rebuilding its rows from the WAL (#160). Since #190's step 6 a
+flush **tick** leaves that `syncfs()` to a thread of its own and drains the queue meanwhile; the
+checkpoint, with the claim frozen when the sync was asked for, is appended by the next tick once the
+sync is done. `FLUSH`, a drop and a clean stop wait for it, so their own checkpoint is the last. So under `every` an
 acknowledged write survives a power cut, and under `interval` everything up to the last WAL sync
 does. Measured with a cut the kernel performs — `tests/integration/test_power_cut.py`, dm-flakey
 over a loop device, switched to drop every write, the way xfstests simulate one: **201 of 201**
