@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/admission.hpp"
 #include "orderbook/aggregation.hpp"
 #include "orderbook/chunked_queue.hpp"
 #include "orderbook/columnar_store.hpp"
@@ -242,6 +243,13 @@ public:
     /// Whether the flush tick merges small segments (#165 part 2b): on unless `--compaction off`.
     /// Not a tuning knob - a valve on a process that rewrites what is stored. Before open().
     void set_compaction_enabled(bool enabled) { compaction_enabled_ = enabled; }
+
+    /// Whether writes are admitted at the rate the device takes once a flush tick shows it behind
+    /// (#190 step 5): on unless `--write-admission off`.
+    void set_write_admission_enabled(bool enabled) { admission_.set_enabled(enabled); }
+
+    /// The admission controller, for a test to show it a tick without a slow device.
+    AdmissionController& admission_for_test() { return admission_; }
 
     /// Keep every segment's files where they are for as long as the returned handle lives (#165 part
     /// 2b): while one is held, the tick neither merges segments nor sweeps retention. A snapshot
@@ -758,6 +766,11 @@ private:
     // moves through five steps across ticks - written, synced, published, synced, inputs removed -
     // and each field is one step's list.
     bool compaction_enabled_{true};
+
+    /// Writes admitted at the rate the device takes (#190 step 5). Its interval is the flush
+    /// interval, declared above and so initialised before this.
+    AdmissionController admission_{AdmissionController::for_interval(std::chrono::nanoseconds(flush_interval_ns_))};
+
     /// A symbol's segments whose end falls in one period: what a merge may take from.
     struct CompactionKey {
         uint64_t    period_start{0};

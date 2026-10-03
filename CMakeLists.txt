@@ -392,9 +392,13 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg or
 add_library(orderbook_compaction STATIC src/compaction.cpp)
 target_link_libraries(orderbook_compaction PUBLIC orderbook_core)
 
+# ── Writes admitted at the rate the device takes (#190 step 5): a policy, tested on its own ──────
+add_library(orderbook_admission STATIC src/admission.cpp)
+target_link_libraries(orderbook_admission PUBLIC orderbook_core)
+
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/engine_compaction.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission)
 
 # ── Backup and restore (#34) ──────────────────────────────────────────────────
 # The server's BACKUP and the offline ob_restore: engine-side, and nothing of the client, whose

@@ -1364,7 +1364,34 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // sampling it inside the batch could only ever have seen it under this lock anyway.
     registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
 
-    if (!multi_master) return;
+    // Admission (#190 step 5): how long this batch's writer waits before it goes on, reserved here
+    // and waited out below without the lock - after the writes are in the WAL and queued, so what
+    // waits is the writer's next batch, not these rows. Nothing while the device keeps up.
+    uint64_t rows_written = 0;
+    for (size_t k = 0; k < s.records.size(); ++k) {
+        if (s.wal[k].error.empty()) rows_written += s.deltas[s.write_of[k]].n_levels;
+    }
+    const auto admission_wait = admission_.admit(rows_written);
+    if (admission_wait > AdmissionController::Clock::duration::zero()) {
+        registry_.increment_counter("ob_writer_admission_delays_total");
+        registry_.increment_counter(
+            "ob_writer_admission_delay_us_total",
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(admission_wait).count()));
+    }
+    const auto wait_for_admission = [&] {
+        if (admission_wait > AdmissionController::Clock::duration::zero()) {
+            std::this_thread::sleep_for(admission_wait);
+        }
+    };
+
+    if (!multi_master) {
+        if (admission_wait > AdmissionController::Clock::duration::zero()) {
+            timing.released = WriteTiming::Clock::now();
+            lock.unlock();
+            wait_for_admission();
+        }
+        return;
+    }
 
     // 6. Broadcast to peers - with mtx_ released, in the order of the writes.
     //
@@ -1382,7 +1409,10 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // the receiving side reads arrival order as meaning anything.
     timing.released = WriteTiming::Clock::now();
     lock.unlock();
-    if (!mm_mgr_) return;
+    if (!mm_mgr_) {
+        wait_for_admission();
+        return;
+    }
     for (size_t k = 0; k < s.records.size(); ++k) {
         if (!s.wal[k].error.empty()) continue;
         const size_t i = s.write_of[k];
@@ -1393,6 +1423,8 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             outcomes[i].error = e.what();
         }
     }
+    // After the peers are told, so that pacing a writer never delays what its rows owe the mesh.
+    wait_for_admission();
 }
 
 void Engine::broadcast_to_replicas(const DeltaUpdate& delta, const Level* levels,
@@ -3363,6 +3395,30 @@ void Engine::flush_tick() {
                          ms_since(drained, sealed), ms_since(sealed, retained),
                          ms_since(retained, finished));
         }
+        // What this tick says about the device, for admission (#190 step 5): the rows it took from
+        // the queue and how long taking them did - the sync, the drain and the seals.
+        switch (admission_.on_tick(taken, TickClock::now() - tick_started)) {
+            case AdmissionController::Change::Began: {
+                const auto m = admission_.last_slow_tick();
+                OB_LOG_WARN("engine", "Writes arrive faster than the device takes them - a flush tick "
+                                      "took %.0f ms for %llu row(s), %.0f rows/s - so each batch now "
+                                      "waits after it is written, at that rate, rather than every writer "
+                                      "stopping at a full pending queue",
+                            std::chrono::duration<double, std::milli>(m.took).count(),
+                            static_cast<unsigned long long>(m.rows), m.rows_per_s);
+                break;
+            }
+            case AdmissionController::Change::Ended:
+                OB_LOG_INFO("engine", "Writes are taken at full speed again: %llu batch(es) waited for "
+                                      "admission, %.1f ms in all",
+                            static_cast<unsigned long long>(admission_.delayed_batches()),
+                            std::chrono::duration<double, std::milli>(admission_.delayed_total()).count());
+                break;
+            case AdmissionController::Change::None:
+                break;
+        }
+        registry_.set_gauge("ob_writer_admission_rate", static_cast<int64_t>(admission_.rate()));
+
         // And said at WARN when a tick takes a second (#186): writers at the ceiling wait for the room
         // a tick frees in the pending queue - up to 3.4 s, measured, with every section this tick
         // holds the lock in short - and which phase it was is what an operator needs to know.
