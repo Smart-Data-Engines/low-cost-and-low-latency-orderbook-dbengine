@@ -3801,11 +3801,18 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
 
     if (!seal_all && only == nullptr) {
         const size_t total = unsealed_rows_.load(std::memory_order_relaxed);
-        if (by_budget > 0) {
+        size_t candidate_rows = 0;
+        for (const SealCandidate& c : candidates) candidate_rows += c.rows;
+        // Over the budget whatever made the stores due: this line used to wait for a store sealed
+        // only because of it, and so said nothing of the tick that sealed 2 977 stores past the
+        // per-tick limit, every one of them due by age (#205).
+        if (candidate_rows > kUnsealedRowsBudget) {
             if (unsealed_budget_episode_.begin()) {
-                OB_LOG_INFO("engine", "%zu unsealed row(s) are over the budget of %zu, so the oldest "
-                                      "stores are sealed before they are due: %zu this tick",
-                            total, kUnsealedRowsBudget, by_budget);
+                OB_LOG_INFO("engine", "%zu unsealed row(s) are over the budget of %zu, so the largest "
+                                      "stores are sealed past the per-tick limit until the rest are "
+                                      "under it: %zu store(s), %zu row(s) this tick, %zu of them not "
+                                      "yet due",
+                            candidate_rows, kUnsealedRowsBudget, seals.size(), sealed_rows, by_budget);
             }
         } else if (const uint64_t ticks = unsealed_budget_episode_.end()) {
             OB_LOG_INFO("engine", "unsealed rows back under the budget after %llu tick(s)",

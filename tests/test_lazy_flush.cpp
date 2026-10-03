@@ -137,8 +137,9 @@ TEST(SealPolicy, AtMostTheLimitATickOldestFirst) {
 }
 
 TEST(SealPolicy, OverTheBudgetTheOldestAreSealedPastTheLimit) {
-    // Neither due by rows nor by age, and together over the budget: sealed oldest first until they
-    // are under it, however many that is - memory is what the budget bounds.
+    // Neither due by rows nor by age, and together over the budget: sealed until they are under it,
+    // however many that is - memory is what the budget bounds. The largest first, and these are all
+    // one size, so the oldest.
     const auto now = Clock::now();
     constexpr size_t kEach = 30'000;
     const size_t stores = ob::Engine::kUnsealedRowsBudget / kEach * 3 / 2;
