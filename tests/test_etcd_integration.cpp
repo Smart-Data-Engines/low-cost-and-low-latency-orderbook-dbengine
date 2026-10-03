@@ -895,8 +895,13 @@ TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
 
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - killed_at);
-    EXPECT_LT(took.count(), 6000)
-        << "promotion took " << took.count()
+    // What a failover costs since #82: up to a monitor tick to see the key go, the election wait
+    // (the lease TTL), and a tick to stand. The bound was 6000 ms against a 5 s wait, which leaves
+    // a second for both ticks: the first CI run of this binary took 6116 ms - 1 s to notice, 5 s,
+    // 0.1 s to promote (#202). A handover's grace window on top (3 s here) still lands past this.
+    const int64_t bound_ms = TEST_LEASE_TTL * 1000 + 2000;
+    EXPECT_LT(took.count(), bound_ms)
+        << "promotion took " << took.count() << " ms against a bound of " << bound_ms
         << " ms; ungraceful failover must not wait out a handover grace window";
 }
 
