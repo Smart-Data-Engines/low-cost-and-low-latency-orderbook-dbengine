@@ -968,6 +968,69 @@ TEST_F(EtcdTestFixture, AHandoverDoesNotTakeTheRoleBackBeforeItsLeaseIsRevoked) 
     EXPECT_EQ(p.fm_a->role(), ob::NodeRole::REPLICA);
 }
 
+/// The engine's role transitions, with a step-down that takes `delay` - as one does when it waits
+/// for the engine's lock behind a write on a slow device (#190).
+struct SlowStepDown : ob::RoleTransitionHandler {
+    ob::Engine& engine;
+    std::chrono::milliseconds delay;
+    SlowStepDown(ob::Engine& e, std::chrono::milliseconds d) : engine(e), delay(d) {}
+    void promote_to_primary(const ob::EpochValue& epoch) override { engine.promote_to_primary(epoch); }
+    void demote_to_replica(const std::string& address) override { engine.demote_to_replica(address); }
+    std::pair<uint32_t, size_t> get_wal_position() const override { return engine.get_wal_position(); }
+    ob::EpochValue get_current_epoch() const override { return engine.get_current_epoch(); }
+    void truncate_and_rebootstrap(const ob::EpochValue& epoch, const std::string& address) override {
+        engine.truncate_and_rebootstrap(epoch, address);
+    }
+    std::optional<ob::StreamPosition> step_down_for_handover() override {
+        std::this_thread::sleep_for(delay);
+        return engine.step_down_for_handover();
+    }
+    std::optional<ob::StreamPosition> replicated_position() override {
+        return engine.replicated_position();
+    }
+};
+
+TEST_F(EtcdTestFixture, AHandoverWhoseStepDownTakesLongerThanTheGraceWindowStillLandsOnItsTarget) {
+    // The intent's deadline is how long everyone else defers to the target once the key goes. It
+    // was set when the first intent was written; a step-down slower than the grace window then
+    // revoked the lease with the intent already expired, and the handover became an ordinary
+    // election - the target waiting the election delay, and maybe losing it to the node it was
+    // meant to replace. The second intent, written as the key is about to go, starts it again.
+    std::unique_ptr<SlowStepDown> slow_a;   // before `p`, so it outlives the manager that calls it
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    const auto cfg_a = make_failover_config("node_A", "127.0.0.1:19045");
+    slow_a = std::make_unique<SlowStepDown>(
+        *p.engine_a, std::chrono::milliseconds(cfg_a.handover_grace_seconds * 1000 + 1000));
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *slow_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19046"), *p.engine_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+    const auto revoked_at = std::chrono::steady_clock::now();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(15)));
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - revoked_at);
+    EXPECT_LT(took.count(), TEST_LEASE_TTL * 1000 / 2)
+        << "the target took " << took.count() << " ms after the revoke: the intent had expired "
+        << "during the step-down, and the handover became an ordinary election";
+}
+
 // ── Task 5.2: GracefulFailover ───────────────────────────────────────────────
 // Validates: Requirements 3.1, 3.2, 3.3, 3.4
 
