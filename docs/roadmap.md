@@ -1200,6 +1200,27 @@ and getting data into their existing Python stack without a copy.
 
 ### 44. Time-bucketed aggregation in the query language
 - `GROUP BY time_bucket(interval)`, OHLCV bar generation, time-weighted mid price, rolling windows
+- **Step 1 done: aggregates over the rows of each bucket** (spec `kiro-workspace/specs/time-buckets/`).
+  `SELECT <aggregates> FROM ... [WHERE ...] GROUP BY TIME_BUCKET(<n><unit>) [LIMIT n]`, the unit one
+  of `ns us ms s m h d`, at most 366 d; buckets on the Unix epoch in UTC, only those holding a row,
+  in time order, `LIMIT` on buckets. `COUNT(*)`, `FIRST`, `LAST`, `MIN`, `MAX` of `price` or
+  `quantity`, `SUM(quantity)`, `AVG` and `VWAP(price)` scaled by 10^6 - `FIRST` and `LAST` by event
+  time, a tie broken as a snapshot breaks it (#168), `VWAP` `NULL` over quantities of zero. The
+  conditions narrow the rows the aggregates read, where beside a function of the live book they are
+  refused (#199, #200); the same names mean the live book's functions without `GROUP BY`, and a
+  side is chosen in `WHERE`. Sums in 128 bits, a value that does not fit 64 refused
+  (`BUCKET_OVERFLOW`), and a ceiling on the buckets of one answer that refuses rather than cuts
+  (`BUCKETS_TOO_MANY`, `--max-query-buckets`, 100 000). The answer's header carries each column's
+  scale; `query_buckets()` in the Python and C++ clients reads it, `query()` refuses it by name, and
+  the local library refuses `GROUP BY`. The scan asks its map only when a row leaves the last
+  bucket - a segment's rows come in about their time order.
+  Measured on the i3-7100U, Release, one million rows in 120 minute bars, 6 rounds a side
+  alternating (`scripts/measure_time_buckets.py`): **44-51 ms of the server's CPU a query and
+  8.6 KB of reply**, where `SELECT *` of the same rows with the bars computed by the client took
+  293-312 ms of the server's CPU, 3.44-3.52 s at the client (p50) and 42.6 MB. Asking the map only
+  when a row leaves the last bucket took the query from 65-67 to 44 ms.
+  Steps 2 (series of the book: open, high, low, close and time-weighted values of the best bid and
+  ask) and 3 (rolling windows) are not built.
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
 
 ### 45. Streaming subscriptions ✅

@@ -4017,6 +4017,11 @@ Learned the hard way. Check here before debugging.
      paced writers since the first second, and the worst wait began 14 s later, in a tick whose WAL
      sync took 4-5 s. The numbers were the step's; the sentence beside them was not. Derive the
      explanation from the run that produced the numbers, with a script kept beside its logs.
+538. **A property whose generated query always asks the same things cannot see a column read without
+     being named.** `VWAP(price)` weighs by the quantity, and the bucket scan read the columns its
+     aggregates name - so with no quantity aggregate beside it every bucket's VWAP was `NULL` (#44).
+     The oracle property passed: its select list always held one. A unit test found it, and the
+     property found it once it drew its list at random. Generate the request, not only the data.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
