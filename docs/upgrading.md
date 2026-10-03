@@ -26,6 +26,8 @@ step 4), against this tree.
 | A primary of the previous version, a replica of this one | the replica holds every row | `test_a_primary_of_the_previous_version_replicates_to_this_one` |
 | A primary of this version, a replica of the previous one | the replica holds every row | `test_a_primary_of_this_version_replicates_to_the_previous_one` |
 | A failover from a previous-version primary to this version's replica, under etcd | no acknowledged write lost; writes go on at the new primary | `test_a_failover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
+| A planned `FAILOVER` from a previous-version primary to this version's replica | it completes: no acknowledged write lost, writes go on at the new primary, the outgoing node is a replica. The previous version's intent says nothing that would let the target stand before the election delay (#204) | `test_a_handover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
+| A planned `FAILOVER` from this version's primary to a previous-version replica | it completes: no acknowledged write lost, writes go on at the new primary, the outgoing node is a replica - the previous version reads this one's intent | `test_a_handover_from_this_versions_primary_to_the_previous_replica_loses_no_write` |
 | A two-node mesh, one node of each version | both hold every row either wrote | `test_a_mesh_of_both_versions_converges` |
 | This version's Python client and `ob_backup` against the previous server | writes and queries work; `capabilities:` has no `backup`, and `ob_backup` refuses with status 2 | `test_this_versions_clients_work_against_the_previous_server` |
 

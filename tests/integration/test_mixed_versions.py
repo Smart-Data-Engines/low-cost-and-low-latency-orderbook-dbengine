@@ -24,7 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ClusterManager, free_port, patience, server_binary_path, wait_for_role
+from conftest import (ClusterManager, free_port, patience, role_of, send_command, server_binary_path,
+                      wait_for_role)
 
 pytestmark = pytest.mark.replication
 
@@ -272,6 +273,39 @@ def test_a_failover_from_the_previous_primary_to_this_versions_replica_loses_no_
         assert prices(replica.tcp_port, "FOV") == expected(0, 35)
     finally:
         cluster.shutdown()
+
+
+def _hand_over(binaries: dict[int, str], symbol: str) -> None:
+    """A planned FAILOVER from node 0 to node 1 of the versions given: it completes, and every write
+    acknowledged before it is on the new primary, which takes writes (#204)."""
+    cluster = MixedCluster(binaries)
+    cluster.start()
+    try:
+        primary, replica = cluster.primary(), cluster.replica()
+        assert primary.index == 0 and replica.index == 1, "the harness started them the other way"
+        write(primary.tcp_port, symbol, 0, 30)
+        want = expected(0, 30)
+        assert eventually(lambda: prices(replica.tcp_port, symbol) == want), "the replica never caught up"
+        reply = send_command(primary.tcp_port, f"FAILOVER {replica.node_id}").strip()
+        assert reply.startswith("OK"), f"the handover was refused: {reply!r}"
+        # Either side may be the one that waits the election delay - the previous version's target
+        # waits it whatever it is told, and so does this one's without a statement from the
+        # previous version - so within three of them.
+        wait_for_role(replica.tcp_port, "PRIMARY", timeout=patience(30))
+        write(replica.tcp_port, symbol, 30, 5)
+        assert ask(replica.tcp_port, "FLUSH").startswith("OK")
+        assert prices(replica.tcp_port, symbol) == expected(0, 35)
+        assert role_of(primary.tcp_port).startswith("REPLICA"), "the outgoing node kept the role"
+    finally:
+        cluster.shutdown()
+
+
+def test_a_handover_from_the_previous_primary_to_this_versions_replica_loses_no_write():
+    _hand_over({0: PREVIOUS, 1: CURRENT}, "HPN")
+
+
+def test_a_handover_from_this_versions_primary_to_the_previous_replica_loses_no_write():
+    _hand_over({0: CURRENT, 1: PREVIOUS}, "HNP")
 
 
 # ── The mesh ──────────────────────────────────────────────────────────────────
