@@ -85,8 +85,9 @@ struct Fixture {
         return meta.value_or(ob::SegmentMeta{});
     }
     /// One segment written beside the index, then put in it with a range that is not its rows':
-    /// what a build before #166 left, starting `earlier` before its first row.
-    void segment_with_a_wider_range(const std::vector<ob::SnapshotRow>& rows, uint64_t earlier) {
+    /// what a build before #166 left - a start `shift` before its first row, or after it, so that
+    /// a row of it is earlier than the start it is delivered by.
+    void segment_with_a_range_not_its_rows(const std::vector<ob::SnapshotRow>& rows, int64_t shift) {
         ob::ColumnarStore writer(dir.string(), ob::ColumnarStore::kDefaultSegmentDurationNs,
                                  ob::ColumnarStore::OwnIndex::kNo);
         writer.set_symbol_exchange("BK", "EX");
@@ -94,7 +95,8 @@ struct Fixture {
         auto meta = writer.flush_segment();
         ASSERT_TRUE(meta.has_value());
         meta->time_range_is_rows = false;
-        meta->start_ts_ns -= std::min(meta->start_ts_ns, earlier);
+        meta->start_ts_ns = static_cast<uint64_t>(static_cast<int64_t>(meta->start_ts_ns) + shift);
+        meta->start_ts_ns = std::min(meta->start_ts_ns, meta->end_ts_ns);
         store.merge_segments({*meta});
     }
     void block(const std::vector<ob::SnapshotRow>& rows) {
@@ -326,8 +328,8 @@ RC_GTEST_PROP(ScanByTimeProperty, TheRowsAreTheScansSortedByTimeStably, ()) {
     const int segments = *rc::gen::inRange(1, 7);
     for (int s = 0; s < segments; ++s) f.segment(rows_of(*rc::gen::inRange(1, 10)));
     if (*rc::gen::inRange(0, 3) == 0) {
-        f.segment_with_a_wider_range(rows_of(*rc::gen::inRange(1, 6)),
-                                     static_cast<uint64_t>(*rc::gen::inRange(0, 20)) * kSec);
+        f.segment_with_a_range_not_its_rows(rows_of(*rc::gen::inRange(2, 8)),
+                                            *rc::gen::inRange<int64_t>(-20, 21) * static_cast<int64_t>(kSec));
     }
     const int blocks = *rc::gen::inRange(0, 3);
     for (int b = 0; b < blocks; ++b) f.block(rows_of(*rc::gen::inRange(1, 6)));
@@ -394,6 +396,52 @@ TEST(ScanByTime, SegmentsApartInTimeAreHeldOneAtATime) {
     EXPECT_EQ(seen, 500u);
     EXPECT_EQ(cost.candidates, 10u);
     EXPECT_EQ(cost.max_held, 50u) << "the read held more than one segment's rows at once";
+}
+
+TEST(ScanByTime, ARunOfManyTiesKeepsTheOrderItHoldsThemIn) {
+    // Two hundred rows at five times, written round-robin: sorted by time, each time's forty must
+    // stay in the order the segment holds them - a sort that is not stable keeps that order only
+    // for runs short enough to be sorted by insertion.
+    Fixture f;
+    std::vector<ob::SnapshotRow> rows;
+    for (int i = 0; i < 200; ++i) rows.push_back(row(kBase + static_cast<uint64_t>(i % 5) * kSec, 0, 0, i));
+    f.segment(rows);
+    std::vector<int64_t> prices;
+    f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
+                         [](const ob::SnapshotRow&) { return true; },
+                         [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
+    ASSERT_EQ(prices.size(), 200u);
+    for (size_t i = 0; i < 200; ++i) {
+        EXPECT_EQ(prices[i], static_cast<int64_t>((i % 40) * 5 + i / 40)) << "at " << i;
+    }
+}
+
+TEST(ScanByTime, ABlockIsMergedWithTheSegmentsByTime) {
+    // A block - delivered after every segment - holding the earliest row: it is read before the
+    // segments are streamed, or the first segment's row would be handed over before it.
+    Fixture f;
+    f.segment({row(kBase + 5 * kSec, 0, 0, 2)});
+    f.segment({row(kBase + 10 * kSec, 0, 0, 3)});
+    f.block({row(kBase + 1 * kSec, 0, 0, 1)});
+    std::vector<int64_t> prices;
+    f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
+                         [](const ob::SnapshotRow&) { return true; },
+                         [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
+    EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3}));
+}
+
+TEST(ScanByTime, ASegmentWhoseRangeIsNotItsRowsIsReadFirst) {
+    // Rows at 1 s and 9 s and a recorded start of 8 s, as a build before #166 could leave it:
+    // read in the order of that start, its row at 1 s would come after the other segment's at 5 s.
+    Fixture f;
+    f.segment({row(kBase + 5 * kSec, 0, 0, 2)});
+    f.segment_with_a_range_not_its_rows({row(kBase + 1 * kSec, 0, 0, 1), row(kBase + 9 * kSec, 0, 0, 3)},
+                                        7 * static_cast<int64_t>(kSec));
+    std::vector<int64_t> prices;
+    f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
+                         [](const ob::SnapshotRow&) { return true; },
+                         [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
+    EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3}));
 }
 
 TEST(ScanByTime, ARowAtTheStartOfTheNextSegmentWaitsForItsTie) {
