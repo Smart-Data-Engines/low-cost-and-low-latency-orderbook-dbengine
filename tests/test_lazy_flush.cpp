@@ -250,6 +250,28 @@ TEST(SealPolicy, OverTheBudgetAsFewStoresAreSealedAsBringTheRestUnderIt) {
     for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kBudget);
 }
 
+TEST(SealPolicy, OverTheBudgetSealingStopsAtTheBudget) {
+    // A hundred and one stores of 40 000 rows, none due: one seal leaves exactly the budget, which
+    // is not over it.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 101; ++i) c.push_back(candidate(40'000, std::chrono::milliseconds(2000 - i), now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 0);
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{0}));
+}
+
+TEST(SealPolicy, AStoreIsTakenOnceWhateverMadeItDue) {
+    // Fifty stores due by rows and over the budget together, in a tick whose share holds them all:
+    // the budget takes ten, the share the other forty, and none twice.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 50; ++i) c.push_back(candidate(100'000, std::chrono::milliseconds(2000 - i), now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 4'000'000);
+    std::vector<size_t> all;
+    for (size_t i = 0; i < 50; ++i) all.push_back(i);
+    ASSERT_EQ(indices(picks), all);
+}
+
 TEST(SealPolicy, SealAllTakesEveryOne) {
     const auto now = Clock::now();
     const auto picks = ob::Engine::pick_seals(
