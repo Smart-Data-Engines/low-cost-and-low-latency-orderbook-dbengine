@@ -313,7 +313,7 @@ def main() -> int:
         for node in nodes:
             c = TCPClient("127.0.0.1", node.tcp)
             agg = c.execute(
-                f"SELECT SPREAD(*), MID_PRICE(*), VWAP(*), IMBALANCE(10) "
+                f"SELECT SPREAD(*), MID_PRICE(*), VWAP(bid), VWAP(ask), IMBALANCE(10) "
                 f"FROM '{SYMBOL}'.'{EXCHANGE}'").strip()
             status = c.execute("STATUS").strip().splitlines()
             print(f"  node {node.index}:")

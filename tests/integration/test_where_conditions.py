@@ -138,3 +138,21 @@ def test_a_subscription_refuses_at(cluster, request):
     ack, pushed = subscribe_and_write(cluster.primary().tcp_port, own_symbol(request), "AT 5", [MID])
     assert ack.startswith("ERR"), f"a subscription with AT was accepted: {ack!r}"
     assert pushed == []
+
+
+def test_side_and_level_narrow_rows(cluster, primary_client, request):
+    """#200: `side` and `level` are conditions as time and price are."""
+    symbol = own_symbol(request)
+    primary_client.insert(symbol, EXCHANGE, "bid", [HIGH, MID], [5, 6])
+    primary_client.insert(symbol, EXCHANGE, "ask", [HIGH + 1, HIGH + 2], [7, 8])
+    primary_client.flush()
+    assert prices(cluster, symbol, "side = 1") == [HIGH + 1, HIGH + 2]
+    assert prices(cluster, symbol, "side = 0 AND level = 0") == [HIGH], "the top of the bids"
+    lines = raw_query(cluster.primary().tcp_port,
+                      f"SELECT price FROM '{symbol}'.'{EXCHANGE}' WHERE AT 18446744073709551615 AND level = 0")
+    assert lines[0] == "OK" and [int(p) for p in lines[2:]] == [HIGH, HIGH + 1], lines
+
+
+def test_a_side_past_its_type_is_refused(cluster, three):
+    lines = raw_query(cluster.primary().tcp_port, f"SELECT * FROM '{three}'.'{EXCHANGE}' WHERE side = 256")
+    assert lines and lines[0].startswith("ERR") and "out of range for side" in lines[0], lines

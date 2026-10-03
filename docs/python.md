@@ -216,10 +216,16 @@ aggs["MID_PRICE(*)"].real       # 100500.0  — already divided by the scale
 aggs["MID_PRICE(*)"].value      # 100500000000  — raw, scaled by 10^6
 aggs["MID_PRICE(*)"].scale      # 1000000
 aggs["SPREAD(*)"].is_empty      # False
+
+# A function of one side of the book names it (#200), so both sides come back in one query:
+aggs = engine.query_agg("BTC-USD", "BINANCE", "VWAP(bid)", "VWAP(ask)", "DEPTH(ask, 6500000)")
+aggs["VWAP(ask)"].real
 ```
 
 No timestamp range is sent: aggregates are computed over the current book, and the server rejects a
-timestamp or price filter rather than accepting one and ignoring it.
+timestamp, price, side or level filter rather than accepting one and ignoring it. `SUM(quantity)`,
+`VWAP(*)` and the other spellings that read the bids without saying so are refused with
+`AGG_NEEDS_SIDE`, raised here as an `OrderbookError` that names the spelling to use.
 
 `query()` raises `OrderbookError` if the query turns out to return aggregates, because the row parser
 would silently discard all three columns and hand back an empty list.

@@ -270,6 +270,86 @@ TEST(QueryConditions, ASubscriptionRefusesAt) {
         << "a subscription with AT pushed every row";
 }
 
+// #200: `side` and `level` are conditions as time and price are, with #199's rules.
+
+TEST(QueryConditions, SideAndLevelNarrowRowsAsTheOtherColumnsDo) {
+    Fixture f;
+    f.segment({row_at(kBase + 1000, 100, kBid, 0), row_at(kBase + 1000, 99, kBid, 1),
+               row_at(kBase + 1000, 101, kAsk, 0), row_at(kBase + 1000, 102, kAsk, 1)});
+    const auto sorted = [](Prices p) { std::sort(p.begin(), p.end()); return p; };
+    EXPECT_EQ(sorted(f.prices("side = 1")), (Prices{101, 102}));
+    EXPECT_EQ(sorted(f.prices("side < 1")), (Prices{99, 100}));
+    EXPECT_EQ(sorted(f.prices("side = 0 AND level = 0")), (Prices{100})) << "the top of the bids";
+    EXPECT_EQ(sorted(f.prices("level >= 1")), (Prices{99, 102}));
+    EXPECT_EQ(sorted(f.prices("level BETWEEN 0 AND 0 AND side > 0")), (Prices{101}));
+    EXPECT_TRUE(f.prices("side = 2").empty());
+    EXPECT_TRUE(f.prices("side > 255").empty());
+}
+
+TEST(QueryConditions, ANarrowedSelectStillReadsTheColumnsItsConditionsAreOn) {
+    // `SELECT price` answers one column and its side condition needs another: a scan that read only
+    // what it answers would see every row's side as 0 and keep none of the asks.
+    Fixture f;
+    f.segment({row_at(kBase + 1000, 100, kBid, 0), row_at(kBase + 1000, 99, kBid, 1),
+               row_at(kBase + 1000, 101, kAsk, 0), row_at(kBase + 1000, 102, kAsk, 1)});
+    Prices got;
+    const std::string err = f.engine.execute("SELECT price FROM 'CND'.'EX' WHERE side = 1 AND level = 1",
+                                             [&](const ob::QueryResult& r) { got.push_back(r.price); });
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(got, (Prices{102}));
+}
+
+TEST(QueryConditions, ASnapshotKeepsTheSideAndTheLevelsItIsAskedFor) {
+    Fixture f;
+    f.segment({row_at(kBase + 1000, 100, kBid, 0), row_at(kBase + 1000, 99, kBid, 1),
+               row_at(kBase + 1000, 101, kAsk, 0), row_at(kBase + 1000, 102, kAsk, 1)});
+    const std::string at = "AT " + std::to_string(kBase + 5000);
+    EXPECT_EQ(f.prices(at + " AND side = 1"), (Prices{101, 102}));
+    EXPECT_EQ(f.prices(at + " AND level = 0"), (Prices{100, 101})) << "the best of each side";
+}
+
+TEST(QueryConditions, ASubscriptionPushesOnlyTheSideItAsksFor) {
+    Fixture f;
+    const std::vector<ob::SnapshotRow> rows = {row_at(kBase + 1000, 100, kBid, 0),
+                                               row_at(kBase + 1000, 101, kAsk, 0)};
+    Prices pushed;
+    const uint64_t id = f.engine.subscribe("SUBSCRIBE * FROM 'CND'.'EX' WHERE side = 1",
+                                           [&](const ob::QueryResult& r) { pushed.push_back(r.price); });
+    ASSERT_NE(id, 0u);
+    f.engine.notify_subscribers("CND", "EX", rows);
+    f.engine.unsubscribe(id);
+    EXPECT_EQ(pushed, (Prices{101}));
+}
+
+TEST(QueryConditions, ASideOrALevelPastItsColumnsTypeIsAParseError) {
+    Fixture f;
+    ob::QueryAST ast;
+    std::string err = f.engine.parse("SELECT * FROM 'CND'.'EX' WHERE side = 256", ast);
+    EXPECT_NE(err.find("out of range for side"), std::string::npos) << err;
+    err = f.engine.parse("SELECT * FROM 'CND'.'EX' WHERE level = 65536", ast);
+    EXPECT_NE(err.find("out of range for level"), std::string::npos) << err;
+    EXPECT_TRUE(f.engine.parse("SELECT * FROM 'CND'.'EX' WHERE level = 65535", ast).empty());
+}
+
+TEST(QueryConditions, SideAndLevelReadBackFromTheCanonicalForm) {
+    Fixture f;
+    for (const std::string where : {"side = 1", "level > 3", "side >= 0 AND level <= 9",
+                                    "AT 5000 AND side = 0 AND level = 0"}) {
+        ob::QueryAST first, again;
+        ASSERT_TRUE(f.engine.parse("SELECT * FROM 'CND'.'EX' WHERE " + where, first).empty()) << where;
+        const std::string canonical = f.engine.format(first);
+        ASSERT_TRUE(f.engine.parse(canonical, again).empty()) << canonical;
+        EXPECT_EQ(again.side_lo, first.side_lo) << canonical;
+        EXPECT_EQ(again.side_hi, first.side_hi) << canonical;
+        EXPECT_EQ(again.level_lo, first.level_lo) << canonical;
+        EXPECT_EQ(again.level_hi, first.level_hi) << canonical;
+    }
+    ob::QueryAST ast;
+    ASSERT_TRUE(f.engine.parse("SELECT * FROM 'CND'.'EX' WHERE side = 1", ast).empty());
+    EXPECT_EQ(f.engine.format(ast), "SELECT * FROM 'CND'.'EX' WHERE side BETWEEN 1 AND 1")
+        << "a side printed as the character it also is";
+}
+
 namespace {
 
 enum class Op { Eq, Lt, Le, Gt, Ge, Between };

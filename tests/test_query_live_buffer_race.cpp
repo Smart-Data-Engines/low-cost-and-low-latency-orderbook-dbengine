@@ -142,7 +142,7 @@ TEST(QueryLiveBufferRace, AggregationTakesTheSameResolvedPointer) {
         ob::Engine engine(dir, 60'000'000'000ULL);
         engine.open();
         write_symbol(engine, 7, 1);
-        const auto err = engine.execute("SELECT VWAP(price) FROM 'SYM0007'.'EX'",
+        const auto err = engine.execute("SELECT VWAP(bid) FROM 'SYM0007'.'EX'",
                                         [](const ob::QueryResult&) {});
         EXPECT_TRUE(err.empty()) << err;
         engine.close();

@@ -78,29 +78,29 @@ TEST(QueryColumns, AddingTheSameColumnTwiceIsStillOneColumn) {
 TEST(QueryColumns, TheTimestampIsReadEvenWhenNobodyAskedForIt) {
     // Every row scan filters on the time range, so the column is read whether or not it is
     // answered. A reader that skipped it would compare against a zero it never loaded.
-    ColumnSet s = columns_to_read({QueryColumn::Price}, /*has_price_filter=*/false);
+    ColumnSet s = columns_to_read({QueryColumn::Price}, ColumnSet{});
     EXPECT_TRUE(s.has(QueryColumn::Price));
     EXPECT_TRUE(s.has(QueryColumn::TimestampNs));
     EXPECT_EQ(s.count(), 2u);
 }
 
 TEST(QueryColumns, APriceFilterReadsThePriceEvenWhenTheAnswerDoesNotCarryIt) {
-    ColumnSet s = columns_to_read({QueryColumn::Quantity}, /*has_price_filter=*/true);
+    ColumnSet s = columns_to_read({QueryColumn::Quantity}, ColumnSet{}.add(QueryColumn::Price));
     EXPECT_TRUE(s.has(QueryColumn::Quantity));
     EXPECT_TRUE(s.has(QueryColumn::TimestampNs));
     EXPECT_TRUE(s.has(QueryColumn::Price)) << "the predicate needs it, the answer does not";
     EXPECT_EQ(s.count(), 3u);
 
     // The control: without the filter, the same question does not read the price.
-    ColumnSet without = columns_to_read({QueryColumn::Quantity}, /*has_price_filter=*/false);
+    ColumnSet without = columns_to_read({QueryColumn::Quantity}, ColumnSet{});
     EXPECT_FALSE(without.has(QueryColumn::Price));
 }
 
 TEST(QueryColumns, AskingForEverythingReadsEverything) {
-    EXPECT_EQ(columns_to_read(all_query_columns(), false), ColumnSet::all());
+    EXPECT_EQ(columns_to_read(all_query_columns(), ColumnSet{}), ColumnSet::all());
 }
 
 TEST(QueryColumns, RepeatingAColumnInTheAnswerDoesNotReadItTwice) {
-    ColumnSet s = columns_to_read({QueryColumn::Price, QueryColumn::Price}, false);
+    ColumnSet s = columns_to_read({QueryColumn::Price, QueryColumn::Price}, ColumnSet{});
     EXPECT_EQ(s.count(), 2u) << "price and the timestamp, not price twice";
 }

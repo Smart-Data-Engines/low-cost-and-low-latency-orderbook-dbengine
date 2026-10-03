@@ -163,3 +163,34 @@ def test_client_query_refuses_to_parse_an_aggregate_response(primary_client, boo
 def test_client_query_agg_rejects_an_empty_expression_list(primary_client, book):
     with pytest.raises(OrderbookError):
         primary_client.query_agg(book, "BINANCE")
+
+
+# ── #200: every function of one side read the bids, and nothing could ask for the asks ──────────
+
+SIDES = "AGG-SIDES"
+
+
+@pytest.fixture
+def two_sided(primary_client: OrderbookEngine) -> str:
+    """Bids 100 x 5 and 99 x 6, asks 101 x 7 and 102 x 8: the book #200 was measured on."""
+    primary_client.insert(SIDES, "BINANCE", "bid", [100, 99], [5, 6])
+    primary_client.insert(SIDES, "BINANCE", "ask", [101, 102], [7, 8])
+    return SIDES
+
+
+def test_one_query_answers_both_sides_and_the_spread(primary_client, two_sided):
+    aggs = primary_client.query_agg(two_sided, "BINANCE", "VWAP(bid)", "VWAP(ask)", "SPREAD(*)",
+                                    "DEPTH(101)", "DEPTH_RANGE(99, 102)", "SUM(ask)", "MAX(ask)")
+    assert aggs["VWAP(bid)"].value == (100 * 5 + 99 * 6) * 10**6 // 11
+    assert aggs["VWAP(ask)"].value == (101 * 7 + 102 * 8) * 10**6 // 15
+    assert aggs["SPREAD(*)"].value == 1
+    assert aggs["DEPTH(101)"].value == 7, "an ask's price answered 0 while every function read the bids"
+    assert aggs["DEPTH_RANGE(99, 102)"].value == 26, "the asks in the range were left out"
+    assert aggs["SUM(ask)"].value == 15
+    assert aggs["MAX(ask)"].value == 102
+
+
+def test_the_spellings_that_meant_the_bids_are_refused(cluster, two_sided):
+    for expr in ("SUM(quantity)", "VWAP(*)", "MAX(price)", "CUMULATIVE_VOLUME(2)"):
+        reply = raw_agg(cluster.primary().tcp_port, f"SELECT {expr} FROM '{two_sided}'.'BINANCE'")
+        assert reply.startswith("ERR") and "AGG_NEEDS_SIDE" in reply, f"{expr}: {reply!r}"
