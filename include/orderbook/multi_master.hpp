@@ -251,6 +251,7 @@ class Engine;  // forward — full integration comes in task 12
 struct MultiMasterConfig {
     uint16_t    node_id{0};                       // --mm-node-id (required)
     uint16_t    replication_port{0};              // --mm-replication-port
+    std::string bind_address;                     // --mm-bind; empty = every interface (#203)
     bool        enabled{false};                   // --multi-master
     bool        compress{false};                  // --replication-compress
     /// --mm-max-catchup-bytes: how much of this node's WAL one catch-up round reads before the io

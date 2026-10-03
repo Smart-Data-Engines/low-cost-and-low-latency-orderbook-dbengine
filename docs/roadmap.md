@@ -2476,6 +2476,24 @@ pass; the other two predate #82 and #70 and are #202's.
   acknowledged writes and stopped writes for ten seconds; a failover of a primary that lost its lease
   lost what it took while its stream was being stopped
 
+### 203. The client, replication and mesh ports listened on every interface, and only the metrics endpoint could be told otherwise ✅ **P2**
+
+**Reported from a deployment.** A test host's client port - TLS and authentication on it - was
+reachable from outside, and the only way to keep it to the machine was a firewall rule:
+`--metrics-bind` existed, and nothing like it for `--port`, `--replication-port` or
+`--mm-replication-port`, whose listeners all bound `INADDR_ANY`.
+
+**Fixed.** `--bind`, `--replication-bind` and `--mm-bind` name the IPv4 address each listens on
+(`bind`, `replication-bind`, `mm-bind` in the configuration file; `--print-config` shows them, every
+interface when unset), and each listener logs where it listens. An address that does not parse is a
+refusal to start, said with the flag that carried it - not a listener on every interface, the
+opposite of what was asked. The address a replica or a peer dials is still the one the node
+publishes (`--advertise-host`). `tests/integration/test_bind_addresses.py` reads where each socket
+listens out of `/proc/net/tcp`; against master's server all but the every-interface control fail.
+
+- Effort: S | Impact: a node that should face one network faced all of them, unless a firewall said
+  otherwise
+
 ### 202. `tests/test_etcd_integration.cpp` ran nowhere - not in ctest, not in CI - and six of its twenty-six tests failed on master ✅ **P2**
 
 The failover manager's tests against a real etcd are gated behind `OB_ETCD_TESTS`, registered with

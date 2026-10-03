@@ -596,15 +596,18 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |
 | `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |
 | `--mm-replication-port` | `<PORT>` | Multi-master peer port |
+| `--mm-bind` | `<ADDR>` | IPv4 address the multi-master port listens on (default: every interface), as `--replication-bind` is for the replication port (#203) |
 | `--multi-master` | — (boolean) | Run as a multi-master node instead of primary/replica |
 | `--node-id` | `<ID>` | This node's name, as it appears to the coordinator |
 | `--port` | `<PORT>` | TCP port to listen on (default: 9090) |
+| `--bind` | `<ADDR>` | IPv4 address the client port listens on (default: every interface). `127.0.0.1` keeps it to the machine without a firewall rule, with or without TLS and authentication on it; an address that does not parse is a refusal to start, not a listener on every interface (#203) |
 | `--primary-host` | `<HOST>` | Primary to replicate from, when starting as a replica |
 | `--primary-port` | `<PORT>` | Primary's replication port |
 | `--print-config` | — (boolean) | Print every setting with its origin and exit; opens no port |
 | `--read-only` | — (boolean) | Refuse writes regardless of role |
 | `--replication-compress` | — (boolean) | Compress the replication stream with LZ4 |
 | `--replication-port` | `<PORT>` | Port replicas connect to on this node |
+| `--replication-bind` | `<ADDR>` | IPv4 address the replication port listens on (default: every interface) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
 | `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
