@@ -2778,7 +2778,7 @@ std::optional<StreamPosition> Engine::step_down_for_handover() {
     return StreamPosition{wal_identity(), end.file_index, end.offset};
 }
 
-std::optional<StreamPosition> Engine::replicated_position() const {
+std::optional<StreamPosition> Engine::replicated_position() {
     // Under the lock that replaces `repl_client_`, so the client cannot be moved out and destroyed
     // while it is asked. The reading itself takes no lock.
     std::lock_guard<std::mutex> lock(mtx_);

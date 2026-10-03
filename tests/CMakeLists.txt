@@ -577,6 +577,12 @@ target_compile_definitions(test_replication
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# A node that steps down closes writes first and keeps serving its stream until it follows
+# somebody (#204).
+ob_add_engine_test(test_handover_stream
+    test_handover_stream.cpp
+)
+
 # ── Snapshot path validation (security) ───────────────────────────────────────
 # Needs rapidcheck on top of the engine library, which ob_add_engine_test does
 # not link.
@@ -621,6 +627,15 @@ target_link_libraries(test_failover_election
         rapidcheck_gtest
 )
 gtest_discover_tests(test_failover_election PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+
+# ── Handover decision tests (#204) ────────────────────────────────────────────
+add_executable(test_handover_decision test_handover_decision.cpp)
+target_link_libraries(test_handover_decision
+    PRIVATE
+        orderbook_failover
+        GTest::gtest_main
+)
+gtest_discover_tests(test_handover_decision PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Failover roles tests (ha-automatic-failover, Properties 10, 15, 16) ──────
 add_executable(test_failover_roles test_failover_roles.cpp)

@@ -562,7 +562,7 @@ public:
     void promote_to_primary(const EpochValue& new_epoch) override;
     void demote_to_replica(const std::string& new_primary_address) override;
     std::optional<StreamPosition> step_down_for_handover() override;
-    std::optional<StreamPosition> replicated_position() const override;
+    std::optional<StreamPosition> replicated_position() override;
 
     /// Throw away everything this node holds, so a stream can be replayed into it from zero.
     ///

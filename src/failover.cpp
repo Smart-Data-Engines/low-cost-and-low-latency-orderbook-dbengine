@@ -372,8 +372,12 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
     note_following({});
 
     // 5. Say so, now that it is true. A successor stands without the election wait on this alone -
-    //    this node takes no writes at `term` - and once it holds the stream to its end.
+    //    this node takes no writes at `term` - and once it holds the stream to its end. The grace
+    //    window starts again here: it is how long the others defer to the target once the key
+    //    goes, and the key goes next, not when the first intent was written.
     intent.stepped_down_term = term;
+    intent.deadline_ns = wall_clock_ns() +
+        static_cast<uint64_t>(config_.handover_grace_seconds) * 1'000'000'000ULL;
     if (stream_end.has_value()) {
         intent.stream_id     = stream_end->stream_id;
         intent.stream_file   = stream_end->file_index;
@@ -401,6 +405,8 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
                     static_cast<unsigned long long>(term), target_node_id.c_str(),
                     static_cast<long long>(lease_wait_ms()));
     }
+
+    if (before_revoke_hook_for_test_) before_revoke_hook_for_test_();
 
     // 6. Revoke the lease; the leader key is held under it, so it disappears and the target sees an
     //    empty leader with an intent naming it.
@@ -440,6 +446,10 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
                 "stays up until this node follows it (#201)",
                 static_cast<long>(lease), target_node_id.c_str());
     return HandoverResult::OK;
+}
+
+void FailoverManager::hold_before_revoke_for_test(std::function<void()> hook) {
+    before_revoke_hook_for_test_ = std::move(hook);
 }
 
 uint64_t FailoverManager::known_leader_term() const {

@@ -872,6 +872,102 @@ TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
         << " ms; ungraceful failover must not wait out a handover grace window";
 }
 
+// ── #204: a handover's target stands without the election wait ───────────────
+
+TEST_F(EtcdTestFixture, AHandoversTargetStandsWithoutTheElectionWait) {
+    // Every candidate waits the lease TTL from the moment the leader key goes (#82), so that the
+    // previous holder has certainly stopped taking writes - and the named target of a handover
+    // waited it too: a whole TTL without a primary after every planned FAILOVER. The outgoing node
+    // now says, before its lease goes, that it has stepped down; these engines serve no stream, so
+    // there is nothing else for the target to wait for.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    p.fm_a = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_A", "127.0.0.1:19041"), *p.engine_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19042"), *p.engine_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+    const auto handed_at = std::chrono::steady_clock::now();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(10)));
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - handed_at);
+    // Half the TTL: one monitor tick to see the empty key, one round trip to take it.
+    EXPECT_LT(took.count(), TEST_LEASE_TTL * 1000 / 2)
+        << "the target took " << took.count() << " ms - the election wait of "
+        << TEST_LEASE_TTL * 1000 << " ms, which a target with the outgoing node's word has no "
+        << "reason to wait";
+    EXPECT_EQ(p.fm_a->role(), ob::NodeRole::REPLICA);
+}
+
+TEST_F(EtcdTestFixture, AHandoverDoesNotTakeTheRoleBackBeforeItsLeaseIsRevoked) {
+    // The step-down comes before the revoke now (#204), so for a moment the leader key names a node
+    // that is a REPLICA - which is what the REPLICA branch reads, since #130, as a promotion it won
+    // and has to finish. Here that moment is held open for two and a half monitor ticks.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    // A grace window longer than the hold below, so the intent is still live when the key goes.
+    auto cfg_a = make_failover_config("node_A", "127.0.0.1:19043");
+    cfg_a.handover_grace_seconds = 10;
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19044"), *p.engine_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    std::string holder_in_window;
+    ob::NodeRole role_in_window = ob::NodeRole::STANDALONE;
+    ob::NodeRole engine_role_in_window = ob::NodeRole::STANDALONE;
+    p.fm_a->hold_before_revoke_for_test([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        auto observer = make_client("observer");
+        if (observer->connect()) {
+            const auto state = observer->get_cluster_state();
+            holder_in_window = state.has_value() ? state->leader_node_id : std::string{};
+            observer->disconnect();
+        }
+        role_in_window = p.fm_a->role();
+        engine_role_in_window = p.engine_a->node_role();
+    });
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+    ASSERT_EQ(holder_in_window, "node_A") << "the window this test holds open did not happen";
+    EXPECT_EQ(role_in_window, ob::NodeRole::REPLICA)
+        << "the node took back the role it had handed over, while its lease still stood";
+    EXPECT_EQ(engine_role_in_window, ob::NodeRole::REPLICA)
+        << "the engine took writes again while the handover was under way";
+    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(8)));
+    EXPECT_EQ(p.fm_a->role(), ob::NodeRole::REPLICA);
+}
+
 // ── Task 5.2: GracefulFailover ───────────────────────────────────────────────
 // Validates: Requirements 3.1, 3.2, 3.3, 3.4
 

@@ -115,7 +115,8 @@ struct RoleTransitionHandler {
 
     /// How far this node is into the stream it replicates, and whose stream that is; nullopt when
     /// it follows none. What a handover's successor compares with the announced end.
-    virtual std::optional<StreamPosition> replicated_position() const { return std::nullopt; }
+    /// Not const: the engine answers it under the lock that replaces its replication client.
+    virtual std::optional<StreamPosition> replicated_position() { return std::nullopt; }
 
     /// Called to get current WAL position for election comparison.
     virtual std::pair<uint32_t, size_t> get_wal_position() const = 0;
@@ -170,23 +171,30 @@ public:
     /// usually means a typo in a node id, while "coordinator error" means the
     /// node is still primary and the handover never started.
     enum class HandoverResult {
-        OK,                 ///< intent published, lease revoked, role given up
+        OK,                 ///< stepped down and said so; the lease revoked, or left to expire
         NOT_PRIMARY,        ///< this node is not the primary
         NOT_CONFIGURED,     ///< no coordinator, or no lease held
         INVALID_TARGET,     ///< target empty, or naming this node itself
         UNKNOWN_TARGET,     ///< target not known to the coordinator
-        COORDINATOR_ERROR,  ///< could not publish the intent; still primary
+        COORDINATOR_ERROR,  ///< could not publish the intent, or revoke and withdraw it; still
+                            ///< primary, or primary again on the next tick
     };
 
     /// Hand the primary role to a named node.
     ///
     /// Publishes a handover intent, blocks itself from standing for election for
-    /// handover_cooldown_seconds, then revokes its lease so the target can take
-    /// over. Only works if we are PRIMARY.
+    /// handover_cooldown_seconds, steps down - writes closed, the replication stream left up -
+    /// publishes the intent again with the term it stepped down from and where its stream ends,
+    /// and only then revokes its lease (#204). Only works if we are PRIMARY.
     ///
-    /// On anything other than OK the node keeps its role and its lease, so a
-    /// rejected handover is not a partial one.
+    /// A rejected handover is not a partial one: before the step-down nothing has changed, and a
+    /// revoke that fails after it is undone when the intent can be withdrawn. When it cannot, the
+    /// node stays a REPLICA and the role moves once its lease expires - and this answers OK.
     HandoverResult initiate_graceful_failover(const std::string& target_node_id);
+
+    /// Test seam: called on the handover's thread after the step-down and the second intent, before
+    /// the lease is revoked - the window in which the leader key names a node that takes no writes.
+    void hold_before_revoke_for_test(std::function<void()> hook);
 
     /// Get the current primary address (from coordinator).
     std::string primary_address() const;
@@ -246,6 +254,8 @@ private:
     LogEpisode              handed_key_episode_{};
     /// A handover's successor waiting for the rest of the outgoing stream, once per episode.
     LogEpisode              awaiting_stream_episode_{};
+    /// See `hold_before_revoke_for_test()`. Set before the handover starts, read on its thread.
+    std::function<void()>   before_revoke_hook_for_test_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 
     /// When this node last *confirmed* that the leader key names it.
