@@ -1625,20 +1625,29 @@ std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback&
     std::unordered_map<uint64_t, BucketState> buckets;
     uint64_t rows = 0;
     bool too_many = false;
+    // The bucket the last row went to: a segment's rows are appended in about their time order, so
+    // the next row is nearly always in it, and the map is asked only when it is not. References to
+    // an unordered_map's elements survive its rehashing.
+    BucketState* last = nullptr;
+    uint64_t last_start = 0;
     store_.scan(ast.ts_start_ns.value_or(0), ast.ts_end_ns.value_or(UINT64_MAX), ast.symbol,
                 ast.exchange, to_read, [&](const SnapshotRow& row) {
                     if (too_many || !row_allowed(ast, row)) return;
                     const uint64_t start = row.timestamp_ns - row.timestamp_ns % width;
-                    auto it = buckets.find(start);
-                    if (it == buckets.end()) {
-                        // Rows do not arrive in time order - segments by their start, a segment's
-                        // rows as appended, and a client's own event times anywhere (#105) - so
-                        // neither LIMIT nor the ceiling can end the scan early; past the ceiling
-                        // the rest of it only counts.
-                        if (buckets.size() >= ceiling) { too_many = true; return; }
-                        it = buckets.emplace(start, BucketState{}).first;
+                    if (last == nullptr || start != last_start) {
+                        auto it = buckets.find(start);
+                        if (it == buckets.end()) {
+                            // Rows do not arrive in time order - segments by their start, a
+                            // segment's rows as appended, and a client's own event times anywhere
+                            // (#105) - so neither LIMIT nor the ceiling can end the scan early;
+                            // past the ceiling the rest of it only counts.
+                            if (buckets.size() >= ceiling) { too_many = true; return; }
+                            it = buckets.emplace(start, BucketState{}).first;
+                        }
+                        last = &it->second;
+                        last_start = start;
                     }
-                    it->second.add(row);
+                    last->add(row);
                     ++rows;
                 });
     if (too_many) {
