@@ -2942,6 +2942,49 @@ held them 779 ms; the `fsync` itself, now outside, took 1.6 ms to 2.33 s. The wr
 did not move: 4 ms to 3.9 s with backups and to 2.1 s without, the device's stalls, which this item
 stays open for (`evidence/2026-09-28-sync-outside-the-lock/`).
 
+**A device slower than the ingest, made reproducible (3 October).** The laptop's ext4 over LUKS
+answered the same run differently from one round to the next. On an m9g.xlarge with its XFS volume's
+writes capped by a cgroup v2 limit - which binds buffered writeback there as well as direct writes,
+58 and 60.5 MB/s against 60 - the rounds of one build agree to a few per cent
+(`evidence/2026-10-03-write-ceiling-ec2/`, the same run as above, 8 rounds a side). At 30 MB/s **the
+node refused writes in every round**: both connections waited the five seconds for room. The two
+prototypes against `bed1212`:
+
+- the seal's sync in the background shortens the stalls on XFS by a third at 60 MB/s - the worst
+  batch 959-992 ms to 622-633 ms, at the same throughput - and changes nothing without a limit. On
+  the laptop's ext4 it had not helped, the WAL's sync waiting behind the same journal commit: the
+  effect is the filesystem's. At 30 MB/s it refuses in every round as well;
+- admission from the queue's occupancy writes at the device's rate at 30 MB/s with no refusal, its
+  worst batch 68 ms - and **halves the throughput of a device that keeps up**, 7.6-7.8 M levels/s to
+  3.8 M: at that rate the pending queue passes half between two ticks with nothing behind.
+
+**Step 5: writes admitted at the rate the device takes** (spec
+`kiro-workspace/specs/admission-at-the-device-rate/`). The signal is the device, not the queue: a
+flush tick that took twice its interval or longer says how many rows the device took in how long, and
+from then on every batch of writes waits, after it is written and outside the engine's lock, for its
+rows' time at that rate - a token bucket shared by the writers, with a tick's worth of credit so a
+writer below the rate waits for nothing. A tick that is not slow raises the rate by a tenth, and
+admission ends once no batch has waited for ten ticks; the next batch waits at most 500 ms, far from
+the five-second deadline, which stays the last line. `ob_writer_admission_rate` and two counters show
+it, one line begins it and one ends it, and `--write-admission off` restores what was. Measured
+against `master` (`4115817`), the same run, 8 rounds a side:
+
+| m9g.xlarge, XFS | master | step 5 |
+|---|---|---|
+| no limit: levels/s | 7.44-7.85 M | 7.66-7.76 M - admission began in no round |
+| no limit: batch p99, p99.9, max | 0.31-0.46 ms, 7.6-11.8 ms, 11.4-34.5 ms | 0.30-0.37 ms, 7.7-11.9 ms, 12.7-18.2 ms |
+| 60 MB/s: levels/s | 1.135-1.148 M | 1.080-1.110 M |
+| 60 MB/s: batch p99, p99.9 | 0.29-0.31 ms, 873-883 ms | 3.2-3.4 ms, **3.2-3.4 ms** |
+| 60 MB/s: worst batch, waits for room | 962-983 ms, 12 a round | 816-849 ms, 2-3 a round |
+| 30 MB/s | **writes refused in every round** | 0.394-0.404 M levels/s, **no refusal**; p99 22-42 ms, worst batch 2.3-4.1 s |
+
+So the refusals are gone and the tail above p99.9 with them, at no cost to a device that keeps up
+and 3-6% of the throughput of one that does not. What is left is the worst batch, and the node log
+says where it comes from: the stall before the first slow tick has ended - admission learns the rate
+from it - and, at 30 MB/s, a tick whose seals took 4.5 s, during which even the admitted inflow
+fills the queue, because the next drain waits for the tick to end. The second is what the seal's
+sync in the background shortens: a step 6 for this item, measured the same way.
+
 - Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
   with the WAL, and a slower device than this one would refuse them
 

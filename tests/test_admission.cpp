@@ -37,8 +37,6 @@ AdmissionController::Config config() {
     return c;
 }
 
-double ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
-
 }  // namespace
 
 TEST(Admission, NothingWaitsUntilASlowTick) {

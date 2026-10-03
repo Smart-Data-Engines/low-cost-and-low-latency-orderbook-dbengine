@@ -754,10 +754,12 @@ integration test holds the names against what a running node serves.
   on each batch of writes waits, after it is written and outside the engine's lock, for its rows'
   time at that rate, and the gauge is that rate in rows a second. A tick that is not slow raises it
   by a tenth, and admission ends once no batch has waited for ten ticks; the gauge is 0 while it is
-  off, which is always on a device that keeps up. It begins and ends with one line each:
+  off, which is always on a device that keeps up. It begins with one line - this one from an
+  m9g.xlarge whose volume's writes were capped at 60 MB/s - and ends with another,
+  `Writes are taken at full speed again: <n> batch(es) waited for admission, <ms> ms in all`:
 
   ```
-  ADMISSION-LOG-LINES-FROM-THE-EC2-RUN
+  Writes arrive faster than the device takes them - a flush tick took 1023 ms for 608000 row(s), 594067 rows/s - so each batch now waits after it is written, at that rate, rather than every writer stopping at a full pending queue
   ```
 
   Without it, a device slower than the ingest stops every writer at the full pending queue for as
