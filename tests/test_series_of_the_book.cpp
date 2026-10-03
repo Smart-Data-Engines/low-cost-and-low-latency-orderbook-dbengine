@@ -444,19 +444,21 @@ TEST(ScanByTime, ASegmentWhoseRangeIsNotItsRowsIsReadFirst) {
     EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3}));
 }
 
-TEST(ScanByTime, ARowAtTheStartOfTheNextSegmentWaitsForItsTie) {
-    // The first segment's last row and the second's first are at one time: the first segment's is
-    // delivered first by a scan, and so here, which it would not be if the earlier segment's row
-    // were handed over before the later segment was read.
+TEST(ScanByTime, ABlocksRowAtTheNextSegmentsStartWaitsForIt) {
+    // At one time a block's row comes after every segment's - a block is delivered after them - and
+    // so after the row of a segment not yet read when the block's was already held: the rows at the
+    // next segment's start wait until it is read. A segment's own rows there need not wait - every
+    // segment read before it is delivered before it.
     Fixture f;
     const uint64_t t = kBase + 5 * kSec;
     f.segment({row(kBase + 1 * kSec, 0, 0, 1), row(t, 0, 0, 2)});
-    f.segment({row(t, 0, 0, 3), row(kBase + 9 * kSec, 0, 0, 4)});
+    f.segment({row(t, 0, 0, 3), row(kBase + 9 * kSec, 0, 0, 5)});
+    f.block({row(t, 0, 0, 4)});
     std::vector<int64_t> prices;
     f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
                          [](const ob::SnapshotRow&) { return true; },
                          [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
-    EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3, 4}));
+    EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3, 4, 5}));
 }
 
 // ── latest_per_level() with the levels wanted ──────────────────────────────────
@@ -625,13 +627,27 @@ TEST(SeriesQuery, TheBookBeforeTheRangeIsItsOpen) {
 }
 
 TEST(SeriesQuery, ARangeToTheLastInstantOfTimeIsAnswered) {
+    // The last six nanoseconds there are, the bid 7 for three and 9 for three: the day the bucket
+    // starts on would end past them, so its window ends at the last.
     Fixture f;
     f.segment({row(kBase, 0, 0, 7)});
-    const auto got = f.buckets("SELECT CLOSE(bid), TWAP(bid) FROM 'BK'.'EX' WHERE timestamp >= " +
-                               std::to_string(UINT64_MAX - 5) + " AND timestamp <= " +
+    f.block({row(UINT64_MAX - 2, 0, 0, 9)});
+    const auto got = f.buckets("SELECT OPEN(bid), HIGH(bid), CLOSE(bid), TWAP(bid) FROM 'BK'.'EX' WHERE "
+                               "timestamp >= " + std::to_string(UINT64_MAX - 5) + " AND timestamp <= " +
                                std::to_string(UINT64_MAX) + " GROUP BY TIME_BUCKET(1d)");
     ASSERT_EQ(got.size(), 1u);
-    EXPECT_EQ(got[0].second, (std::vector<int64_t>{7, 7'000'000}));
+    EXPECT_EQ(got[0].second, (std::vector<int64_t>{7, 9, 9, 8'000'000}));
+}
+
+TEST(SeriesQuery, TheMidsTwapIsWeightedByTheTimeEachMidHeld) {
+    // A mid of 102 for 4 s and of 103 for 6 s: 102.6, at MID_PRICE's scale.
+    Fixture f;
+    f.segment({row(kBase, 0, 0, 100), row(kBase, 1, 0, 104), row(kBase + 4 * kSec, 0, 0, 102)});
+    const auto got = f.buckets("SELECT TWAP(mid), TWAP(bid) FROM 'BK'.'EX' WHERE timestamp BETWEEN " +
+                               std::to_string(kBase) + " AND " + std::to_string(kBase + 10 * kSec - 1) +
+                               " GROUP BY TIME_BUCKET(10s)");
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0].second, (std::vector<int64_t>{102'600'000, 101'200'000}));
 }
 
 TEST(SeriesQuery, AMidPastSixtyFourBitsIsRefused) {
