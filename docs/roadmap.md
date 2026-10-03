@@ -3003,6 +3003,31 @@ from it - and, at 30 MB/s, a tick whose seals took 4.5 s, during which even the 
 fills the queue, because the next drain waits for the tick to end. The second is what the seal's
 sync in the background shortens: a step 6 for this item, measured the same way.
 
+**Step 6: the seal's sync in the background** (spec `kiro-workspace/specs/drain-beside-the-seal/`,
+requirements 1 and 2). A tick no longer waits for the `syncfs()` of what it sealed before it drains the
+queue again: it hands the sync to a thread of its own with the checkpoint's claim frozen when it asks -
+the drain's position, the seal epoch, and whether rows wait in blocks - and the next tick appends that
+checkpoint once the sync is done, under `flush_mtx_` and before its own WAL sync, where the checkpoint
+always was, so retention follows it as it did (#160). A sync asked while one waits replaces it: the
+one that starts next covers what either was for. A failed sync freezes the checkpoints when a tick takes
+it in. Syncs of the data directory are numbered when they start, since one that began before a merge
+wrote and ended after it would otherwise be taken for one that covered the write. FLUSH, `close()` and
+a drop take the background sync in first, so their own checkpoint is the last. On top of step 5,
+against it, the same run, 8 rounds a side (`evidence/2026-10-03-write-ceiling-ec2/`, `s6-*`):
+
+| m9g.xlarge, XFS | step 5 | step 6 |
+|---|---|---|
+| no limit: levels/s | 7.39-7.78 M | 7.53-7.81 M |
+| no limit: batch p99, max | 0.31-0.60 ms, 12.6-23.4 ms | 0.32-0.47 ms, 12.3-31.4 ms |
+| 60 MB/s: levels/s | 1.090-1.133 M | 1.122-1.143 M |
+| 60 MB/s: batch p99, p99.9 | 3.19-3.48 ms, 3.21-3.50 ms (45.0 once) | 2.33-2.55 ms, 2.36-2.56 ms |
+| 60 MB/s: worst batch | 734-830 ms | **560-585 ms** |
+| 30 MB/s: levels/s | 0.387-0.403 M | **0.414-0.431 M** |
+| 30 MB/s: batch p99, worst | 23.5-55.7 ms, 3.34-4.25 s | 12.3-21.0 ms, 2.77-4.68 s |
+
+The worst batch at 30 MB/s does not move: it is the stall before the first slow tick, which
+admission learns the rate from - what is left of this item.
+
 - Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
   with the WAL, and a slower device than this one would refuse them
 
