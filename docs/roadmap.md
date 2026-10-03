@@ -3025,8 +3025,13 @@ against it, the same run, 8 rounds a side (`evidence/2026-10-03-write-ceiling-ec
 | 30 MB/s: levels/s | 0.387-0.403 M | **0.414-0.431 M** |
 | 30 MB/s: batch p99, worst | 23.5-55.7 ms, 3.34-4.25 s | 12.3-21.0 ms, 2.77-4.68 s |
 
-The worst batch at 30 MB/s does not move: it is the stall before the first slow tick, which
-admission learns the rate from - what is left of this item.
+Where the worst batch comes from, read from the node logs of these rounds. At 60 MB/s admission
+begins sooner - the first slow tick, without the seal's sync, takes 358-368 ms where step 5's took
+1.0-1.1 s - but at the rate that tick measured, 1.63-1.78 M rows/s, above the 1.12-1.14 M the rounds
+sustained, so the queue, still full, waits once more for the next tick: the 560-585 ms. At 30 MB/s
+it is not the stall before the first slow tick: admission has paced writers since 0.85-0.96 s into
+the ingest, and at 14.0-15.4 s one tick's WAL sync takes 3.9-5.1 s. Step 5's worst batches at
+30 MB/s begin at the same point, 14.5-15.6 s. What makes that sync long is what is left of this item.
 
 - Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
   with the WAL, and a slower device than this one would refuse them
