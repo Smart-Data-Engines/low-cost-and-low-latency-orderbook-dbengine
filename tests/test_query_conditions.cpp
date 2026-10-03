@@ -186,6 +186,8 @@ TEST(QueryConditions, TheCanonicalFormReadsBackAsTheSameRange) {
         "timestamp > 18446744073709551615",
         "price < -9223372036854775808",
         "timestamp BETWEEN 10 AND 20 AND timestamp BETWEEN 15 AND 30",
+        "AT 5000 AND price BETWEEN 95 AND 160",
+        "AT 5000 AND price > 100",
     };
     for (const auto& where : wheres) {
         ob::QueryAST first, again;
@@ -196,6 +198,7 @@ TEST(QueryConditions, TheCanonicalFormReadsBackAsTheSameRange) {
         EXPECT_EQ(again.ts_end_ns, first.ts_end_ns) << where << " -> " << canonical;
         EXPECT_EQ(again.price_lo, first.price_lo) << where << " -> " << canonical;
         EXPECT_EQ(again.price_hi, first.price_hi) << where << " -> " << canonical;
+        EXPECT_EQ(again.snapshot_ts_ns, first.snapshot_ts_ns) << where << " -> " << canonical;
     }
     ob::QueryAST ast;
     ASSERT_TRUE(f.engine.parse("SELECT * FROM 'CND'.'EX' WHERE price > 200", ast).empty());

@@ -1205,18 +1205,20 @@ std::string QueryEngine::format(const QueryAST& ast) {
             write_where_or_and();
             os << " timestamp <= " << ast.ts_end_ns.value();
         }
+    }
 
-        if (ast.price_lo.has_value() && ast.price_hi.has_value()) {
-            write_where_or_and();
-            os << " price BETWEEN " << ast.price_lo.value()
-               << " AND " << ast.price_hi.value();
-        } else if (ast.price_lo.has_value()) {
-            write_where_or_and();
-            os << " price >= " << ast.price_lo.value();
-        } else if (ast.price_hi.has_value()) {
-            write_where_or_and();
-            os << " price <= " << ast.price_hi.value();
-        }
+    // Beside `AT` too: a snapshot's price condition is applied since #199, so the canonical form
+    // that left it out no longer read back as the same query.
+    if (ast.price_lo.has_value() && ast.price_hi.has_value()) {
+        write_where_or_and();
+        os << " price BETWEEN " << ast.price_lo.value()
+           << " AND " << ast.price_hi.value();
+    } else if (ast.price_lo.has_value()) {
+        write_where_or_and();
+        os << " price >= " << ast.price_lo.value();
+    } else if (ast.price_hi.has_value()) {
+        write_where_or_and();
+        os << " price <= " << ast.price_hi.value();
     }
 
     // 5. LIMIT (SELECT only)
