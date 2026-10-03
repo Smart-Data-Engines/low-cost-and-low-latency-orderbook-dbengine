@@ -6,6 +6,7 @@
 #include "orderbook/async_snapshot.hpp"
 #include "orderbook/log_episode.hpp"
 #include "orderbook/snapshot.hpp"
+#include "orderbook/stream_position.hpp"
 #include "orderbook/wal.hpp"
 
 #include <atomic>
@@ -471,6 +472,20 @@ public:
     void broadcast(const WALRecord& hdr, const void* payload, size_t payload_len,
                    WalPosition record_pos);
 
+    /// Where the stream this manager serves ends: the position just past the last record it
+    /// broadcast, which is what a replica confirms once it has applied that record (#98 - it saves
+    /// `byte_offset + total_len`). Before the first broadcast, the WAL's position when this manager
+    /// was made, so the records written before it - by an earlier process, say - are covered too.
+    ///
+    /// Not `wal_.current_position()` once records flow. The WAL rotates *after* an append that
+    /// crosses its threshold, so its current position can be in a file the last record is not in,
+    /// and records this manager never sends - a checkpoint, an epoch - move it without any
+    /// replica's knowledge. A handover's successor compares its own confirmed position with this
+    /// one, so it has to be in the terms the replica confirms in. Where it cannot be - a rotation
+    /// at the very end of the log, before any broadcast - it is past what a replica confirms, and
+    /// the successor waits the election delay as it did before, rather than standing early.
+    WalPosition last_broadcast_end() const;
+
     /// Get current replica states (for STATUS command).
     std::vector<ReplicaInfo> replica_states() const;
 
@@ -488,6 +503,8 @@ private:
 
     mutable std::mutex         mtx_;
     std::vector<ReplicaInfo>   replicas_;
+    /// See `last_broadcast_end()`. Under `mtx_`, written by `broadcast()`.
+    WalPosition                last_broadcast_end_{};
 
     /// Serialises `stop()`, so that its early return means *stopped* rather than *stopping*.
     ///
@@ -704,6 +721,15 @@ public:
     };
     State state() const;
 
+    /// Whose stream this replica follows and how far into it it has got, from one moment - which
+    /// `state()` does not promise: there the fields are diagnostics, read one at a time. A
+    /// handover's successor *decides* on these - it stands without the election wait once its
+    /// position is at the end of the stream the outgoing primary announced - and two loads can name
+    /// a position that never existed (#85: a file index from one record with the offset of another
+    /// reads as a replica further on than it is). Returns a zeroed position - unknown - rather than
+    /// spin while the receive thread keeps writing.
+    StreamPosition stream_position() const;
+
 private:
     ReplicationClientConfig config_;
     Engine&                 engine_;
@@ -768,6 +794,30 @@ private:
     /// restored from the same backup, or one primary rebuilt from scratch at the same address,
     /// produce byte offsets that read as valid and name different records.
     std::atomic<uint64_t> stream_id_{0};
+
+    /// A sequence lock over `confirmed_file_`, `confirmed_offset_` and `stream_id_`, for
+    /// `stream_position()`: odd while a write is under way. Every write of the three goes through
+    /// `set_position()` or `set_stream()`, and all of them happen on one thread at a time - `start()`
+    /// before the receive thread exists, then the receive thread - so the writer needs no lock, and
+    /// what it costs per record is two stores.
+    std::atomic<uint64_t> position_seq_{0};
+    void set_position(uint32_t file_index, size_t byte_offset);
+    void set_stream(uint64_t stream_id, uint32_t file_index, size_t byte_offset);
+
+    /// One write under `position_seq_`, for as long as it lives: odd from construction, even again
+    /// at destruction. The fence keeps the stores after it from being seen before the odd value.
+    struct PositionWrite {
+        std::atomic<uint64_t>& seq;
+        explicit PositionWrite(std::atomic<uint64_t>& s) : seq(s) {
+            seq.store(seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release);
+        }
+        ~PositionWrite() {
+            seq.store(seq.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        }
+        PositionWrite(const PositionWrite&) = delete;
+        PositionWrite& operator=(const PositionWrite&) = delete;
+    };
 
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};

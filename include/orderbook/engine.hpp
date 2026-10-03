@@ -561,6 +561,8 @@ public:
     /// RoleTransitionHandler overrides.
     void promote_to_primary(const EpochValue& new_epoch) override;
     void demote_to_replica(const std::string& new_primary_address) override;
+    std::optional<StreamPosition> step_down_for_handover() override;
+    std::optional<StreamPosition> replicated_position() const override;
 
     /// Throw away everything this node holds, so a stream can be replayed into it from zero.
     ///
@@ -838,6 +840,21 @@ private:
 
     // External read-only flag (owned by TcpServer, toggled during role transitions)
     std::atomic<bool>*                   read_only_flag_{nullptr};
+
+    /// Client writes are refused (`OB_ERR_READ_ONLY`), decided under `mtx_` - the lock a write
+    /// holds from its WAL append to its broadcast. Set by every demotion before it touches the
+    /// stream, cleared only by a promotion (#204).
+    ///
+    /// `read_only_flag_` cannot do this alone: the server reads it before it calls the engine, so a
+    /// write that passed that check could still be appended - and answered OK - after a demotion
+    /// had stopped the stream, or after a handover had announced where the stream ends. Measured:
+    /// 4308 acknowledged writes a planned FAILOVER's target never received. Replicated records are
+    /// not client writes and still apply.
+    std::atomic<bool>                    writes_closed_{false};
+
+    /// What both demotions do first, under `mtx_` (which the caller holds): close writes and say
+    /// REPLICA everywhere a role is answered.
+    void close_writes_locked();
 
     // TTL / data retention
     TTLConfig ttl_config_;

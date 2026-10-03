@@ -26,6 +26,9 @@ inline constexpr ob_status_t OB_ERR_MOVING      = -10;
 /// A write taken on an adoption of its symbol (#196) that no longer stands - abandoned, or begun
 /// again since: this shard does not own the symbol, and a client asks the map which one does.
 inline constexpr ob_status_t OB_ERR_NOT_OWNER   = -11;
+/// This node stopped taking writes - it was demoted, or is handing the role over - after the
+/// write passed the server's own read-only check (#204). Answered as that check answers.
+inline constexpr ob_status_t OB_ERR_READ_ONLY   = -12;
 inline constexpr ob_status_t OB_ERR_INTERNAL    = -99;
 
 // ── Exception ─────────────────────────────────────────────────────────────────
