@@ -2031,11 +2031,12 @@ StreamPosition ReplicationClient::stream_position() const {
             std::this_thread::yield();
             continue;
         }
-        const StreamPosition reading{stream_id_.load(std::memory_order_relaxed),
-                                     confirmed_file_.load(std::memory_order_relaxed),
+        // Acquire, each: a field written by a write still under way synchronises with its
+        // release store, so the odd sequence before it is visible to the load below.
+        const StreamPosition reading{stream_id_.load(std::memory_order_acquire),
+                                     confirmed_file_.load(std::memory_order_acquire),
                                      static_cast<uint64_t>(
-                                         confirmed_offset_.load(std::memory_order_relaxed))};
-        std::atomic_thread_fence(std::memory_order_acquire);
+                                         confirmed_offset_.load(std::memory_order_acquire))};
         if (position_seq_.load(std::memory_order_relaxed) == before) return reading;
     }
     OB_LOG_DEBUG("repl_client", "no consistent reading of the stream position in 64 attempts - "
@@ -2045,15 +2046,15 @@ StreamPosition ReplicationClient::stream_position() const {
 
 void ReplicationClient::set_position(uint32_t file_index, size_t byte_offset) {
     const PositionWrite write{position_seq_};
-    confirmed_file_.store(file_index, std::memory_order_relaxed);
-    confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
+    confirmed_file_.store(file_index, std::memory_order_release);
+    confirmed_offset_.store(byte_offset, std::memory_order_release);
 }
 
 void ReplicationClient::set_stream(uint64_t stream_id, uint32_t file_index, size_t byte_offset) {
     const PositionWrite write{position_seq_};
-    stream_id_.store(stream_id, std::memory_order_relaxed);
-    confirmed_file_.store(file_index, std::memory_order_relaxed);
-    confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
+    stream_id_.store(stream_id, std::memory_order_release);
+    confirmed_file_.store(file_index, std::memory_order_release);
+    confirmed_offset_.store(byte_offset, std::memory_order_release);
 }
 
 ReplicationClient::State ReplicationClient::state() const {
@@ -2748,18 +2749,18 @@ void ReplicationClient::load_state() {
     // Not left at whatever a previous connection resolved: `start()` may follow a `stop()` on the
     // same object, and an identity that outlived the file it came from would let a position resume
     // against a stream this file never named.
-    stream_id_.store(0, std::memory_order_relaxed);
+    stream_id_.store(0, std::memory_order_release);
 
     // A file written before #101 has no `stream_id` line, and this loop ignores what it does not
     // recognise, so it reads as 0 - "we do not know whose position this is" - which is the answer
     // that makes the replica start over rather than resume against a stream it cannot identify.
     while (std::fgets(line, sizeof(line), f)) {
         if (std::sscanf(line, "file_index=%u", &file_index) == 1) {
-            confirmed_file_.store(file_index, std::memory_order_relaxed);
+            confirmed_file_.store(file_index, std::memory_order_release);
         } else if (std::sscanf(line, "byte_offset=%zu", &byte_offset) == 1) {
-            confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
+            confirmed_offset_.store(byte_offset, std::memory_order_release);
         } else if (std::sscanf(line, "stream_id=%" SCNu64, &stream_id) == 1) {
-            stream_id_.store(stream_id, std::memory_order_relaxed);
+            stream_id_.store(stream_id, std::memory_order_release);
         } else if (std::sscanf(line, "epoch=%" SCNu64, &saved_epoch) == 1) {
             // Raised into the engine rather than kept here, which is what makes it survive the next
             // role change: `demote_to_replica()` builds a new client and this object goes away.

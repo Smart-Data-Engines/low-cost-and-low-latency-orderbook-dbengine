@@ -805,12 +805,13 @@ private:
     void set_stream(uint64_t stream_id, uint32_t file_index, size_t byte_offset);
 
     /// One write under `position_seq_`, for as long as it lives: odd from construction, even again
-    /// at destruction. The fence keeps the stores after it from being seen before the odd value.
+    /// at destruction. The fields themselves are stored with release and read with acquire, which
+    /// is what orders them after the odd value - a standalone fence would do it more cheaply, and
+    /// GCC refuses those under ThreadSanitizer (`-Werror=tsan`).
     struct PositionWrite {
         std::atomic<uint64_t>& seq;
         explicit PositionWrite(std::atomic<uint64_t>& s) : seq(s) {
             seq.store(seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-            std::atomic_thread_fence(std::memory_order_release);
         }
         ~PositionWrite() {
             seq.store(seq.load(std::memory_order_relaxed) + 1, std::memory_order_release);
