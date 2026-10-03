@@ -408,6 +408,16 @@ private:
         return false;
     }
 
+    /// `bid` or `ask`, in any case: a book aggregate's side (#200).
+    bool at_side_word() const {
+        return at(TokKind::UNKNOWN) && (iequal(current().text, "bid") || iequal(current().text, "ask"));
+    }
+    std::string take_side_word() {
+        std::string word = consume().text;
+        for (auto& ch : word) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return word;
+    }
+
     bool is_agg_func(TokKind k) const {
         return k == TokKind::KW_SUM || k == TokKind::KW_AVG ||
                k == TokKind::KW_MIN || k == TokKind::KW_MAX ||
@@ -430,19 +440,33 @@ private:
         consume(); // consume '('
 
         std::string inner;
+        // The side a function of one side of the book reads, `bid` or `ask` in any case, first in
+        // its argument (#200), written lower case into the expression the answer names. Not
+        // keywords: nothing else in the language takes a side by name.
+        std::string side;
+        if (func_tok.kind == TokKind::KW_CUMULATIVE_VOLUME || func_tok.kind == TokKind::KW_DEPTH ||
+            func_tok.kind == TokKind::KW_DEPTH_RANGE) {
+            if (at_side_word()) {
+                side = take_side_word();
+                if (!at(TokKind::COMMA))
+                    return make_error("expected ',' after the side in " + func_name + "(...)");
+                consume();
+            }
+        }
+        const std::string prefix = side.empty() ? std::string{} : side + ", ";
         if (func_tok.kind == TokKind::KW_IMBALANCE ||
             func_tok.kind == TokKind::KW_CUMULATIVE_VOLUME) {
-            // IMBALANCE(integer_literal) / CUMULATIVE_VOLUME(integer_literal)
+            // IMBALANCE(integer_literal) / CUMULATIVE_VOLUME([side,] integer_literal)
             if (!at(TokKind::INT_LIT))
                 return make_error("expected integer literal in " + func_name + "(...)");
-            inner = consume().text;
+            inner = prefix + consume().text;
         } else if (func_tok.kind == TokKind::KW_DEPTH) {
-            // DEPTH(price_expr) — price_expr is an integer literal
+            // DEPTH([side,] price_expr) — price_expr is an integer literal
             if (!at(TokKind::INT_LIT))
                 return make_error("expected price expression in DEPTH(...)");
-            inner = consume().text;
+            inner = prefix + consume().text;
         } else if (func_tok.kind == TokKind::KW_DEPTH_RANGE) {
-            // DEPTH_RANGE(price_expr, price_expr)
+            // DEPTH_RANGE([side,] price_expr, price_expr)
             if (!at(TokKind::INT_LIT))
                 return make_error("expected first price expression in DEPTH_RANGE(...)");
             std::string p1 = consume().text;
@@ -452,15 +476,19 @@ private:
             if (!at(TokKind::INT_LIT))
                 return make_error("expected second price expression in DEPTH_RANGE(...)");
             std::string p2 = consume().text;
-            inner = p1 + ", " + p2;
+            inner = prefix + p1 + ", " + p2;
         } else {
-            // SUM, AVG, MIN, MAX, VWAP, SPREAD, MID_PRICE — agg_arg ::= column_name | "*"
+            // SUM, AVG, MIN, MAX, VWAP: agg_arg ::= side | column_name | "*", the side since #200 and
+            // the other two refused in execute() with the spelling that names one. SPREAD and
+            // MID_PRICE: "*".
             if (at(TokKind::STAR)) {
                 inner = "*"; consume();
+            } else if (at_side_word()) {
+                inner = take_side_word();
             } else if (is_column_name(current().kind)) {
                 inner = consume().text;
             } else {
-                return make_error("expected column name or '*' in " + func_name + "(...)");
+                return make_error("expected bid, ask, a column name or '*' in " + func_name + "(...)");
             }
         }
 
@@ -517,11 +545,60 @@ private:
             consume();
             return parse_price_condition(out);
         }
+        if (at(TokKind::KW_SIDE)) {
+            consume();
+            return parse_narrow_condition<uint8_t>(out.side_lo, out.side_hi, "side");
+        }
+        if (at(TokKind::KW_LEVEL)) {
+            consume();
+            return parse_narrow_condition<uint16_t>(out.level_lo, out.level_hi, "level");
+        }
         if (at(TokKind::KW_AT)) {
             const Token at_tok = consume();
             return parse_snapshot_condition(out, at_tok);
         }
-        return make_error("expected 'timestamp', 'price', or 'AT' condition");
+        return make_error("expected 'timestamp', 'price', 'side', 'level' or 'AT' condition");
+    }
+
+    /// `side` and `level` (#200): #199's rules over a column narrower than its literals, which are
+    /// read as a uint64 and refused past the column's type rather than wrapped into it - `side = 256`
+    /// is a mistake to say, not the bid side.
+    template <typename T>
+    std::string parse_narrow_condition(std::optional<T>& lo, std::optional<T>& hi, const char* name) {
+        const auto read = [&](T& v) -> std::string {
+            const Token tok = current();
+            uint64_t wide = 0;
+            if (auto e = parse_uint64(wide); !e.empty()) return e;
+            if (wide > std::numeric_limits<T>::max()) {
+                return make_error_at(tok, std::string("value out of range for ") + name + ": " +
+                                              tok.text + " (at most " +
+                                              std::to_string(std::numeric_limits<T>::max()) + ")");
+            }
+            v = static_cast<T>(wide);
+            return {};
+        };
+        if (at(TokKind::KW_BETWEEN)) {
+            consume();
+            T a{};
+            T b{};
+            if (auto e = read(a); !e.empty()) return e;
+            if (!at(TokKind::KW_AND)) return make_error("expected AND in BETWEEN clause");
+            consume();
+            if (auto e = read(b); !e.empty()) return e;
+            narrow<T>(lo, hi, a, b);
+        } else {
+            const TokKind op = current().kind;
+            if (!is_comparison_op(op)) {
+                return make_error(std::string("expected comparison operator or BETWEEN after '") + name + "'");
+            }
+            consume();
+            T v{};
+            if (auto e = read(v); !e.empty()) return e;
+            apply_comparison<T>(lo, hi, op, v);
+        }
+        OB_LOG_DEBUG("query", "%s condition: now [%s, %s]", name, bound_text(lo).c_str(),
+                     bound_text(hi).c_str());
+        return {};
     }
 
     // ts_condition (after "timestamp" consumed)
@@ -646,13 +723,14 @@ private:
             case TokKind::EQ: narrow<T>(lo, hi, v, v); break;
             case TokKind::GE: narrow<T>(lo, hi, v, std::nullopt); break;
             case TokKind::LE: narrow<T>(lo, hi, std::nullopt, v); break;
+            // Cast back, because for `side` and `level` (#200) the step is taken in `int`.
             case TokKind::GT:
-                if (v == kMax) narrow<T>(lo, hi, kMax, kMax - 1);
-                else           narrow<T>(lo, hi, v + 1, std::nullopt);
+                if (v == kMax) narrow<T>(lo, hi, kMax, static_cast<T>(kMax - 1));
+                else           narrow<T>(lo, hi, static_cast<T>(v + 1), std::nullopt);
                 break;
             case TokKind::LT:
-                if (v == kMin) narrow<T>(lo, hi, kMin + 1, kMin);
-                else           narrow<T>(lo, hi, std::nullopt, v - 1);
+                if (v == kMin) narrow<T>(lo, hi, static_cast<T>(kMin + 1), kMin);
+                else           narrow<T>(lo, hi, std::nullopt, static_cast<T>(v - 1));
                 break;
             default: break;
         }
@@ -719,6 +797,46 @@ std::string QueryEngine::parse(std::string_view sql, QueryAST& out) {
 namespace {
 
 // Check whether a select_expr string is an aggregation call.
+/// Whether a row is inside every condition of `ast` (#199, #200): its time, price, side and level,
+/// each a range inclusive at both ends. One predicate for the row scan, a snapshot's levels and a
+/// subscription's pushes, which kept three copies of the time and price checks between them.
+static bool row_allowed(const QueryAST& ast, const SnapshotRow& row) {
+    const auto in = [](auto v, const auto& lo, const auto& hi) {
+        return (!lo.has_value() || v >= *lo) && (!hi.has_value() || v <= *hi);
+    };
+    return in(row.timestamp_ns, ast.ts_start_ns, ast.ts_end_ns) &&
+           in(row.price, ast.price_lo, ast.price_hi) &&
+           in(row.side, ast.side_lo, ast.side_hi) &&
+           in(row.level_index, ast.level_lo, ast.level_hi);
+}
+
+/// A book aggregate's argument split (#200): the side it names first, if any - `bid` or `ask`,
+/// already lower case from the parser - and the numbers after it, as text. `VWAP(bid)` is
+/// {"bid", {}}, `DEPTH_RANGE(ask, 1, 2)` {"ask", {"1", "2"}}, `DEPTH(100)` {"", {"100"}}.
+struct BookArgs {
+    std::string side;
+    std::vector<std::string> numbers;
+};
+
+static BookArgs book_args(const std::string& farg) {
+    BookArgs out;
+    size_t at = 0;
+    while (at <= farg.size()) {
+        const size_t comma = farg.find(',', at);
+        std::string part = farg.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        const size_t first = part.find_first_not_of(' ');
+        part = first == std::string::npos ? std::string{} : part.substr(first);
+        if (out.numbers.empty() && out.side.empty() && (part == "bid" || part == "ask")) {
+            out.side = part;
+        } else if (!part.empty()) {
+            out.numbers.push_back(part);
+        }
+        if (comma == std::string::npos) break;
+        at = comma + 1;
+    }
+    return out;
+}
+
 static bool is_agg_expr(const std::string& expr) {
     // Agg calls contain a '(' character; plain column names do not.
     return expr.find('(') != std::string::npos;
@@ -896,20 +1014,37 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
             // returned a quantity labelled SUM(price) and AVG(quantity) returned a
             // price. An argument that would be ignored is an error, not decoration.
             const std::string farg = agg_func_arg(expr);
+            // The one-sided functions name the side they read (#200): every one of them read the
+            // bids whatever the query said, and nothing could ask for the asks. The forms that used
+            // to mean the bids are refused with the spelling that says so, rather than answered with
+            // a number that quietly changed meaning.
+            const auto needs_side = [&]() {
+                OB_LOG_WARN("query", "Rejecting %s: %s reads one side of the book and names none",
+                            expr.c_str(), fname.c_str());
+                return "AGG_NEEDS_SIDE: " + fname + " reads one side of the book: write " + fname +
+                       (fname == "CUMULATIVE_VOLUME" ? "(bid, n) or " + fname + "(ask, n)"
+                                                     : "(bid) or " + fname + "(ask)") +
+                       ", not '" + expr + "'";
+            };
+            const bool names_a_side = farg == "bid" || farg == "ask";
             if (fname == "SUM") {
-                if (farg != "*" && farg != "quantity") {
+                if (farg == "*" || farg == "quantity") return needs_side();
+                if (!names_a_side) {
                     OB_LOG_WARN("query", "Rejecting %s: SUM aggregates quantity", expr.c_str());
-                    return "AGG_BAD_ARGUMENT: SUM aggregates quantity; write SUM(quantity) "
-                           "or SUM(*), not '" + expr + "'";
+                    return "AGG_BAD_ARGUMENT: SUM aggregates the quantity of a side; write SUM(bid) "
+                           "or SUM(ask), not '" + expr + "'";
                 }
             } else if (fname == "AVG" || fname == "MIN" || fname == "MAX" ||
                        fname == "VWAP") {
-                if (farg != "*" && farg != "price") {
+                if (farg == "*" || farg == "price") return needs_side();
+                if (!names_a_side) {
                     OB_LOG_WARN("query", "Rejecting %s: %s aggregates price",
                                 expr.c_str(), fname.c_str());
-                    return "AGG_BAD_ARGUMENT: " + fname + " aggregates price; write " +
-                           fname + "(price) or " + fname + "(*), not '" + expr + "'";
+                    return "AGG_BAD_ARGUMENT: " + fname + " aggregates the prices of a side; write " +
+                           fname + "(bid) or " + fname + "(ask), not '" + expr + "'";
                 }
+            } else if (fname == "CUMULATIVE_VOLUME") {
+                if (book_args(farg).side.empty()) return needs_side();
             } else if (fname == "SPREAD" || fname == "MID_PRICE") {
                 if (farg != "*") {
                     OB_LOG_WARN("query", "Rejecting %s: %s takes no argument",
@@ -949,6 +1084,23 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
                         ast.symbol.c_str(), ast.exchange.c_str());
             return "AGG_PRICE_FILTER: aggregates are computed over the whole live book; "
                    "a price filter is not supported (use DEPTH_RANGE(lo, hi))";
+        }
+        // A level range beside an aggregate (#200): the functions that read part of a side say how
+        // much of it in their own argument (`CUMULATIVE_VOLUME(n)`, `IMBALANCE(n)`), and a second
+        // answer to that question would be one of them ignored.
+        if (ast.level_lo.has_value() || ast.level_hi.has_value()) {
+            OB_LOG_WARN("query", "Rejecting aggregate with a level condition: symbol=%s exchange=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str());
+            return "AGG_LEVEL_FILTER: aggregates read the book by side and by their own arguments; "
+                   "a level condition is not supported";
+        }
+        // A side condition beside an aggregate (#200): the side a function reads is its argument,
+        // `VWAP(bid)`, so that one query can ask for both sides and the spread at once.
+        if (ast.side_lo.has_value() || ast.side_hi.has_value()) {
+            OB_LOG_WARN("query", "Rejecting aggregate with a side condition: symbol=%s exchange=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str());
+            return "AGG_SIDE_FILTER: an aggregate names the side it reads in its argument - "
+                   "VWAP(bid), DEPTH(ask, p) - not in a side condition";
         }
         // `AT` made the query a SNAPSHOT, whose branch below answers rows and never reads the
         // select list: `SELECT SPREAD(*) ... WHERE AT t` answered the book at t as rows (#199).
@@ -1015,8 +1167,8 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         uint64_t lim = ast.limit.value_or(UINT64_MAX);
         for (auto& [k, row] : state) {
             if (count >= lim) break;
-            if ((ast.price_lo.has_value() && row.price < *ast.price_lo) ||
-                (ast.price_hi.has_value() && row.price > *ast.price_hi)) {
+            // And its side and level conditions the same way (#200): the bids of the book at t.
+            if (!row_allowed(ast, row)) {
                 ++priced_out;
                 continue;
             }
@@ -1032,7 +1184,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
             ++count;
         }
         if (priced_out != 0) {
-            OB_LOG_DEBUG("query_engine", "SNAPSHOT: %llu level(s) outside the price condition",
+            OB_LOG_DEBUG("query_engine", "SNAPSHOT: %llu level(s) outside the conditions",
                          static_cast<unsigned long long>(priced_out));
         }
         return {};
@@ -1050,7 +1202,6 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         SoASide snap_bid, snap_ask;
         read_snapshot(*buf, snap_bid, snap_ask);
 
-        uint32_t depth = snap_bid.depth; // use bid depth as default n_levels
 
         QueryResult qr{};
         qr.timestamp_ns    = buf->last_timestamp_ns;
@@ -1060,48 +1211,67 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
             if (!is_agg_expr(expr)) continue;
             std::string fname = agg_func_name(expr);
             std::string farg  = agg_func_arg(expr);
+            // The side a function names first in its argument (#200), validated above for those
+            // that must name one; `DEPTH` and `DEPTH_RANGE` read both sides when theirs names none.
+            const BookArgs args = book_args(farg);
+            const SoASide& side = args.side == "ask" ? snap_ask : snap_bid;
+            const bool bids = args.side.empty() || args.side == "bid";
+            const bool asks = args.side.empty() || args.side == "ask";
+            OB_LOG_DEBUG("query", "%s reads %s", expr.c_str(),
+                         args.side.empty() ? "both sides" : (args.side + "s").c_str());
 
             AggResult res{0, true};
 
             if (fname == "SUM") {
-                res = agg_.sum_qty(snap_bid, depth);
+                res = agg_.sum_qty(side, side.depth);
             } else if (fname == "AVG") {
-                res = agg_.avg_price(snap_bid, depth);
+                res = agg_.avg_price(side, side.depth);
             } else if (fname == "MIN") {
-                res = agg_.min_price(snap_bid, depth);
+                res = agg_.min_price(side, side.depth);
             } else if (fname == "MAX") {
-                res = agg_.max_price(snap_bid, depth);
+                res = agg_.max_price(side, side.depth);
             } else if (fname == "VWAP") {
-                res = agg_.vwap(snap_bid, depth);
+                res = agg_.vwap(side, side.depth);
             } else if (fname == "SPREAD") {
                 res = agg_.spread(snap_bid, snap_ask);
             } else if (fname == "MID_PRICE") {
                 res = agg_.mid_price(snap_bid, snap_ask);
             } else if (fname == "IMBALANCE") {
                 uint32_t n = parse_u32(farg);
-                if (n == 0) n = depth;
+                if (n == 0) n = snap_bid.depth;   // as before #200: two-sided, and its default is unchanged
                 res = agg_.imbalance(snap_bid, snap_ask, n);
             } else if (fname == "DEPTH") {
-                int64_t price = parse_i64(farg);
-                res = agg_.depth_at_price(snap_bid, price);
+                // By price, so both sides unless the argument names one (#200): a price is on one
+                // side of a book that is not crossed, and on both of one that is.
+                const int64_t price = args.numbers.empty() ? 0 : parse_i64(args.numbers[0]);
+                res = AggResult{0, false, kAggScaleRaw};
+                if (bids) res.value += agg_.depth_at_price(snap_bid, price).value;
+                if (asks) res.value += agg_.depth_at_price(snap_ask, price).value;
             } else if (fname == "DEPTH_RANGE") {
-                // farg = "lo, hi" — the space is inserted by the parser, not the client.
-                auto comma = farg.find(',');
+                // "[side, ]lo, hi" - the spaces are the parser's, not the client's.
                 int64_t lo = 0, hi = 0;
-                if (comma == std::string::npos ||
-                    !parse_i64_strict(farg.substr(0, comma), lo) ||
-                    !parse_i64_strict(farg.substr(comma + 1), hi)) {
+                if (args.numbers.size() != 2 || !parse_i64_strict(args.numbers[0], lo) ||
+                    !parse_i64_strict(args.numbers[1], hi)) {
                     OB_LOG_WARN("query",
                                 "Rejecting DEPTH_RANGE with unparseable bounds: arg='%s'",
                                 farg.c_str());
                     return "AGG_BAD_ARGUMENT: DEPTH_RANGE needs two integer bounds, got '" +
                            farg + "'";
                 }
-                res = agg_.depth_within_range(snap_bid, lo, hi);
+                // Both sides unless the argument names one (#200), empty when no side read has a
+                // level in the range.
+                res = AggResult{0, true, kAggScaleRaw};
+                for (const SoASide* s : {bids ? &snap_bid : nullptr, asks ? &snap_ask : nullptr}) {
+                    if (s == nullptr) continue;
+                    const AggResult part = agg_.depth_within_range(*s, lo, hi);
+                    if (part.empty) continue;
+                    res.value += part.value;
+                    res.empty = false;
+                }
             } else if (fname == "CUMULATIVE_VOLUME") {
-                uint32_t n = parse_u32(farg);
-                if (n == 0) n = depth;
-                res = agg_.cumulative_volume(snap_bid, n);
+                uint32_t n = args.numbers.empty() ? 0 : parse_u32(args.numbers[0]);
+                if (n == 0) n = side.depth;
+                res = agg_.cumulative_volume(side, n);
             }
 
             // All four fields travel. value alone was what shipped, which is how a
@@ -1133,18 +1303,18 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     uint64_t lim      = ast.limit.value_or(UINT64_MAX);
     uint64_t count    = 0;
 
-    // Wider than the answer where a predicate needs it to be: a price filter reads `price.col`
-    // whether or not the answer carries the price.
-    const ColumnSet to_read = columns_to_read(
-        shape.columns, ast.price_lo.has_value() || ast.price_hi.has_value());
+    // Wider than the answer where a predicate needs it to be: a price, side or level condition
+    // reads its column whether or not the answer carries it.
+    ColumnSet filtered;
+    if (ast.price_lo.has_value() || ast.price_hi.has_value()) filtered.add(QueryColumn::Price);
+    if (ast.side_lo.has_value() || ast.side_hi.has_value()) filtered.add(QueryColumn::Side);
+    if (ast.level_lo.has_value() || ast.level_hi.has_value()) filtered.add(QueryColumn::Level);
+    const ColumnSet to_read = columns_to_read(shape.columns, filtered);
 
     store_.scan(ts_start, ts_end, ast.symbol, ast.exchange, to_read,
                 [&](const SnapshotRow& row) {
                     if (count >= lim) return;
-
-                    // Apply price filter if set
-                    if (ast.price_lo.has_value() && row.price < ast.price_lo.value()) return;
-                    if (ast.price_hi.has_value() && row.price > ast.price_hi.value()) return;
+                    if (!row_allowed(ast, row)) return;
 
                     QueryResult qr{};
                     qr.timestamp_ns    = row.timestamp_ns;
@@ -1190,36 +1360,32 @@ std::string QueryEngine::format(const QueryAST& ast) {
         else                { os << " AND"; }
     };
 
+    // One column's range, inclusive at both ends, as the parser reads it back. Unary plus, so that a
+    // `side` - a uint8_t - prints as a number rather than as the character it also is (#200).
+    const auto write_range = [&](const char* column, const auto& lo, const auto& hi) {
+        if (lo.has_value() && hi.has_value()) {
+            write_where_or_and();
+            os << " " << column << " BETWEEN " << +*lo << " AND " << +*hi;
+        } else if (lo.has_value()) {
+            write_where_or_and();
+            os << " " << column << " >= " << +*lo;
+        } else if (hi.has_value()) {
+            write_where_or_and();
+            os << " " << column << " <= " << +*hi;
+        }
+    };
+
     if (ast.snapshot_ts_ns.has_value()) {
         write_where_or_and();
         os << " AT " << ast.snapshot_ts_ns.value();
     } else {
-        if (ast.ts_start_ns.has_value() && ast.ts_end_ns.has_value()) {
-            write_where_or_and();
-            os << " timestamp BETWEEN " << ast.ts_start_ns.value()
-               << " AND " << ast.ts_end_ns.value();
-        } else if (ast.ts_start_ns.has_value()) {
-            write_where_or_and();
-            os << " timestamp >= " << ast.ts_start_ns.value();
-        } else if (ast.ts_end_ns.has_value()) {
-            write_where_or_and();
-            os << " timestamp <= " << ast.ts_end_ns.value();
-        }
+        write_range("timestamp", ast.ts_start_ns, ast.ts_end_ns);
     }
-
-    // Beside `AT` too: a snapshot's price condition is applied since #199, so the canonical form
-    // that left it out no longer read back as the same query.
-    if (ast.price_lo.has_value() && ast.price_hi.has_value()) {
-        write_where_or_and();
-        os << " price BETWEEN " << ast.price_lo.value()
-           << " AND " << ast.price_hi.value();
-    } else if (ast.price_lo.has_value()) {
-        write_where_or_and();
-        os << " price >= " << ast.price_lo.value();
-    } else if (ast.price_hi.has_value()) {
-        write_where_or_and();
-        os << " price <= " << ast.price_hi.value();
-    }
+    // A snapshot's price, side and level conditions are its own since #199 and #200, so they are
+    // written for it too: they used to be left out, which was harmless only while they were ignored.
+    write_range("price", ast.price_lo, ast.price_hi);
+    write_range("side", ast.side_lo, ast.side_hi);
+    write_range("level", ast.level_lo, ast.level_hi);
 
     // 5. LIMIT (SELECT only)
     if (ast.type != QueryType::SUBSCRIBE && ast.limit.has_value()) {
@@ -1352,14 +1518,7 @@ void QueryEngine::notify_subscribers(const std::string& symbol,
             const Subscription& sub = *matched[i];
             const QueryAST& ast     = sub.ast;
             for (const SnapshotRow& row : rows) {
-                // Check timestamp filter
-                if (ast.ts_start_ns.has_value() && row.timestamp_ns < ast.ts_start_ns.value())
-                    continue;
-                if (ast.ts_end_ns.has_value() && row.timestamp_ns > ast.ts_end_ns.value())
-                    continue;
-                // Check price filter
-                if (ast.price_lo.has_value() && row.price < ast.price_lo.value()) continue;
-                if (ast.price_hi.has_value() && row.price > ast.price_hi.value()) continue;
+                if (!row_allowed(ast, row)) continue;
                 // Build QueryResult and invoke callback
                 QueryResult qr{};
                 qr.timestamp_ns    = row.timestamp_ns;

@@ -14,13 +14,17 @@ subscribe_query = "SUBSCRIBE" select_list "FROM" symbol_ref
 
 select_list = "*" | column { "," column } ;
 column      = identifier | agg_call ;
-agg_call    = identifier "(" [ identifier ] ")" ;
+agg_call    = identifier "(" [ agg_args ] ")" ;
+agg_args    = side | "*" | identifier | [ side "," ] integer [ "," integer ] ;
+side        = "bid" | "ask" ;
 
 symbol_ref  = "'" symbol_name "'" "." "'" exchange_name "'" ;
 
 where_clause = condition { "AND" condition } ;
 condition    = "timestamp" range
              | "price" range
+             | "side" range
+             | "level" range
              | "AT" integer ;
 range        = "BETWEEN" integer "AND" integer
              | comparison integer ;
@@ -65,6 +69,10 @@ SELECT * FROM 'BTC-USD'.'BINANCE'
   AND price >= 6490000 AND price < 6510000
 ```
 
+`side` (0 for the bids, 1 for the asks) and `level` (0 the best) are conditions as the time and
+the price are, with the same rules (#200): `side = 0 AND level = 0` is the top of the bids, and a
+value past the column's type - `side = 256`, `level = 65536` - does not parse rather than wrap.
+
 Before #199 in the roadmap every comparison set one end of the range and nothing else: `=` meant
 `>=`, `>` and `<` kept the value they exclude, and a second condition on a column replaced the
 first instead of narrowing it - all of it answered `OK`. A subscription's conditions are read the
@@ -102,22 +110,38 @@ silently ignored:
   the book as it is now. Aggregation over a time range is a separate feature (roadmap #44).
 - **A price filter is refused.** Use `DEPTH_RANGE(lo, hi)`, which does what a price filter on an
   aggregate would be expected to do.
+- **So are side and level conditions** (#200): a function names the side it reads in its argument,
+  and how deep in its own argument where it takes one.
+
+**A function of one side of the book names the side** - `bid` or `ask`, in any case, the expression
+in the answer in lower case - so one query can answer both sides and the spread:
+
+```sql
+SELECT VWAP(bid), VWAP(ask), SPREAD(*), DEPTH_RANGE(ask, 6490000, 6510000) FROM 'BTC-USD'.'BINANCE'
+```
+
+Until #200 every one of them read the bids whatever the query said, and nothing could ask for the
+asks: on a book of bids 100×5, 99×6 and asks 101×7, 102×8, `MAX(price)` answered 100, `DEPTH(101)`
+answered 0 and `DEPTH_RANGE(99, 102)` 11 of the 26 in the range. The spellings that meant the bids -
+`SUM(quantity)`, `SUM(*)`, `AVG(price)`, `VWAP(*)`, `CUMULATIVE_VOLUME(n)` and the rest - are refused
+with `AGG_NEEDS_SIDE`, which names the spelling to use, rather than answered with a number whose
+meaning changed.
 
 ### Available functions
 
-| Function | Description | Scale |
-|----------|-------------|-------|
-| `SUM(quantity)` | Sum of quantities over the first n levels | raw |
-| `AVG(price)` | Average price | raw |
-| `MIN(price)` | Minimum price | raw |
-| `MAX(price)` | Maximum price | raw |
-| `VWAP(price)` | Volume-weighted average price | × 10⁶ |
-| `SPREAD(*)` | Best ask − best bid | raw |
-| `MID_PRICE(*)` | (best ask + best bid) / 2 | × 10⁶ |
-| `IMBALANCE(n)` | (bid_vol − ask_vol) / (bid_vol + ask_vol) over n levels | × 10⁹ |
-| `DEPTH(price)` | Quantity at exactly that price | raw |
-| `DEPTH_RANGE(lo, hi)` | Sum of quantities for levels priced in [lo, hi] | raw |
-| `CUMULATIVE_VOLUME(n)` | Sum of quantities over the first n levels | raw |
+| Function | Reads | Description | Scale |
+|----------|-------|-------------|-------|
+| `SUM(bid)`, `SUM(ask)` | the side named | Sum of the side's quantities | raw |
+| `AVG(bid)`, `AVG(ask)` | the side named | Average of the side's prices, truncated | raw |
+| `MIN(bid)`, `MIN(ask)` | the side named | Lowest price of the side | raw |
+| `MAX(bid)`, `MAX(ask)` | the side named | Highest price of the side | raw |
+| `VWAP(bid)`, `VWAP(ask)` | the side named | The side's prices weighted by their quantities | × 10⁶ |
+| `CUMULATIVE_VOLUME(bid, n)`, `(ask, n)` | the side named | Sum of the side's quantities over its first n levels | raw |
+| `SPREAD(*)` | both | Best ask − best bid | raw |
+| `MID_PRICE(*)` | both | (best ask + best bid) / 2 | × 10⁶ |
+| `IMBALANCE(n)` | both | (bid_vol − ask_vol) / (bid_vol + ask_vol) over n levels | × 10⁹ |
+| `DEPTH(price)`, `DEPTH(bid, price)`, `DEPTH(ask, price)` | both, or the side named | Quantity at exactly that price | raw |
+| `DEPTH_RANGE(lo, hi)`, `DEPTH_RANGE(bid, lo, hi)`, `DEPTH_RANGE(ask, lo, hi)` | both, or the side named | Sum of quantities for levels priced in [lo, hi] | raw |
 
 Function names are case-insensitive. The scale column is not documentation you have to remember —
 every response carries the scale with the value.
@@ -164,6 +188,8 @@ aggs["SPREAD(*)"].is_empty    # False
 | `AGG_WITH_COLUMNS` | Aggregates mixed with plain columns (`SELECT price, SPREAD(*)`). There is no `GROUP BY`, so the column would have to be dropped |
 | `AGG_TIME_FILTER` | A timestamp predicate, or `AT`, combined with an aggregate |
 | `AGG_PRICE_FILTER` | A price predicate combined with an aggregate; use `DEPTH_RANGE(lo, hi)` |
+| `AGG_SIDE_FILTER`, `AGG_LEVEL_FILTER` | A side or level condition combined with an aggregate: name the side in the function, `VWAP(bid)` |
+| `AGG_NEEDS_SIDE` | A function of one side that names none - `SUM(quantity)`, `VWAP(*)`, `CUMULATIVE_VOLUME(5)`: write `SUM(bid)`, `VWAP(ask)`, `CUMULATIVE_VOLUME(bid, 5)` |
 | `OB_ERR_PARSE: undefined aggregation function` | Unknown function name |
 
 ## SNAPSHOT Queries
@@ -182,7 +208,9 @@ AT …`), and reads the columnar store, so a row the flush tick has not yet writ
 
 A price condition keeps the levels of that book priced within it - `WHERE AT t AND price BETWEEN lo
 AND hi` is the book at `t` inside a band - and it is applied to the book, so a level whose latest
-price is outside the band is left out even when an earlier row of it was inside. `LIMIT` counts the
+price is outside the band is left out even when an earlier row of it was inside. Side and level
+conditions keep that side and those levels of it the same way (#200): `AT t AND level = 0` is the
+best bid and the best ask at `t`. `LIMIT` counts the
 levels answered. A timestamp condition beside `AT` is refused with `SNAPSHOT_TIME_FILTER`, since `AT`
 names the moment, and a second `AT` does not parse. Before #199 the price and the timestamp
 conditions were accepted and ignored, and a second `AT` replaced the first.
@@ -202,7 +230,8 @@ SUBSCRIBE price FROM 'BTC-USD'.'BINANCE'
   WHERE price BETWEEN 6490000 AND 6510000
 ```
 
-A subscription takes timestamp and price conditions as a `SELECT` does (see Conditions above).
+A subscription takes timestamp, price, side and level conditions as a `SELECT` does (see
+Conditions above).
 `AT` is refused: it names a moment of the stored book, and a subscription is what is written from
 now on. It used to be accepted and dropped, which subscribed to every row.
 

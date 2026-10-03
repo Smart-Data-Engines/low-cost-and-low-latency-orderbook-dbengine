@@ -320,7 +320,9 @@ class OrderbookSystem:
         self._ensure_running()
         assert self._engine is not None
         started = time.perf_counter()
-        aggs = self._engine.query_agg(symbol, "EX", "VWAP(*)")
+        # The bids' VWAP: the side is the function's argument since #200, when VWAP(*) - which
+        # read the bids without saying so - became a refusal.
+        aggs = self._engine.query_agg(symbol, "EX", "VWAP(bid)")
         elapsed = time.perf_counter() - started
-        value = aggs["VWAP(*)"].real
+        value = aggs["VWAP(bid)"].real
         return QueryResult(rows=[(value,)], seconds=elapsed)

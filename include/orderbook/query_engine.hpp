@@ -66,6 +66,12 @@ struct QueryAST {
     std::optional<uint64_t> ts_end_ns;
     std::optional<int64_t>  price_lo;
     std::optional<int64_t>  price_hi;
+    /// `side` and `level` conditions (#200), ranges as the two above are. Row scans, a snapshot's
+    /// levels and a subscription's pushes are filtered on them; a one-sided aggregate reads the side.
+    std::optional<uint8_t>  side_lo;
+    std::optional<uint8_t>  side_hi;
+    std::optional<uint16_t> level_lo;
+    std::optional<uint16_t> level_hi;
     std::vector<std::string> select_exprs;  // column names or agg calls
 
     /// The columns to answer with, in the order the query asked for them. Empty means `SELECT *`.

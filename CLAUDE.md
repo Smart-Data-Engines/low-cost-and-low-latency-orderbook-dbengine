@@ -3998,6 +3998,10 @@ Learned the hard way. Check here before debugging.
      node named its successor while replicating nothing, after every planned `FAILOVER`. Keep what a
      component *does* (whom the client follows) apart from what it *reports* (the leader's address),
      and compare the leader against the first.
+535. **A fixture that builds one side of the book cannot see a function that reads the wrong
+     side.** Every live-book aggregate of one side read the bids (#200) - `DEPTH` of an ask's price
+     answered 0 - and every test of those functions built a book of bids, so each passed. Give a
+     book both sides, with different values on each, whenever a function could read either.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

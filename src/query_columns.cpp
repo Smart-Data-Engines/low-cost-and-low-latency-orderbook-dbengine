@@ -79,7 +79,7 @@ const std::vector<QueryColumn>& all_query_columns() {
     return kAll;
 }
 
-ColumnSet columns_to_read(const std::vector<QueryColumn>& output, bool has_price_filter) {
+ColumnSet columns_to_read(const std::vector<QueryColumn>& output, ColumnSet filtered) {
     ColumnSet set;
     for (QueryColumn c : output) set.add(c);
 
@@ -87,11 +87,12 @@ ColumnSet columns_to_read(const std::vector<QueryColumn>& output, bool has_price
     // column is read whether or not it is answered.
     set.add(QueryColumn::TimestampNs);
 
-    if (has_price_filter) set.add(QueryColumn::Price);
+    for (uint8_t i = 0; i < kQueryColumnCount; ++i) {
+        if (filtered.has(static_cast<QueryColumn>(i))) set.add(static_cast<QueryColumn>(i));
+    }
 
-    OB_LOG_DEBUG("query", "Columns to read: %zu of %zu (output %zu, price filter %s)",
-                 set.count(), kQueryColumnCount, output.size(),
-                 has_price_filter ? "yes" : "no");
+    OB_LOG_DEBUG("query", "Columns to read: %zu of %zu (output %zu, conditions on %zu)",
+                 set.count(), kQueryColumnCount, output.size(), filtered.count());
     return set;
 }
 

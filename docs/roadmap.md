@@ -2465,6 +2465,41 @@ anything follows it or not.
   primary its lease, the old primary is a replica that replicates nothing - one copy of every write
   from then on, stale reads, and the stale node next in line
 
+### 200. Every aggregate of one side of the book read the bids: `DEPTH` of an ask's price answered 0, and nothing could ask for the asks ✅ **P1**
+
+**Found reading the aggregate path for #44.** `QueryEngine::execute()` handed every function of one
+side `snap_bid`, at the bids' depth, whatever the query said; the documentation said "Sum of
+quantities over the first n levels", "Minimum price", "Quantity at exactly that price". Measured on
+master's server (`14d5095`), bids 100×5 and 99×6, asks 101×7 and 102×8:
+
+| Expression | Answered | The book |
+|---|---|---|
+| `SUM(quantity)` | 11 | 26 in all, 15 on the asks |
+| `MIN(price)`, `MAX(price)` | 99, 100 | 99 and 102 |
+| `DEPTH(101)` | **0**, not empty | 7: an ask stands there |
+| `DEPTH_RANGE(99, 102)` | **11** | 26 |
+| `CUMULATIVE_VOLUME(2)`, `VWAP(price)` | the bids' | and no spelling asked for the asks' |
+
+The tests built books of bids for every function of one side, so none could tell. And `WHERE`
+could not narrow rows to a side or a level at all, which #44 needs: the top of the book is `side = 0
+AND level = 0`.
+
+**Fixed.** A function of one side names it - `SUM(bid)`, `VWAP(ask)`, `CUMULATIVE_VOLUME(bid, n)` -
+so that one query answers both sides and the spread (`SELECT VWAP(bid), VWAP(ask), SPREAD(*)`);
+`DEPTH` and `DEPTH_RANGE` are by price and read both sides, or the one their argument names. The
+spellings that meant the bids - `SUM(quantity)`, `VWAP(*)`, `CUMULATIVE_VOLUME(n)` and the rest -
+are refused with `AGG_NEEDS_SIDE`, which names the spelling to use, rather than answered with a
+number whose meaning changed; the engine has no release yet (#42). A first design took the side
+from `WHERE side = …` and was dropped: both sides' VWAP would have taken two queries. `side` and
+`level` are `WHERE` conditions now, with #199's rules, for row scans, a snapshot's levels and a
+subscription's pushes, through one predicate where three copies of the time and price checks were;
+beside an aggregate they are refused (`AGG_SIDE_FILTER`, `AGG_LEVEL_FILTER`), since the side is the
+function's and the depth its argument's. A literal past the column's type - `side = 256` - does not
+parse rather than wrap.
+
+- Effort: S | Impact: wrong live-book answers, `OK`: an ask's depth 0, a range's depth short by the
+  asks in it, a book's extremes the bids'; and no way to ask about the asks
+
 ### 199. A comparison in a `WHERE` answered a different question: `=` was `>=`, `>` and `<` kept their bound, and a second condition on a column replaced the first ✅ **P1**
 
 **Found reading the parser for #44.** The grammar documented `BETWEEN` alone, and the parser

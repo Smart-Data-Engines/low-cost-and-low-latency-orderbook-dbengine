@@ -105,8 +105,8 @@ size_t max_row_bytes(const std::vector<QueryColumn>& output);
 /// Everything a scan has to read to answer `output` under these predicates.
 ///
 /// Wider than `output` on purpose. `TimestampNs` is always in it because every row scan filters on
-/// the time range, and `Price` joins it when the query filters on price - a column a predicate
-/// needs is read whether or not it is answered.
-ColumnSet columns_to_read(const std::vector<QueryColumn>& output, bool has_price_filter);
+/// the time range, and every column a condition is on joins it - `filtered`, the price, side and
+/// level since #200: a column a predicate needs is read whether or not it is answered.
+ColumnSet columns_to_read(const std::vector<QueryColumn>& output, ColumnSet filtered);
 
 } // namespace ob

@@ -157,8 +157,8 @@ TEST(QueryAggExecution, VwapCarriesItsScale) {
     fix.add_bid(100'000, 10);
     fix.add_bid(99'000, 30);
 
-    auto result = fix.run("SELECT VWAP(price) FROM 'BTC-USD'.'BINANCE'");
-    const auto* vwap = find_agg(result, "VWAP(price)");
+    auto result = fix.run("SELECT VWAP(bid) FROM 'BTC-USD'.'BINANCE'");
+    const auto* vwap = find_agg(result, "VWAP(bid)");
     ASSERT_NE(vwap, nullptr);
 
     // (100000*10 + 99000*30) / 40 = 3970000/40 = 99250, scaled by 10^6.
@@ -295,13 +295,15 @@ TEST(QueryAggArguments, ValidFormsStillWork) {
     fix.add_bid(100'000, 50);
     fix.add_ask(101'000, 30);
 
-    for (const char* sql : {"SELECT SUM(quantity) FROM 'BTC-USD'.'BINANCE'",
-                            "SELECT SUM(*) FROM 'BTC-USD'.'BINANCE'",
-                            "SELECT AVG(price) FROM 'BTC-USD'.'BINANCE'",
-                            "SELECT VWAP(*) FROM 'BTC-USD'.'BINANCE'",
+    for (const char* sql : {"SELECT SUM(bid) FROM 'BTC-USD'.'BINANCE'",
+                            "SELECT SUM(ask) FROM 'BTC-USD'.'BINANCE'",
+                            "SELECT AVG(bid) FROM 'BTC-USD'.'BINANCE'",
+                            "SELECT VWAP(ask) FROM 'BTC-USD'.'BINANCE'",
                             "SELECT SPREAD(*) FROM 'BTC-USD'.'BINANCE'",
-                            "SELECT CUMULATIVE_VOLUME(5) FROM 'BTC-USD'.'BINANCE'",
-                            "SELECT DEPTH(100000) FROM 'BTC-USD'.'BINANCE'"}) {
+                            "SELECT CUMULATIVE_VOLUME(bid, 5) FROM 'BTC-USD'.'BINANCE'",
+                            "SELECT DEPTH(100000) FROM 'BTC-USD'.'BINANCE'",
+                            "SELECT DEPTH(ask, 101000) FROM 'BTC-USD'.'BINANCE'",
+                            "SELECT DEPTH_RANGE(bid, 1, 2) FROM 'BTC-USD'.'BINANCE'"}) {
         std::string err;
         auto result = fix.run(sql, &err);
         EXPECT_TRUE(err.empty()) << sql << ": " << err;
@@ -355,4 +357,117 @@ TEST(QueryAggArguments, DepthRangeOutsideAnyLevelIsEmptyNotZero) {
     ASSERT_EQ(result.agg_values.size(), 1u);
     EXPECT_TRUE(result.agg_values[0].empty)
         << "no levels in range is an empty result, not a depth of zero";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #200: every one-sided function read the bids, and nothing could ask for the asks.
+//
+// Measured on master (14d5095) with this book: SUM(quantity) 11, MIN(price) 99, MAX(price) 100,
+// DEPTH(101) 0 and not empty, DEPTH_RANGE(99, 102) 11. The side is the function's argument now,
+// so that one query answers both sides and the spread at once.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// Bids 100 x 5 and 99 x 6, asks 101 x 7 and 102 x 8.
+void the_measured_book(AggFixture& fix) {
+    fix.add_bid(100, 5);
+    fix.add_bid(99, 6);
+    fix.add_ask(101, 7);
+    fix.add_ask(102, 8);
+}
+
+int64_t value_of(AggFixture& fix, const std::string& expr) {
+    std::string err;
+    const auto result = fix.run("SELECT " + expr + " FROM 'BTC-USD'.'BINANCE'", &err);
+    EXPECT_TRUE(err.empty()) << expr << ": " << err;
+    const auto* v = find_agg(result, expr);
+    EXPECT_NE(v, nullptr) << expr;
+    return v == nullptr ? INT64_MIN : v->value;
+}
+
+}  // namespace
+
+TEST(QueryAggSides, EachOneSidedFunctionReadsTheSideItNames) {
+    AggFixture fix;
+    the_measured_book(fix);
+    EXPECT_EQ(value_of(fix, "SUM(bid)"), 11);
+    EXPECT_EQ(value_of(fix, "SUM(ask)"), 15) << "the asks could not be asked for at all";
+    EXPECT_EQ(value_of(fix, "MIN(bid)"), 99);
+    EXPECT_EQ(value_of(fix, "MAX(bid)"), 100);
+    EXPECT_EQ(value_of(fix, "MIN(ask)"), 101);
+    EXPECT_EQ(value_of(fix, "MAX(ask)"), 102);
+    EXPECT_EQ(value_of(fix, "AVG(ask)"), 101) << "(101 + 102) / 2, truncated as AVG always was";
+    // (101 * 7 + 102 * 8) / 15, scaled by 10^6.
+    EXPECT_EQ(value_of(fix, "VWAP(ask)"), (101LL * 7 + 102LL * 8) * 1'000'000LL / 15);
+    EXPECT_EQ(value_of(fix, "CUMULATIVE_VOLUME(ask, 1)"), 7);
+    EXPECT_EQ(value_of(fix, "CUMULATIVE_VOLUME(bid, 2)"), 11);
+}
+
+TEST(QueryAggSides, DepthIsByPriceAndReadsBothSidesUnlessOneIsNamed) {
+    AggFixture fix;
+    the_measured_book(fix);
+    EXPECT_EQ(value_of(fix, "DEPTH(101)"), 7) << "an ask's price answered 0";
+    EXPECT_EQ(value_of(fix, "DEPTH(100)"), 5);
+    EXPECT_EQ(value_of(fix, "DEPTH(bid, 101)"), 0);
+    EXPECT_EQ(value_of(fix, "DEPTH(ask, 101)"), 7);
+    EXPECT_EQ(value_of(fix, "DEPTH_RANGE(99, 102)"), 26) << "the asks in the range were left out";
+    EXPECT_EQ(value_of(fix, "DEPTH_RANGE(bid, 99, 102)"), 11);
+    EXPECT_EQ(value_of(fix, "DEPTH_RANGE(ask, 99, 102)"), 15);
+
+    std::string err;
+    const auto none = fix.run("SELECT DEPTH_RANGE(ask, 1, 2) FROM 'BTC-USD'.'BINANCE'", &err);
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(none.agg_values.size(), 1u);
+    EXPECT_TRUE(none.agg_values[0].empty) << "no level of the side read is in the range";
+}
+
+TEST(QueryAggSides, OneQueryAnswersBothSidesAndTheSpread) {
+    AggFixture fix;
+    the_measured_book(fix);
+    std::string err;
+    const auto result =
+        fix.run("SELECT VWAP(bid), VWAP(ask), SPREAD(*) FROM 'BTC-USD'.'BINANCE'", &err);
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(result.agg_values.size(), 3u);
+    EXPECT_EQ(result.agg_values[0].name, "VWAP(bid)");
+    EXPECT_EQ(result.agg_values[1].name, "VWAP(ask)");
+    EXPECT_EQ(result.agg_values[2].name, "SPREAD(*)");
+    EXPECT_EQ(result.agg_values[0].value, (100LL * 5 + 99LL * 6) * 1'000'000LL / 11);
+    EXPECT_EQ(result.agg_values[2].value, 1);
+}
+
+TEST(QueryAggSides, TheSideIsReadInAnyCaseAndNamedInLowerCase) {
+    AggFixture fix;
+    the_measured_book(fix);
+    std::string err;
+    const auto result = fix.run("SELECT SUM(ASK), DEPTH(Bid, 100) FROM 'BTC-USD'.'BINANCE'", &err);
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(result.agg_values.size(), 2u);
+    EXPECT_EQ(result.agg_values[0].name, "SUM(ask)");
+    EXPECT_EQ(result.agg_values[0].value, 15);
+    EXPECT_EQ(result.agg_values[1].name, "DEPTH(bid, 100)");
+    EXPECT_EQ(result.agg_values[1].value, 5);
+}
+
+TEST(QueryAggSides, TheSpellingsThatMeantTheBidsAreRefusedWithTheOneThatSaysSo) {
+    AggFixture fix;
+    the_measured_book(fix);
+    for (const char* expr : {"SUM(quantity)", "SUM(*)", "AVG(price)", "AVG(*)", "MIN(price)",
+                             "MAX(*)", "VWAP(price)", "VWAP(*)", "CUMULATIVE_VOLUME(5)"}) {
+        std::string err;
+        fix.run(std::string("SELECT ") + expr + " FROM 'BTC-USD'.'BINANCE'", &err);
+        EXPECT_EQ(err.rfind("AGG_NEEDS_SIDE", 0), 0u) << expr << " answered, or said: " << err;
+        EXPECT_NE(err.find("(bid"), std::string::npos) << expr << ": " << err;
+    }
+}
+
+TEST(QueryAggSides, ASideOrALevelConditionBesideAnAggregateIsRefused) {
+    AggFixture fix;
+    the_measured_book(fix);
+    std::string err;
+    fix.run("SELECT SPREAD(*) FROM 'BTC-USD'.'BINANCE' WHERE side = 1", &err);
+    EXPECT_EQ(err.rfind("AGG_SIDE_FILTER", 0), 0u) << err;
+    fix.run("SELECT SUM(bid) FROM 'BTC-USD'.'BINANCE' WHERE level < 1", &err);
+    EXPECT_EQ(err.rfind("AGG_LEVEL_FILTER", 0), 0u) << err;
 }

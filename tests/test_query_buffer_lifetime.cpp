@@ -89,8 +89,9 @@ TEST(QueryBufferLifetime, ASnapshotInstallDuringAQueryDoesNotFreeWhatTheQueryRea
                 // used it, drove the race for three ASan runs and reported clean, because the
                 // pointer it was racing was only ever compared against null. The aggregation
                 // branch is the one that reads through it (`read_snapshot(*buf, ...)`), which is
-                // also why #91's test picked VWAP.
-                engine.execute("SELECT VWAP(price) FROM 'LIFE'.'EX'",
+                // also why #91's test picked VWAP. With its side since #200: the old spelling is
+                // refused before the buffer is read, and this would race nothing.
+                engine.execute("SELECT VWAP(bid) FROM 'LIFE'.'EX'",
                                [](const ob::QueryResult&) {});
                 queries.fetch_add(1, std::memory_order_relaxed);
             }

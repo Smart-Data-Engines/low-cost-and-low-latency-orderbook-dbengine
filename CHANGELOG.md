@@ -28,8 +28,9 @@ The first release. What it contains, by area:
 
 - A SQL-like language: conditions on time and price with `=`, `<`, `<=`, `>`, `>=` and `BETWEEN`
   that narrow each other (#199), `LIMIT`, `SELECT` lists that read only the column files they need
-  (#139), snapshots of the book at a time (`AT`), and aggregates - VWAP, spread, mid-price,
-  imbalance - carrying their scale and telling an empty aggregate from a zero.
+  (#139), conditions on the side and the level (#200), snapshots of the book at a time (`AT`), and
+  aggregates - VWAP, spread, mid-price, imbalance, depth - each function of one side naming it
+  (`VWAP(bid)`, #200), carrying their scale and telling an empty aggregate from a zero.
 - `BOOK` for the live book over the wire, and `SUBSCRIBE` for rows pushed as they are written.
 
 ### Replication and availability
