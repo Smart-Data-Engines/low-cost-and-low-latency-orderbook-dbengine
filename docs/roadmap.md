@@ -2422,6 +2422,77 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 204. A planned `FAILOVER` lost acknowledged writes, and left the cluster without a primary for a whole lease TTL ✅ **P1**
+
+**Measured through the server** (`evidence/2026-10-03-handover-before/`, the m9g.xlarge at #201's
+head): one client inserting a level per `INSERT` into the primary, `FAILOVER` two seconds in, five
+runs per build. The target answered `PRIMARY` **10.73 s** after the `OK` in every Release run, and in
+nine runs of ten it lacked the last writes the outgoing primary had acknowledged - **1, 2, 4, 0, 2**
+on Release and **3, 1, 3, 4308, 2** on Debug.
+
+Two causes, one order. `Engine::demote_to_replica()` stopped the replication manager first and
+turned read-only after: `stop()` joins its thread - 106 ms in the run that lost 4308 - and the writes
+taken meanwhile reached the WAL and an `OK`, but no replica, because the manager they would have
+been broadcast through was already gone. And whatever the target had not received when the stream
+stopped had nowhere left to come from. The ten seconds were the election wait (#82): the outgoing
+primary revoked its lease and only then demoted, so for a moment the key was gone while it still
+took writes, and every candidate - the named target included - waits a lease TTL after the key goes
+for exactly that reason.
+
+**Fixed by closing that moment at its source** (spec `kiro-workspace/specs/handover-without-the-lease-wait/`):
+
+- **Every demotion closes writes first**, in the engine, under the lock a write holds from its WAL
+  append to its broadcast (`writes_closed_`, `OB_ERR_READ_ONLY`, answered `ERR read-only replica`
+  like the server's own check): a write is either in the stream or refused. The server's read-only
+  flag could not do it alone - it is read before the engine is called.
+- **A node with nobody to follow keeps its stream up** - after a handover, or a lease lost with
+  nobody elected - and ends it when it follows a primary (#201).
+- **The handover steps down before its lease goes**, then publishes its intent again with the term
+  it stepped down from and where its stream ends (`ReplicationManager::last_broadcast_end()`: the
+  position a replica confirms after the last record, in the replica's own terms, #98). That is a
+  statement of fact, written once it is true.
+- **The target stands without the election wait** when the live intent names it, the statement is
+  at the term it knows, and its own position (`ReplicationClient::stream_position()`, one reading
+  under a sequence lock - #85's lesson) is at the stream's end - and then without position deference
+  (#70), since nobody holds more of that log than it streamed. Short of the end it waits for the rest,
+  at most until the election wait ends, and then stands as it always did. The decision is one pure
+  function, `decide_on_vacant_leader()`.
+- Between the step-down and the revoke the key still names the outgoing node while it is a REPLICA:
+  the #130 arm does not finish a promotion at a term the node handed over. A revoke that fails
+  withdraws the intent and the node takes the role back (`ERR failover_failed`, as before); when the
+  intent cannot be withdrawn either, the node stays a replica and the role moves when its lease
+  expires.
+
+After the fix, through the server: `tests/integration/test_handover.py` - three handovers under a
+writer that never pauses lose nothing, and the target is primary well within half the TTL; against
+the server before it, the same module lost an acknowledged write in its first round and waited
+10.74 s. Of `tests/test_etcd_integration.cpp`'s six failures on master, the four that are handovers
+pass; the other two predate #82 and #70 and are #202's.
+
+- Effort: M | Impact: every planned handover - maintenance, an upgrade - lost the tail of the
+  acknowledged writes and stopped writes for ten seconds; a failover of a primary that lost its lease
+  lost what it took while its stream was being stopped
+
+### 202. `tests/test_etcd_integration.cpp` runs nowhere - not in ctest, not in CI - and six of its twenty-six tests failed on master **P2**
+
+The failover manager's tests against a real etcd are gated behind `OB_ETCD_TESTS`, registered with
+no `gtest_discover_tests()`, and named by no CI job, so nothing ran them. Run by hand on master
+(`4115817`): six of twenty-six failed, and they had been failing for a while. Four were handovers,
+and the cause was real (#204: the target waited a whole TTL, and with the test's cooldown shorter
+than that the outgoing primary took back the role it had handed over). **#204 makes those four
+pass.** Two are expectations older than the code:
+
+- `LeaseExpiry` wants the replica primary within 2 s of the key's deletion; since #82 a candidate
+  waits the lease TTL first.
+- `GracefulFailoverTargetGoneFallsBackToElection` wants the remaining replica to win once the intent
+  to a dead target expires; since #70 the election prefers the further published position, which is
+  the node that handed over, back after its cooldown.
+
+Open until the two are settled and the binary runs in CI with etcd.
+
+- Effort: S | Impact: the one suite that drives the failover manager against etcd regressed
+  unnoticed, and #204's defect sat in it
+
 ### 201. A primary that gave the role up before anyone took it never replicated again - after every planned `FAILOVER`, and after a lease lost to the coordinator - while `ROLE` named its successor ✅ **P0**
 
 **Found in the integration battery, under load.** Another session's test suite kept the
@@ -12995,7 +13066,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #202.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

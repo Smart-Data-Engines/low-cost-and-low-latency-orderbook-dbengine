@@ -4002,6 +4002,14 @@ Learned the hard way. Check here before debugging.
      side.** Every live-book aggregate of one side read the bids (#200) - `DEPTH` of an ask's price
      answered 0 - and every test of those functions built a book of bids, so each passed. Give a
      book both sides, with different values on each, whenever a function could read either.
+536. **A safety wait guards a window; close the window and the wait has nothing left to guard.** Every
+     candidate waited a lease TTL after the leader key went (#82), because the old holder could still
+     be taking writes - and a planned handover's target waited it too, ten seconds without a primary,
+     while the handover's own order (revoke, then demote) was what opened the window. And the
+     demotion stopped the replication stream before it stopped taking writes, so writes acknowledged
+     in between went to no replica (#204: up to 4308 lost). When a wait exists for a state, ask
+     whether the party that knows the state can end it and say so - a statement written once it is
+     true, at a term, with what the waiter needs to check.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
