@@ -308,6 +308,13 @@ ob_add_query_test(test_query_conditions
     test_query_conditions.cpp
 )
 
+# Aggregates over time buckets (#44): GROUP BY TIME_BUCKET(...), against an oracle, and the answer
+# on the wire - which needs the server library's formatter.
+ob_add_query_test(test_time_buckets
+    test_time_buckets.cpp
+)
+target_link_libraries(test_time_buckets PRIVATE orderbook_tcp_server_lib)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

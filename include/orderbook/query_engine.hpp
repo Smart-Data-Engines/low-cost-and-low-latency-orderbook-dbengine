@@ -55,6 +55,23 @@ struct QueryResult {
 
 enum class QueryType { SELECT, SUBSCRIBE, SNAPSHOT };
 
+// ── Time buckets (#44) ────────────────────────────────────────────────────────
+
+/// An aggregate over the rows of a time bucket, as opposed to one over the live book (#44).
+enum class BucketFn : uint8_t { Count, First, Last, Min, Max, Sum, Avg, Vwap };
+
+/// One aggregate of a `GROUP BY TIME_BUCKET(...)` query: the function, the row column it reads, and
+/// the expression as the answer names it.
+struct BucketAgg {
+    BucketFn    fn;
+    QueryColumn column;   ///< what it reads; `COUNT(*)` reads nothing and says TimestampNs
+    std::string text;     ///< e.g. "VWAP(price)", the canonical spelling the parser wrote
+    bool operator==(const BucketAgg&) const = default;
+};
+
+/// The longest bucket a query may ask for: a leap year (#44, requirement 1.2).
+inline constexpr uint64_t kMaxBucketNs = 366ULL * 86'400ULL * 1'000'000'000ULL;
+
 // ── QueryAST ──────────────────────────────────────────────────────────────────
 // Internal representation of a parsed query.
 
@@ -82,6 +99,12 @@ struct QueryAST {
     std::vector<QueryColumn> projection;
     std::optional<uint64_t> limit;
     std::optional<uint64_t> snapshot_ts_ns;
+
+    /// `GROUP BY TIME_BUCKET(<n><unit>)` (#44): the interval in nanoseconds, and the select list as
+    /// aggregates over each bucket's rows. With it, `select_exprs` still holds the text and
+    /// `bucket_aggs` what it means; without it, `bucket_aggs` is empty.
+    std::optional<uint64_t>  bucket_ns;
+    std::vector<BucketAgg>   bucket_aggs;
 };
 
 // ── RowCallback ───────────────────────────────────────────────────────────────
@@ -127,6 +150,16 @@ struct QueryShape {
 
     /// True when the answer is aggregates, which have their own three-column shape.
     bool is_aggregate{false};
+
+    /// A `GROUP BY TIME_BUCKET(...)` answer (#44): one row a bucket, its start first and then one
+    /// column per aggregate, each with the scale its values are in - known from the function alone,
+    /// so the header can carry it before the first row.
+    struct BucketColumn {
+        std::string text;    ///< the aggregate as written, e.g. "VWAP(price)"
+        int64_t     scale;   ///< divide by this for the natural value: 1, or 10^6 for AVG and VWAP
+    };
+    bool is_buckets{false};
+    std::vector<BucketColumn> bucket_columns;
 };
 
 // ── QueryEngine ───────────────────────────────────────────────────────────────
@@ -175,6 +208,12 @@ public:
     /// Parse only; returns error string on failure, empty on success.
     std::string parse(std::string_view sql, QueryAST& out);
 
+    /// The most buckets one `GROUP BY TIME_BUCKET(...)` answer may have (#44); past it the query is
+    /// refused with `BUCKETS_TOO_MANY` rather than cut short. `--max-query-buckets`.
+    void set_max_query_buckets(size_t n) { max_query_buckets_.store(n, std::memory_order_relaxed); }
+    size_t max_query_buckets() const { return max_query_buckets_.load(std::memory_order_relaxed); }
+    static constexpr size_t kDefaultMaxQueryBuckets = 100'000;
+
     /// Pretty-print AST back to canonical SQL string.
     std::string format(const QueryAST& ast);
 
@@ -220,6 +259,13 @@ private:
     const ColumnarStore& store_;
     LiveBufferLookup     live_buffer_;
     const AggregationEngine& agg_;
+    std::atomic<size_t>  max_query_buckets_{kDefaultMaxQueryBuckets};
+
+    /// A `GROUP BY TIME_BUCKET(...)` query (#44): one scan of the rows its conditions keep, each
+    /// added to its bucket's state, then every bucket's values computed and checked before the
+    /// first row is handed out - an aggregate that does not fit is a refusal, and a refusal after
+    /// rows would be an answer and an error at once.
+    std::string execute_buckets(const QueryAST& ast, const RowCallback& cb, QueryShape& shape);
 
     // ── Subscription tracking ────────────────────────────────────────────────────────────────
     //

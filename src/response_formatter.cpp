@@ -203,8 +203,47 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
 
 // ── QueryResponseBuilder ──────────────────────────────────────────────────────
 
+std::string format_bucket_header(const QueryShape& shape) {
+    std::string out = "bucket_ns";
+    for (const QueryShape::BucketColumn& c : shape.bucket_columns) {
+        out += '\t';
+        out += c.text;
+        out += '/';
+        out += std::to_string(c.scale);
+    }
+    return out;
+}
+
+void QueryResponseBuilder::start_buckets() {
+    started_ = true;
+    buckets_ = true;
+    out_.reserve(1024);
+    out_ += "OK\n";
+    out_ += format_bucket_header(shape_);
+    out_ += '\n';
+}
+
+void QueryResponseBuilder::add_bucket(const QueryResult& r) {
+    // The bucket's start, then its values in the header's order; NULL for one with nothing to
+    // compute it from, as the live book's aggregates answer (#44).
+    out_ += std::to_string(r.timestamp_ns);
+    for (const AggValue& v : r.agg_values) {
+        out_ += '\t';
+        if (v.empty) {
+            out_ += "NULL";
+        } else {
+            out_ += std::to_string(v.value);
+        }
+    }
+    out_ += '\n';
+}
+
 void QueryResponseBuilder::start(const QueryResult& first) {
     started_ = true;
+    if (shape_.is_buckets) {
+        start_buckets();
+        return;
+    }
     if (!first.agg_values.empty()) {
         aggregate_  = true;
         aggregates_ = first.agg_values;
@@ -227,6 +266,10 @@ void QueryResponseBuilder::start(const QueryResult& first) {
 
 void QueryResponseBuilder::add(const QueryResult& r) {
     if (!started_) start(r);
+    if (buckets_) {
+        add_bucket(r);
+        return;
+    }
     if (aggregate_) return;   // the one aggregate result is the whole answer
     if (all_seven_) {
         // The canonical seven unrolled into a fixed local array, as format_query_response() writes
@@ -254,6 +297,8 @@ void QueryResponseBuilder::add(const QueryResult& r) {
 
 std::string QueryResponseBuilder::finish() {
     if (aggregate_) return format_agg_response(aggregates_);
+    // A bucket query with no bucket answers its header and nothing else (#44, requirement 2.2).
+    if (!started_ && shape_.is_buckets) start_buckets();
     if (!started_) return format_query_response({}, shape_.columns);
     out_ += '\n';   // empty line terminator
     return std::move(out_);
