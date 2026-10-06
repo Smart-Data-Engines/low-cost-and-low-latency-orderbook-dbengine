@@ -4047,6 +4047,17 @@ Learned the hard way. Check here before debugging.
      registers. Count instructions and cycles before reading an ABAB difference as work, and look for
      what costs on each machine: a 64-bit division a row was tens of cycles on the i3-7100U and none
      of the difference on the ARM - dropping it took the query from 42-49 to 33-40 ms there.
+543. **A code path no build compiles is not in the product - until a compiler turns it on.** The AVX2
+     and AVX-512 paths of `src/aggregation.cpp` failed `-Werror` with every compiler (#207): no CI job
+     set `OB_ENABLE_AVX2` or `OB_ENABLE_AVX512`, so nobody knew. Then GCC 15 on Ubuntu 26.04, which
+     targets x86-64-v3 by default, defined `__AVX2__` with no flag and a clean clone did not build.
+     Every `#ifdef` variant needs a build that takes it, and a test of what it computes.
+544. **A library cannot ignore SIGPIPE for the process it lives in.** OpenSSL's socket BIO writes
+     without `MSG_NOSIGNAL`; the server ignores the signal process-wide (#59), and the C++ client
+     ended the application around it whenever a server went under a TLS write (#208). Block the
+     signal on the calling thread around each call that can write, and take back only one it raised.
+     A test that needs the race to go one way is a test of the OpenSSL version: the one that caught
+     it passes on OpenSSL 3.0, on the i3-7100U and in CI, and failed 20 of 20 on 3.5.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
