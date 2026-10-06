@@ -315,6 +315,32 @@ else()
     target_include_directories(orderbook_compression PUBLIC ${LZ4_INCLUDE_DIR})
 endif()
 
+# ── ZSTD, for the compressed column blocks of segment format 3 ─────────────────
+if(PkgConfig_FOUND)
+    pkg_check_modules(ZSTD IMPORTED_TARGET libzstd)
+endif()
+if(NOT ZSTD_FOUND)
+    find_library(ZSTD_LIBRARY NAMES zstd)
+    find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
+    if(ZSTD_LIBRARY AND ZSTD_INCLUDE_DIR)
+        set(ZSTD_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "ZSTD library not found. Install libzstd-dev (Debian, Ubuntu) or "
+                            "libzstd-devel (Amazon Linux, Fedora, RHEL).")
+    endif()
+endif()
+
+# ── Column blocks of segment format 3 ──────────────────────────────────────────
+add_library(orderbook_column_codec STATIC src/column_codec.cpp)
+target_link_libraries(orderbook_column_codec PUBLIC orderbook_codec orderbook_logger)
+if(TARGET PkgConfig::ZSTD)
+    target_link_libraries(orderbook_column_codec PRIVATE PkgConfig::ZSTD)
+else()
+    target_link_libraries(orderbook_column_codec PRIVATE ${ZSTD_LIBRARY})
+    target_include_directories(orderbook_column_codec PRIVATE ${ZSTD_INCLUDE_DIR})
+endif()
+target_link_libraries(orderbook_columnar PUBLIC orderbook_column_codec)
+
 # ── Metrics registry compiled library ──────────────────────────────────────────
 # ── Structured logger compiled library ─────────────────────────────────────────
 add_library(orderbook_logger STATIC src/logger.cpp)

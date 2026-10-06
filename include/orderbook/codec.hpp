@@ -69,4 +69,9 @@ std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t co
 /// decode_simple8b() into `out`, keeping its capacity, as decode_prices_into() does.
 void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::vector<uint64_t>& out);
 
+/// How many of `words` decoding `count` values reads - the decoder stops at `count` and ignores
+/// what follows, which a reader holding words of a known length wants to know is nothing; or
+/// `words.size() + 1` when the words hold fewer than `count` values.
+size_t simple8b_words_used(std::span<const uint64_t> words, size_t count);
+
 } // namespace ob

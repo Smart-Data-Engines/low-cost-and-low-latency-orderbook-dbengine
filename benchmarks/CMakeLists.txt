@@ -95,6 +95,13 @@ target_link_libraries(segment_read_cost PRIVATE orderbook_columnar)
 # Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
 add_executable(segment_encoding_probe segment_encoding_probe.cpp)
 target_link_libraries(segment_encoding_probe PRIVATE orderbook_codec orderbook_compression)
+target_compile_definitions(segment_encoding_probe PRIVATE OB_PROBE_ZSTD)
+if(TARGET PkgConfig::ZSTD)
+    target_link_libraries(segment_encoding_probe PRIVATE PkgConfig::ZSTD)
+else()
+    target_link_libraries(segment_encoding_probe PRIVATE ${ZSTD_LIBRARY})
+    target_include_directories(segment_encoding_probe PRIVATE ${ZSTD_INCLUDE_DIR})
+endif()
 
 # ── What a version vector costs to send, receive and compare as it grows (#177) ──
 #

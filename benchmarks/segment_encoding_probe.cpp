@@ -15,10 +15,13 @@
 //     on a tick, a quantity in lots;
 //   - packing: Simple8b, as format 2 packs quantities; runs (each run of equal values as its value
 //     and its length, both in Simple8b); fixed-width blocks of 128 values, each at the width of
-//     its largest.
-// Signed results are zigzagged before packing. For scale, LZ4 over the format-2 file and over the
-// best candidate's words: what a general-purpose compressor would add, which requirement 2 asks
-// about if the target is out of reach without one.
+//     its largest; or the values as they are, eight bytes each (only under a compressor);
+//   - and then, or not, a general-purpose compressor over the packed bytes: LZ4, which the engine
+//     links already, and - when built with `OB_PROBE_ZSTD` - ZSTD at levels 1, 3 and 9. What a
+//     compressor adds is what requirement 2 asks about if the target is out of reach without one,
+//     and what repeats from one update to the next - a book's levels between two snapshots - is
+//     what no transform of one column sees.
+// Signed results are zigzagged before packing. LZ4 over the format-2 file is beside them, for scale.
 //
 // Usage: segment_encoding_probe <data dir>
 //
@@ -28,6 +31,9 @@
 #include "orderbook/codec.hpp"
 
 #include <lz4.h>
+#ifdef OB_PROBE_ZSTD
+#include <zstd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -80,11 +86,12 @@ unsigned width(uint64_t v) { return v == 0 ? 0 : 64 - static_cast<unsigned>(__bu
 uint64_t magnitude(int64_t v) { return v < 0 ? 0 - static_cast<uint64_t>(v) : static_cast<uint64_t>(v); }
 
 enum class Transform { kNone, kFor, kDelta, kDod };
-enum class Packing { kSimple8b, kRuns, kBlocks };
+enum class Packing { kSimple8b, kRuns, kBlocks, kRaw64, kNarrow, kSplit };
 
 constexpr std::array<Transform, 4> kTransforms{Transform::kNone, Transform::kFor, Transform::kDelta,
                                                Transform::kDod};
-constexpr std::array<Packing, 3> kPackings{Packing::kSimple8b, Packing::kRuns, Packing::kBlocks};
+constexpr std::array<Packing, 6> kPackings{Packing::kSimple8b, Packing::kRuns, Packing::kBlocks,
+                                          Packing::kRaw64, Packing::kNarrow, Packing::kSplit};
 
 const char* name(Transform t) {
     switch (t) {
@@ -101,6 +108,9 @@ const char* name(Packing p) {
     case Packing::kSimple8b: return "s8b";
     case Packing::kRuns:     return "runs";
     case Packing::kBlocks:   return "blocks";
+    case Packing::kRaw64:    return "raw64";
+    case Packing::kNarrow:   return "narrow";
+    case Packing::kSplit:    return "split";
     }
     return "?";
 }
@@ -139,14 +149,18 @@ std::vector<uint64_t> transformed(const std::vector<uint64_t>& v, Transform t, b
     return out;   // the first value is the anchor, in the header
 }
 
-size_t simple8b_bytes(const std::vector<uint64_t>& v) {
-    return ob::encode_simple8b(v).words.size() * sizeof(uint64_t);
+std::string words_bytes(const std::vector<uint64_t>& w) {
+    return std::string(reinterpret_cast<const char*>(w.data()), w.size() * sizeof(uint64_t));
 }
 
-size_t packed_bytes(const std::vector<uint64_t>& v, Packing p) {
+/// The packed bytes, or - for blocks, which nothing here compresses further - only their count,
+/// with `bytes` empty.
+size_t packed(const std::vector<uint64_t>& v, Packing p, std::string& bytes) {
+    bytes.clear();
     switch (p) {
     case Packing::kSimple8b:
-        return simple8b_bytes(v);
+        bytes = words_bytes(ob::encode_simple8b(v).words);
+        return bytes.size();
     case Packing::kRuns: {
         std::vector<uint64_t> values, lengths;
         for (size_t i = 0; i < v.size();) {
@@ -156,17 +170,38 @@ size_t packed_bytes(const std::vector<uint64_t>& v, Packing p) {
             lengths.push_back(j - i - 1);
             i = j;
         }
-        return simple8b_bytes(values) + simple8b_bytes(lengths);
+        bytes = words_bytes(ob::encode_simple8b(values).words) + words_bytes(ob::encode_simple8b(lengths).words);
+        return bytes.size();
     }
     case Packing::kBlocks: {
-        size_t bytes = 0;
+        size_t n_bytes = 0;
         for (size_t i = 0; i < v.size(); i += 128) {
             const size_t n = std::min<size_t>(128, v.size() - i);
             unsigned w = 0;
             for (size_t k = 0; k < n; ++k) w = std::max(w, width(v[i + k]));
-            bytes += 1 + (n * w + 7) / 8;
+            n_bytes += 1 + (n * w + 7) / 8;
         }
-        return bytes;
+        return n_bytes;
+    }
+    case Packing::kRaw64:
+        bytes = words_bytes(v);
+        return bytes.size();
+    case Packing::kNarrow:
+    case Packing::kSplit: {
+        // Each value in as many bytes as the column's largest needs; `split` writes the lowest
+        // byte of every value, then the next byte of every value, and so on (Parquet's
+        // BYTE_STREAM_SPLIT), so that a compressor sees each byte position's distribution apart.
+        unsigned w = 0;
+        for (uint64_t x : v) w = std::max(w, (width(x) + 7) / 8);
+        bytes.resize(v.size() * w);
+        for (size_t i = 0; i < v.size(); ++i) {
+            for (unsigned b = 0; b < w; ++b) {
+                const char byte = static_cast<char>((v[i] >> (8 * b)) & 0xff);
+                if (p == Packing::kNarrow) bytes[i * w + b] = byte;
+                else bytes[b * v.size() + i] = byte;
+            }
+        }
+        return bytes.size();
     }
     }
     return 0;
@@ -178,6 +213,16 @@ size_t lz4_bytes(const char* data, size_t n) {
     const int c = LZ4_compress_default(data, out.data(), static_cast<int>(n), static_cast<int>(out.size()));
     return c > 0 ? static_cast<size_t>(c) : n;
 }
+
+#ifdef OB_PROBE_ZSTD
+size_t zstd_bytes(const std::string& in, int level) {
+    if (in.empty()) return 0;
+    std::vector<char> out(ZSTD_compressBound(in.size()));
+    const size_t c = ZSTD_compress(out.data(), out.size(), in.data(), in.size(), level);
+    return ZSTD_isError(c) ? in.size() : c;
+}
+constexpr std::array<int, 3> kZstdLevels{1, 3, 9};
+#endif
 
 struct Column {
     const char* name{nullptr};
@@ -192,25 +237,32 @@ void probe(Column& c, const std::vector<uint64_t>& values, const std::string& v2
     c.v2_bytes += v2_file.size();
     c.lz4_v2_bytes += lz4_bytes(v2_file.data(), v2_file.size());
     size_t best = SIZE_MAX;
-    std::vector<uint64_t> best_values;
+    size_t best_lz4 = SIZE_MAX;
+    auto add = [&](const std::string& key, size_t bytes) {
+        bytes += kHeaderBytes;
+        c.candidates[key] += bytes;
+        best = std::min(best, bytes);
+    };
+    std::string bytes;
     for (Transform t : kTransforms) {
         for (bool scale : {false, true}) {
             const auto x = transformed(values, t, scale);
             for (Packing p : kPackings) {
-                const size_t bytes = kHeaderBytes + packed_bytes(x, p);
                 const std::string key = std::string(name(t)) + (scale ? "+gcd" : "") + "/" + name(p);
-                c.candidates[key] += bytes;
-                if (bytes < best) {
-                    best = bytes;
-                    best_values = x;
-                }
+                const size_t n = packed(x, p, bytes);
+                if (p == Packing::kSimple8b || p == Packing::kRuns || p == Packing::kBlocks) add(key, n);
+                if (p == Packing::kBlocks) continue;
+                const size_t l = lz4_bytes(bytes.data(), bytes.size());
+                add(key + "+lz4", l);
+                best_lz4 = std::min(best_lz4, l + kHeaderBytes);
+#ifdef OB_PROBE_ZSTD
+                for (int level : kZstdLevels) add(key + "+zstd" + std::to_string(level), zstd_bytes(bytes, level));
+#endif
             }
         }
     }
     c.adaptive_bytes += best;
-    const auto words = ob::encode_simple8b(best_values).words;
-    c.lz4_best_bytes += kHeaderBytes + lz4_bytes(reinterpret_cast<const char*>(words.data()),
-                                                 words.size() * sizeof(uint64_t));
+    c.lz4_best_bytes += best_lz4;
 }
 
 }  // namespace
@@ -276,7 +328,7 @@ int main(int argc, char** argv) {
         fixed_total += best->second;
         adaptive_total += c.adaptive_bytes;
         std::printf("    \"%s\": {\"v2\": %.3f, \"lz4_v2\": %.3f, \"best\": \"%s\", \"best_bpr\": %.3f, "
-                    "\"adaptive\": %.3f, \"lz4_over_best_s8b\": %.3f, \"candidates\": {",
+                    "\"adaptive\": %.3f, \"best_lz4\": %.3f, \"candidates\": {",
                     c.name, c.v2_bytes / r, c.lz4_v2_bytes / r, best->first.c_str(), best->second / r,
                     c.adaptive_bytes / r, c.lz4_best_bytes / r);
         bool first = true;

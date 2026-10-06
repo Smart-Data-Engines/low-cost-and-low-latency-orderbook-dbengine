@@ -286,4 +286,18 @@ void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::ve
     out.resize(decode_simple8b_words<false>(words, want, out.data()));
 }
 
+size_t simple8b_words_used(std::span<const uint64_t> words, size_t count) {
+    // The walk decode_simple8b_words() makes, counting instead of unpacking.
+    size_t n = 0;
+    size_t wi = 0;
+    while (n < count) {
+        if (wi == words.size()) return words.size() + 1;
+        const uint64_t word = words[wi++];
+        const uint32_t sel = static_cast<uint32_t>(word >> 60);
+        if (sel == 15 && (word & kFallbackMarker) == kFallbackMarker && wi < words.size()) ++wi;
+        n += std::min<size_t>(kSelectors[sel].count, count - n);
+    }
+    return wi;
+}
+
 } // namespace ob

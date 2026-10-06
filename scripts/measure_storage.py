@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Bytes on disk for one order book dataset - the engine, ClickHouse and TimescaleDB.
 
-    scripts/measure_storage.py [--rows 200000] [--seed 7] [--build-dir build-release]
+    scripts/measure_storage.py [--rows 200000] [--seed 7] [--csv FILE] [--build-dir build-release]
 
-Each system loads the comparative harness's dataset through the harness's own adapter
+Each system loads the comparative harness's dataset - or `--csv`, a file in its format, such as one
+`scripts/binance_capture_csv.py` recorded - through the harness's own adapter
 (`benchmarks/comparative/systems`), with the schema and tuning each adapter declares. Then:
 
 - orderbook: the files of its sealed segments - every file in a directory holding a `meta.json` -
-  and its WAL beside them, after the adapter's FLUSH and a pause for a background merge;
+  and its WAL beside them, after the adapter's FLUSH and a pause for a background merge; and the
+  segment files by name, which is the bytes of each column;
 - ClickHouse: `sum(bytes_on_disk)` of the table's active parts in `system.parts` after
-  `OPTIMIZE TABLE ... FINAL`, with the compressed and uncompressed column bytes beside it;
+  `OPTIMIZE TABLE ... FINAL`, with the compressed and uncompressed column bytes beside it and each
+  column's own from `system.columns`. Then the same rows in tables whose columns carry the codecs
+  ClickHouse's documentation recommends for them, at three settings (`clickhouse_codecs`): the
+  harness's table is ClickHouse as installed, and a claim about storage has to hold against
+  ClickHouse as an expert would set it up too;
 - TimescaleDB: `hypertable_size()` as loaded, and again with native compression enabled
   (segmentby symbol, orderby ts_ns) and every chunk compressed. Both are TimescaleDB; the adapter
   loads without compression.
@@ -40,21 +46,55 @@ from benchmarks.comparative.systems.orderbook import OrderbookSystem  # noqa: E4
 from benchmarks.comparative.systems.timescaledb import TimescaleDbSystem  # noqa: E402
 
 
-def tree_bytes(root: Path) -> tuple[int, int, int]:
-    """Segment files, WAL files and everything else under the engine's data directory."""
-    seg, wal, other = 0, 0, 0
+def tree_bytes(root: Path) -> tuple[int, int, int, dict[str, int], int]:
+    """Segment files, WAL files and everything else under the engine's data directory; the
+    segment files' bytes by file name; and the number of segments."""
+    seg, wal, other, segments = 0, 0, 0, 0
+    by_file: dict[str, int] = {}
     for dirpath, _dirs, files in os.walk(root):
         d = Path(dirpath)
         is_segment = (d / "meta.json").exists()
+        segments += is_segment
         for f in files:
             size = (d / f).stat().st_size
             if is_segment:
                 seg += size
+                by_file[f] = by_file.get(f, 0) + size
             elif f.endswith(".wal") or f.startswith("wal_"):
                 wal += size
             else:
                 other += size
-    return seg, wal, other
+    return seg, wal, other, dict(sorted(by_file.items())), segments
+
+
+# The columns ClickHouse's documentation recommends codecs for, as an expert would declare them:
+# DoubleDelta for a timestamp that rises, Delta for a value that moves by small steps, T64 for
+# integers far narrower than their type - each followed by ZSTD, at three levels.
+CLICKHOUSE_CODECS = {
+    "zstd1": {"ts_ns": "DoubleDelta, ZSTD(1)", "level": "ZSTD(1)", "price_ticks": "ZSTD(1)",
+              "size_lots": "ZSTD(1)"},
+    "specialised_zstd3": {"ts_ns": "DoubleDelta, ZSTD(3)", "level": "T64, ZSTD(3)",
+                          "price_ticks": "Delta, ZSTD(3)", "size_lots": "T64, ZSTD(3)"},
+    "specialised_zstd9": {"ts_ns": "DoubleDelta, ZSTD(9)", "level": "T64, ZSTD(9)",
+                          "price_ticks": "Delta, ZSTD(9)", "size_lots": "T64, ZSTD(9)"},
+}
+
+
+CLICKHOUSE_TYPES = {"ts_ns": "Int64", "level": "UInt16", "price_ticks": "Int64", "size_lots": "Int64"}
+
+
+def clickhouse_columns(ch: ClickHouseSystem, table: str) -> dict[str, int]:
+    out = ch._ask("SELECT name, data_compressed_bytes FROM system.columns "
+                  f"WHERE database = 'ob_bench' AND table = '{table}'")
+    return {name: int(b) for name, b in (line.split("\t") for line in out.strip().splitlines())}
+
+
+def clickhouse_parts(ch: ClickHouseSystem, table: str) -> tuple[int, int, int, int]:
+    row = ch._ask("SELECT sum(bytes_on_disk), sum(data_compressed_bytes), "
+                  "sum(data_uncompressed_bytes), count() FROM system.parts "
+                  f"WHERE database = 'ob_bench' AND table = '{table}' AND active")
+    on_disk, compressed, uncompressed, parts = (int(x) for x in row.split())
+    return on_disk, compressed, uncompressed, parts
 
 
 def main() -> int:
@@ -62,6 +102,8 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=200_000)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--build-dir", type=Path, default=REPO / "build-release")
+    ap.add_argument("--csv", type=Path, default=None,
+                    help="load this file, in the harness's format, instead of generating the dataset")
     ap.add_argument("--port", type=int, default=21986)
     ap.add_argument("--work-dir", type=Path, default=Path.home() / "measure-storage",
                     help="the dataset and the engine's data directory; not a tmpfs, which would "
@@ -69,17 +111,24 @@ def main() -> int:
     args = ap.parse_args()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = args.work_dir / f"dataset-{args.rows}-{args.seed}.csv"
-    if not csv_path.exists():
-        dataset.generate(csv_path, rows=args.rows, seed=args.seed)
-    out: dict = {"rows": args.rows, "seed": args.seed, "csv_bytes": csv_path.stat().st_size}
+    if args.csv is not None:
+        csv_path = args.csv.resolve()
+        with csv_path.open("rb") as handle:
+            rows = sum(1 for _ in handle) - 1
+        out: dict = {"csv": str(csv_path), "rows": rows, "csv_bytes": csv_path.stat().st_size}
+    else:
+        csv_path = args.work_dir / f"dataset-{args.rows}-{args.seed}.csv"
+        if not csv_path.exists():
+            dataset.generate(csv_path, rows=args.rows, seed=args.seed)
+        out = {"rows": args.rows, "seed": args.seed, "csv_bytes": csv_path.stat().st_size}
 
     ob = OrderbookSystem(args.build_dir / "ob_tcp_server", args.port, args.work_dir)
     try:
         loaded = ob.load(csv_path)
         time.sleep(3)   # the adapter's FLUSH sealed everything; let a background merge settle
-        seg, wal, other = tree_bytes(Path(ob._data_dir))
+        seg, wal, other, by_file, segments = tree_bytes(Path(ob._data_dir))
         out["orderbook"] = {"rows_loaded": loaded.rows_loaded, "segment_bytes": seg,
+                            "segments": segments, "segment_bytes_by_file": by_file,
                             "wal_bytes": wal, "other_bytes": other, "version": ob.version(),
                             "tuning": ob.tuning_applied()}
     finally:
@@ -91,14 +140,26 @@ def main() -> int:
         try:
             loaded = ch.load(csv_path)
             ch._ask("OPTIMIZE TABLE ob_bench.book FINAL")
-            row = ch._ask("SELECT sum(bytes_on_disk), sum(data_compressed_bytes), "
-                          "sum(data_uncompressed_bytes), count() FROM system.parts "
-                          "WHERE database = 'ob_bench' AND table = 'book' AND active")
-            on_disk, compressed, uncompressed, parts = (int(x) for x in row.split())
+            on_disk, compressed, uncompressed, parts = clickhouse_parts(ch, "book")
             out["clickhouse"] = {"rows_loaded": loaded.rows_loaded, "bytes_on_disk": on_disk,
                                  "data_compressed_bytes": compressed,
                                  "data_uncompressed_bytes": uncompressed, "parts": parts,
+                                 "column_compressed_bytes": clickhouse_columns(ch, "book"),
                                  "version": ch.version(), "tuning": ch.tuning_applied()}
+            variants = {}
+            for variant, codecs in CLICKHOUSE_CODECS.items():
+                table = f"book_{variant}"
+                ch._ask(f"CREATE TABLE ob_bench.{table} AS ob_bench.book")
+                for column, codec in codecs.items():
+                    ch._ask(f"ALTER TABLE ob_bench.{table} MODIFY COLUMN {column} "
+                            f"{CLICKHOUSE_TYPES[column]} CODEC({codec})")
+                ch._ask(f"INSERT INTO ob_bench.{table} SELECT * FROM ob_bench.book")
+                ch._ask(f"OPTIMIZE TABLE ob_bench.{table} FINAL")
+                v_disk, v_comp, _v_uncomp, v_parts = clickhouse_parts(ch, table)
+                variants[variant] = {"codecs": codecs, "bytes_on_disk": v_disk,
+                                     "data_compressed_bytes": v_comp, "parts": v_parts,
+                                     "column_compressed_bytes": clickhouse_columns(ch, table)}
+            out["clickhouse_codecs"] = variants
         finally:
             ch.teardown()
     else:
