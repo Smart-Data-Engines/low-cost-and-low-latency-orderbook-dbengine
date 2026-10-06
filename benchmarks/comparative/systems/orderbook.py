@@ -34,7 +34,7 @@ FLUSH_INTERVAL_MS = 1000
 class OrderbookSystem:
     name = "orderbook"
 
-    def __init__(self, binary: Path, port: int, data_parent: Path):
+    def __init__(self, binary: Path, port: int, data_parent: Path, extra_args: tuple[str, ...] = ()):
         """`data_parent` is where the engine's storage goes, and the caller picks it.
 
         This was `tempfile.mkdtemp()` with no argument, which means `/tmp`. Where `/tmp` is a tmpfs
@@ -44,6 +44,9 @@ class OrderbookSystem:
         """
         self._binary = binary
         self._port = port
+        # Server options beyond the harness's own, named in the report by tuning_applied() - for a
+        # measurement of one build's two settings, such as `--segment-format 2` against 3.
+        self._extra_args = tuple(extra_args)
         self._proc: subprocess.Popen | None = None
         self._data_dir = tempfile.mkdtemp(prefix="ob_bench_", dir=str(data_parent))
         self._log = open(os.path.join(self._data_dir, "node.log"), "a",
@@ -95,7 +98,7 @@ class OrderbookSystem:
             "`OrderbookEngine.query()`: measured on 4000 rows, the client's row objects cost p50 "
             "15.5 ms against 5.3 ms for the same bytes parsed as tuples, and no other adapter here "
             "pays that - it is a real cost to a Python user and not a property of the engine",
-        ]
+        ] + ([f"{' '.join(self._extra_args)}: set for this measurement"] if self._extra_args else [])
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -104,7 +107,8 @@ class OrderbookSystem:
             return
         self._proc = subprocess.Popen(
             [str(self._binary), "--port", str(self._port), "--data-dir", self._data_dir,
-             "--metrics-port", "0", "--flush-interval-ms", str(FLUSH_INTERVAL_MS)],
+             "--metrics-port", "0", "--flush-interval-ms", str(FLUSH_INTERVAL_MS),
+             *self._extra_args],
             stdout=self._log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
