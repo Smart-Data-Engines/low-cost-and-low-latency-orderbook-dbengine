@@ -52,6 +52,9 @@ struct EncodeOptions {
     /// How much smaller, in percent, a compressed candidate must be than the smallest
     /// uncompressed one to be chosen: reading it costs a decompression the other does not.
     unsigned zstd_margin_pct{0};
+    /// The encoding to write in without searching - what the column's last segment chose - or
+    /// null to search. A compressed one with `zstd_level` 0 is searched for instead.
+    const Encoding* hint{nullptr};
 };
 
 struct Choice {

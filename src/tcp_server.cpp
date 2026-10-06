@@ -1134,6 +1134,7 @@ const std::vector<std::string>& known_flags() {
         "wal-dir",
         "wal-rotate-bytes",
         "write-admission",
+        "segment-format",
     };
     return flags;
 }
@@ -1174,6 +1175,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"write-admission", {"on|off", "Whether writes are taken at the rate the device takes them once "
                                        "a flush tick shows it behind, rather than every writer stopping "
                                        "at a full pending queue (default: on)"}},
+        {"segment-format", {"2|3", "The format new segments are written in (default: 3). A build before "
+                                   "format 3 cannot read a segment written in it: 2 is for a cluster "
+                                   "being upgraded"}},
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
@@ -1640,6 +1644,16 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                              val.c_str());
                 std::exit(1);
             }
+        } else if (arg == "--segment-format") {
+            const std::string val{cursor.value()};
+            if (val == "2" || val == "3") {
+                config.segment_format = static_cast<uint32_t>(val[0] - '0');
+            } else {
+                // Refused rather than defaulted, as --compaction is: a node meant to write what the
+                // build before reads must not write what it cannot because of a typo.
+                std::fprintf(stderr, "Error: --segment-format expects 2 or 3, got '%s'\n", val.c_str());
+                std::exit(1);
+            }
         } else if (arg == "--write-admission") {
             const std::string val{cursor.value()};
             if (val == "on") {
@@ -1976,6 +1990,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
     line("compaction", c.compaction ? "on" : "off");
     line("write-admission", c.write_admission ? "on" : "off");
+    line("segment-format", std::to_string(c.segment_format));
     line("fsync-policy",
          c.fsync_policy == FsyncPolicy::EVERY ? "every"
              : c.fsync_policy == FsyncPolicy::NONE ? "none" : "interval");
@@ -3086,6 +3101,7 @@ void TcpServer::run() {
     engine_->set_read_only_flag(&read_only_);
     engine_->set_compaction_enabled(config_.compaction);
     engine_->set_write_admission_enabled(config_.write_admission);
+    engine_->set_segment_version(config_.segment_format);
     static_assert(ServerConfig{}.max_query_buckets == QueryEngine::kDefaultMaxQueryBuckets,
                   "the server's default bucket ceiling is the query engine's");
     engine_->query_engine().set_max_query_buckets(static_cast<size_t>(config_.max_query_buckets));

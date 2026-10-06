@@ -273,6 +273,15 @@ public:
     /// Not a tuning knob - a valve on a process that rewrites what is stored. Before open().
     void set_compaction_enabled(bool enabled) { compaction_enabled_ = enabled; }
 
+    /// The format this node writes segments in (`--segment-format`): 3 unless told 2. Before open(),
+    /// so that nothing - a replay's seal included - is written in the other.
+    void set_segment_version(uint32_t version);
+    /// How segments are written: a seal's, and a merge's (segment format v3, design §3).
+    void set_segment_formats(const ColumnarStore::SegmentFormat& seal,
+                             const ColumnarStore::SegmentFormat& merge);
+    const ColumnarStore::SegmentFormat& seal_format() const { return seal_format_; }
+    const ColumnarStore::SegmentFormat& merge_format() const { return merge_format_; }
+
     /// Whether writes are admitted at the rate the device takes once a flush tick shows it behind
     /// (#190 step 5): on unless `--write-admission off`.
     void set_write_admission_enabled(bool enabled) { admission_.set_enabled(enabled); }
@@ -801,6 +810,17 @@ private:
     // moves through five steps across ticks - written, synced, published, synced, inputs removed -
     // and each field is one step's list.
     bool compaction_enabled_{true};
+    // A seal reuses its store's last choice of encodings and searches every sixteenth segment; a
+    // merge searches always, writing what stays (segment format v3, design §3). Measured choices,
+    // not guesses: kiro-workspace/specs/segment-format-v3/.
+    ColumnarStore::SegmentFormat seal_format_{default_segment_format(1, 16)};
+    ColumnarStore::SegmentFormat merge_format_{default_segment_format(3, 1)};
+    static ColumnarStore::SegmentFormat default_segment_format(int zstd_level, uint32_t search_every) {
+        ColumnarStore::SegmentFormat f;
+        f.search.zstd_level = zstd_level;
+        f.search_every = search_every;
+        return f;
+    }
 
     /// Writes admitted at the rate the device takes (#190 step 5). Its interval is the flush
     /// interval, declared above and so initialised before this.

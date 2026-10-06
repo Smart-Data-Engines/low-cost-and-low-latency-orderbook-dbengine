@@ -3084,6 +3084,25 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     return ref;
 }
 
+void Engine::set_segment_version(uint32_t version) {
+    if (!columnar_format_readable(version)) {
+        throw std::invalid_argument("segment format " + std::to_string(version) + " is not one this build writes");
+    }
+    seal_format_.version = version;
+    merge_format_.version = version;
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto& [key, store] : stores_) store->set_segment_format(seal_format_);
+    OB_LOG_INFO("engine", "new segments are written in format %u", version);
+}
+
+void Engine::set_segment_formats(const ColumnarStore::SegmentFormat& seal,
+                                 const ColumnarStore::SegmentFormat& merge) {
+    seal_format_ = seal;
+    merge_format_ = merge;
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto& [key, store] : stores_) store->set_segment_format(seal_format_);
+}
+
 ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
                                             const std::string& exchange, bool mtx_held) {
     const std::string key = symbol + "." + exchange;
@@ -3097,6 +3116,7 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
     store->set_symbol_exchange(symbol, exchange);
     // Whose rows are its own (#184): the segments it seals record their highest number.
     store->set_own_origin(mm_config_.enabled ? mm_config_.node_id : 0);
+    store->set_segment_format(seal_format_);
     auto& ref = *store;
     if (mtx_held) {
         stores_[key] = std::move(store);

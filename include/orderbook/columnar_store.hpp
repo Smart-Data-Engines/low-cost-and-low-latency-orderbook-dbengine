@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/column_codec.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/query_columns.hpp"
 
@@ -26,7 +27,20 @@ namespace ob {
 /// Version 1 stored only ts/price/qty/cnt and silently zeroed side, level_index
 /// and sequence_number on read, which lost the order side of every row that made
 /// it past a flush. Version 2 stores all seven columns.
-inline constexpr uint32_t kColumnarFormatVersion = 2;
+///
+/// Version 3 (kiro-workspace/specs/segment-format-v3/) stores them in one file, `columns.v3`, each
+/// column in the smallest of nine encodings (column_codec.hpp) and checksummed: version 2 wrote four
+/// of them raw, 25 bytes a row on the comparative dataset where version 3 writes under 2.
+inline constexpr uint32_t kColumnarFormatV2 = 2;
+inline constexpr uint32_t kColumnarFormatV3 = 3;
+/// The version a store writes unless told otherwise (`segment-format`).
+inline constexpr uint32_t kColumnarFormatVersion = kColumnarFormatV3;
+/// Whether this build reads a segment of `version`.
+inline constexpr bool columnar_format_readable(uint32_t version) {
+    return version == kColumnarFormatV2 || version == kColumnarFormatV3;
+}
+/// The file a version-3 segment holds its columns in.
+inline constexpr const char* kColumnsV3File = "columns.v3";
 
 /// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets
 /// the book at an instant skip a segment none of whose rows can be the latest of its level - the
@@ -56,9 +70,10 @@ struct LevelSet {
     static std::shared_ptr<const LevelSet> from_columns(const std::vector<uint8_t>& sides,
                                                         const std::vector<uint16_t>& levels);
     /// One side as `meta.json` holds it: `kLevels / 4` hex digits, the lowest level the lowest bit
-    /// of the last digit.
-    static std::string to_hex(const Bits& bits);
-    /// The reverse; false for a string that is not that, or that names a level past `kLevels`.
+    /// of the last digit - or, `trimmed`, without the leading zeros, as segment format 3 writes it.
+    static std::string to_hex(const Bits& bits, bool trimmed = false);
+    /// The reverse, of either; false for a string that is neither, or that names a level past
+    /// `kLevels`.
     static bool from_hex(const std::string& hex, Bits& bits);
 };
 
@@ -355,6 +370,24 @@ public:
     /// segment it closes records the highest number among them - a row appended alone counts as
     /// own, and a block says its own highest.
     void set_own_origin(uint16_t origin) { own_origin_ = origin; }
+
+    /// How this store writes a segment (segment format v3, design §3): the format's version, and
+    /// how a version-3 column's encoding is chosen.
+    struct SegmentFormat {
+        uint32_t version{kColumnarFormatVersion};
+        /// The search over the nine candidates: its ZSTD level and margin.
+        column_codec::EncodeOptions search{};
+        /// A segment reuses the encoding this store's last one chose for each column, and searches
+        /// again every this many segments - and always when it has none to reuse. 1: every segment
+        /// searches.
+        uint32_t search_every{1};
+    };
+    void set_segment_format(const SegmentFormat& format) {
+        segment_format_ = format;
+        segments_since_search_ = 0;
+        has_last_choice_ = false;
+    }
+    const SegmentFormat& segment_format() const { return segment_format_; }
 
     /// What the next segment written records as its own highest number instead of what its rows
     /// say (#184) - for a merge, whose rows are its inputs' and whose answer is theirs: the highest
@@ -721,6 +754,13 @@ private:
     std::vector<SegmentInput> lineage_inputs_;
     uint64_t                  lineage_last_row_ts_{0};
 
+    // How segments are written, and what the last version-3 one chose per column (ts, price, qty,
+    // cnt, side, level, seq) - see set_segment_format().
+    SegmentFormat segment_format_{};
+    uint32_t segments_since_search_{0};
+    bool has_last_choice_{false};
+    std::array<column_codec::Encoding, 7> last_choice_{};
+
     // Accumulation buffers for the active segment
     std::vector<int64_t>  price_buf_;
     std::vector<uint64_t> qty_buf_;
@@ -817,6 +857,9 @@ private:
     /// Encode the active segment's buffers into `dir`, which exists and is empty, and reset the
     /// active state: what flush_segment() and flush_segment_into() share.
     SegmentMeta write_active_segment(const std::string& dir);
+    /// The active segment's seven columns as `dir`/columns.v3 (segment format v3): each column in
+    /// the encoding its last segment chose, or in the smallest of the nine when this one searches.
+    void write_columns_v3(const std::string& dir);
 
     /// What reading one segment came to: its rows handed over, or none because a column was
     /// missing or short (logged), or none because retention removed it while this read it.

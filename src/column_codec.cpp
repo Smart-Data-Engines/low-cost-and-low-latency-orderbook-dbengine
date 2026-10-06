@@ -549,6 +549,13 @@ size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int
 }
 
 Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, std::string& out) {
+    if (options.hint != nullptr && (!options.hint->zstd || options.zstd_level != 0)) {
+        Choice choice;
+        choice.encoding = *options.hint;
+        choice.bytes = encode_as(values, *options.hint, options.zstd_level, out);
+        choice.uncompressed_bytes = choice.bytes;
+        return choice;
+    }
     // Design §3: both transforms; uncompressed Simple8b and runs of each, blocks of `for`; and,
     // under ZSTD, runs and narrow of each. Each payload is packed once, and compressed once, and
     // the chosen one is written from what was packed rather than packed again.
