@@ -7,7 +7,10 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <pthread.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -592,9 +595,55 @@ int classify_blocking(ssl_st* ssl, int ret, const char* op, std::string* why) {
     }
 }
 
+/// SIGPIPE held back on this thread for as long as it lives (#208).
+///
+/// A TLS connection writes through OpenSSL's socket BIO, which sends with no MSG_NOSIGNAL - so a
+/// write to a peer that has gone raises SIGPIPE, and its default action ends the process. The server
+/// ignores the signal process-wide (#59); the client library cannot decide that for the application
+/// it lives in, and it was killing it: with OpenSSL 3.5 a client that met a plaintext server sent its
+/// alert into the reset the server's close left, every time. So each blocking TLS call blocks the
+/// signal on its own thread, and takes back one it raised itself - one that was already pending when
+/// it began is its owner's, and stays.
+class SigpipeHeldBack {
+public:
+    SigpipeHeldBack() {
+        sigemptyset(&pipe_);
+        sigaddset(&pipe_, SIGPIPE);
+        sigset_t pending;
+        sigemptyset(&pending);
+        sigpending(&pending);
+        was_pending_ = sigismember(&pending, SIGPIPE) == 1;
+        pthread_sigmask(SIG_BLOCK, &pipe_, &before_);
+    }
+    ~SigpipeHeldBack() {
+        if (!was_pending_) {
+            sigset_t pending;
+            sigemptyset(&pending);
+            sigpending(&pending);
+            if (sigismember(&pending, SIGPIPE) == 1) {
+                const int saved = errno;
+                const timespec now{0, 0};
+                while (sigtimedwait(&pipe_, nullptr, &now) == -1 && errno == EINTR) {}
+                errno = saved;
+                OB_LOG_DEBUG("tls", "a TLS call raised SIGPIPE writing to a peer that had gone; taken "
+                                    "back, and the call reports the closed connection instead");
+            }
+        }
+        pthread_sigmask(SIG_SETMASK, &before_, nullptr);
+    }
+    SigpipeHeldBack(const SigpipeHeldBack&) = delete;
+    SigpipeHeldBack& operator=(const SigpipeHeldBack&) = delete;
+
+private:
+    sigset_t pipe_{};
+    sigset_t before_{};
+    bool     was_pending_{false};
+};
+
 } // namespace
 
 int tls_blocking_handshake(ssl_st* ssl, std::string* why) {
+    const SigpipeHeldBack held;
     for (;;) {
         ERR_clear_error();
         const int ret = SSL_do_handshake(ssl);
@@ -609,6 +658,7 @@ int tls_blocking_handshake(ssl_st* ssl, std::string* why) {
 }
 
 int tls_blocking_write_all(ssl_st* ssl, const char* buf, size_t len, std::string* why) {
+    const SigpipeHeldBack held;
     size_t done = 0;
     while (done < len) {
         // SSL_MODE_ENABLE_PARTIAL_WRITE is on for every context this file builds, so a short write
@@ -627,6 +677,8 @@ int tls_blocking_write_all(ssl_st* ssl, const char* buf, size_t len, std::string
 }
 
 int tls_blocking_read(ssl_st* ssl, char* buf, size_t len, std::string* why) {
+    // A read writes too: TLS 1.3 answers a key update, and a failed record is answered by an alert.
+    const SigpipeHeldBack held;
     if (len > static_cast<size_t>(INT_MAX)) len = static_cast<size_t>(INT_MAX);
     for (;;) {
         ERR_clear_error();
@@ -638,6 +690,7 @@ int tls_blocking_read(ssl_st* ssl, char* buf, size_t len, std::string* why) {
 }
 
 void tls_blocking_shutdown(ssl_st* ssl) {
+    const SigpipeHeldBack held;   // close_notify is a write, to a peer that may have gone
     // One call, result ignored, and deliberately no second one. SSL_shutdown returns 0 having sent
     // our close_notify and not yet seen theirs; waiting for the peer's would block for a whole
     // SO_RCVTIMEO on every disconnect, to learn something no caller uses. And after a

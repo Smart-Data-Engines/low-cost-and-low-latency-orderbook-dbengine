@@ -17,6 +17,8 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -65,7 +67,10 @@ KeyPair generate(const std::string& tag, const std::string& san) {
 /// the defect as being on the wrong side.
 class TinyTlsServer {
 public:
-    TinyTlsServer(const KeyPair& kp, bool speak_tls) : speak_tls_(speak_tls) {
+    /// `reset_on_command`: after its banner, the first command the client sends is answered by a
+    /// reset - the connection closed with SO_LINGER 0 - rather than a reply (#208).
+    TinyTlsServer(const KeyPair& kp, bool speak_tls, bool reset_on_command = false)
+        : speak_tls_(speak_tls), reset_on_command_(reset_on_command) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
         ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -131,6 +136,11 @@ private:
         for (;;) {
             const int n = ob::tls_blocking_read(ssl.get(), buf, sizeof(buf), &why);
             if (n <= 0) return;
+            if (reset_on_command_) {
+                const linger abort_on_close{1, 0};
+                ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &abort_on_close, sizeof(abort_on_close));
+                return;   // run() closes it: a reset, with what was read and nothing answered
+            }
             const std::string_view cmd(buf, static_cast<size_t>(n));
             const char* reply = cmd.starts_with("PING") ? "PONG\n" : "ERR unsupported\n";
             if (ob::tls_blocking_write_all(ssl.get(), reply, std::strlen(reply), &why) != 1) return;
@@ -139,6 +149,7 @@ private:
     }
 
     bool             speak_tls_;
+    bool             reset_on_command_{false};
     int              listen_fd_{-1};
     uint16_t         port_{0};
     std::thread      thread_;
@@ -266,6 +277,60 @@ TEST(TlsClient, APlaintextServerIsRefusedRatherThanRead) {
     auto conn = client.connect();
     ASSERT_FALSE(conn) << "a plaintext banner was accepted as a TLS connection";
     EXPECT_FALSE(client.connected());
+}
+
+TEST(TlsClient, AWriteToAPeerThatHasGoneIsAnErrorNotASignal) {
+    // #208. A TLS write goes through OpenSSL's socket BIO, which sends without MSG_NOSIGNAL, so a write
+    // to a peer that reset the connection raised SIGPIPE - and its default action ended the process,
+    // the application the client library lives in. Found on Ubuntu 26.04, where OpenSSL 3.5 makes the
+    // test above send its alert into the reset every time. This one does not depend on a version:
+    // the server resets on the first command, the reset's error is taken off the socket without
+    // OpenSSL seeing it, and the next TLS write meets the closed pipe.
+    const auto kp = generate("server", "subjectAltName=IP:127.0.0.1");
+    ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
+    TinyTlsServer server(kp, /*speak_tls=*/true, /*reset_on_command=*/true);
+    ASSERT_NE(server.port(), 0);
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(server.port());
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ob::TlsContext ctx = ob::TlsContext::client("", /*verify=*/false);
+    auto ssl = ctx.wrap(fd, /*server_side=*/false);
+    std::string why;
+    ASSERT_EQ(ob::tls_blocking_handshake(ssl.get(), &why), 1) << why;
+    char buf[256];
+    ASSERT_GT(ob::tls_blocking_read(ssl.get(), buf, sizeof(buf), &why), 0) << "no banner: " << why;
+    static constexpr char kPing[] = "PING\n";
+    ASSERT_EQ(ob::tls_blocking_write_all(ssl.get(), kPing, sizeof(kPing) - 1, &why), 1) << why;
+
+    // Wait for the reset, and take its error off the socket below OpenSSL, so that the next TLS write
+    // reaches send() and meets the closed pipe rather than a connection OpenSSL already knows is gone.
+    pollfd pfd{fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&pfd, 1, 5000), 1) << "no reset within 5 s";
+    char c = 0;
+    errno = 0;
+    EXPECT_EQ(::recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT), -1);
+    EXPECT_EQ(errno, ECONNRESET);
+
+    // The signal's default action, which an application has unless it chose otherwise: had the write
+    // raised SIGPIPE, this process would end here.
+    struct sigaction dfl{};
+    struct sigaction before{};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    ::sigaction(SIGPIPE, &dfl, &before);
+    const int written = ob::tls_blocking_write_all(ssl.get(), kPing, sizeof(kPing) - 1, &why);
+    ::sigaction(SIGPIPE, &before, nullptr);
+    EXPECT_NE(written, 1) << "a write to a reset connection was reported as written";
+    sigset_t pending;
+    sigemptyset(&pending);
+    sigpending(&pending);
+    EXPECT_EQ(sigismember(&pending, SIGPIPE), 0) << "a SIGPIPE was left pending for the application";
+    ::close(fd);
 }
 
 // ── Configurations that describe a protection the caller does not have ────────
