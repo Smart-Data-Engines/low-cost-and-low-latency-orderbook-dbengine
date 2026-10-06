@@ -1237,8 +1237,15 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
             conn.connected = false;
             conn.compress  = config_.compress;
             peers_[peer.node_id] = std::move(conn);
-        } else if (it->second.address.empty()) {
+        } else if (!peer.address.empty() && it->second.address != peer.address) {
             it->second.address = peer.address;
+        }
+        if (peer.address == own_address()) {
+            // handle_topology_change() has said why, once. The record stays, so MM_PEERS shows the
+            // peer and the address that cannot be dialled.
+            OB_LOG_DEBUG("mm", "Not dialling peer %u at %s: that is this node's own address",
+                         peer.node_id, peer.address.c_str());
+            return;
         }
         // Claim the attempt before the lock goes, so the reconnect loop does not open a second
         // connection to the same peer while this one is in flight.
@@ -2128,7 +2135,10 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
                     peer.fd, msg.node_id,
                     msg.node_id == 0 ? "the value reserved for a connection that has not "
                                        "identified itself"
-                                     : "this node's own id");
+                                     : "this node's own id: this node dialled itself, so the "
+                                       "address the registry gives for one of its peers leads here "
+                                       "- what a peer advertising 127.0.0.1 is from another host "
+                                       "(--advertise-host, #216)");
         if (peer.fd >= 0) {
             release_tls(peer);
             ::close(peer.fd);
@@ -2503,6 +2513,8 @@ void MultiMasterManager::reconnect_loop() {
                     // connection to a peer this one is still dialling.
                     const uint32_t delay_ms = peer.backoff.next_delay_ms();
                     peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                    // An address that is this node's own reaches only this node (#216).
+                    if (peer.address == own_address()) continue;
                     due.emplace_back(nid, peer.address);
                 }
 
@@ -2889,6 +2901,10 @@ void MultiMasterManager::handle_catchup_request(PeerConnection& peer,
     // Full implementation in task 12 — replay WAL from position to peer.
 }
 
+std::string MultiMasterManager::own_address() const {
+    return config_.advertise_host + ":" + std::to_string(config_.replication_port);
+}
+
 void MultiMasterManager::handle_topology_change(
     const std::vector<PeerInfo>& new_peers) {
     OB_LOG_INFO("mm", "Topology change: %zu peers", new_peers.size());
@@ -2917,20 +2933,49 @@ void MultiMasterManager::handle_topology_change(
         }
     }
 
-    // Fill in addresses we could not know earlier. A peer that dialled us arrives
-    // over an accepted socket whose source port is ephemeral, so the connection has
-    // no usable address until the registry tells us what the node advertises. This
-    // is the moment it does.
+    // Take the address the registry gives for each peer. A peer that dialled us arrives over an
+    // accepted socket whose source port is ephemeral, so its record has no address until the
+    // registry says what the node advertises. And a peer that registers again at another address
+    // - restarted with `--advertise-host` corrected, or moved - is dialled there from now on: only
+    // the empty case used to be filled in, so the reconnect loop went on dialling the old address
+    // and MM_PEERS showed it (#216).
     {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& [nid, conn] : peers_) {
-            if (!conn.address.empty()) continue;
             auto it = new_map.find(conn.node_id);
-            if (it != new_map.end() && !it->second.address.empty()) {
-                conn.address = it->second.address;
+            if (it == new_map.end() || it->second.address.empty()) continue;
+            if (conn.address == it->second.address) continue;
+            if (conn.address.empty()) {
                 OB_LOG_DEBUG("mm", "Learned address for inbound peer %u: %s",
-                             conn.node_id, conn.address.c_str());
+                             conn.node_id, it->second.address.c_str());
+            } else {
+                OB_LOG_INFO("mm", "Peer %u now advertises %s, not %s: the next dial goes there%s",
+                            conn.node_id, it->second.address.c_str(), conn.address.c_str(),
+                            conn.connected ? ", and the link up now stays" : "");
             }
+            conn.address = it->second.address;
+        }
+
+        // A peer registered at the address this node advertises is one a dial reaches this node by.
+        // Two nodes cannot share an address, so one of the two configurations is wrong - most often
+        // both nodes advertising 127.0.0.1, the default, across hosts - and dialling it only ever
+        // connected this node to itself, once a second, for ever (#216). Said once per peer and
+        // address, and not dialled.
+        const std::string ours = own_address();
+        for (const auto& [nid, info] : new_map) {
+            if (info.address != ours) {
+                reported_same_address_.erase(nid);
+                continue;
+            }
+            auto& said = reported_same_address_[nid];
+            if (said == info.address) continue;
+            said = info.address;
+            OB_LOG_ERROR("mm",
+                         "Peer %u is registered at %s, the address this node advertises: a dial to "
+                         "it reaches this node, so it is not dialled. Two nodes cannot share one - "
+                         "set --advertise-host on each to the address the others reach it by "
+                         "(docs/operations.md, \"A cluster across hosts\")",
+                         nid, info.address.c_str());
         }
     }
 
