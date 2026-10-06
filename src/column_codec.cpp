@@ -314,29 +314,6 @@ bool unpack_simple8b(std::span<const char> p, size_t n, std::vector<uint64_t>& o
     return true;
 }
 
-bool unpack_runs(std::span<const char> p, size_t n, std::vector<uint64_t>& out, std::string* why) {
-    size_t at = 0;
-    uint64_t runs = 0, value_words = 0;
-    if (!get_varint(p, at, runs) || !get_varint(p, at, value_words)) return fail(why, "runs header cut short");
-    if (runs > n || (n > 0 && runs == 0)) return fail(why, "runs more than values, or none for some");
-    const size_t rest = p.size() - at;
-    if (value_words > rest / sizeof(uint64_t)) return fail(why, "runs' value words past the payload");
-    const size_t value_bytes = static_cast<size_t>(value_words) * sizeof(uint64_t);
-    thread_local std::vector<uint64_t> values, lengths;
-    if (!unpack_simple8b(p.subspan(at, value_bytes), static_cast<size_t>(runs), values, why)) return false;
-    if (!unpack_simple8b(p.subspan(at + value_bytes), static_cast<size_t>(runs), lengths, why)) return false;
-    out.resize(n);
-    size_t o = 0;
-    for (size_t r = 0; r < runs; ++r) {
-        if (o >= n || lengths[r] > n - o - 1) return fail(why, "runs longer than the values");
-        const size_t len = static_cast<size_t>(lengths[r]) + 1;
-        std::fill_n(out.data() + o, len, values[r]);
-        o += len;
-    }
-    if (o != n) return fail(why, "runs shorter than the values");
-    return true;
-}
-
 bool unpack_blocks(std::span<const char> p, size_t n, std::vector<uint64_t>& out, std::string* why) {
     out.resize(n);
     thread_local std::vector<unsigned char> buf;
@@ -371,127 +348,204 @@ bool unpack_blocks(std::span<const char> p, size_t n, std::vector<uint64_t>& out
     return true;
 }
 
-template <unsigned W>
-void unpack_narrow_w(const char* p, size_t n, uint64_t* out) {
-    for (size_t i = 0; i < n; ++i) {
-        uint64_t x = 0;
-        std::memcpy(&x, p + i * W, W);
-        out[i] = x;
-    }
-}
+/// A block's header, read and checked: what is packed, how, and where the payload begins.
+struct Header {
+    Transform transform{Transform::kNone};
+    Packing packing{Packing::kSimple8b};
+    bool zstd{false};
+    unsigned width{0};
+    uint64_t anchor{0};
+    uint64_t scale{1};
+    uint64_t packed{0};      ///< the payload's length before compression, when compressed
+    size_t payload_at{0};
+    size_t n{0};             ///< the values the payload packs: the count, or one fewer for delta
+};
 
-bool unpack_narrow(std::span<const char> p, size_t n, unsigned width, std::vector<uint64_t>& out,
-                   std::string* why) {
-    if (width < 1 || width > 8) return fail(why, "a narrow width outside 1 - 8");
-    if (p.size() != n * width) return fail(why, "narrow payload is not the values' bytes");
-    out.resize(n);
-    switch (width) {
-    case 1: unpack_narrow_w<1>(p.data(), n, out.data()); break;
-    case 2: unpack_narrow_w<2>(p.data(), n, out.data()); break;
-    case 3: unpack_narrow_w<3>(p.data(), n, out.data()); break;
-    case 4: unpack_narrow_w<4>(p.data(), n, out.data()); break;
-    case 5: unpack_narrow_w<5>(p.data(), n, out.data()); break;
-    case 6: unpack_narrow_w<6>(p.data(), n, out.data()); break;
-    case 7: unpack_narrow_w<7>(p.data(), n, out.data()); break;
-    default: unpack_narrow_w<8>(p.data(), n, out.data()); break;
-    }
-    return true;
-}
-
-/// The stream a block packs: its values, with the header read into `s`.
-bool read_stream(std::span<const char> block, size_t count, Stream& s, std::string* why) {
+bool read_header(std::span<const char> block, size_t count, Header& h, std::string* why) {
     if (block.empty()) return fail(why, "an empty block");
     const auto e = static_cast<uint8_t>(block[0]);
     if ((e & 0xC0) != 0) return fail(why, "unknown encoding bits");
     const auto t = static_cast<uint8_t>(e & 0x3);
     if (t > 2) return fail(why, "unknown transform");
-    s.transform = static_cast<Transform>(t);
+    h.transform = static_cast<Transform>(t);
     const bool scaled = (e & kScaledBit) != 0;
-    const auto p = static_cast<Packing>((e >> 3) & 0x3);
-    const bool zstd = (e & kZstdBit) != 0;
+    h.packing = static_cast<Packing>((e >> 3) & 0x3);
+    h.zstd = (e & kZstdBit) != 0;
     size_t at = 1;
-    unsigned width = 0;
-    if (p == Packing::kNarrow) {
+    h.width = 0;
+    if (h.packing == Packing::kNarrow) {
         if (at >= block.size()) return fail(why, "header cut short");
-        width = static_cast<uint8_t>(block[at++]);
+        h.width = static_cast<uint8_t>(block[at++]);
+        if (h.width < 1 || h.width > 8) return fail(why, "a narrow width outside 1 - 8");
     }
-    if (!get_varint(block, at, s.count)) return fail(why, "header cut short");
-    if (s.count != count) return fail(why, "the block holds another number of values than the column");
-    s.anchor = 0;
-    if (s.transform != Transform::kNone && !get_varint(block, at, s.anchor)) return fail(why, "header cut short");
-    s.scale = 1;
+    uint64_t declared = 0;
+    if (!get_varint(block, at, declared)) return fail(why, "header cut short");
+    if (declared != count) return fail(why, "the block holds another number of values than the column");
+    h.anchor = 0;
+    if (h.transform != Transform::kNone && !get_varint(block, at, h.anchor)) return fail(why, "header cut short");
+    h.scale = 1;
     if (scaled) {
-        if (!get_varint(block, at, s.scale)) return fail(why, "header cut short");
-        if (s.scale < 2) return fail(why, "a scale below 2");
-        if (s.transform == Transform::kNone) return fail(why, "a scale without a transform");
+        if (!get_varint(block, at, h.scale)) return fail(why, "header cut short");
+        if (h.scale < 2) return fail(why, "a scale below 2");
+        if (h.transform == Transform::kNone) return fail(why, "a scale without a transform");
     }
-    const size_t n = s.transform == Transform::kDelta ? (count == 0 ? 0 : count - 1) : count;
-    std::span<const char> payload;
-    if (zstd) {
-        uint64_t packed = 0;
-        if (!get_varint(block, at, packed)) return fail(why, "header cut short");
+    h.n = h.transform == Transform::kDelta ? (count == 0 ? 0 : count - 1) : count;
+    h.packed = 0;
+    if (h.zstd) {
+        if (!get_varint(block, at, h.packed)) return fail(why, "header cut short");
         // No packing takes more than 32 bytes a value (runs at Simple8b's worst, two words for each
         // of a value and a length), so a declared length past that is not a block of this count.
-        if (packed > 32 * static_cast<uint64_t>(n) + 64) return fail(why, "a packed length past any packing of the values");
-        thread_local ZSTD_DCtx* dctx = ZSTD_createDCtx();
-        thread_local std::string plain;
-        plain.resize(static_cast<size_t>(packed));
-        const size_t got = ZSTD_decompressDCtx(dctx, plain.data(), plain.size(), block.data() + at, block.size() - at);
-        if (ZSTD_isError(got) || got != packed) return fail(why, "ZSTD payload does not decompress to its declared length");
-        payload = std::span<const char>(plain.data(), plain.size());
-    } else {
-        payload = block.subspan(at);
+        if (h.packed > 32 * static_cast<uint64_t>(h.n) + 64) {
+            return fail(why, "a packed length past any packing of the values");
+        }
     }
-    switch (p) {
-    case Packing::kSimple8b: return unpack_simple8b(payload, n, s.values, why);
-    case Packing::kRuns:     return unpack_runs(payload, n, s.values, why);
-    case Packing::kBlocks:   return unpack_blocks(payload, n, s.values, why);
-    case Packing::kNarrow:   return unpack_narrow(payload, n, width, s.values, why);
+    h.payload_at = at;
+    return true;
+}
+
+/// The packed payload: the block's own bytes, or - compressed - decompressed into this thread's
+/// buffer, which it is then a view of.
+bool payload_of(std::span<const char> block, const Header& h, std::span<const char>& payload,
+                std::string* why) {
+    if (!h.zstd) {
+        payload = block.subspan(h.payload_at);
+        return true;
     }
-    return fail(why, "unknown packing");
+    thread_local ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    thread_local std::string plain;
+    plain.resize(static_cast<size_t>(h.packed));
+    const size_t got = ZSTD_decompressDCtx(dctx, plain.data(), plain.size(), block.data() + h.payload_at,
+                                           block.size() - h.payload_at);
+    if (ZSTD_isError(got) || got != h.packed) {
+        return fail(why, "ZSTD payload does not decompress to its declared length");
+    }
+    payload = std::span<const char>(plain.data(), plain.size());
+    return true;
 }
 
 template <typename T>
 constexpr bool kTakesEveryValue = std::is_same_v<T, uint64_t> || std::is_same_v<T, int64_t>;
 
 template <typename T>
-bool inverse(const Stream& s, size_t count, std::vector<T>& out, std::string* why) {
-    out.resize(count);
-    const uint64_t g = s.scale;
-    // What does not fit is collected and refused once, after the loop, so that the loop has no
-    // branch out of it for the compiler to keep.
+constexpr uint64_t kMaxOf = kTakesEveryValue<T> ? std::numeric_limits<uint64_t>::max()
+                                                : static_cast<uint64_t>(std::numeric_limits<T>::max());
+
+/// The zigzagged difference `z` as the 64-bit value it adds, wrapping: -1 for 1, 1 for 2.
+inline uint64_t unzigzag(uint64_t z) { return (z >> 1) ^ (0 - (z & 1)); }
+
+/// The inverse of `h`'s transform over the `count` values `get(i)` packs, written to `o` as T, in
+/// one pass: the unpacking and the inverse fused, each loop specialised for a divisor of 1. What
+/// does not fit T is collected and refused once, after the loop, so that the loop has no branch
+/// out of it for the compiler to keep. Returns whether every value fitted.
+template <typename T, typename Get>
+bool apply_inverse(const Header& h, size_t count, Get get, T* o) {
+    constexpr uint64_t kMax = kMaxOf<T>;
+    const uint64_t g = h.scale;
+    const uint64_t a = h.anchor;
     uint64_t above = 0;
-    constexpr uint64_t kMaxT = kTakesEveryValue<T> ? std::numeric_limits<uint64_t>::max()
-                                                    : static_cast<uint64_t>(std::numeric_limits<T>::max());
-    switch (s.transform) {
+    switch (h.transform) {
     case Transform::kNone:
         for (size_t i = 0; i < count; ++i) {
-            const uint64_t v = s.values[i];
-            above |= v > kMaxT;
-            out[i] = static_cast<T>(v);
+            const uint64_t v = get(i);
+            above |= v > kMax;
+            o[i] = static_cast<T>(v);
         }
         break;
     case Transform::kFor:
-        for (size_t i = 0; i < count; ++i) {
-            const uint64_t v = s.values[i] * g + s.anchor;
-            above |= v > kMaxT;
-            out[i] = static_cast<T>(v);
+        if (g == 1) {
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t v = get(i) + a;
+                above |= v > kMax;
+                o[i] = static_cast<T>(v);
+            }
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t v = get(i) * g + a;
+                above |= v > kMax;
+                o[i] = static_cast<T>(v);
+            }
         }
         break;
     case Transform::kDelta: {
         if (count == 0) break;
-        uint64_t v = s.anchor;
-        above |= v > kMaxT;
-        out[0] = static_cast<T>(v);
-        for (size_t i = 1; i < count; ++i) {
-            const uint64_t z = s.values[i - 1];
-            const uint64_t d = ((z >> 1) + (z & 1)) * g;
-            v = (z & 1) ? v - d : v + d;
-            above |= v > kMaxT;
-            out[i] = static_cast<T>(v);
+        uint64_t v = a;
+        above |= v > kMax;
+        o[0] = static_cast<T>(v);
+        if (g == 1) {
+            for (size_t i = 1; i < count; ++i) {
+                v += unzigzag(get(i - 1));
+                above |= v > kMax;
+                o[i] = static_cast<T>(v);
+            }
+        } else {
+            for (size_t i = 1; i < count; ++i) {
+                v += unzigzag(get(i - 1)) * g;
+                above |= v > kMax;
+                o[i] = static_cast<T>(v);
+            }
         }
         break;
     }
+    }
+    return above == 0;
+}
+
+template <typename T, unsigned W>
+bool narrow_inverse(const Header& h, const char* p, size_t count, T* o) {
+    return apply_inverse<T>(h, count, [p](size_t i) {
+        uint64_t x = 0;
+        std::memcpy(&x, p + i * W, W);   // little-endian hosts only, as the WAL is
+        return x;
+    }, o);
+}
+
+/// Runs, unpacked straight into the column: a value filled run by run for none and for, and the
+/// running sum stepped by one run's difference at a time for delta.
+template <typename T>
+bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, std::string* why) {
+    size_t at = 0;
+    uint64_t runs = 0, value_words = 0;
+    if (!get_varint(p, at, runs) || !get_varint(p, at, value_words)) return fail(why, "runs header cut short");
+    const size_t n = h.n;
+    if (runs > n || (n > 0 && runs == 0)) return fail(why, "runs more than values, or none for some");
+    const size_t rest = p.size() - at;
+    if (value_words > rest / sizeof(uint64_t)) return fail(why, "runs' value words past the payload");
+    const size_t value_bytes = static_cast<size_t>(value_words) * sizeof(uint64_t);
+    thread_local std::vector<uint64_t> values, lengths;
+    if (!unpack_simple8b(p.subspan(at, value_bytes), static_cast<size_t>(runs), values, why)) return false;
+    if (!unpack_simple8b(p.subspan(at + value_bytes), static_cast<size_t>(runs), lengths, why)) return false;
+    // The runs cover the packed values exactly - checked before anything is written.
+    size_t total = 0;
+    for (size_t r = 0; r < runs; ++r) {
+        if (total >= n || lengths[r] > n - total - 1) return fail(why, "runs longer than the values");
+        total += static_cast<size_t>(lengths[r]) + 1;
+    }
+    if (total != n) return fail(why, "runs shorter than the values");
+    constexpr uint64_t kMax = kMaxOf<T>;
+    const uint64_t g = h.scale;
+    uint64_t above = 0;
+    if (h.transform == Transform::kDelta) {
+        if (count == 0) return true;
+        uint64_t v = h.anchor;
+        above |= v > kMax;
+        o[0] = static_cast<T>(v);
+        size_t i = 1;
+        for (size_t r = 0; r < runs; ++r) {
+            const uint64_t d = unzigzag(values[r]) * g;
+            for (uint64_t k = 0; k <= lengths[r]; ++k) {
+                v += d;
+                above |= v > kMax;
+                o[i++] = static_cast<T>(v);
+            }
+        }
+    } else {
+        size_t i = 0;
+        for (size_t r = 0; r < runs; ++r) {
+            const uint64_t v = h.transform == Transform::kFor ? values[r] * g + h.anchor : values[r];
+            above |= v > kMax;
+            std::fill_n(o + i, static_cast<size_t>(lengths[r]) + 1, static_cast<T>(v));
+            i += static_cast<size_t>(lengths[r]) + 1;
+        }
     }
     if (above != 0) return fail(why, "a value past the column's type");
     return true;
@@ -654,9 +708,44 @@ bool decode(std::span<const char> block, size_t count, std::vector<uint64_t>& ou
 
 template <typename T>
 bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, std::string* why) {
-    thread_local Stream s;
-    if (!read_stream(block, count, s, why)) return false;
-    return inverse<T>(s, count, out, why);
+    Header h;
+    if (!read_header(block, count, h, why)) return false;
+    std::span<const char> payload;
+    if (!payload_of(block, h, payload, why)) return false;
+    out.resize(count);
+    T* o = out.data();
+    bool fits = true;
+    switch (h.packing) {
+    case Packing::kNarrow: {
+        if (payload.size() != h.n * h.width) return fail(why, "narrow payload is not the values' bytes");
+        const char* p = payload.data();
+        switch (h.width) {
+        case 1: fits = narrow_inverse<T, 1>(h, p, count, o); break;
+        case 2: fits = narrow_inverse<T, 2>(h, p, count, o); break;
+        case 3: fits = narrow_inverse<T, 3>(h, p, count, o); break;
+        case 4: fits = narrow_inverse<T, 4>(h, p, count, o); break;
+        case 5: fits = narrow_inverse<T, 5>(h, p, count, o); break;
+        case 6: fits = narrow_inverse<T, 6>(h, p, count, o); break;
+        case 7: fits = narrow_inverse<T, 7>(h, p, count, o); break;
+        default: fits = narrow_inverse<T, 8>(h, p, count, o); break;
+        }
+        break;
+    }
+    case Packing::kRuns:
+        return runs_inverse<T>(h, payload, count, o, why);
+    case Packing::kSimple8b:
+    case Packing::kBlocks: {
+        thread_local std::vector<uint64_t> values;
+        const bool unpacked = h.packing == Packing::kSimple8b ? unpack_simple8b(payload, h.n, values, why)
+                                                              : unpack_blocks(payload, h.n, values, why);
+        if (!unpacked) return false;
+        const uint64_t* v = values.data();
+        fits = apply_inverse<T>(h, count, [v](size_t i) { return v[i]; }, o);
+        break;
+    }
+    }
+    if (!fits) return fail(why, "a value past the column's type");
+    return true;
 }
 
 template bool decode_as<uint64_t>(std::span<const char>, size_t, std::vector<uint64_t>&, std::string*);
