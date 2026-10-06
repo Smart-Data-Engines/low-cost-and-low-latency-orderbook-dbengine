@@ -2029,6 +2029,35 @@ std::string format_config(const ResolvedConfig& resolved) {
     return out;
 }
 
+namespace {
+
+bool is_loopback_host(const std::string& host) {
+    return host == "localhost" || host.rfind("127.", 0) == 0 || host == "::1" || host == "[::1]";
+}
+
+/// The host of an endpoint URL: `http://10.0.0.1:2379` gives `10.0.0.1`, `[::1]:2379` gives `[::1]`.
+std::string endpoint_host(const std::string& url) {
+    std::string rest = url;
+    const auto scheme = rest.find("://");
+    if (scheme != std::string::npos) rest = rest.substr(scheme + 3);
+    if (!rest.empty() && rest[0] == '[') {
+        const auto close = rest.find(']');
+        return close == std::string::npos ? std::string{} : rest.substr(0, close + 1);
+    }
+    return rest.substr(0, rest.find_first_of(":/"));
+}
+
+}  // namespace
+
+std::string remote_coordinator_for_loopback_advertise(const ServerConfig& config) {
+    if (!is_loopback_host(config.advertise_host)) return {};
+    for (const auto& endpoint : config.coordinator_endpoints) {
+        const std::string host = endpoint_host(endpoint);
+        if (!host.empty() && !is_loopback_host(host)) return endpoint;
+    }
+    return {};
+}
+
 ServerConfig parse_cli_args(int argc, char* argv[]) {
     return resolve_cli_args(argc, argv).config;
 }
@@ -2087,6 +2116,14 @@ TcpServer::TcpServer(ServerConfig config)
         // 127.0.0.1 whatever that was - a replica on another host dialled itself (#195).
         failover_config.replication_address =
             config_.advertise_host + ":" + std::to_string(config_.replication_port);
+        if (const std::string remote = remote_coordinator_for_loopback_advertise(config_);
+            !remote.empty()) {
+            OB_LOG_WARN("tcp_server",
+                        "advertise-host is %s, a loopback address, while the coordinator is at %s: "
+                        "nodes on other hosts read this node's address there and reach themselves "
+                        "by it. Set advertise-host to the address they reach this node by (#217)",
+                        config_.advertise_host.c_str(), remote.c_str());
+        }
         // A shard's group elects its own primary, under its own keys: two shards on one etcd shared
         // /ob/leader, and the second became the first one's replica (#175).
         if (!config_.shard_id.empty()) {

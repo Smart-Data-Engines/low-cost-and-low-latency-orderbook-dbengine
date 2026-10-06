@@ -258,6 +258,29 @@ TEST(WalDirInConfig, TheFlagAndTheFileNameTheWalsDirectory) {
     EXPECT_NE(printed.find("/srv/ob"), std::string::npos) << printed;
 }
 
+TEST(AdvertiseHostInConfig, ALoopbackAddressWithACoordinatorElsewhereIsNamed) {
+    // #217: the documented procedure for a cluster across hosts set the coordinator and not the
+    // advertised address, so every node published 127.0.0.1 and every peer on another host dialled
+    // itself. The start says so, naming the endpoint that makes the address wrong.
+    const auto with = [](std::vector<std::string> extra) {
+        std::vector<std::string> args = {"--node-id", "n1"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        return ob::remote_coordinator_for_loopback_advertise(resolve(args).config);
+    };
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://10.0.0.1:2379"}), "http://10.0.0.1:2379");
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://127.0.0.1:2379,http://10.0.0.2:2379"}),
+              "http://10.0.0.2:2379")
+        << "one endpoint on another machine is enough";
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://10.0.0.1:2379", "--advertise-host", "localhost"}),
+              "http://10.0.0.1:2379");
+    // The controls: an address peers can reach, a coordinator on this machine, no coordinator.
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://10.0.0.1:2379", "--advertise-host", "10.0.0.11"}),
+              "");
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://127.0.0.1:2379"}), "");
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://localhost:2379"}), "");
+    EXPECT_EQ(with({}), "");
+}
+
 TEST(AdvertiseHostInConfig, TheFlagAndTheFileNameTheHostPublished) {
     // #175, #195: the host this node publishes to the coordinator - in the shard map and the leader
     // key - was 127.0.0.1, fixed. It still is by default.

@@ -619,6 +619,15 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]);
 /// Render a resolved configuration for a human, sorted, with the provenance of each value.
 std::string format_config(const ResolvedConfig& resolved);
 
+/// The coordinator endpoint that makes this configuration's advertised address wrong, or empty.
+///
+/// A node publishes `advertise-host` to the coordinator, and its mesh peers and replicas dial what it
+/// published. A loopback address there with a coordinator on another machine is what the documented
+/// procedure for a cluster across hosts produced until #217: every node advertised 127.0.0.1, and
+/// every node on another host reached itself by it. A warning at the start rather than a refusal,
+/// because a cluster on one host may keep its etcd elsewhere.
+std::string remote_coordinator_for_loopback_advertise(const ServerConfig& config);
+
 /// The `--help` text, generated from `known_flags()` rather than written beside it.
 ///
 /// It used to be a hardcoded string in `tools/ob_tcp_server.cpp` naming six of the forty flags the
