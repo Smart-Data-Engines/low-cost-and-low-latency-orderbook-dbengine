@@ -103,6 +103,12 @@ else()
     target_include_directories(segment_encoding_probe PRIVATE ${ZSTD_INCLUDE_DIR})
 endif()
 
+# ── What segment format 3's column blocks cost to write and read, against format 2's read ──
+#
+# Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
+add_executable(column_codec_cost column_codec_cost.cpp)
+target_link_libraries(column_codec_cost PRIVATE orderbook_column_codec)
+
 # ── What a version vector costs to send, receive and compare as it grows (#177) ──
 #
 # Compiled, deliberately not run: it prints a table, and the numbers in the roadmap came from it.
