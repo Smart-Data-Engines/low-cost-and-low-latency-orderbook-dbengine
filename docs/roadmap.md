@@ -2522,6 +2522,25 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 218. `scripts/measure_cpu_cost.py` read the engine's CPU as zero from #151 on ✅ **P3**
+
+**Found measuring on the x86 cluster host**: five runs of five printed the engine's server CPU as
+`0.000` and its levels per CPU-second as `nan`. The script finds each server's processes by the name
+in `/proc/<pid>/stat`, and since #151 (PR #168, 23 September) the engine's main thread is named
+`ob-io-0`, which renames the process: `ob_tcp_server` matched nothing. The README's table was
+measured on 19 September, before it, and nothing had run the script since. The harness starts the
+engine, so the script reads that process by its pid now (`OrderbookSystem.server_pid()`); ClickHouse
+and PostgreSQL are services, still found by name.
+
+Run again on the m8a.xlarge at master `3157ce7`, five runs: the engine's server CPU 0.290 s for
+2,000,000 levels in each - 6,896,552 levels per server CPU-second, against ClickHouse's 2,040,816 -
+2,247,191 and TimescaleDB's 621,118 - 628,931 - in the README's "What it costs" with what it does
+not say. `scripts/measure_storage.py`, the probe behind that section's bytes on disk, is in the tree
+now too (`evidence/2026-10-06-cpu-cost/`).
+
+- Effort: S | Impact: the one measurement of what the engine's ingest costs had been unrunnable
+  for two weeks, silently
+
 ### 217. The documented procedure for a cluster across hosts did not form a cluster ✅ **P2**
 
 **Found carrying it out** on the two cluster hosts - #33 asked for exactly that and had no second

@@ -96,39 +96,50 @@ does not govern.
 Wall-clock on a four-core box conflates "faster per core" with "uses more cores", and this engine's
 name contains a claim about cost. Measured over 2,000,000 levels by
 [`scripts/measure_cpu_cost.py`](scripts/measure_cpu_cost.py), counting each server's
-`utime+stime+cutime+cstime` and each client's own CPU including its live children:
+`utime+stime+cutime+cstime` and each client's own CPU including its live children, in five runs on an
+**Amazon EC2 m8a.xlarge** (4 vCPU, AMD EPYC 9R45, Ubuntu 26.04, GCC 15.2, ext4) on **6 October 2026**,
+master `3157ce7`, against ClickHouse 26.9.12.8 and TimescaleDB 2.30.2 on PostgreSQL 16.15, installed
+natively and tuned as [`benchmarks/install_competitors.md`](benchmarks/install_competitors.md) says.
+Each cell is the range of the five:
 
 | system | wall | levels/s | server CPU | client CPU | **levels per server CPU-second** | server cores |
 |---|---|---|---|---|---|---|
-| orderbook | 4.055 s | 493,254 | 0.880 s | 4.403 s | **2,272,727** | **0.22** |
-| clickhouse | 0.466 s | 4,295,642 | 1.140 s | 0.046 s | **1,754,386** | **2.45** |
-| timescaledb | 4.907 s | 407,580 | 4.130 s | 0.073 s | 484,262 | 0.84 |
+| orderbook | 3.027 - 3.075 s | 650,505 - 660,763 | 0.290 s | 3.004 - 3.053 s | **6,896,552** | **0.09 - 0.10** |
+| clickhouse | 0.356 - 0.373 s | 5,356,117 - 5,621,269 | 0.890 - 0.980 s | 0.025 - 0.030 s | **2,040,816 - 2,247,191** | **2.42 - 2.63** |
+| timescaledb | 4.158 - 4.331 s | 461,830 - 480,993 | 3.180 - 3.220 s | 0.043 - 0.063 s | 621,118 - 628,931 | 0.74 - 0.77 |
 
-Per server CPU-second the engine is **2,272,727 against ClickHouse's 1,754,386**, a ratio of
-**1.30**. This is a different script from the comparative run above and carries no floor of its
-own, so it is given as the two figures and their ratio rather than borrowed into the vocabulary
-that run owns — the claim checker refuses the phrase for exactly that reason, and refused this
-sentence once. It did not lead before: the previous run put the two at 1,769,912 against 1,785,714,
-one 10 ms clock tick apart and indistinguishable twice over.
+The engine's server CPU was 0.290 s in all five runs, which the kernel counts in 10 ms ticks: the
+figure stands for 0.285 - 0.295 s, a 3.4% resolution, and its levels per CPU-second for 6.78 - 7.02
+million. Its lowest against each competitor's highest, per server CPU-second the engine ingests
+**3.07 times** what ClickHouse does and **10.97 times** what TimescaleDB does. This is a different
+script from the comparative run above and carries no floor of its own, so it is given as the figures
+and their ratio rather than borrowed into the vocabulary that run owns.
 
-**What moved was the server's CPU, and it moved because of a client change.** The same 2,000,000
-levels cost the server **0.880 s** where they cost 1.130 s, because 64 updates per round trip
-(#141) is 64 times fewer wire reads, parses and responses for the same rows. Both competitors are
-within 2% of their previous figures, which is the control. Do not read the engine's wall-clock
-improvement as storage getting faster — `apply_delta` was not touched by any of this.
+**Where it was before.** On 19 September, on the m9g.xlarge the table above was measured on, the
+same script put the two at 2,272,727 against 1,754,386, a ratio of 1.30, and TimescaleDB at 484,262.
+It was not run again until 6 October, and then it read the engine's CPU as zero in five runs of five:
+since #151 the engine's main thread is named `ob-io-0`, which renames the process in `/proc`, and the
+script looked for `ob_tcp_server` (#218). It reads the engine by its pid now. Between the two, the
+machine changed - the m9g.xlarge's ARM cores for the m8a.xlarge's x86 ones - and so did the engine;
+the figures say what each costs on the machine named, not how much of the change is which.
 
-ClickHouse still wins the clock, by spending **2.45 cores** where the engine spends **0.22**:
-eleven times the parallelism for eight times the throughput. TimescaleDB costs **4.7×** the CPU
-per level of the engine.
+ClickHouse still wins the clock, by spending **2.42 - 2.63 cores** where the engine spends **0.09 -
+0.10**: about twenty-five times the parallelism for about eight times the throughput. TimescaleDB
+costs **11 times** the CPU per level of the engine.
 
-Three things belong beside that rather than after it. ClickHouse is doing **more** work per level —
-parsing text and building compressed parts where the engine receives binary frames and appends — so
-parity per CPU-second is not a flattering result for us. **Our client burns four times what our
-server burns**, and a C++ client sending the same 100,000 round trips does it with 0.44 s and
-reaches 1,319,261 levels/s, so this ingest column measures the harness's Python as much as the
-protocol: the loss to ClickHouse is 4.1× rather than 11.9×, and the smaller number is the honest one
-to argue against. And two CPU figures one 10 ms tick apart agree to within the measurement's own
-resolution and nothing more should be read into them.
+Three things belong beside that rather than after it. ClickHouse is doing **more** work per level -
+parsing text and building compressed parts where the engine receives binary frames and appends - so
+what this compares is the cost of loading the data each way it is loaded, not of the same work.
+**Our client burns ten times what our server burns**: this ingest column measures the harness's
+Python as much as the protocol, and a C++ client sends the same updates with a fraction of it - see
+`benchmarks/wire_load.cpp` and [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
+And the engine keeps what it ingests in more bytes than ClickHouse does, and than TimescaleDB once
+its compression has run: on the comparative dataset, 200,000 rows, its segments take 25.34 bytes a
+row against ClickHouse's 4.23 and compressed TimescaleDB's 14.05 (114.81 before compression), by
+[`scripts/measure_storage.py`](scripts/measure_storage.py) on the same machine and versions. Its
+segments write the timestamp, the order count, the side and the level raw - fifteen of the
+twenty-five bytes - and encode only the price, the quantity and the sequence number. Cheaper to load
+is not cheaper to keep, yet.
 
 Every figure in the query column also includes Python-side parsing for 4000 rows, identical for all
 three systems, because each adapter turns text into tuples. It is **measured in the run** and stated
