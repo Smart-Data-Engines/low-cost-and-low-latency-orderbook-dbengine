@@ -11,6 +11,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "orderbook/column_codec.hpp"
@@ -173,6 +174,45 @@ TEST(ColumnCodec, ACompressedCandidateMustSaveTheMarginToBeChosen) {
     EXPECT_EQ(lz4_kept.encoding.compressor, Compressor::kLz4) << lz4_kept.encoding.name();
 }
 
+TEST(ColumnCodec, AHintIsWrittenInUnlessTheOptionsLeaveItsCompressorOut) {
+    // A seal writes in what the column's last segment chose, without a search - whatever the search
+    // would choose - unless the options leave that encoding's compressor out.
+    std::vector<uint64_t> column;
+    for (uint64_t i = 0; i < 1000; ++i) column.push_back(1000 + (i * 7) % 300);
+    for (const Encoding& e : all_encodings()) {
+        SCOPED_TRACE(e.name());
+        EncodeOptions options;
+        options.hint = &e;
+        std::string block;
+        const Choice c = encode(column, options, block);
+        EXPECT_EQ(c.encoding, e);
+        EXPECT_EQ(c.bytes, block.size());
+        std::vector<uint64_t> back;
+        std::string why;
+        ASSERT_TRUE(decode(bytes(block), column.size(), back, &why)) << why;
+        EXPECT_EQ(back, column);
+    }
+    // Left out, the hint is searched for instead: the block is the one the same options write
+    // without it.
+    const Encoding zstd_runs{Transform::kFor, Packing::kRuns, Compressor::kZstd};
+    const Encoding lz4_runs{Transform::kFor, Packing::kRuns, Compressor::kLz4};
+    EncodeOptions no_zstd;
+    no_zstd.zstd_level = 0;
+    EncodeOptions no_lz4;
+    no_lz4.lz4 = false;
+    for (const auto& [options, hint] : {std::pair{no_zstd, &zstd_runs}, std::pair{no_lz4, &lz4_runs}}) {
+        SCOPED_TRACE(hint->name());
+        std::string searched, hinted;
+        const Choice s = encode(column, options, searched);
+        EncodeOptions with_hint = options;
+        with_hint.hint = hint;
+        const Choice h = encode(column, with_hint, hinted);
+        EXPECT_NE(h.encoding.compressor, hint->compressor) << h.encoding.name();
+        EXPECT_EQ(h.encoding, s.encoding) << h.encoding.name();
+        EXPECT_EQ(hinted, searched);
+    }
+}
+
 TEST(ColumnCodec, ADivisorTakesTheTickOutOfAPrice) {
     // The same steps, once in ticks and once at a tick of 10^6: the block differs by the divisor's
     // own bytes, not by twenty bits a value.
@@ -251,6 +291,16 @@ TEST(ColumnCodec, ABlockThatIsNotWhatTheEncoderWritesIsRefused) {
         std::string b = block;
         b[0] = static_cast<char>(static_cast<uint8_t>(b[0]) | bad);
         EXPECT_FALSE(decode(bytes(b), column.size(), out, &why)) << int(bad);
+    }
+    // LZ4's bit on a ZSTD block and ZSTD's on an LZ4 one: a block is under one compressor, and one
+    // claiming both is refused even where its payload decompresses under one of them.
+    for (const auto& [compressor, other] :
+         {std::pair{Compressor::kZstd, uint8_t{0x40}}, std::pair{Compressor::kLz4, uint8_t{0x20}}}) {
+        std::string b;
+        encode_as(column, Encoding{Transform::kFor, Packing::kRuns, compressor}, 3, b);
+        ASSERT_TRUE(decode(bytes(b), column.size(), out, &why)) << why;
+        b[0] = static_cast<char>(static_cast<uint8_t>(b[0]) | other);
+        EXPECT_FALSE(decode(bytes(b), column.size(), out, &why)) << int(other);
     }
     // A narrow width outside 1 - 8.
     std::string narrow;
