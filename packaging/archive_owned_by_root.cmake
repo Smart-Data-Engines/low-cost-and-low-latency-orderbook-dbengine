@@ -24,9 +24,12 @@ foreach(package IN LISTS CPACK_PACKAGE_FILES)
     if(NOT count EQUAL 1)
         message(FATAL_ERROR "archive_owned_by_root: ${package} holds ${count} top-level entries, not one: ${top}")
     endif()
+    # Its children rather than the directory itself: CPack writes no entry for the top-level directory,
+    # and one here would be a path the .deb does not have.
+    file(GLOB children RELATIVE "${unpacked}" "${unpacked}/${top}/*")
     execute_process(COMMAND tar --create --gzip --file "${package}"
                             --owner=0 --group=0 --numeric-owner --mode=go-w --sort=name
-                            -C "${unpacked}" "${top}"
+                            -C "${unpacked}" ${children}
                     RESULT_VARIABLE rc ERROR_VARIABLE err)
     if(NOT rc EQUAL 0)
         message(FATAL_ERROR "archive_owned_by_root: could not write ${package} again: ${err}")
