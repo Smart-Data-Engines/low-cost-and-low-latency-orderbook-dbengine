@@ -4070,6 +4070,12 @@ Learned the hard way. Check here before debugging.
      artefact (#210). Check owners and modes in the artefact itself, as an installer reads it.
      A package built on a newer distribution than it is installed on fails the same quiet way: built
      on Ubuntu 24.04, every binary asks for glibc 2.38 through `__isoc23_strtol` (#212).
+547. **A failover test that waits for replication before the kill measures replication, not
+     failover.** `test_acknowledged_data_survives_a_kill` sleeps 1.5 s before the kill. On two hosts,
+     killing the primary while a writer still wrote found a rejoining replica that never reached the
+     stream - the primary sent it live records while its snapshot was being made - promoted with none
+     of the round's 415 875 - 438 625 acknowledged writes (#214). Kill under writes, count what the
+     client was told, and run it more than once in each direction: the loss was in every other round.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -24,6 +24,7 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <cinttypes>
 #include <chrono>
 #include <cstring>
@@ -1944,6 +1945,125 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
     engine.close();
 }
 
+TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotGoAheadOfSnapshotBegin) {
+    // #214, the primary half. A replica rejoining after a failover asks for a snapshot, and the
+    // primary makes it on the worker. Until `SNAPSHOT_BEGIN` the replica reads every line as that
+    // answer, so a record broadcast in the meantime abandoned the bootstrap - measured on two hosts
+    // under 115 000 writes a second, every attempt, and the node that never joined was promoted.
+    //
+    // Held open deterministically: the gate keeps the worker from taking the snapshot until the
+    // record has been broadcast, which a snapshot of this small store would not otherwise allow.
+    ob::Engine engine(tmp_->str() + "/engine", 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    std::vector<ob::Level> lv(8);
+    for (size_t l = 0; l < lv.size(); ++l) {
+        lv[l].price = static_cast<int64_t>(l) + 1;
+        lv[l].qty   = 10;
+        lv[l].cnt   = 1;
+        lv[l]._pad  = 0;
+    }
+    for (int i = 0; i < 50; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "PREP", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+        d.timestamp_ns = 8'000'000'000ULL + static_cast<uint64_t>(i);
+        d.side         = ob::SIDE_BID;
+        d.n_levels     = static_cast<uint16_t>(lv.size());
+        ASSERT_EQ(engine.apply_delta(d, lv.data()), ob::OB_OK);
+    }
+    engine.flush_incremental();
+
+    auto mgr = start_manager(&engine);
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic<bool> gate_opened{false};
+    mgr->set_snapshot_gate_for_test([released] { released.wait(); });
+    // Whatever happens below, the worker is let go before the manager stops, or stop() waits on it.
+    const auto open_gate = [&] {
+        if (!gate_opened.exchange(true)) release.set_value();
+    };
+    struct OpenOnExit {
+        std::function<void()> f;
+        ~OpenOnExit() { f(); }
+    } open_on_exit{open_gate};
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+    ASSERT_TRUE(wait_for_registered_replicas(*mgr, 1));
+    const char* request = "SNAPSHOT_REQUEST\n";
+    ASSERT_GT(::send(fd, request, std::strlen(request), MSG_NOSIGNAL), 0);
+
+    bool preparing = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (mgr->snapshot_preparing()) { preparing = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(preparing) << "the request never reached the worker, so this test never reached the "
+                              "window it is about";
+
+    // A live write while the snapshot is being made, far past any position it could be taken at.
+    constexpr uint64_t kMarkerSeq = 4343;
+    ob::Level one{};
+    one.price = 1; one.qty = 1; one.cnt = 1;
+    ob::DeltaUpdate marker{};
+    std::strncpy(marker.symbol, "MARKER", sizeof(marker.symbol) - 1);
+    std::strncpy(marker.exchange, "BINANCE", sizeof(marker.exchange) - 1);
+    marker.sequence_number = kMarkerSeq;
+    marker.timestamp_ns    = 9'000'000'000ULL;
+    marker.side            = ob::SIDE_BID;
+    marker.n_levels        = 1;
+    std::vector<uint8_t> payload(sizeof(ob::DeltaUpdate) + sizeof(ob::Level));
+    std::memcpy(payload.data(), &marker, sizeof(marker));
+    std::memcpy(payload.data() + sizeof(marker), &one, sizeof(one));
+    ob::WALRecord mhdr{};
+    mhdr.sequence_number = kMarkerSeq;
+    mhdr.timestamp_ns    = marker.timestamp_ns;
+    mhdr.payload_len     = static_cast<uint16_t>(payload.size());
+    mhdr.checksum        = ob::crc32c(payload.data(), payload.size());
+    mhdr.record_type     = ob::WAL_RECORD_DELTA;
+    mgr->broadcast(mhdr, payload.data(), payload.size(), ob::WalPosition{9999, 0});
+
+    open_gate();
+
+    struct timeval tv{};
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::string in;
+    char rbuf[65536];
+    const auto pull = [&]() {
+        const ssize_t n = ::recv(fd, rbuf, sizeof(rbuf), 0);
+        if (n > 0) in.append(rbuf, static_cast<size_t>(n));
+        return n > 0;
+    };
+    const auto next_line = [&]() -> std::string {
+        for (;;) {
+            const size_t nl = in.find('\n');
+            if (nl != std::string::npos) {
+                const std::string line = in.substr(0, nl);
+                in.erase(0, nl + 1);
+                return line;
+            }
+            if (!pull()) return {};
+        }
+    };
+
+    // A heartbeat queued before the request reached the manager may come first; the replica skips
+    // it. Anything else before SNAPSHOT_BEGIN is the defect.
+    std::string first = next_line();
+    while (first.rfind("HEARTBEAT", 0) == 0) first = next_line();
+    EXPECT_EQ(first.rfind("SNAPSHOT_BEGIN", 0), 0u)
+        << "expected SNAPSHOT_BEGIN, got '" << first << "' - a record broadcast while the snapshot "
+           "was being made went ahead of it (#214)";
+
+    ::close(fd);
+    mgr->stop();
+    engine.close();
+}
+
 
 // ── #99/#100: what to do with a live record, as a contract ───────────────────────────────────
 
@@ -2007,6 +2127,33 @@ TEST(LiveRecordDecision, TheAnswerIsAContractRatherThanASideEffect) {
     EXPECT_EQ(ob::live_record_action(r, WalPosition{6, 0}), LiveRecordAction::Drop);
 }
 
+TEST(LiveRecordDecision, NothingGoesAheadOfASnapshotStillBeingMade) {
+    // #214. Between a replica's snapshot request and `SNAPSHOT_BEGIN` the snapshot is being made on
+    // the worker, and the replica reads its next line as the answer. Neither a catch-up nor a
+    // transfer was in progress there, so a live record was sent - under writes, into every
+    // bootstrap, which the replica abandoned each time. The snapshot is taken at or before the
+    // record's position, so a record is either inside it or in the WAL the replica asks for from
+    // the snapshot's position: dropped, wherever it lies.
+    using ob::LiveRecordAction;
+    using ob::WalPosition;
+
+    ob::ReplicaInfo r;
+    r.asked_for_stream   = true;
+    r.snapshot_preparing = true;
+    EXPECT_TRUE(ob::transfer_in_progress(r))
+        << "a heartbeat queued now would be read as the answer to the request";
+    for (const WalPosition p : {WalPosition{0, 0}, WalPosition{3, 100}, WalPosition{9, 1}}) {
+        EXPECT_EQ(ob::live_record_action(r, p), LiveRecordAction::Drop)
+            << "a record at file " << p.file_index << " offset " << p.offset
+            << " would go ahead of SNAPSHOT_BEGIN";
+    }
+
+    // The control: the same replica once the request has an answer is streaming again.
+    r.snapshot_preparing = false;
+    EXPECT_FALSE(ob::transfer_in_progress(r));
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 100}), LiveRecordAction::Send);
+}
+
 
 // ── #99: a live record spliced into a snapshot stream ────────────────────────────────────────
 
@@ -2021,10 +2168,32 @@ struct SnapshotBootstrapOutcome {
     /// `repl_state.txt` as it stands once the install is done, read before `stop()` so it is the
     /// install's own write rather than the one on the way out (#101 requirement 4.4).
     std::string saved_state;
+    /// With `time_the_resume`: milliseconds from `SNAPSHOT_END` to the replica's next connection,
+    /// and the `REPLICATE` line it opened with (#214).
+    std::optional<double> resumed_after_ms;
+    std::string           resume_line;
+};
+
+/// What the mock primary does besides the stream it always sends.
+struct BootstrapScript {
+    bool splice_a_live_record{false};   ///< a live `WAL` record between the two files (#99)
+    bool heartbeat_before_begin{false}; ///< a `HEARTBEAT` before `SNAPSHOT_BEGIN` (#214)
+    bool time_the_resume{false};        ///< wait for the replica to come back, and time it (#214)
 };
 
 SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
+                                                 BootstrapScript script);
+
+SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
                                                  bool splice_a_live_record) {
+    BootstrapScript script;
+    script.splice_a_live_record = splice_a_live_record;
+    return run_snapshot_bootstrap(dir, port, script);
+}
+
+SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
+                                                 BootstrapScript script) {
+    const bool splice_a_live_record = script.splice_a_live_record;
     SnapshotBootstrapOutcome out;
     const int listen_fd = create_mock_primary(port);
     if (listen_fd < 0) return out;
@@ -2062,6 +2231,13 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
         return ::send(peer_fd, text.data(), text.size(), MSG_NOSIGNAL) ==
                static_cast<ssize_t>(text.size());
     };
+
+    if (script.heartbeat_before_begin) {
+        // What the primary's five-second timer puts on the wire when it fires between its
+        // `ERR WAL_TRUNCATED` and the request reaching it.
+        const char* hb = "HEARTBEAT 0\n";
+        EXPECT_GT(::send(peer_fd, hb, std::strlen(hb), MSG_NOSIGNAL), 0);
+    }
 
     // A non-zero WAL position, deliberately: a snapshot taken at 0 0 is indistinguishable from
     // the zeros a wipe writes, so an assertion about where the bootstrap left the replica would
@@ -2115,6 +2291,7 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     char end[64];
     std::snprintf(end, sizeof(end), "SNAPSHOT_END %u\n", expected.transferred_digest());
     EXPECT_TRUE(send_str(end));
+    const auto end_sent = std::chrono::steady_clock::now();
 
     // Long enough for the install, and the assertion is on the filesystem rather than on a timer:
     // a bootstrap that has not finished by now has not finished because it was abandoned.
@@ -2126,6 +2303,19 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
         std::ifstream in(cfg.state_file);
         out.saved_state.assign(std::istreambuf_iterator<char>(in),
                                std::istreambuf_iterator<char>());
+    }
+
+    if (script.time_the_resume) {
+        // The replica ends the connection once it has installed, and asks for the stream from the
+        // snapshot's position on a new one. Waited for well past the five seconds it used to leave.
+        const int again = accept_with_timeout(listen_fd, 9000);
+        if (again >= 0) {
+            out.resumed_after_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - end_sent).count();
+            answer_stream_id(again, 0x51DULL);
+            out.resume_line = recv_line(again, 3000);
+            ::close(again);
+        }
     }
 
     client.stop();
@@ -2143,6 +2333,32 @@ TEST_F(ReplicationClientTest, ASnapshotBootstrapInstallsWhatThePrimarySends) {
     const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/false);
     EXPECT_TRUE(out.first_file_installed) << "the first snapshot file was not installed";
     EXPECT_TRUE(out.second_file_installed) << "the second snapshot file was not installed";
+}
+
+TEST_F(ReplicationClientTest, AHeartbeatBeforeSnapshotBeginIsNotTheAnswer) {
+    // #214. The primary's heartbeat timer can fire between its `ERR WAL_TRUNCATED` and the
+    // replica's request reaching it, and the replica read that line as the answer to the request.
+    BootstrapScript script;
+    script.heartbeat_before_begin = true;
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
+    EXPECT_TRUE(out.first_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
+    EXPECT_TRUE(out.second_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
+}
+
+TEST_F(ReplicationClientTest, AfterASnapshotTheReplicaAsksForTheStreamAtOnce) {
+    // #214. Installing a snapshot ends the connection, and the reconnect loop gave that the delay it
+    // gives an error: five seconds in which the node held the snapshot and nothing after it, was not
+    // connected - so the primary could free the file it would ask for - and could be promoted.
+    BootstrapScript script;
+    script.time_the_resume = true;
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
+    ASSERT_TRUE(out.second_file_installed) << "the snapshot was not installed, so there is no resume to time";
+    ASSERT_TRUE(out.resumed_after_ms.has_value()) << "the replica did not come back within 9 s";
+    // 800 ms of it is the harness's own wait before it looks; the delay this replaces was 5000.
+    EXPECT_LT(*out.resumed_after_ms, 2500.0)
+        << "the replica asked for the stream " << *out.resumed_after_ms << " ms after SNAPSHOT_END";
+    EXPECT_EQ(out.resume_line.rfind("REPLICATE 3 4096", 0), 0u)
+        << "it did not ask from the snapshot's position: '" << out.resume_line << "'";
 }
 
 TEST_F(ReplicationClientTest, ASplicedLiveRecordAbandonsTheSnapshotBootstrap) {

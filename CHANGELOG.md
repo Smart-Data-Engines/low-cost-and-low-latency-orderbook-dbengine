@@ -45,7 +45,11 @@ The first release. What it contains, by area:
 ### Replication and availability
 
 - WAL streaming replication with snapshot bootstrap of replicas, lag in the bytes a replica has yet
-  to acknowledge, and a new WAL lineage after a snapshot is installed (#197).
+  to acknowledge, and a new WAL lineage after a snapshot is installed (#197). A replica rejoining
+  under writes takes its snapshot and reaches the stream - 0.30 - 0.39 s on two hosts - where before
+  every attempt was abandoned and the next failover lost the whole round (#214). Replication is
+  asynchronous: what an unplanned failover can lose is in `docs/operations.md`, "What a failover
+  keeps", and a replica still joining can be elected (#215).
 - Automatic failover through etcd with epoch fencing, and graceful handover to a named replica;
   a primary that gives the role up replicates from whoever takes it (#201). A handover loses no
   acknowledged write and takes a monitor tick rather than a lease TTL: the outgoing primary closes
