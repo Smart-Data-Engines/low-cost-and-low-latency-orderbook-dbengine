@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -141,11 +142,13 @@ enum class LiveRecordAction {
     Drop,    ///< The transfer in progress already covers this record, or covered it.
 };
 
-/// Is a transfer streaming to this replica — a catch-up walking a WAL range, or a snapshot?
+/// Is a transfer streaming to this replica — a catch-up walking a WAL range, or a snapshot, or one
+/// being prepared?
 ///
 /// Anything queued while one is means bytes spliced into that stream. For a catch-up that is an
 /// ordering problem; for a snapshot it abandons the bootstrap, because the receiver reads a header
-/// and then exactly as many bytes as the header named.
+/// and then exactly as many bytes as the header named - and while the snapshot is still being
+/// created, it reads the next line as `SNAPSHOT_BEGIN` (#214).
 bool transfer_in_progress(const ReplicaInfo& replica);
 
 /// What to do with a live record at `record_pos`.
@@ -366,6 +369,13 @@ struct ReplicaInfo {
     // Per-replica buffered reader for efficient line parsing.
     BufferedReader reader;
 
+    /// A snapshot for this connection is being created on the worker thread (#79): asked for, and
+    /// `SNAPSHOT_BEGIN` not yet sent. The replica reads the next line as that answer, so nothing may
+    /// be queued ahead of it - a live record or a heartbeat there abandoned the bootstrap, and under
+    /// writes every attempt ended that way (#214). Set where the worker is started, cleared when the
+    /// transfer begins or the request fails.
+    bool        snapshot_preparing{false};
+
     // Per-replica snapshot transfer state (active during SNAPSHOT_REQUEST handling).
     SnapshotTransferState snapshot_transfer;
 
@@ -493,7 +503,20 @@ public:
     /// Returns true if any replica is currently receiving a snapshot.
     bool snapshot_active() const;
 
+    /// True while a snapshot is being created for a replica, between its request and
+    /// `SNAPSHOT_BEGIN` (#214).
+    bool snapshot_preparing() const;
+
+    /// Runs on the snapshot worker before the snapshot is taken, and blocks it until it returns: a
+    /// test holds a request in its preparation this way, which nothing else can do deterministically
+    /// - a snapshot of a small store is ready in under a millisecond.
+    void set_snapshot_gate_for_test(std::function<void()> gate) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        snapshot_gate_for_test_ = std::move(gate);
+    }
+
 private:
+    std::function<void()> snapshot_gate_for_test_;
     ReplicationConfig config_;
     WALWriter&        wal_;
     Engine*           engine_{nullptr};
@@ -823,6 +846,10 @@ private:
 
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};
+    /// A snapshot was installed, so the connection ends to ask for the stream from the snapshot's
+    /// position - which `run_loop()` does at once rather than after the delay it leaves after an
+    /// error (#214). Read and cleared on the replication thread only.
+    bool resume_at_once_{false};
     std::atomic<size_t> snapshot_bytes_received_{0};
     std::atomic<size_t> snapshot_bytes_total_{0};
 
@@ -892,8 +919,9 @@ private:
     /// Handle snapshot bootstrap: send SNAPSHOT_REQUEST, receive files, verify, load.
     void request_and_receive_snapshot();
 
-    /// Move staged files into data directory and load columnar index.
-    void install_snapshot(const std::string& staging_dir, const SnapshotManifest& manifest);
+    /// Move staged files into data directory and load columnar index. True when the store was
+    /// replaced and the snapshot's WAL position saved.
+    bool install_snapshot(const std::string& staging_dir, const SnapshotManifest& manifest);
 
     /// Clean up the staging directory.
     void cleanup_staging(const std::string& staging_dir);

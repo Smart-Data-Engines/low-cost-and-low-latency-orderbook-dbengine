@@ -565,14 +565,14 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
         if (live_record_action(*it, record_pos) == LiveRecordAction::Drop) {
             OB_LOG_DEBUG("repl_mgr",
                          "not broadcasting seq=%lu at file=%u offset=%u to fd=%d: "
-                         "asked_for_stream=%d catchup_active=%d through=%u/%u snapshot_active=%d - "
-                         "the transfer in progress covers this record",
+                         "asked_for_stream=%d catchup_active=%d through=%u/%u snapshot_preparing=%d "
+                         "snapshot_active=%d - the transfer in progress covers this record",
                          static_cast<unsigned long>(hdr.sequence_number),
                          record_pos.file_index, record_pos.offset, it->fd,
                          it->asked_for_stream ? 1 : 0, it->catchup.active ? 1 : 0,
                          it->catchup.through_file,
                          static_cast<unsigned>(it->catchup.through_offset),
-                         it->snapshot_transfer.active ? 1 : 0);
+                         it->snapshot_preparing ? 1 : 0, it->snapshot_transfer.active ? 1 : 0);
             ++it;
             continue;
         }
@@ -610,6 +610,11 @@ WalPosition ReplicationManager::last_broadcast_end() const {
 std::vector<ReplicaInfo> ReplicationManager::replica_states() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return replicas_;
+}
+
+bool ReplicationManager::snapshot_preparing() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return snapshot_prepare_.active;
 }
 
 bool ReplicationManager::snapshot_active() const {
@@ -1633,7 +1638,7 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
 }
 
 bool transfer_in_progress(const ReplicaInfo& replica) {
-    return replica.catchup.active || replica.snapshot_transfer.active;
+    return replica.catchup.active || replica.snapshot_preparing || replica.snapshot_transfer.active;
 }
 
 LiveRecordAction live_record_action(const ReplicaInfo& replica, WalPosition record_pos) {
@@ -1653,6 +1658,13 @@ LiveRecordAction live_record_action(const ReplicaInfo& replica, WalPosition reco
                    ? LiveRecordAction::Drop
                    : LiveRecordAction::Defer;
     }
+
+    // A snapshot still being created on the worker. The replica reads its next line as
+    // `SNAPSHOT_BEGIN`, so a record sent now abandoned the bootstrap, and under writes every attempt
+    // (#214). Dropped rather than deferred: the snapshot is taken at or before this record's
+    // position, a record before that is inside it, and one at or past it is in the WAL the replica
+    // asks for from the snapshot's position once it has installed it.
+    if (replica.snapshot_preparing) return LiveRecordAction::Drop;
 
     // A snapshot being streamed. The snapshot carries the WAL position it was taken at, so a
     // record before that position is already inside the files this replica is installing, and a
@@ -1723,7 +1735,9 @@ void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
     // The pointer is captured by value rather than read from the member on the worker, so the
     // worker never touches state this manager can change under it.
     Engine* engine = engine_;
-    if (!snapshot_builder_.start(token, [engine] {
+    std::function<void()> gate = snapshot_gate_for_test_;
+    if (!snapshot_builder_.start(token, [engine, gate] {
+            if (gate) gate();
             // The manifest, and the pin that keeps the files it names until the transfer ends
             // (#165 part 2b); the sequence state is the mesh's, and this link does not send it.
             SnapshotWithSequenceState full = engine->create_snapshot_with_sequence_state();
@@ -1745,10 +1759,11 @@ void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
     snapshot_prepare_.conn_id    = replica.conn_id;
     snapshot_prepare_.token      = token;
     snapshot_prepare_.started_at = std::chrono::steady_clock::now();
+    replica.snapshot_preparing   = true;
 
     OB_LOG_INFO("repl_mgr",
                 "snapshot for replica fd=%d (connection %llu) is being created on a worker thread "
-                "(token %llu)",
+                "(token %llu); nothing is sent to it until SNAPSHOT_BEGIN",
                 replica.fd, static_cast<unsigned long long>(replica.conn_id),
                 static_cast<unsigned long long>(token));
 }
@@ -1802,7 +1817,11 @@ void ReplicationManager::poll_snapshot_preparation() {
         int len = std::snprintf(err, sizeof(err), "ERR SNAPSHOT_FAILED %s\n",
                                 result->error.c_str());
         prep = ReplicaSnapshotPrepare{};
+        replica->snapshot_preparing = false;
         enqueue_send(*replica, err, static_cast<size_t>(len));
+        // Heartbeats held back while the snapshot was being made go after the answer they waited
+        // for, not with the connection.
+        if (!replica->deferred_live.empty()) release_deferred_live(*replica);
         return;
     }
 
@@ -1810,6 +1829,8 @@ void ReplicationManager::poll_snapshot_preparation() {
                 replica->fd, prepare_ms, static_cast<unsigned long long>(result->token));
 
     prep = ReplicaSnapshotPrepare{};
+    // The transfer that begins now is what holds bytes back from here on.
+    replica->snapshot_preparing = false;
     begin_snapshot_transfer(*replica, std::move(result->snap.manifest),
                             std::move(result->snap.pin));
 }
@@ -2103,6 +2124,22 @@ void ReplicationClient::run_loop() {
         // Clean up socket on disconnect. Through close_socket() so it cannot race stop()'s
         // shutdown() on the same descriptor.
         close_socket();
+
+        // A snapshot installed is not a failure, and the delay below was what it got: five seconds
+        // in which this node held a snapshot and none of the stream after it, was not connected, so
+        // the primary's retention could free the file it would ask for - and was a replica the
+        // election would promote (#214).
+        if (resume_at_once_) {
+            resume_at_once_ = false;
+            backoff_sec     = 5;
+            OB_LOG_INFO("repl_client",
+                        "snapshot installed at file=%u offset=%zu: asking %s:%u for the stream "
+                        "from there at once",
+                        confirmed_file_.load(std::memory_order_relaxed),
+                        confirmed_offset_.load(std::memory_order_relaxed),
+                        config_.primary_host.c_str(), config_.primary_port);
+            continue;
+        }
 
         // Wait before reconnecting, checking running_ periodically.
         for (int i = 0; i < backoff_sec * 10 && running_.load(std::memory_order_acquire); ++i) {
@@ -2809,9 +2846,15 @@ void ReplicationClient::request_and_receive_snapshot() {
         return;
     }
 
-    // Read SNAPSHOT_BEGIN response.
+    // Read SNAPSHOT_BEGIN response. A HEARTBEAT may come first and it is not the answer: the
+    // primary's timer can fire between its `ERR WAL_TRUNCATED` and this request reaching it, and the
+    // answer was read as `SNAPSHOT_BEGIN` and the bootstrap abandoned (#214).
     char line_buf[512];
     ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
+    while (n > 0 && std::strncmp(line_buf, "HEARTBEAT", 9) == 0) {
+        OB_LOG_DEBUG("repl_client", "a HEARTBEAT before SNAPSHOT_BEGIN; still waiting for the answer");
+        n = reader_.read_line(line_buf, sizeof(line_buf));
+    }
     if (n <= 0) {
         OB_LOG_WARN("repl_client",
                     "snapshot bootstrap abandoned: no SNAPSHOT_BEGIN from the primary "
@@ -3022,12 +3065,12 @@ void ReplicationClient::request_and_receive_snapshot() {
     }
 
     // Install the snapshot.
-    install_snapshot(staging_dir, manifest);
+    if (install_snapshot(staging_dir, manifest)) resume_at_once_ = true;
 
     bootstrapping_.store(false, std::memory_order_release);
 }
 
-void ReplicationClient::install_snapshot(const std::string& staging_dir,
+bool ReplicationClient::install_snapshot(const std::string& staging_dir,
                                           const SnapshotManifest& manifest) {
     const std::string& data_dir = engine_.base_dir();
 
@@ -3042,7 +3085,7 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
             OB_LOG_ERROR("repl_client",
                          "Refusing to install a snapshot naming an unsafe path: '%s'",
                          entry.path.c_str());
-            return;
+            return false;
         }
     }
 
@@ -3052,7 +3095,7 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
         OB_LOG_ERROR("repl_client",
                      "Snapshot install failed; not recording its WAL position, so the next "
                      "attempt starts from the position this node already had");
-        return;
+        return false;
     }
 
     // Update confirmed WAL position.
@@ -3061,6 +3104,7 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
 
     // Clean up staging directory.
     cleanup_staging(staging_dir);
+    return true;
 }
 
 void ReplicationClient::cleanup_staging(const std::string& staging_dir) {
