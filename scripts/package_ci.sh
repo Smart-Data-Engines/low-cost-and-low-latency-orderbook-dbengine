@@ -48,6 +48,15 @@ if command -v rpm > /dev/null; then
     rpm -qlp "$RPM" | grep -qx /usr/lib/orderbook-dbengine/liborderbook_shared.so
     rpm -qip "$RPM" | grep -q "^License *: Apache-2.0"
     echo "  ok: the RPM: config at /etc and marked, the C API library, Apache-2.0"
+    # The rule verify_package.sh holds the .deb and the tarball to (#210), and the user the unit runs
+    # as - which only the .deb's postinst created, so after an RPM install the service had no user to
+    # start as (#211).
+    BAD=$(rpm -qlvp "$RPM" | awk '$3 != "root" || $4 != "root" || ($1 !~ /^l/ && (substr($1, 6, 1) == "w" || substr($1, 9, 1) == "w"))')
+    [ -z "$BAD" ] || { echo "FAIL: RPM entries that are not root's, or are writable beyond their owner:"; echo "$BAD" | head -5; exit 1; }
+    SCRIPTS=$(rpm -qp --scripts "$RPM")
+    echo "$SCRIPTS" | grep -q "useradd .*orderbook" \
+        || { echo "FAIL: the RPM does not create the orderbook user its unit runs as"; exit 1; }
+    echo "  ok: the RPM: every entry root's and none writable beyond its owner, and it creates the orderbook user"
 fi
 
 step "the Python client's wheel and sdist"

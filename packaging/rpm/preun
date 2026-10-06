@@ -1,0 +1,8 @@
+#!/bin/sh
+# On removal - $1 is 0 then, and 1 when an upgrade replaces the package - stop and disable the
+# service, as the .deb's prerm does. The user and /var/lib/orderbook stay: the directory holds the
+# database.
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl stop ob_tcp_server >/dev/null 2>&1 || true
+    systemctl disable ob_tcp_server >/dev/null 2>&1 || true
+fi

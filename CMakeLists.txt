@@ -561,6 +561,12 @@ set_target_properties(orderbook_shared PROPERTIES
 # `cmake --install` then places files under `<prefix>/usr/...`, which is odd and acceptable: these
 # rules exist for packaging. (They were guarded by `if(NOT SKBUILD)` while the Python wheel ran this
 # build for `orderbook_shared`; the wheel builds no native code since #42, so nothing else runs them.)
+#
+# The directories these rules create implicitly take this mode rather than the builder's umask: a
+# .deb built under umask 0002 carried fourteen group-writable directories, /etc/orderbook among them
+# (#210). CPack takes CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS from it.
+set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+    OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 install(TARGETS ob_tcp_server ob_restore ob_backup
     RUNTIME DESTINATION usr/bin
     COMPONENT runtime
@@ -625,7 +631,17 @@ if(RPMBUILD_EXECUTABLE)
     # the distribution's filesystem package.
     set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
         "/etc;/usr;/usr/bin;/usr/include;/usr/lib;/usr/lib/systemd;/usr/lib/systemd/system;/usr/share;/usr/share/doc;/usr/share/man;/usr/share/man/man1")
+    # The unit runs as `orderbook`, which only the .deb's postinst created: after an RPM install the
+    # service had no user to start as (#211). The scripts do what packaging/debian/ does.
+    set(CPACK_RPM_PRE_INSTALL_SCRIPT_FILE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/rpm/preinst")
+    set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/rpm/postinst")
+    set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/rpm/preun")
+    set(CPACK_RPM_PACKAGE_REQUIRES_PRE "/usr/sbin/useradd, /usr/bin/getent")
 endif()
+# The archive generators record the staging files' owner - the builder's uid, `runner` (1001) on a
+# CI runner - and no CMake up to 4.2 lets a project choose it, so this script writes each .tar.gz
+# again with every entry root's (#210).
+set(CPACK_POST_BUILD_SCRIPTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/archive_owned_by_root.cmake")
 # Both generators produce the same relative layout; see the note above the install rules.
 set(CPACK_PACKAGING_INSTALL_PREFIX "/")
 # Every file name carries the architecture (#42): a release has x86_64 and aarch64 builds, and the
