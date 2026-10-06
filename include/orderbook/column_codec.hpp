@@ -9,7 +9,7 @@
 // blocks on random quantities, ZSTD on a book's snapshots, whose levels repeat from one to the
 // next - so every column of every segment is written in the smallest of nine candidates.
 //
-// A candidate is a transform, a packing and, or not, ZSTD over the packed bytes:
+// A candidate is a transform, a packing and, or not, LZ4 or ZSTD over the packed bytes:
 //
 //   transform   for     each value minus the column's minimum, the minimum kept as the anchor
 //               delta   each value minus the one before it, zigzagged; the first is the anchor
@@ -18,6 +18,9 @@
 //   packing     Simple8b, runs (each run of equal values as its value and its length, both in
 //               Simple8b), blocks (128 values at the width of their largest), narrow (each
 //               value in the bytes the largest needs)
+//   compressor  none, LZ4 or ZSTD: ZSTD makes the smaller blocks and LZ4 the ones read several
+//               times faster, so a seal - what queries read most - uses LZ4, and a merge, which
+//               writes what stays, takes ZSTD where it saves enough over LZ4 (design §3)
 //
 // Values are uint64. A signed column - the price, the sequence number - is its int64 reinterpreted,
 // and both transforms work modulo 2^64 as encode_prices() does, so every value has an encoding and
@@ -36,24 +39,30 @@ namespace ob::column_codec {
 
 enum class Transform : uint8_t { kNone = 0, kFor = 1, kDelta = 2 };
 enum class Packing : uint8_t { kSimple8b = 0, kRuns = 1, kBlocks = 2, kNarrow = 3 };
+enum class Compressor : uint8_t { kNone = 0, kZstd = 1, kLz4 = 2 };
 
 struct Encoding {
     Transform transform{Transform::kNone};
     Packing packing{Packing::kSimple8b};
-    bool zstd{false};
+    Compressor compressor{Compressor::kNone};
     /// "delta/runs+zstd" - what the logs and the cost benchmark name it.
     std::string name() const;
     bool operator==(const Encoding&) const = default;
 };
 
 struct EncodeOptions {
-    /// The ZSTD level of the compressed candidates; 0 leaves them out.
-    int zstd_level{1};
+    /// Whether runs and narrow of each transform are tried under LZ4.
+    bool lz4{true};
+    /// The ZSTD level of the same four under ZSTD; 0 leaves them out.
+    int zstd_level{3};
     /// How much smaller, in percent, a compressed candidate must be than the smallest
     /// uncompressed one to be chosen: reading it costs a decompression the other does not.
+    unsigned compressed_margin_pct{0};
+    /// How much smaller, in percent, a ZSTD candidate must be than the smallest LZ4 one, when LZ4
+    /// is tried: ZSTD's decompression costs several times LZ4's.
     unsigned zstd_margin_pct{0};
     /// The encoding to write in without searching - what the column's last segment chose - or
-    /// null to search. A compressed one with `zstd_level` 0 is searched for instead.
+    /// null to search. One whose compressor these options leave out is searched for instead.
     const Encoding* hint{nullptr};
 };
 
@@ -67,7 +76,7 @@ struct Choice {
 Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, std::string& out);
 
 /// Appends to `out` the block of `values` in `encoding` - for the tests and the cost benchmark;
-/// `zstd_level` applies when the encoding compresses. Returns the block's size.
+/// `zstd_level` applies when the encoding compresses with ZSTD. Returns the block's size.
 size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int zstd_level,
                  std::string& out);
 

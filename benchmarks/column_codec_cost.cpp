@@ -6,9 +6,10 @@
 //
 //   - format 2's read: its file's bytes, in memory, to the typed column the store reads into - a
 //     copy for the four raw columns, the decoders for price, quantity and sequence number;
-//   - each of the nine candidates (design §3): its encode, and its decode into the same type;
-//   - the choice itself, `column_codec::encode()`, at ZSTD levels 1 and 3: what sealing a segment
-//     would cost, and the decode of what it chose.
+//   - each candidate (design §3): its encode, and its decode into the same type;
+//   - the choice itself, `column_codec::encode()`, under the engine's policies - a seal's (LZ4 or
+//     nothing), a merge's (ZSTD at 3 where it saves 10% over LZ4) and the smallest: what writing
+//     a segment costs, and the decode of what it chose.
 //
 // Bytes in memory on both sides, so this is the codec and nothing of the disk or the page cache.
 // Each timing is the fastest of five passes over every segment, in ns a value.
@@ -115,13 +116,41 @@ bool v3_read(size_t c, const std::string& block, size_t rows) {
     }
 }
 
-const cc::Encoding kNine[] = {
-    {cc::Transform::kFor, cc::Packing::kSimple8b, false}, {cc::Transform::kFor, cc::Packing::kRuns, false},
-    {cc::Transform::kFor, cc::Packing::kBlocks, false},   {cc::Transform::kDelta, cc::Packing::kSimple8b, false},
-    {cc::Transform::kDelta, cc::Packing::kRuns, false},   {cc::Transform::kFor, cc::Packing::kRuns, true},
-    {cc::Transform::kFor, cc::Packing::kNarrow, true},    {cc::Transform::kDelta, cc::Packing::kRuns, true},
-    {cc::Transform::kDelta, cc::Packing::kNarrow, true},
+std::vector<cc::Encoding> candidates() {
+    std::vector<cc::Encoding> out = {
+        {cc::Transform::kFor, cc::Packing::kSimple8b, cc::Compressor::kNone},
+        {cc::Transform::kFor, cc::Packing::kRuns, cc::Compressor::kNone},
+        {cc::Transform::kFor, cc::Packing::kBlocks, cc::Compressor::kNone},
+        {cc::Transform::kDelta, cc::Packing::kSimple8b, cc::Compressor::kNone},
+        {cc::Transform::kDelta, cc::Packing::kRuns, cc::Compressor::kNone},
+    };
+    for (cc::Compressor z : {cc::Compressor::kLz4, cc::Compressor::kZstd}) {
+        for (cc::Transform t : {cc::Transform::kFor, cc::Transform::kDelta}) {
+            for (cc::Packing p : {cc::Packing::kRuns, cc::Packing::kNarrow}) out.push_back({t, p, z});
+        }
+    }
+    return out;
+}
+
+/// The engine's two policies (engine.hpp): a seal's, LZ4 or nothing, and a merge's, ZSTD at 3
+/// where it saves 10% over LZ4.
+struct Policy {
+    const char* name;
+    cc::EncodeOptions options;
 };
+std::vector<Policy> policies() {
+    cc::EncodeOptions seal;
+    seal.lz4 = true;
+    seal.zstd_level = 0;
+    cc::EncodeOptions merge;
+    merge.lz4 = true;
+    merge.zstd_level = 3;
+    merge.zstd_margin_pct = 10;
+    cc::EncodeOptions smallest;
+    smallest.lz4 = true;
+    smallest.zstd_level = 3;
+    return {{"seal", seal}, {"merge", merge}, {"smallest", smallest}};
+}
 
 }  // namespace
 
@@ -172,9 +201,9 @@ int main(int argc, char** argv) {
         std::printf("    \"%s\": {\"v2\": {\"bytes_per_row\": %.3f, \"read_ns\": %.2f}, \"candidates\": {",
                     kNames[c], static_cast<double>(v2_bytes) / rows, v2_ns);
         bool first = true;
-        for (const cc::Encoding& e : kNine) {
+        for (const cc::Encoding& e : candidates()) {
             for (int level : {1, 3}) {
-                if (!e.zstd && level == 3) continue;
+                if (e.compressor != cc::Compressor::kZstd && level == 3) continue;
                 std::vector<std::string> blocks(segs.size());
                 const double enc_ns = fastest_ns([&] {
                     for (size_t i = 0; i < segs.size(); ++i) {
@@ -191,7 +220,7 @@ int main(int argc, char** argv) {
                 const double dec_ns = fastest_ns([&] {
                     for (size_t i = 0; i < segs.size(); ++i) v3_read(c, blocks[i], segs[i].rows);
                 }, rows);
-                const std::string key = e.name() + (e.zstd ? std::to_string(level) : "");
+                const std::string key = e.name() + (e.compressor == cc::Compressor::kZstd ? std::to_string(level) : "");
                 std::printf("%s\"%s\": {\"bytes_per_row\": %.3f, \"encode_ns\": %.2f, \"decode_ns\": %.2f%s}",
                             first ? "" : ", ", key.c_str(), static_cast<double>(bytes) / rows, enc_ns, dec_ns,
                             ok ? "" : ", \"decode_failed\": true");
@@ -200,13 +229,13 @@ int main(int argc, char** argv) {
         }
         std::printf("}, \"choice\": {");
         first = true;
-        for (int level : {1, 3}) {
+        for (const Policy& policy : policies()) {
             std::vector<std::string> blocks(segs.size());
             std::vector<cc::Choice> chosen(segs.size());
             const double enc_ns = fastest_ns([&] {
                 for (size_t i = 0; i < segs.size(); ++i) {
                     blocks[i].clear();
-                    chosen[i] = cc::encode(segs[i].values[c], cc::EncodeOptions{level, 0}, blocks[i]);
+                    chosen[i] = cc::encode(segs[i].values[c], policy.options, blocks[i]);
                 }
             }, rows);
             size_t bytes = 0;
@@ -214,12 +243,15 @@ int main(int argc, char** argv) {
             const double dec_ns = fastest_ns([&] {
                 for (size_t i = 0; i < segs.size(); ++i) v3_read(c, blocks[i], segs[i].rows);
             }, rows);
-            size_t zstd_segments = 0;
-            for (const auto& ch : chosen) zstd_segments += ch.encoding.zstd;
-            std::printf("%s\"zstd%d\": {\"bytes_per_row\": %.3f, \"encode_ns\": %.2f, \"decode_ns\": %.2f, "
-                        "\"segments_compressed\": %zu, \"first_choice\": \"%s\"}",
-                        first ? "" : ", ", level, static_cast<double>(bytes) / rows, enc_ns, dec_ns,
-                        zstd_segments, chosen[0].encoding.name().c_str());
+            size_t lz4_segments = 0, zstd_segments = 0;
+            for (const auto& ch : chosen) {
+                lz4_segments += ch.encoding.compressor == cc::Compressor::kLz4;
+                zstd_segments += ch.encoding.compressor == cc::Compressor::kZstd;
+            }
+            std::printf("%s\"%s\": {\"bytes_per_row\": %.3f, \"encode_ns\": %.2f, \"decode_ns\": %.2f, "
+                        "\"segments_lz4\": %zu, \"segments_zstd\": %zu, \"first_choice\": \"%s\"}",
+                        first ? "" : ", ", policy.name, static_cast<double>(bytes) / rows, enc_ns, dec_ns,
+                        lz4_segments, zstd_segments, chosen[0].encoding.name().c_str());
             first = false;
         }
         std::printf("}}%s\n", c + 1 < 7 ? "," : "");

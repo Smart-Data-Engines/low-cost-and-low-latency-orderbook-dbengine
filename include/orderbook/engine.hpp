@@ -810,14 +810,18 @@ private:
     // moves through five steps across ticks - written, synced, published, synced, inputs removed -
     // and each field is one step's list.
     bool compaction_enabled_{true};
-    // A seal reuses its store's last choice of encodings and searches every sixteenth segment; a
-    // merge searches always, writing what stays (segment format v3, design §3). Measured choices,
-    // not guesses: kiro-workspace/specs/segment-format-v3/.
-    ColumnarStore::SegmentFormat seal_format_{default_segment_format(1, 16)};
-    ColumnarStore::SegmentFormat merge_format_{default_segment_format(3, 1)};
-    static ColumnarStore::SegmentFormat default_segment_format(int zstd_level, uint32_t search_every) {
+    // A seal - what queries read most - writes LZ4 or nothing, reusing its store's last choice and
+    // searching every sixteenth segment; a merge searches always and takes ZSTD where it saves 10%
+    // over LZ4, since what it writes is what stays (segment format v3, design §3). Measured
+    // choices, not guesses: kiro-workspace/specs/segment-format-v3/.
+    ColumnarStore::SegmentFormat seal_format_{default_segment_format(0, 0, 16)};
+    ColumnarStore::SegmentFormat merge_format_{default_segment_format(3, 10, 1)};
+    static ColumnarStore::SegmentFormat default_segment_format(int zstd_level, unsigned zstd_margin_pct,
+                                                               uint32_t search_every) {
         ColumnarStore::SegmentFormat f;
+        f.search.lz4 = true;
         f.search.zstd_level = zstd_level;
+        f.search.zstd_margin_pct = zstd_margin_pct;
         f.search_every = search_every;
         return f;
     }

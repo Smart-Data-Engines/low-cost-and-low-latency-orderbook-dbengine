@@ -126,9 +126,11 @@ def clickhouse_columns(ch: ClickHouseSystem, table: str) -> dict[str, int]:
 
 
 def clickhouse_allocated(ch: ClickHouseSystem, table: str) -> int | None:
-    """The table's directories as the file system allocates them, asked of `du`."""
-    paths = ch._ask("SELECT arrayJoin(data_paths) FROM system.tables "
-                    f"WHERE database = 'ob_bench' AND name = '{table}'").split()
+    """The table's active parts as the file system allocates them, asked of `du`. Active only: a
+    merge leaves the parts it replaced on the disk for `old_parts_lifetime` (eight minutes by
+    default), and the table's directory counted them too."""
+    paths = ch._ask("SELECT path FROM system.parts "
+                    f"WHERE database = 'ob_bench' AND table = '{table}' AND active").split()
     sizes = [allocated_bytes(p) for p in paths]
     return None if not sizes or any(x is None for x in sizes) else sum(x for x in sizes if x)
 

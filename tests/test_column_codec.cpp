@@ -23,7 +23,9 @@ std::vector<Encoding> all_encodings() {
     std::vector<Encoding> out;
     for (Transform t : {Transform::kNone, Transform::kFor, Transform::kDelta}) {
         for (Packing p : {Packing::kSimple8b, Packing::kRuns, Packing::kBlocks, Packing::kNarrow}) {
-            for (bool z : {false, true}) out.push_back(Encoding{t, p, z});
+            for (Compressor c : {Compressor::kNone, Compressor::kZstd, Compressor::kLz4}) {
+                out.push_back(Encoding{t, p, c});
+            }
         }
     }
     return out;
@@ -109,21 +111,27 @@ RC_GTEST_PROP(ColumnCodec, EveryEncodingGivesBackAnyColumn, ()) {
 TEST(ColumnCodec, TheChoiceIsTheSmallestCandidateAndGivesItsValuesBack) {
     for (const auto& column : edge_columns()) {
         std::string chosen;
-        const Choice c = encode(column, EncodeOptions{3, 0}, chosen);
+        const Choice c = encode(column, EncodeOptions{}, chosen);
         ASSERT_EQ(c.bytes, chosen.size());
         std::vector<uint64_t> back;
         std::string why;
         ASSERT_TRUE(decode(bytes(chosen), column.size(), back, &why)) << c.encoding.name() << ": " << why;
         ASSERT_EQ(back, column);
-        // No candidate of the nine is smaller.
-        const Encoding nine[] = {
-            {Transform::kFor, Packing::kSimple8b, false}, {Transform::kFor, Packing::kRuns, false},
-            {Transform::kFor, Packing::kBlocks, false},   {Transform::kDelta, Packing::kSimple8b, false},
-            {Transform::kDelta, Packing::kRuns, false},   {Transform::kFor, Packing::kRuns, true},
-            {Transform::kFor, Packing::kNarrow, true},    {Transform::kDelta, Packing::kRuns, true},
-            {Transform::kDelta, Packing::kNarrow, true},
+        // No candidate is smaller: the five uncompressed, and runs and narrow of each transform
+        // under each compressor.
+        std::vector<Encoding> candidates = {
+            {Transform::kFor, Packing::kSimple8b, Compressor::kNone},
+            {Transform::kFor, Packing::kRuns, Compressor::kNone},
+            {Transform::kFor, Packing::kBlocks, Compressor::kNone},
+            {Transform::kDelta, Packing::kSimple8b, Compressor::kNone},
+            {Transform::kDelta, Packing::kRuns, Compressor::kNone},
         };
-        for (const Encoding& e : nine) {
+        for (Compressor z : {Compressor::kLz4, Compressor::kZstd}) {
+            for (Transform t : {Transform::kFor, Transform::kDelta}) {
+                for (Packing p : {Packing::kRuns, Packing::kNarrow}) candidates.push_back(Encoding{t, p, z});
+            }
+        }
+        for (const Encoding& e : candidates) {
             std::string other;
             encode_as(column, e, 3, other);
             EXPECT_LE(chosen.size(), other.size()) << c.encoding.name() << " chosen over " << e.name();
@@ -138,17 +146,31 @@ TEST(ColumnCodec, ACompressedCandidateMustSaveTheMarginToBeChosen) {
     for (int s = 0; s < 200; ++s) {
         for (uint64_t l = 0; l < 20; ++l) qty.push_back(100'000 + l * 7'919 % 5'003);
     }
-    std::string a, b, c;
-    const Choice free = encode(qty, EncodeOptions{3, 0}, a);
-    EXPECT_TRUE(free.encoding.zstd) << free.encoding.name();
+    std::string a, b, c, d, e;
+    EncodeOptions options;
+    const Choice free = encode(qty, options, a);
+    EXPECT_NE(free.encoding.compressor, Compressor::kNone) << free.encoding.name();
     // A margin it cannot meet - it would have to save all of it - keeps the uncompressed one.
-    const Choice never = encode(qty, EncodeOptions{3, 100}, b);
-    EXPECT_FALSE(never.encoding.zstd) << never.encoding.name();
+    options.compressed_margin_pct = 100;
+    const Choice never = encode(qty, options, b);
+    EXPECT_EQ(never.encoding.compressor, Compressor::kNone) << never.encoding.name();
     EXPECT_EQ(never.bytes, never.uncompressed_bytes);
-    // And without ZSTD at all, the same.
-    const Choice none = encode(qty, EncodeOptions{0, 0}, c);
-    EXPECT_FALSE(none.encoding.zstd);
+    // And with neither compressor tried, the same.
+    EncodeOptions none_tried;
+    none_tried.lz4 = false;
+    none_tried.zstd_level = 0;
+    const Choice none = encode(qty, none_tried, c);
+    EXPECT_EQ(none.encoding.compressor, Compressor::kNone);
     EXPECT_EQ(none.bytes, never.bytes);
+    // ZSTD over LZ4 only past its own margin: here ZSTD is smaller, and a margin of all of it
+    // leaves LZ4.
+    EncodeOptions zstd_free;
+    const Choice zstd_chosen = encode(qty, zstd_free, d);
+    ASSERT_EQ(zstd_chosen.encoding.compressor, Compressor::kZstd) << zstd_chosen.encoding.name();
+    EncodeOptions zstd_never;
+    zstd_never.zstd_margin_pct = 100;
+    const Choice lz4_kept = encode(qty, zstd_never, e);
+    EXPECT_EQ(lz4_kept.encoding.compressor, Compressor::kLz4) << lz4_kept.encoding.name();
 }
 
 TEST(ColumnCodec, ADivisorTakesTheTickOutOfAPrice) {
@@ -162,8 +184,11 @@ TEST(ColumnCodec, ADivisorTakesTheTickOutOfAPrice) {
         scaled.push_back(p * 1'000'000);
     }
     std::string a, b;
-    const Choice in_ticks = encode(ticks, EncodeOptions{0, 0}, a);
-    const Choice in_units = encode(scaled, EncodeOptions{0, 0}, b);
+    EncodeOptions uncompressed;
+    uncompressed.lz4 = false;
+    uncompressed.zstd_level = 0;
+    const Choice in_ticks = encode(ticks, uncompressed, a);
+    const Choice in_units = encode(scaled, uncompressed, b);
     EXPECT_LE(in_units.bytes, in_ticks.bytes + 8) << in_ticks.encoding.name() << " " << in_units.encoding.name();
 }
 
@@ -171,7 +196,7 @@ TEST(ColumnCodec, ANarrowColumnTypeTakesItsValuesAndRefusesOthers) {
     std::vector<uint64_t> levels;
     for (uint64_t i = 0; i < 400; ++i) levels.push_back(i % 20);
     std::string block;
-    encode(levels, EncodeOptions{3, 0}, block);
+    encode(levels, EncodeOptions{}, block);
     std::vector<uint16_t> as16;
     std::vector<uint8_t> as8;
     std::string why;
@@ -181,7 +206,7 @@ TEST(ColumnCodec, ANarrowColumnTypeTakesItsValuesAndRefusesOthers) {
 
     levels.push_back(256);
     block.clear();
-    encode(levels, EncodeOptions{3, 0}, block);
+    encode(levels, EncodeOptions{}, block);
     EXPECT_FALSE(decode_as(bytes(block), levels.size(), as8, &why));
     EXPECT_NE(why.find("type"), std::string::npos) << why;
     EXPECT_TRUE(decode_as(bytes(block), levels.size(), as16, &why)) << why;
@@ -191,7 +216,7 @@ TEST(ColumnCodec, ANarrowColumnTypeTakesItsValuesAndRefusesOthers) {
                                       std::numeric_limits<int64_t>::max()};
     std::vector<uint64_t> as_unsigned(seq.begin(), seq.end());
     block.clear();
-    encode(as_unsigned, EncodeOptions{3, 0}, block);
+    encode(as_unsigned, EncodeOptions{}, block);
     std::vector<int64_t> back;
     ASSERT_TRUE(decode_as(bytes(block), seq.size(), back, &why)) << why;
     EXPECT_EQ(back, seq);
@@ -220,15 +245,16 @@ TEST(ColumnCodec, ABlockThatIsNotWhatTheEncoderWritesIsRefused) {
     }
     // Encoding bits no encoder writes.
     std::string block;
-    encode_as(column, Encoding{Transform::kFor, Packing::kSimple8b, false}, 3, block);
-    for (uint8_t bad : {uint8_t{0x03}, uint8_t{0x40}, uint8_t{0x80}}) {
+    encode_as(column, Encoding{Transform::kFor, Packing::kSimple8b, Compressor::kNone}, 3, block);
+    // Transform 3, ZSTD and LZ4 at once, bit 7.
+    for (uint8_t bad : {uint8_t{0x03}, uint8_t{0x60}, uint8_t{0x80}}) {
         std::string b = block;
         b[0] = static_cast<char>(static_cast<uint8_t>(b[0]) | bad);
         EXPECT_FALSE(decode(bytes(b), column.size(), out, &why)) << int(bad);
     }
     // A narrow width outside 1 - 8.
     std::string narrow;
-    encode_as(column, Encoding{Transform::kFor, Packing::kNarrow, false}, 3, narrow);
+    encode_as(column, Encoding{Transform::kFor, Packing::kNarrow, Compressor::kNone}, 3, narrow);
     for (char w : {char{0}, char{9}}) {
         std::string b = narrow;
         b[1] = w;
@@ -237,28 +263,32 @@ TEST(ColumnCodec, ABlockThatIsNotWhatTheEncoderWritesIsRefused) {
 }
 
 TEST(ColumnCodec, ACompressedBlockMustDecompressToTheLengthItDeclares) {
-    // A ZSTD frame that is whole and sound, under a header declaring one byte more or one less than
-    // it holds: the declared length is what the unpacking is sized by, so it has to be the frame's.
+    // A frame that is whole and sound, under a header declaring one byte more or one less than it
+    // holds: the declared length is what the unpacking is sized by, so it has to be the frame's.
     std::vector<uint64_t> column;
     for (uint64_t i = 0; i < 2000; ++i) column.push_back(5'000 + i % 37);
-    std::string block;
-    encode_as(column, Encoding{Transform::kFor, Packing::kNarrow, true}, 3, block);
-    // The header: encoding byte, narrow width, then the count, the anchor and the packed length as
-    // varints - the scale is absent, since the values share no divisor past 1.
-    size_t at = 2;
-    uint64_t count = 0, anchor = 0, packed = 0;
-    ASSERT_TRUE(get_varint(bytes(block), at, count));
-    ASSERT_TRUE(get_varint(bytes(block), at, anchor));
-    const size_t length_at = at;
-    ASSERT_TRUE(get_varint(bytes(block), at, packed));
-    std::vector<uint64_t> out;
-    std::string why;
-    ASSERT_TRUE(decode(bytes(block), column.size(), out, &why)) << why;
-    for (const uint64_t declared : {packed - 1, packed + 1}) {
-        std::string tail;
-        put_varint(tail, declared);
-        std::string changed = block.substr(0, length_at) + tail + block.substr(at);
-        EXPECT_FALSE(decode(bytes(changed), column.size(), out, &why)) << "declared " << declared;
+    for (const Compressor compressor : {Compressor::kZstd, Compressor::kLz4}) {
+        SCOPED_TRACE(static_cast<int>(compressor));
+        std::string block;
+        encode_as(column, Encoding{Transform::kFor, Packing::kNarrow, compressor}, 3, block);
+        // The header: encoding byte, narrow width, then the count, the anchor and the packed length
+        // as varints - the scale is absent, since the values share no divisor past 1.
+        size_t at = 2;
+        uint64_t count = 0, anchor = 0, packed = 0;
+        ASSERT_TRUE(get_varint(bytes(block), at, count));
+        ASSERT_TRUE(get_varint(bytes(block), at, anchor));
+        const size_t length_at = at;
+        ASSERT_TRUE(get_varint(bytes(block), at, packed));
+        std::vector<uint64_t> out;
+        std::string why;
+        ASSERT_TRUE(decode(bytes(block), column.size(), out, &why)) << why;
+        ASSERT_EQ(out, column);
+        for (const uint64_t declared : {packed - 1, packed + 1}) {
+            std::string tail;
+            put_varint(tail, declared);
+            std::string changed = block.substr(0, length_at) + tail + block.substr(at);
+            EXPECT_FALSE(decode(bytes(changed), column.size(), out, &why)) << "declared " << declared;
+        }
     }
 }
 

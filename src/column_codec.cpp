@@ -3,6 +3,7 @@
 #include "orderbook/codec.hpp"
 #include "orderbook/logger.hpp"
 
+#include <lz4.h>
 #include <zstd.h>
 
 #include <algorithm>
@@ -16,13 +17,13 @@ namespace ob::column_codec {
 // ── The block ────────────────────────────────────────────────────────────────
 //
 //   u8      encoding: bits 0-1 the transform, bit 2 divided by a scale, bits 3-4 the packing,
-//           bit 5 ZSTD, bits 6-7 zero
+//           bit 5 ZSTD, bit 6 LZ4 (not both), bit 7 zero
 //   u8      narrow packing only: the bytes a value takes, 1 - 8
 //   varint  the values in the column - Simple8b pads its last word with zeros, so the words
 //           alone do not say how many there are
 //   varint  the anchor: for - the minimum; delta - the first value; none - absent
 //   varint  scaled only: the divisor, 2 or more
-//   varint  ZSTD only: the packed payload's length before compression
+//   varint  compressed only: the packed payload's length before compression
 //   ...     the payload, to the end of the block
 //
 // The payload, by packing (after decompression when compressed):
@@ -37,11 +38,13 @@ namespace {
 
 constexpr uint8_t kScaledBit = 1u << 2;
 constexpr uint8_t kZstdBit = 1u << 5;
+constexpr uint8_t kLz4Bit = 1u << 6;
 constexpr size_t kBlockValues = 128;
 
-uint8_t encoding_byte(Transform t, bool scaled, Packing p, bool zstd) {
+uint8_t encoding_byte(Transform t, bool scaled, Packing p, Compressor c) {
     return static_cast<uint8_t>(static_cast<uint8_t>(t) | (scaled ? kScaledBit : 0) |
-                                (static_cast<uint8_t>(p) << 3) | (zstd ? kZstdBit : 0));
+                                (static_cast<uint8_t>(p) << 3) |
+                                (c == Compressor::kZstd ? kZstdBit : c == Compressor::kLz4 ? kLz4Bit : 0));
 }
 
 uint64_t zigzag(bool negative, uint64_t magnitude) {
@@ -235,6 +238,18 @@ void pack_narrow(const std::vector<uint64_t>& v, unsigned width, std::string& ou
     }
 }
 
+bool lz4_compress(const std::string& in, std::string& out) {
+    out.resize(static_cast<size_t>(LZ4_compressBound(static_cast<int>(in.size()))));
+    const int n = LZ4_compress_default(in.data(), out.data(), static_cast<int>(in.size()),
+                                       static_cast<int>(out.size()));
+    if (n <= 0) {
+        out.clear();
+        return false;
+    }
+    out.resize(static_cast<size_t>(n));
+    return true;
+}
+
 /// One compression context a thread, kept: a context made per call allocates its tables each time.
 bool zstd_compress(const std::string& in, int level, std::string& out) {
     thread_local ZSTD_CCtx* cctx = ZSTD_createCCtx();
@@ -248,21 +263,27 @@ bool zstd_compress(const std::string& in, int level, std::string& out) {
     return true;
 }
 
-void put_header(std::string& out, const Stream& s, Packing p, unsigned width, bool zstd,
+void put_header(std::string& out, const Stream& s, Packing p, unsigned width, Compressor c,
                 size_t packed_bytes) {
-    out.push_back(static_cast<char>(encoding_byte(s.transform, s.scale > 1, p, zstd)));
+    out.push_back(static_cast<char>(encoding_byte(s.transform, s.scale > 1, p, c)));
     if (p == Packing::kNarrow) out.push_back(static_cast<char>(width));
     put_varint(out, s.count);
     if (s.transform != Transform::kNone) put_varint(out, s.anchor);
     if (s.scale > 1) put_varint(out, s.scale);
-    if (zstd) put_varint(out, packed_bytes);
+    if (c != Compressor::kNone) put_varint(out, packed_bytes);
 }
 
-size_t header_bytes(const Stream& s, Packing p, bool zstd, size_t packed_bytes) {
+size_t header_bytes(const Stream& s, Packing p, Compressor c, size_t packed_bytes) {
     thread_local std::string h;
     h.clear();
-    put_header(h, s, p, 1, zstd, packed_bytes);
+    put_header(h, s, p, 1, c, packed_bytes);
     return h.size();
+}
+
+/// `in` compressed by `c` into `out`; false when it could not be, which LZ4 and ZSTD do not do for
+/// a valid level and a buffer of their bound.
+bool compress(Compressor c, const std::string& in, int zstd_level, std::string& out) {
+    return c == Compressor::kZstd ? zstd_compress(in, zstd_level, out) : lz4_compress(in, out);
 }
 
 void pack(const Stream& s, Packing p, unsigned width, std::string& out) {
@@ -274,23 +295,23 @@ void pack(const Stream& s, Packing p, unsigned width, std::string& out) {
     }
 }
 
-/// `s` packed as `p`, compressed or not, as a whole block appended to `out`; its size.
-size_t emit(const Stream& s, Packing p, bool zstd, int zstd_level, std::string& out) {
+/// `s` packed as `p`, compressed by `c` or not, as a whole block appended to `out`; its size.
+size_t emit(const Stream& s, Packing p, Compressor c, int zstd_level, std::string& out) {
     const unsigned width = p == Packing::kNarrow ? narrow_width(s.values) : 0;
     thread_local std::string packed, compressed;
     packed.clear();
     pack(s, p, width, packed);
     const size_t at = out.size();
-    if (zstd && zstd_compress(packed, zstd_level, compressed)) {
-        put_header(out, s, p, width, true, packed.size());
+    if (c != Compressor::kNone && compress(c, packed, zstd_level, compressed)) {
+        put_header(out, s, p, width, c, packed.size());
         out += compressed;
         return out.size() - at;
     }
-    if (zstd) {
-        OB_LOG_WARN("codec", "ZSTD could not compress %zu bytes at level %d; the block is written "
-                             "uncompressed", packed.size(), zstd_level);
+    if (c != Compressor::kNone) {
+        OB_LOG_WARN("codec", "%s could not compress %zu bytes; the block is written uncompressed",
+                    c == Compressor::kZstd ? "ZSTD" : "LZ4", packed.size());
     }
-    put_header(out, s, p, width, false, 0);
+    put_header(out, s, p, width, Compressor::kNone, 0);
     out += packed;
     return out.size() - at;
 }
@@ -352,7 +373,7 @@ bool unpack_blocks(std::span<const char> p, size_t n, std::vector<uint64_t>& out
 struct Header {
     Transform transform{Transform::kNone};
     Packing packing{Packing::kSimple8b};
-    bool zstd{false};
+    Compressor compressor{Compressor::kNone};
     unsigned width{0};
     uint64_t anchor{0};
     uint64_t scale{1};
@@ -364,13 +385,17 @@ struct Header {
 bool read_header(std::span<const char> block, size_t count, Header& h, std::string* why) {
     if (block.empty()) return fail(why, "an empty block");
     const auto e = static_cast<uint8_t>(block[0]);
-    if ((e & 0xC0) != 0) return fail(why, "unknown encoding bits");
+    if ((e & 0x80) != 0 || (e & (kZstdBit | kLz4Bit)) == (kZstdBit | kLz4Bit)) {
+        return fail(why, "unknown encoding bits");
+    }
     const auto t = static_cast<uint8_t>(e & 0x3);
     if (t > 2) return fail(why, "unknown transform");
     h.transform = static_cast<Transform>(t);
     const bool scaled = (e & kScaledBit) != 0;
     h.packing = static_cast<Packing>((e >> 3) & 0x3);
-    h.zstd = (e & kZstdBit) != 0;
+    h.compressor = (e & kZstdBit) != 0 ? Compressor::kZstd
+                 : (e & kLz4Bit) != 0  ? Compressor::kLz4
+                                       : Compressor::kNone;
     size_t at = 1;
     h.width = 0;
     if (h.packing == Packing::kNarrow) {
@@ -391,7 +416,7 @@ bool read_header(std::span<const char> block, size_t count, Header& h, std::stri
     }
     h.n = h.transform == Transform::kDelta ? (count == 0 ? 0 : count - 1) : count;
     h.packed = 0;
-    if (h.zstd) {
+    if (h.compressor != Compressor::kNone) {
         if (!get_varint(block, at, h.packed)) return fail(why, "header cut short");
         // No packing takes more than 32 bytes a value (runs at Simple8b's worst, two words for each
         // of a value and a length), so a declared length past that is not a block of this count.
@@ -407,17 +432,30 @@ bool read_header(std::span<const char> block, size_t count, Header& h, std::stri
 /// buffer, which it is then a view of.
 bool payload_of(std::span<const char> block, const Header& h, std::span<const char>& payload,
                 std::string* why) {
-    if (!h.zstd) {
+    if (h.compressor == Compressor::kNone) {
         payload = block.subspan(h.payload_at);
         return true;
     }
-    thread_local ZSTD_DCtx* dctx = ZSTD_createDCtx();
     thread_local std::string plain;
     plain.resize(static_cast<size_t>(h.packed));
-    const size_t got = ZSTD_decompressDCtx(dctx, plain.data(), plain.size(), block.data() + h.payload_at,
-                                           block.size() - h.payload_at);
-    if (ZSTD_isError(got) || got != h.packed) {
-        return fail(why, "ZSTD payload does not decompress to its declared length");
+    const char* src = block.data() + h.payload_at;
+    const size_t src_size = block.size() - h.payload_at;
+    if (h.compressor == Compressor::kZstd) {
+        thread_local ZSTD_DCtx* dctx = ZSTD_createDCtx();
+        const size_t got = ZSTD_decompressDCtx(dctx, plain.data(), plain.size(), src, src_size);
+        if (ZSTD_isError(got) || got != h.packed) {
+            return fail(why, "ZSTD payload does not decompress to its declared length");
+        }
+    } else {
+        // LZ4 takes int lengths; the declared one is bounded above, and the block's own is a file's.
+        if (src_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return fail(why, "an LZ4 payload longer than LZ4 takes");
+        }
+        const int got = LZ4_decompress_safe(src, plain.data(), static_cast<int>(src_size),
+                                            static_cast<int>(plain.size()));
+        if (got < 0 || static_cast<uint64_t>(got) != h.packed) {
+            return fail(why, "LZ4 payload does not decompress to its declared length");
+        }
     }
     payload = std::span<const char>(plain.data(), plain.size());
     return true;
@@ -562,7 +600,8 @@ std::string Encoding::name() const {
     case Packing::kBlocks:   s += "blocks"; break;
     case Packing::kNarrow:   s += "narrow"; break;
     }
-    if (zstd) s += "+zstd";
+    if (compressor == Compressor::kZstd) s += "+zstd";
+    if (compressor == Compressor::kLz4) s += "+lz4";
     return s;
 }
 
@@ -599,102 +638,130 @@ size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int
     case Transform::kFor:   transform_for(values, s); break;
     case Transform::kDelta: transform_delta(values, s); break;
     }
-    return emit(s, encoding.packing, encoding.zstd, zstd_level, out);
+    return emit(s, encoding.packing, encoding.compressor, zstd_level, out);
 }
 
 Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, std::string& out) {
-    if (options.hint != nullptr && (!options.hint->zstd || options.zstd_level != 0)) {
+    if (options.hint != nullptr &&
+        (options.hint->compressor == Compressor::kNone ||
+         (options.hint->compressor == Compressor::kLz4 && options.lz4) ||
+         (options.hint->compressor == Compressor::kZstd && options.zstd_level != 0))) {
         Choice choice;
         choice.encoding = *options.hint;
         choice.bytes = encode_as(values, *options.hint, options.zstd_level, out);
         choice.uncompressed_bytes = choice.bytes;
         return choice;
     }
-    // Design §3: both transforms; uncompressed Simple8b and runs of each, blocks of `for`; and,
-    // under ZSTD, runs and narrow of each. Each payload is packed once, and compressed once, and
-    // the chosen one is written from what was packed rather than packed again.
+    // Design §3: both transforms; uncompressed Simple8b and runs of each, blocks of `for`; and, under
+    // LZ4 and under ZSTD where these options try them, runs and narrow of each. Each payload is
+    // packed once and compressed once per compressor, and the chosen block is written from what was
+    // packed rather than packed again.
     thread_local Stream streams[2];
-    thread_local std::string s8b[2], runs[2], narrow[2], z_runs[2], z_narrow[2];
+    thread_local std::string s8b[2], runs[2], narrow[2];
+    thread_local std::string compressed[2][2][2];   // [compressor: lz4, zstd][stream][runs, narrow]
     transform_for(values, streams[0]);
     transform_delta(values, streams[1]);
 
-    enum class What { kS8b, kRuns, kBlocks, kZRuns, kZNarrow };
+    enum class What { kS8b, kRuns, kBlocks, kCompressedRuns, kCompressedNarrow };
     struct Best {
         int stream{0};
         What what{What::kS8b};
+        Compressor compressor{Compressor::kNone};
         size_t bytes{std::numeric_limits<size_t>::max()};
-    } light, best;
-
+    };
+    Best light, lz4, zstd;
     for (int t = 0; t < 2; ++t) {
         const Stream& s = streams[t];
         s8b[t].clear();
         put_u64_words(s8b[t], encode_simple8b(s.values).words);
         runs[t].clear();
         pack_runs(s.values, runs[t]);
-        const size_t b_s8b = header_bytes(s, Packing::kSimple8b, false, 0) + s8b[t].size();
-        const size_t b_runs = header_bytes(s, Packing::kRuns, false, 0) + runs[t].size();
-        if (b_s8b < light.bytes) light = Best{t, What::kS8b, b_s8b};
-        if (b_runs < light.bytes) light = Best{t, What::kRuns, b_runs};
+        const size_t b_s8b = header_bytes(s, Packing::kSimple8b, Compressor::kNone, 0) + s8b[t].size();
+        const size_t b_runs = header_bytes(s, Packing::kRuns, Compressor::kNone, 0) + runs[t].size();
+        if (b_s8b < light.bytes) light = Best{t, What::kS8b, Compressor::kNone, b_s8b};
+        if (b_runs < light.bytes) light = Best{t, What::kRuns, Compressor::kNone, b_runs};
         if (t == 0) {
-            const size_t b_blocks = header_bytes(s, Packing::kBlocks, false, 0) + blocks_bytes(s.values);
-            if (b_blocks < light.bytes) light = Best{t, What::kBlocks, b_blocks};
+            const size_t b_blocks =
+                header_bytes(s, Packing::kBlocks, Compressor::kNone, 0) + blocks_bytes(s.values);
+            if (b_blocks < light.bytes) light = Best{t, What::kBlocks, Compressor::kNone, b_blocks};
         }
     }
-    best = light;
-    if (options.zstd_level != 0) {
-        const uint64_t margin = 100 - std::min(options.zstd_margin_pct, 100u);
-        auto consider = [&](int t, What what, size_t bytes) {
-            // Chosen only when smaller by the margin: 100 * bytes < (100 - margin) * light.
-            if (100 * static_cast<uint64_t>(bytes) < margin * light.bytes && bytes < best.bytes) {
-                best = Best{t, what, bytes};
-            }
-        };
+    const bool try_lz4 = options.lz4;
+    const bool try_zstd = options.zstd_level != 0;
+    if (try_lz4 || try_zstd) {
+        for (int t = 0; t < 2; ++t) {
+            narrow[t].clear();
+            pack_narrow(streams[t].values, narrow_width(streams[t].values), narrow[t]);
+        }
+    }
+    for (int c = 0; c < 2; ++c) {
+        const Compressor compressor = c == 0 ? Compressor::kLz4 : Compressor::kZstd;
+        if ((c == 0 && !try_lz4) || (c == 1 && !try_zstd)) continue;
+        Best& best_here = c == 0 ? lz4 : zstd;
         for (int t = 0; t < 2; ++t) {
             const Stream& s = streams[t];
-            narrow[t].clear();
-            pack_narrow(s.values, narrow_width(s.values), narrow[t]);
-            if (zstd_compress(runs[t], options.zstd_level, z_runs[t])) {
-                consider(t, What::kZRuns, header_bytes(s, Packing::kRuns, true, runs[t].size()) + z_runs[t].size());
-            }
-            if (zstd_compress(narrow[t], options.zstd_level, z_narrow[t])) {
-                consider(t, What::kZNarrow,
-                         header_bytes(s, Packing::kNarrow, true, narrow[t].size()) + z_narrow[t].size());
+            std::string* payloads[2] = {&runs[t], &narrow[t]};
+            for (int k = 0; k < 2; ++k) {
+                std::string& z = compressed[c][t][k];
+                if (!compress(compressor, *payloads[k], options.zstd_level, z)) continue;
+                const Packing packing = k == 0 ? Packing::kRuns : Packing::kNarrow;
+                const size_t bytes = header_bytes(s, packing, compressor, payloads[k]->size()) + z.size();
+                if (bytes < best_here.bytes) {
+                    best_here = Best{t, k == 0 ? What::kCompressedRuns : What::kCompressedNarrow,
+                                     compressor, bytes};
+                }
             }
         }
+    }
+    // The smallest, with two margins: a compressed candidate has to be smaller than the smallest
+    // uncompressed one by `compressed_margin_pct`, and a ZSTD one than the smallest LZ4 one by
+    // `zstd_margin_pct` - both cost a decompression, ZSTD's several times LZ4's.
+    const auto smaller_by = [](size_t bytes, size_t than, unsigned pct) {
+        return 100 * static_cast<uint64_t>(bytes) <
+               static_cast<uint64_t>(100 - std::min(pct, 100u)) * than;
+    };
+    Best best = light;
+    if (try_lz4 && lz4.bytes < best.bytes && smaller_by(lz4.bytes, light.bytes, options.compressed_margin_pct)) {
+        best = lz4;
+    }
+    if (try_zstd && zstd.bytes < best.bytes &&
+        smaller_by(zstd.bytes, light.bytes, options.compressed_margin_pct) &&
+        (!try_lz4 || smaller_by(zstd.bytes, lz4.bytes, options.zstd_margin_pct))) {
+        best = zstd;
     }
 
     const Stream& s = streams[best.stream];
     const int t = best.stream;
+    const int c = best.compressor == Compressor::kZstd ? 1 : 0;
     const size_t at = out.size();
     Choice choice;
     choice.encoding.transform = s.transform;
+    choice.encoding.compressor = best.compressor;
     switch (best.what) {
     case What::kS8b:
-        put_header(out, s, Packing::kSimple8b, 0, false, 0);
+        put_header(out, s, Packing::kSimple8b, 0, Compressor::kNone, 0);
         out += s8b[t];
         choice.encoding.packing = Packing::kSimple8b;
         break;
     case What::kRuns:
-        put_header(out, s, Packing::kRuns, 0, false, 0);
+        put_header(out, s, Packing::kRuns, 0, Compressor::kNone, 0);
         out += runs[t];
         choice.encoding.packing = Packing::kRuns;
         break;
     case What::kBlocks:
-        put_header(out, s, Packing::kBlocks, 0, false, 0);
+        put_header(out, s, Packing::kBlocks, 0, Compressor::kNone, 0);
         pack_blocks(s.values, out);
         choice.encoding.packing = Packing::kBlocks;
         break;
-    case What::kZRuns:
-        put_header(out, s, Packing::kRuns, 0, true, runs[t].size());
-        out += z_runs[t];
+    case What::kCompressedRuns:
+        put_header(out, s, Packing::kRuns, 0, best.compressor, runs[t].size());
+        out += compressed[c][t][0];
         choice.encoding.packing = Packing::kRuns;
-        choice.encoding.zstd = true;
         break;
-    case What::kZNarrow:
-        put_header(out, s, Packing::kNarrow, narrow_width(s.values), true, narrow[t].size());
-        out += z_narrow[t];
+    case What::kCompressedNarrow:
+        put_header(out, s, Packing::kNarrow, narrow_width(s.values), best.compressor, narrow[t].size());
+        out += compressed[c][t][1];
         choice.encoding.packing = Packing::kNarrow;
-        choice.encoding.zstd = true;
         break;
     }
     choice.bytes = out.size() - at;
