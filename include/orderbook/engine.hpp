@@ -42,7 +42,7 @@ namespace ob {
 /// The data directory's note that its numbering from before per-origin numbers is closed (#187).
 /// What keeps a later start from closing it again: a node that joined after the close numbers a symbol
 /// from 1, and closing again would take its records below kClosedNumberingBase for ones this node
-/// has. A file, neither .col nor meta.json, so no snapshot carries it: set from the snapshot's vector
+/// has. A file that is not a segment's (is_segment_file()), so no snapshot carries it: set from the snapshot's vector
 /// when one is installed, and by `restore_backup()` from the backup's description (#34).
 inline constexpr const char* kNumberingClosedFile = "numbering_closed";
 

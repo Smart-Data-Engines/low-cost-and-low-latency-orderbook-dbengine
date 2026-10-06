@@ -768,7 +768,11 @@ TEST_P(MMSnapshotDamage, AnEndWithFilesStillMissingIsRefused) {
     std::error_code ec;
     for (auto it = fs::recursive_directory_iterator(receiver.tmp.path, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (it->is_regular_file() && it->path().extension() == ".col") ++col_files;
+        // A segment's data, in either format: format 2's column files or format 3's one file.
+        if (it->is_regular_file() &&
+            (it->path().extension() == ".col" || it->path().filename() == ob::kColumnsV3File)) {
+            ++col_files;
+        }
     }
     EXPECT_EQ(col_files, 0u)
         << "an incomplete snapshot must install nothing at all, not the files that did arrive";
@@ -813,7 +817,12 @@ TEST(MMSnapshotRefusal, ASecondRequestToASenderAlreadyStreamingIsRefused) {
     // first call: with the production 4 MB and a store this small, everything is enqueued at once
     // and there is no "already streaming" state to test.
     Node sender(1, /*snapshot_watermark=*/256);
-    sender.write_rows("BTC", 8, 8'000'000);
+    // Thirty-two symbols: in segment format 3 a symbol of eight rows is a few hundred bytes in two
+    // files, and one symbol's went out whole before the socket filled.
+    for (int sym = 0; sym < 32; ++sym) {
+        sender.write_rows(("BTC" + std::to_string(sym)).c_str(), 8,
+                          8'000'000 + static_cast<uint64_t>(sym) * 1000);
+    }
 
     WiredPeer a(2, /*tiny_buffers=*/true);
     WiredPeer b(3);
@@ -1125,7 +1134,11 @@ TEST(MMSnapshotOnePeer, ABeginThatArrivesOnceThisNodeHoldsDataIsRefused) {
 TEST(MMSnapshotOnePeer, ASenderItsTargetRefusedStopsSending) {
     // A refused sender used to stream every file, and the receiver drop each chunk.
     Node sender(1, /*snapshot_watermark=*/256);   // pauses on a full socket rather than finishing
-    sender.write_rows("BTC", 8, 14'000'000);
+    // Enough for the socket to fill: one symbol of eight rows is a few hundred bytes in format 3.
+    for (int sym = 0; sym < 32; ++sym) {
+        sender.write_rows(("BTC" + std::to_string(sym)).c_str(), 8,
+                          14'000'000 + static_cast<uint64_t>(sym) * 1000);
+    }
     WiredPeer a(2, /*tiny_buffers=*/true);
     WiredPeer other(3);
     request_snapshot_and_settle(sender, a);
@@ -1363,14 +1376,16 @@ TEST(MMSnapshotPreparation, TearingDownWithASnapshotInFlightIsClean) {
 // straight onto the target path with no lock, so two of them could interleave their JSON.
 //
 // Two details make this test able to see that, and the first version had neither. The store holds
-// thirty symbols so the manifest is tens of kilobytes — a two-file manifest fits in one stdio buffer
+// 120 symbols so the manifest is past 8 KiB — a two-file manifest fits in one stdio buffer
 // and goes out in a single write(), which no reader can catch mid-way. And an empty read counts as a
 // failure once the file has been seen non-empty: `trunc` on the target path empties it before the
 // first byte of the replacement arrives, and a manifest that describes nothing is exactly the
 // corruption at issue. With a rename neither window exists.
 TEST(MMSnapshotPreparation, ConcurrentCreationNeverLeavesAHalfWrittenManifest) {
     Node node(1);
-    for (int sym = 0; sym < 30; ++sym) {
+    // Each symbol's segment is two files in format 3 (it was eight in format 2), and thirty of them
+    // made a manifest of 2.5 KiB.
+    for (int sym = 0; sym < 120; ++sym) {
         // std::to_string rather than snprintf into a fixed buffer: at -O1 and above GCC cannot
         // narrow the loop variable and reports "%02d may write up to 11 bytes into a region of
         // size 5" as an error. A Debug build at -O0 does not run that analysis at all, so the

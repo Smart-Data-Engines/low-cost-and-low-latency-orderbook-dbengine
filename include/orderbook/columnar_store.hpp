@@ -41,6 +41,14 @@ inline constexpr bool columnar_format_readable(uint32_t version) {
 }
 /// The file a version-3 segment holds its columns in.
 inline constexpr const char* kColumnsV3File = "columns.v3";
+/// Whether `filename` is one of a segment's files, in either format: its `meta.json`, format 2's
+/// column files (`*.col`) or format 3's `columns.v3` - what a snapshot, a backup and a shard
+/// migration carry. One definition: a snapshot that matched `*.col` alone shipped format-3
+/// segments without their data, and a replica bootstrapped from it held none of their rows.
+inline bool is_segment_file(std::string_view filename) {
+    return filename == "meta.json" || filename == kColumnsV3File ||
+           (filename.size() > 4 && filename.substr(filename.size() - 4) == ".col");
+}
 
 /// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets
 /// the book at an instant skip a segment none of whose rows can be the latest of its level - the

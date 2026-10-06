@@ -43,7 +43,7 @@ namespace {
 /// The data directory's note of where its WAL lives, when that is not the data directory itself
 /// (#186): what lets a start without --wal-dir, or with another one, see that the WAL is elsewhere
 /// rather than begin an empty one. Not a directory, so no sweep of the data directory removes it,
-/// and neither .col nor meta.json, so no snapshot carries it.
+/// and not a segment's file (is_segment_file()), so no snapshot carries it.
 constexpr const char* kWalLocationFile = "wal_location";
 
 /// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
@@ -2010,15 +2010,14 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
             const auto& path = entry.path();
             const auto filename = path.filename().string();
 
-            // Include every columnar file plus its metadata.
+            // Include every file of a segment, in either format.
             //
-            // Matched by extension rather than by an allowlist of names: the
-            // allowlist version silently dropped side.col, level.col and seq.col
-            // when they were added, which would have shipped replicas segments
-            // the reader then rejects as incomplete. One place to forget is
-            // better than two.
-            const bool is_column_file = path.extension() == ".col";
-            if (!is_column_file && filename != "meta.json") {
+            // Matched by what a segment's files are rather than by an allowlist of
+            // names: the allowlist version silently dropped side.col, level.col and
+            // seq.col when they were added, and matching `*.col` alone then left out
+            // segment format 3's columns.v3 - both shipped replicas segments the reader
+            // rejects as incomplete. is_segment_file() is the one place to change.
+            if (!is_segment_file(filename)) {
                 continue;
             }
 

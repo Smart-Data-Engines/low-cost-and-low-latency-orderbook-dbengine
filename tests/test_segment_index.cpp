@@ -356,15 +356,24 @@ TEST(SegmentIndex, AQueryThatMeetsASegmentRetentionIsDeletingLeavesItOutQuietly)
 
 TEST(SegmentIndex, AMissingFileOfASegmentStillIndexedIsStillAnError) {
     // The quiet path above is for a segment the index no longer has. One it still has and whose
-    // file is gone is what it always was: a segment the query cannot read.
-    TempDir dir;
-    ob::ColumnarStore store(dir.str());
-    const auto meta = segment(store, "A", {kBase + 1 * kSec}, 1);
-    fs::remove(fs::path(meta.dir_path) / "price.col");
-    StderrCapture log;
-    EXPECT_TRUE(prices(store, "A", 0, UINT64_MAX).empty());
-    const std::string text = log.text();
-    EXPECT_NE(text.find("missing column price.col"), std::string::npos) << text;
+    // file is gone is what it always was: a segment the query cannot read - in either format.
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+        SCOPED_TRACE(format);
+        TempDir dir;
+        ob::ColumnarStore store(dir.str());
+        auto written_as = store.segment_format();
+        written_as.version = format;
+        store.set_segment_format(written_as);
+        const auto meta = segment(store, "A", {kBase + 1 * kSec}, 1);
+        const std::string file = format == ob::kColumnarFormatV2 ? "price.col" : ob::kColumnsV3File;
+        ASSERT_TRUE(fs::remove(fs::path(meta.dir_path) / file)) << file;
+        StderrCapture log;
+        EXPECT_TRUE(prices(store, "A", 0, UINT64_MAX).empty());
+        const std::string text = log.text();
+        const std::string said = format == ob::kColumnarFormatV2 ? "missing column price.col"
+                                                                 : "missing columns.v3";
+        EXPECT_NE(text.find(said), std::string::npos) << text;
+    }
 }
 
 TEST(SegmentIndex, AStoreWhoseSegmentsGoElsewhereKeepsNoIndex) {

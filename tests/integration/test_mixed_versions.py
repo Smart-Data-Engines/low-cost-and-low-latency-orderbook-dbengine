@@ -164,9 +164,10 @@ def eventually(done, within: float = 60.0) -> bool:
     return done()
 
 
-def written_then_killed(binary: str, data_dir: str, symbol: str) -> list[int]:
+def written_then_killed(binary: str, data_dir: str, symbol: str,
+                        extra: list[str] | None = None) -> list[int]:
     """Rows in segments and more in the WAL alone, then a SIGKILL: what an upgrade finds."""
-    n = Node(binary, data_dir, ["--flush-interval-ms", "600000"])
+    n = Node(binary, data_dir, ["--flush-interval-ms", "600000", *(extra or [])])
     n.start()
     try:
         write(n.port, symbol, 0, 20)
@@ -194,8 +195,9 @@ def test_an_upgrade_in_place_keeps_every_row_once():
 
 
 def test_a_downgrade_keeps_every_row_once_or_refuses_to_start():
+    # Segment format 2, which the previous version reads: what a node keeping the way back runs.
     with tempfile.TemporaryDirectory(prefix="ob_mixed_down_") as tmp:
-        want = written_then_killed(CURRENT, f"{tmp}/data", "DWN")
+        want = written_then_killed(CURRENT, f"{tmp}/data", "DWN", ["--segment-format", "2"])
         n = Node(PREVIOUS, f"{tmp}/data")
         try:
             n.start()
@@ -210,6 +212,33 @@ def test_a_downgrade_keeps_every_row_once_or_refuses_to_start():
             print("downgrade: the previous version started and holds every row")
         finally:
             n.stop()
+
+
+def test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing():
+    """A data directory this version wrote in segment format 3, the default, opened by the previous
+    one: a start with part of the rows, which this matrix calls a failure, and why it is the answer
+    since format 3 - the previous version cannot decode those segments. It says so for each and
+    removes none, and this version started again holds every row once (docs/upgrading.md)."""
+    with tempfile.TemporaryDirectory(prefix="ob_mixed_down3_") as tmp:
+        want = written_then_killed(CURRENT, f"{tmp}/data", "DW3")
+        previous = Node(PREVIOUS, f"{tmp}/data")
+        previous.start()
+        try:
+            # What only the WAL held, the previous version replays into segments of its own; what
+            # this version sealed is format 3.
+            assert prices(previous.port, "DW3") == expected(20, 10), (
+                "the previous version read rows of a format-3 segment, or lost a replayed one")
+            assert "unsupported format_version=3" in previous.log(), (
+                "the previous version left format-3 segments out without saying so")
+        finally:
+            previous.stop()
+        again = Node(CURRENT, f"{tmp}/data")
+        again.start()
+        try:
+            assert prices(again.port, "DW3") == want, (
+                "this version, started again after the previous one, lost rows or holds some twice")
+        finally:
+            again.stop()
 
 
 # ── Replication ───────────────────────────────────────────────────────────────

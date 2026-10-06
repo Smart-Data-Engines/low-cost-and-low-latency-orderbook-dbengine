@@ -63,6 +63,28 @@ ob::SnapshotRow row_at(uint64_t ts, int64_t price, uint16_t level = 1) {
     return row;
 }
 
+/// The format the helpers below write segments in (segment format v3): the tests of a short
+/// segment run in both, since each format says how many rows it holds its own way.
+uint32_t g_format = ob::kColumnarFormatVersion;
+
+void use_format(ob::ColumnarStore& store) {
+    auto format = store.segment_format();
+    format.version = g_format;
+    store.set_segment_format(format);
+}
+
+/// What a storage that did not keep what it acknowledged leaves: a segment's timestamps short of
+/// its rows - in format 2 its `ts.col` holding one, in format 3 its one file a byte short of what
+/// its directory says.
+void shorten_timestamps(const std::string& segment_dir) {
+    const std::string v3 = segment_dir + "/" + ob::kColumnsV3File;
+    if (fs::exists(v3)) {
+        fs::resize_file(v3, fs::file_size(v3) - 1);
+    } else {
+        fs::resize_file(segment_dir + "/ts.col", sizeof(uint64_t));
+    }
+}
+
 struct Stamp {
     uint64_t identity{77};
     uint32_t file{1};
@@ -75,6 +97,7 @@ ob::SegmentMeta written(const std::string& base, const std::string& symbol,
                         const std::vector<std::pair<uint64_t, int64_t>>& rows, Stamp stamp = {}) {
     ob::ColumnarStore writer(base, ob::ColumnarStore::kDefaultSegmentDurationNs,
                              ob::ColumnarStore::OwnIndex::kNo);
+    use_format(writer);
     writer.set_symbol_exchange(symbol, "EX");
     writer.set_wal_position(stamp.identity, stamp.file, stamp.offset);
     writer.set_seal_epoch(stamp.epoch);
@@ -88,6 +111,7 @@ ob::SegmentMeta written(const std::string& base, const std::string& symbol,
 ob::SegmentMeta merged(const ob::ColumnarStore& store, const std::string& base,
                        const std::vector<ob::SegmentMeta>& inputs) {
     ob::ColumnarStore writer(base, UINT64_MAX, ob::ColumnarStore::OwnIndex::kNo);
+    use_format(writer);
     writer.set_symbol_exchange(inputs.front().symbol, inputs.front().exchange);
     uint64_t last_row = 0, epoch = 0;
     uint32_t level = 0, file = 0;
@@ -165,15 +189,21 @@ TEST(CompactionStore, AMergeReadsASegmentWholeInTheOrderItHoldsItsRows) {
 }
 
 TEST(CompactionStore, AMergeDoesNotTakeASegmentWithAShortColumn) {
-    TempDir dir;
-    ob::ColumnarStore store(dir.str());
-    const auto seg = written(dir.str(), "A", {{kBase + 1 * kSec, 10}, {kBase + 2 * kSec, 20}});
-    store.merge_segments({seg});
-    // One timestamp of two: a query pads the second row's with zero, and a merge must not write it.
-    fs::resize_file(seg.dir_path + "/ts.col", sizeof(uint64_t));
-    size_t rows = 0;
-    EXPECT_FALSE(store.read_segment(seg, [&](const ob::SnapshotRow&) { ++rows; }));
-    EXPECT_EQ(rows, 0u) << "a segment that cannot be merged whole handed over rows";
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+        SCOPED_TRACE(format);
+        g_format = format;
+        TempDir dir;
+        ob::ColumnarStore store(dir.str());
+        const auto seg = written(dir.str(), "A", {{kBase + 1 * kSec, 10}, {kBase + 2 * kSec, 20}});
+        ASSERT_EQ(seg.format_version, format);
+        store.merge_segments({seg});
+        // One timestamp of two: a query pads the second row's with zero, and a merge must not write it.
+        shorten_timestamps(seg.dir_path);
+        size_t rows = 0;
+        EXPECT_FALSE(store.read_segment(seg, [&](const ob::SnapshotRow&) { ++rows; }));
+        EXPECT_EQ(rows, 0u) << "a segment that cannot be merged whole handed over rows";
+    }
+    g_format = ob::kColumnarFormatVersion;
 }
 
 TEST(CompactionStore, AMergedSegmentIsWrittenWhereItIsToldAndSaysWhatItReplaced) {
@@ -539,53 +569,63 @@ TEST(CompactionStore, OnlyAMergesOwnNameAtASegmentsDepthIsAWorkingDirectory) {
 }
 
 TEST(CompactionStore, ARebuildKeepsTheInputsOfAMergedSegmentWhoseColumnsAreShort) {
-    TempDir dir;
-    std::vector<ob::SnapshotRow> rows_before;
-    std::string merged_dir;
-    {
-        ob::ColumnarStore store(dir.str());
-        const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
-        const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
-        store.merge_segments({a, b});
-        rows_before = delivered(store, "A");
-        auto out = merged(store, dir.str(), {a, b});
-        ASSERT_TRUE(rename_to_segment(out));
-        merged_dir = out.dir_path;
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+        SCOPED_TRACE(format);
+        g_format = format;
+        TempDir dir;
+        std::vector<ob::SnapshotRow> rows_before;
+        std::string merged_dir;
+        {
+            ob::ColumnarStore store(dir.str());
+            const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
+            const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
+            store.merge_segments({a, b});
+            rows_before = delivered(store, "A");
+            auto out = merged(store, dir.str(), {a, b});
+            ASSERT_TRUE(rename_to_segment(out));
+            merged_dir = out.dir_path;
+        }
+        // What a storage that did not keep what it acknowledged leaves: the merged segment's timestamps
+        // short of its rows.
+        shorten_timestamps(merged_dir);
+        ob::ColumnarStore reopened(dir.str());
+        reopened.open_existing();
+        EXPECT_EQ(reopened.last_rebuild_removed().superseded, 0u)
+            << "the inputs of a merged segment short of its rows were removed";
+        EXPECT_EQ(reopened.last_rebuild_removed().short_merges, 1u);
+        EXPECT_FALSE(fs::exists(merged_dir)) << "the short merged segment was kept";
+        EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before));
     }
-    // What a storage that did not keep what it acknowledged leaves: the merged segment's timestamps
-    // short of its rows.
-    fs::resize_file(merged_dir + "/ts.col", sizeof(uint64_t));
-    ob::ColumnarStore reopened(dir.str());
-    reopened.open_existing();
-    EXPECT_EQ(reopened.last_rebuild_removed().superseded, 0u)
-        << "the inputs of a merged segment short of its rows were removed";
-    EXPECT_EQ(reopened.last_rebuild_removed().short_merges, 1u);
-    EXPECT_FALSE(fs::exists(merged_dir)) << "the short merged segment was kept";
-    EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before));
+    g_format = ob::kColumnarFormatVersion;
 }
 
 TEST(CompactionStore, AShortMergedSegmentWhoseInputsAreGoneIsKept) {
-    TempDir dir;
-    std::string merged_dir;
-    {
-        ob::ColumnarStore store(dir.str());
-        const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
-        const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
-        store.merge_segments({a, b});
-        auto out = merged(store, dir.str(), {a, b});
-        ASSERT_TRUE(rename_to_segment(out));
-        merged_dir = out.dir_path;
-        // A merge that finished: its inputs removed.
-        fs::remove_all(a.dir_path);
-        fs::remove_all(b.dir_path);
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+        SCOPED_TRACE(format);
+        g_format = format;
+        TempDir dir;
+        std::string merged_dir;
+        {
+            ob::ColumnarStore store(dir.str());
+            const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
+            const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
+            store.merge_segments({a, b});
+            auto out = merged(store, dir.str(), {a, b});
+            ASSERT_TRUE(rename_to_segment(out));
+            merged_dir = out.dir_path;
+            // A merge that finished: its inputs removed.
+            fs::remove_all(a.dir_path);
+            fs::remove_all(b.dir_path);
+        }
+        shorten_timestamps(merged_dir);
+        ob::ColumnarStore reopened(dir.str());
+        reopened.open_existing();
+        EXPECT_TRUE(fs::exists(merged_dir + "/meta.json"))
+            << "the only copy of its rows was removed for one short column";
+        EXPECT_EQ(reopened.last_rebuild_removed().short_merges, 0u);
+        EXPECT_EQ(reopened.segment_count(), 1u);
     }
-    fs::resize_file(merged_dir + "/ts.col", sizeof(uint64_t));
-    ob::ColumnarStore reopened(dir.str());
-    reopened.open_existing();
-    EXPECT_TRUE(fs::exists(merged_dir + "/price.col"))
-        << "the only copy of its rows was removed for one short column";
-    EXPECT_EQ(reopened.last_rebuild_removed().short_merges, 0u);
-    EXPECT_EQ(reopened.segment_count(), 1u);
+    g_format = ob::kColumnarFormatVersion;
 }
 
 TEST(CompactionStore, ARebuildTellsAnInputFromEveryMergedSegmentThatNamesItsPath) {

@@ -1795,6 +1795,53 @@ nothing and replays from the checkpoint record, which would skip the records of 
 waiting — so start the node once with the newer build, let it replay, stop it cleanly, and then go
 back.
 
+## Segment format 3
+
+A segment written in format 3 holds its seven columns in one file, `columns.v3`, beside its
+`meta.json`. Each column is in the smallest of nine encodings:
+
+- a transform: each value less the column's minimum, or less the value before it, divided by what
+  they all share - a price's tick, a quantity's lot;
+- a packing: Simple8b, runs of equal values, fixed-width blocks, or each value in the bytes it needs;
+- and ZSTD over the packed bytes where that is smaller.
+
+Each column carries a CRC32C, checked whenever the column is read. Format 2 wrote the timestamp, the
+order count, the side and the level raw, and the price as one 64-bit word a row.
+
+Choosing costs a search over the nine, so a seal reuses the encodings its symbol's last segment chose
+and searches again every sixteenth segment, while a merge always searches: what it writes is what
+stays.
+
+`segment-format = 2|3` (`--segment-format`) says what new segments are written in; `3` is the
+default. Both are read, always. A store written in format 2 is not rewritten: merges write their
+segments again in format 3 as they take them.
+
+### A cluster being upgraded to format 3
+
+A snapshot - a replica's bootstrap, a mesh node joining - and a shard migration send segment files
+as they are, so a node of a build before format 3 can receive one it cannot read. Either upgrade
+every node with `segment-format = 2` in its `ob.conf` and set `3` once every node runs this build,
+or upgrade the nodes that receive snapshots before the nodes that send them: replicas before their
+primary, as before.
+
+### Going back to a build before format 3
+
+A build before format 3 reads a format-3 segment's `meta.json` and stops at its version:
+
+```
+Skipping segment <dir>: unsupported format_version=3 (this build reads 2)
+```
+
+at `ERROR`, each time a query reaches the segment, and the segment's rows are missing from that
+build's answers. It does not merge such a segment, and retention judges it by its `meta.json` as it
+judges any other. One case it removes: a merged segment whose inputs are all still beside it - a
+crash between a merge's publication and the removal of its inputs - which it takes for one cut
+short, keeping the inputs that hold the same rows. Started again on this build, every format-3
+segment is read again (`docs/upgrading.md`, the matrix).
+
+Nothing converts a format-3 segment back. A node that has to keep the way back runs
+`segment-format = 2` from its upgrade on.
+
 ## Stopping a node
 
 `SIGTERM` (or `SIGINT`) closes the listening socket **immediately** — a new connection is refused

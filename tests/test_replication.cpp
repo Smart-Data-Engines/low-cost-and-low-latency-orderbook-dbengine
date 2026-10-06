@@ -1778,6 +1778,9 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
     // `snapshot_transfer.active` still true and the live broadcast lands inside the window for
     // certain. `snapshot_active()` is the signal, so the test does not guess.
     ob::Engine engine(tmp_->str() + "/engine", 100'000'000ULL, ob::FsyncPolicy::NONE);
+    // Segment format 2, whose snapshot of the rows below is the 14.6 MB measured here: in format 3
+    // the same rows are a few hundred kilobytes, and the transfer ends in one pass.
+    engine.set_segment_version(ob::kColumnarFormatV2);
     engine.open();
 
     // Something to put in the snapshot: rows flushed to columnar files, across several symbols so
@@ -2953,21 +2956,22 @@ TEST_F(SnapshotEngineTest, SnapshotIncludesEveryColumnFile) {
 
     auto manifest = engine.create_snapshot();
 
-    // Gather the column files that actually exist on disk.
+    // Gather the segments' data files that actually exist on disk - format 2's column files and
+    // format 3's columns.v3 - by their path, since every format-3 segment's has the same name.
+    // Matching `*.col` alone is what left format 3's out of every snapshot.
     std::set<std::string> on_disk;
+    const std::string base = tmp_->str() + "/";
     for (auto& entry : std::filesystem::recursive_directory_iterator(tmp_->str())) {
-        if (entry.is_regular_file() && entry.path().extension() == ".col") {
-            on_disk.insert(entry.path().filename().string());
+        const auto name = entry.path().filename().string();
+        if (entry.is_regular_file() && name != "meta.json" && ob::is_segment_file(name)) {
+            on_disk.insert(entry.path().string().substr(base.size()));
         }
     }
     ASSERT_FALSE(on_disk.empty()) << "sanity: the flush should have written columns";
 
     std::set<std::string> in_manifest;
     for (const auto& f : manifest.files) {
-        auto name = std::filesystem::path(f.path).filename().string();
-        if (std::filesystem::path(name).extension() == ".col") {
-            in_manifest.insert(name);
-        }
+        in_manifest.insert(f.path);
     }
 
     for (const auto& name : on_disk) {

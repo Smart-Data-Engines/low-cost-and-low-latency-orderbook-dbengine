@@ -431,8 +431,10 @@ std::string LevelSet::to_hex(const Bits& bits, bool trimmed) {
 
 bool LevelSet::from_hex(const std::string& hex, Bits& bits) {
     static_assert(kLevels % 4 == 0, "a digit is four levels");
-    // Every digit, or - as segment format 3 writes it - without the leading zeros.
+    // Every digit, or - as segment format 3 writes it - without the leading zeros: a shorter string
+    // that begins with a zero is neither, which is what a string cut short of a digit mostly is.
     if (hex.empty() || hex.size() > kLevels / 4) return false;
+    if (hex.size() < kLevels / 4 && hex.size() > 1 && hex[0] == '0') return false;
     bits.fill(0);
     for (size_t d = 0; d < hex.size(); ++d) {
         const char c = hex[hex.size() - 1 - d];
@@ -1235,10 +1237,15 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     bool raw_qty = active_has_raw_qty_;
     if (segment_format_.version == kColumnarFormatV3) {
         write_columns_v3(dir);
-        // The anchor format 2 records, kept in meta.json for what reads it: the first price, zigzagged.
+        // What format 2 records beside its columns, kept in meta.json for what reads it: the first
+        // price, zigzagged, and whether a quantity is too wide for a Simple8b word - from the
+        // quantities themselves, since append_block() leaves that to the seal (#165 part 2a).
         if (!price_buf_.empty()) {
             first_price = encode_prices(std::span<const int64_t>(price_buf_.data(), 1))[0];
         }
+        constexpr uint64_t kSimple8bMarker = (uint64_t{1} << 60) - 1;
+        raw_qty = raw_qty || std::any_of(qty_buf_.begin(), qty_buf_.end(),
+                                         [](uint64_t q) { return q >= kSimple8bMarker; });
     } else {
         // Encode price column: delta + zigzag
         auto encoded_prices = encode_prices(price_buf_);
