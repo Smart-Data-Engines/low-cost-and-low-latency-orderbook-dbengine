@@ -328,10 +328,9 @@ bool unpack_simple8b(std::span<const char> p, size_t n, std::vector<uint64_t>& o
     thread_local std::vector<uint64_t> words;
     words.resize(p.size() / sizeof(uint64_t));
     if (!words.empty()) std::memcpy(words.data(), p.data(), p.size());
-    if (simple8b_words_used(words, n) != words.size()) {
+    if (!decode_simple8b_exact(words, n, out)) {
         return fail(why, "Simple8b words do not hold exactly the values the block declares");
     }
-    decode_simple8b_into(words, n, out);
     return true;
 }
 
@@ -350,18 +349,35 @@ bool unpack_blocks(std::span<const char> p, size_t n, std::vector<uint64_t>& out
             std::fill_n(out.data() + i, m, uint64_t{0});
             continue;
         }
-        // The block's bytes, padded so that the eight bytes at any value's first bit and the ninth
-        // after them can be read.
-        buf.assign(need + 9, 0);
-        std::memcpy(buf.data(), p.data() + at, need);
+        // The eight bytes at any value's first bit, and the ninth after them, are read: straight
+        // from the payload while those nine cannot pass its end, and from a padded copy of the block
+        // where they could - the last block or two. Copying every block, zeros first, was a tenth of
+        // a format-3 scan's time (measured on the ARM host).
+        const unsigned char* base;
+        if (at + need + 9 <= p.size()) {
+            base = reinterpret_cast<const unsigned char*>(p.data()) + at;
+        } else {
+            buf.assign(need + 9, 0);
+            std::memcpy(buf.data(), p.data() + at, need);
+            base = buf.data();
+        }
         const uint64_t mask = w == 64 ? std::numeric_limits<uint64_t>::max() : (uint64_t{1} << w) - 1;
-        for (size_t k = 0; k < m; ++k) {
-            const size_t bit = k * w;
-            const unsigned shift = static_cast<unsigned>(bit & 7);
-            const unsigned char* q = buf.data() + (bit >> 3);
-            uint64_t x = load64(q) >> shift;
-            if (shift + w > 64) x |= static_cast<uint64_t>(q[8]) << (64 - shift);
-            out[i + k] = x & mask;
+        uint64_t* o = out.data() + i;
+        if (w <= 56) {
+            // A value and its shift fit the eight bytes: no ninth to look at.
+            for (size_t k = 0; k < m; ++k) {
+                const size_t bit = k * w;
+                o[k] = (load64(base + (bit >> 3)) >> (bit & 7)) & mask;
+            }
+        } else {
+            for (size_t k = 0; k < m; ++k) {
+                const size_t bit = k * w;
+                const unsigned shift = static_cast<unsigned>(bit & 7);
+                const unsigned char* q = base + (bit >> 3);
+                uint64_t x = load64(q) >> shift;
+                if (shift + w > 64) x |= static_cast<uint64_t>(q[8]) << (64 - shift);
+                o[k] = x & mask;
+            }
         }
         at += need;
     }
@@ -569,12 +585,18 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
         o[0] = static_cast<T>(v);
         size_t i = 1;
         for (size_t r = 0; r < runs; ++r) {
+            // One run's difference d added len times: the k-th value is v + (k + 1) d, which has no
+            // dependence on the value before it, so the run fills as a vector does.
             const uint64_t d = unzigzag(values[r]) * g;
-            for (uint64_t k = 0; k <= lengths[r]; ++k) {
-                v += d;
-                above |= v > kMax;
-                o[i++] = static_cast<T>(v);
+            const size_t len = static_cast<size_t>(lengths[r]) + 1;
+            T* run = o + i;
+            for (size_t k = 0; k < len; ++k) {
+                const uint64_t x = v + (k + 1) * d;
+                above |= x > kMax;
+                run[k] = static_cast<T>(x);
             }
+            v += len * d;
+            i += len;
         }
     } else {
         size_t i = 0;

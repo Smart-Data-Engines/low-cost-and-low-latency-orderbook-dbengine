@@ -206,7 +206,8 @@ namespace {
 /// value on the i3-7100U, level on the ARM host - which is what a column of quantities is made of,
 /// at the price of words holding one 60-bit value each on the ARM host.
 template <bool kZeroed>
-size_t decode_simple8b_words(std::span<const uint64_t> words, size_t want, uint64_t* o) noexcept {
+size_t decode_simple8b_words(std::span<const uint64_t> words, size_t want, uint64_t* o,
+                             size_t* used = nullptr) noexcept {
     const uint64_t* w = words.data();
     const size_t nw = words.size();
     size_t n = 0;
@@ -225,6 +226,7 @@ size_t decode_simple8b_words(std::span<const uint64_t> words, size_t want, uint6
             } else if (!kZeroed) {
                 std::fill_n(o + n, room, uint64_t{0});
             }
+            if (used != nullptr) *used = wi;
             return want;
         }
         switch (sel) {
@@ -256,6 +258,7 @@ size_t decode_simple8b_words(std::span<const uint64_t> words, size_t want, uint6
         }
         }
     }
+    if (used != nullptr) *used = wi;
     return n;
 }
 
@@ -274,6 +277,13 @@ void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::ve
     const size_t want = std::min(count, words.size() * 240);
     out.resize(want);   // capacity kept; what an earlier decode left is written over or cut off
     out.resize(decode_simple8b_words<false>(words, want, out.data()));
+}
+
+bool decode_simple8b_exact(std::span<const uint64_t> words, size_t count, std::vector<uint64_t>& out) {
+    out.resize(count);
+    size_t used = 0;
+    const size_t n = decode_simple8b_words<false>(words, count, out.data(), &used);
+    return n == count && used == words.size();
 }
 
 size_t simple8b_words_used(std::span<const uint64_t> words, size_t count) {
