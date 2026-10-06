@@ -717,6 +717,13 @@ public:
     /// worker thread, and the peer may be gone by then (#79).
     PeerConnection& install_peer_for_test(PeerConnection peer);
 
+    /// What the registry's watch does on every change, driven by a test with the peers it names
+    /// (#216): the decisions about a peer's address are made here, and a registry is not needed to
+    /// reach them.
+    void handle_topology_change_for_test(const std::vector<PeerInfo>& peers) {
+        handle_topology_change(peers);
+    }
+
     /// Start a catch-up of an installed peer, as a vector showing it lacks something does, and run
     /// one pass of rounds, as the io loop does between its passes (#178). Test seams, like the
     /// snapshot ones: they take the lock themselves, and the rounds read the WAL without it.
@@ -969,6 +976,13 @@ private:
     void handle_catchup_request(PeerConnection& peer, uint32_t from_file,
                                 size_t from_offset);
     void handle_topology_change(const std::vector<PeerInfo>& new_peers);
+
+    /// The address this node registers for its peers: `advertise_host` and the mesh port.
+    std::string own_address() const;
+
+    /// Peers already told about, by the address they share with this node, so the ERROR saying so
+    /// is one line per peer and address rather than one per topology event (#216). Under `mtx_`.
+    std::unordered_map<uint16_t, std::string> reported_same_address_;
 
     // Frame-based send methods (task 5.1)
     /// Encode payload into a Frame and append to peer.send_buf, then try to drain.

@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <thread>
 #include <chrono>
@@ -205,6 +206,131 @@ TEST(MultiMasterUnit, ConnectToPeerAddsToStates) {
     auto states = mgr.peer_states();
     EXPECT_EQ(states.size(), 0u);  // No peers initially.
 
+    mgr.stop();
+}
+
+// ── #216: the address a peer registers is the one it is dialled at ──────────────────────────────
+
+namespace {
+
+/// A listener of the test's own, standing where a dial would arrive.
+int listen_on(const char* ip, uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    const int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    ::inet_pton(AF_INET, ip, &addr.sin_addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(fd, 8) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    // Non-blocking, so accepts_within() can give up.
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+    return fd;
+}
+
+/// Whether something connected to `fd` within `ms`; the connection is closed at once, which the
+/// dialling node reads as a peer that went away.
+bool accepts_within(int fd, int ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        sockaddr_in from{};
+        socklen_t len = sizeof(from);
+        const int c = ::accept(fd, reinterpret_cast<sockaddr*>(&from), &len);
+        if (c >= 0) {
+            ::close(c);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+std::string address_of(const ob::MultiMasterManager& mgr, uint16_t node_id) {
+    for (const auto& s : mgr.peer_states()) {
+        if (s.node_id == node_id) return s.address;
+    }
+    return {};
+}
+
+ob::PeerInfo peer_at(uint16_t node_id, const std::string& address) {
+    ob::PeerInfo p{};
+    p.node_id = node_id;
+    p.address = address;
+    p.status  = "active";
+    return p;
+}
+
+}  // namespace
+
+TEST(MultiMasterUnit, APeerThatRegistersAtANewAddressIsDialledThereFromThenOn) {
+    // A peer restarted with `--advertise-host` corrected registers again at its new address. The
+    // topology handler filled in only an address that was empty, so the record kept the old one:
+    // MM_PEERS showed it, and the reconnect loop went on dialling it. Seen on two hosts, where a
+    // node that read a peer's old 127.0.0.1 registration at its start dialled itself by it until it
+    // was restarted.
+    TestContext ctx(1, ob::test::kPortsMultiMaster + 10);
+    ctx.config.bind_address = "127.0.0.1";
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    const uint16_t old_port = ob::test::kPortsMultiMaster + 11;  // nothing listens there
+    const uint16_t new_port = ob::test::kPortsMultiMaster + 12;
+    const int at_new = listen_on("127.0.0.1", new_port);
+    ASSERT_GE(at_new, 0);
+    mgr.start();
+
+    const std::string old_address = "127.0.0.1:" + std::to_string(old_port);
+    const std::string new_address = "127.0.0.1:" + std::to_string(new_port);
+    mgr.handle_topology_change_for_test({peer_at(2, old_address)});
+    EXPECT_EQ(address_of(mgr, 2), old_address);
+
+    mgr.handle_topology_change_for_test({peer_at(2, new_address)});
+    EXPECT_EQ(address_of(mgr, 2), new_address)
+        << "the record kept the address the peer registered at before";
+
+    // The topology event dials the new address itself. What the record decides is every dial after
+    // it: the listener closes this one, and the reconnect loop has to come back to the same place.
+    EXPECT_TRUE(accepts_within(at_new, 3000)) << "nothing dialled the new address";
+    EXPECT_TRUE(accepts_within(at_new, 6000))
+        << "the reconnect after the link closed did not dial the new address";
+
+    ::close(at_new);
+    mgr.stop();
+}
+
+TEST(MultiMasterUnit, APeerRegisteredAtThisNodesOwnAddressIsNotDialled) {
+    // Two nodes advertising one address - both at the default 127.0.0.1 across hosts, the
+    // documented procedure as it stood - and each dialled the other's registration, reached itself,
+    // refused its own id, and did it again every second. Held apart here: the mesh listens on
+    // 127.0.0.2 and advertises 127.0.0.1, where the test listens on the same port, so a dial of
+    // this node's own address arrives at the test.
+    const uint16_t port = ob::test::kPortsMultiMaster + 13;
+    TestContext ctx(1, port);
+    ctx.config.bind_address   = "127.0.0.2";
+    ctx.config.advertise_host = "127.0.0.1";
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    const int where_we_say_we_are = listen_on("127.0.0.1", port);
+    ASSERT_GE(where_we_say_we_are, 0);
+    // The control: a peer at an address of its own is dialled, so this setup sees a dial.
+    const uint16_t other_port = ob::test::kPortsMultiMaster + 14;
+    const int elsewhere = listen_on("127.0.0.1", other_port);
+    ASSERT_GE(elsewhere, 0);
+    mgr.start();
+
+    const std::string ours = "127.0.0.1:" + std::to_string(port);
+    mgr.handle_topology_change_for_test(
+        {peer_at(2, ours), peer_at(3, "127.0.0.1:" + std::to_string(other_port))});
+
+    EXPECT_TRUE(accepts_within(elsewhere, 3000)) << "the control: peer 3 was not dialled";
+    EXPECT_FALSE(accepts_within(where_we_say_we_are, 2500))
+        << "this node dialled the address it advertises itself";
+    // MM_PEERS still lists peer 2, at the address that cannot be dialled.
+    EXPECT_EQ(address_of(mgr, 2), ours);
+
+    ::close(where_we_say_we_are);
+    ::close(elsewhere);
     mgr.stop();
 }
 

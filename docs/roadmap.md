@@ -2522,6 +2522,84 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 218. `scripts/measure_cpu_cost.py` read the engine's CPU as zero from #151 on ✅ **P3**
+
+**Found measuring on the x86 cluster host**: five runs of five printed the engine's server CPU as
+`0.000` and its levels per CPU-second as `nan`. The script finds each server's processes by the name
+in `/proc/<pid>/stat`, and since #151 (PR #168, 23 September) the engine's main thread is named
+`ob-io-0`, which renames the process: `ob_tcp_server` matched nothing. The README's table was
+measured on 19 September, before it, and nothing had run the script since. The harness starts the
+engine, so the script reads that process by its pid now (`OrderbookSystem.server_pid()`); ClickHouse
+and PostgreSQL are services, still found by name.
+
+Run again on the m8a.xlarge at master `3157ce7`, five runs: the engine's server CPU 0.290 s for
+2,000,000 levels in each - 6,896,552 levels per server CPU-second, against ClickHouse's 2,040,816 -
+2,247,191 and TimescaleDB's 621,118 - 628,931 - in the README's "What it costs" with what it does
+not say. `scripts/measure_storage.py`, the probe behind that section's bytes on disk, is in the tree
+now too (`evidence/2026-10-06-cpu-cost/`).
+
+- Effort: S | Impact: the one measurement of what the engine's ingest costs had been unrunnable
+  for two weeks, silently
+
+### 217. The documented procedure for a cluster across hosts did not form a cluster ✅ **P2**
+
+**Found carrying it out** on the two cluster hosts - #33 asked for exactly that and had no second
+machine. Followed as written:
+
+- **There was no `advertise-host`.** Every node registered `127.0.0.1:9092`; each dialled the
+  other's registration, reached itself and refused its own id - `Peer on fd=11 claims node id 2,
+  which is this node's own id`, once a second - and `MM_PEERS` showed each peer `disconnected`
+  while each node looked healthy on its own. With the line, the mesh formed.
+- **The cluster secret** was written into `/etc/orderbook/secrets/`, which nothing creates, and,
+  run on each node as the section read, made a secret each: every link failed authentication.
+- **`tls-peer-names`** in the example form, `node-10.0.0.1`, matched - through OpenSSL's fallback to
+  the subject CN for a certificate with no `dNSName`, which the section did not give as the rule. A
+  list covering neither certificate kept the mesh from forming, naming the identity presented.
+- **What two writers leave behind** - the same book and different histories - was nowhere.
+
+The procedure has the line now, the secret is made once and installed on every node, and the
+section says the CN rule and the history. A node whose advertised address is loopback while a
+coordinator endpoint is on another machine says so at the start
+(`remote_coordinator_for_loopback_advertise()`, tested in `tests/test_cli_config.cpp`), and #216
+keeps it from dialling itself. On the two hosts again, with packages built from this change: the
+procedure without the line left each node saying both things once and dialling itself 0 times; with
+it the mesh formed; the secret made once and TLS by the section's commands gave the same 807 181
+bytes of answer on both nodes for each writer (`evidence/2026-10-06-cluster-across-hosts/`, s6).
+
+- Effort: S | Impact: a cluster built from the document did not form, and every node looked healthy
+
+### 216. A mesh node kept a peer's old address after the peer registered at a new one, and dialled its own address when a peer shared it ✅ **P2**
+
+**Found on the two cluster hosts.** A node that started while its peer was being restarted read the
+peer's old registration, `127.0.0.1:9092`, and kept it after the peer registered again at its
+private address: `handle_topology_change()` filled in only an address that was empty, so the record
+went on naming the old one. The link came up the other way, the peer dialling this node, but
+`MM_PEERS` showed the old address until a restart, and had the link dropped this node would have
+gone on dialling itself. Where two nodes advertised one address - both at the default, the
+procedure of #217 - each dialled its own registration once a second, for ever.
+
+- A node takes the address the registry gives for each peer, and says when it changes
+  (`Peer 2 now advertises 10.0.0.2:9092, not 127.0.0.1:9092`).
+- It does not dial a peer registered at its own address - from `connect_to_peer()` or from the
+  reconnect loop - and says so once per peer and address, at ERROR, naming the fix. `MM_PEERS` still
+  lists the peer, at that address.
+- The accept side's refusal of its own id says what it means: this node dialled itself.
+
+Tests in `tests/test_multi_master.cpp`: `APeerThatRegistersAtANewAddressIsDialledThereFromThenOn`
+closes the link at the new address and waits for the reconnect to come back there;
+`APeerRegisteredAtThisNodesOwnAddressIsNotDialled` has the mesh listen on 127.0.0.2 and advertise
+127.0.0.1, where the test listens, beside a peer elsewhere that is dialled - the control.
+Mutations: the handler taking only an empty address, and a dial of this node's own address from
+`connect_to_peer()` or from the reconnect loop, are killed; the ERROR said on every event rather than
+once survives, since no test reads the log, and so does the control
+(`evidence/2026-10-06-mesh-address/`). On the two hosts, with packages built from this change, the
+race forced: one node started while the other was registered at `127.0.0.1:9092`, and when the
+other registered at its private address it said `Peer 2 now advertises 172.30.25.11:9092, not
+127.0.0.1:9092` and took it, dialling itself 0 times (`evidence/2026-10-06-cluster-across-hosts/`,
+s6).
+
+- Effort: S | Impact: a moved or corrected peer was dialled at its old address until a restart
+
 ### 215. A replica that is still joining stands for election **P1**
 
 A node rejoining after a failover discards its data, installs a snapshot of the new primary's store

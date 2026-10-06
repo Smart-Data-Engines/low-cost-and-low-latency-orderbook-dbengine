@@ -63,6 +63,8 @@ struct ThreadCpu {
 
 std::map<int, ThreadCpu> per_thread_cpu(int pid) {
     std::map<int, ThreadCpu> out;
+    // A node on another host (`OB_HOST`, pid 0) has no threads here to read.
+    if (pid <= 0) return out;
     const double tck = static_cast<double>(::sysconf(_SC_CLK_TCK));
     for (const auto& e : std::filesystem::directory_iterator("/proc/" + std::to_string(pid) + "/task")) {
         std::ifstream in(e.path() / "stat");
@@ -101,7 +103,11 @@ int connect_to(int port) {
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons(static_cast<uint16_t>(port));
-    ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    // `OB_HOST` for a node on another host (#217); its resident memory is not readable from here,
+    // so give 0 for the pid there.
+    const char* host = std::getenv("OB_HOST");
+    if (host == nullptr || *host == '\0') host = "127.0.0.1";
+    if (::inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;
     if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return -1;
     std::string banner;
     char buf[4096];
@@ -127,8 +133,9 @@ int main(int argc, char** argv) {
     const int batches = std::atoi(argv[4]);
     const int levels = std::atoi(argv[5]);
     const int batch = std::atoi(argv[6]);
-    if (port <= 0 || pid <= 0 || conns < 1 || batches < 1 || levels < 1 || batch < 1) {
-        std::fprintf(stderr, "every argument must be a positive number\n");
+    // The pid may be 0: a node on another host (`OB_HOST`), whose threads are not readable here.
+    if (port <= 0 || pid < 0 || conns < 1 || batches < 1 || levels < 1 || batch < 1) {
+        std::fprintf(stderr, "every argument must be a positive number, the pid 0 or more\n");
         return 2;
     }
     constexpr int kVariants = 8;   // distinct prebuilt batches, so prices move between updates
@@ -285,13 +292,16 @@ int main(int argc, char** argv) {
         if (d > 0.005) busy.emplace_back(d, t.name + ":" + std::to_string(tid));
     }
     std::sort(busy.rbegin(), busy.rend());
+    // A server not read is -1, not 0: a zero would read as a server that cost nothing (#218).
+    const double server_cpu_s = pid == 0 ? -1.0 : server_total;
+    const double server_cores = pid == 0 ? -1.0 : server_total / wall;
     std::printf("{\"connections\": %d, \"batch\": %d, \"levels\": %d, \"wall_s\": %.3f, "
                 "\"levels_per_s\": %.0f, \"batch_p50_us\": %.1f, \"batch_p99_us\": %.1f, "
                 "\"batch_p999_us\": %.1f, \"batch_max_us\": %.1f, \"server_rss_peak_kb\": %ld, "
                 "\"client_cpu_s\": %.2f, \"server_cpu_s\": %.2f, \"server_cores\": %.2f, \"threads\": [",
                 conns, batch, levels, wall, total_levels / wall, all[all.size() / 2] / 1e3,
                 all[(all.size() * 99) / 100] / 1e3, all[(all.size() * 999) / 1000] / 1e3,
-                all.back() / 1e3, rss_peak_kb, cli1 - cli0, server_total, server_total / wall);
+                all.back() / 1e3, rss_peak_kb, cli1 - cli0, server_cpu_s, server_cores);
     for (size_t i = 0; i < busy.size() && i < 8; ++i) {
         std::printf("%s{\"thread\": \"%s\", \"cpu_s\": %.2f, \"of_wall\": %.2f}", i ? ", " : "",
                     busy[i].second.c_str(), busy[i].first, busy[i].first / wall);

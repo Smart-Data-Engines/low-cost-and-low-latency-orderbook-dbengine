@@ -75,22 +75,23 @@ specific defects. The bootstrap script's job ends when the mesh is up.
 
 ## A cluster across hosts
 
-**There is deliberately no script for this**, and the reason is worth stating: it could not be
-verified on the machine this was written on — `sshd` is installed but inactive and no key is set up,
-and standing one up would be a change to a developer's system rather than a test. A deployment
-script nobody has run is worse than a procedure someone has read. Roadmap #33 records what verifying
-it would take.
+**There is deliberately no script for this**: a deployment script nobody has run is worse than a
+procedure someone has. This one has been run, on 6 October 2026, on two hosts in one subnet - an x86
+node with Ubuntu 26.04 and an ARM node with Amazon Linux 2023, etcd on the first - as a mesh, then
+with cluster authentication and TLS on its links, with a node stopped and caught up, and as a
+failover group in both directions (#217). Carrying out the version before that found what the
+first bullet below is about.
 
 The procedure, per host, with three hosts as the example:
 
 ```bash
-# 1. On every host: install the package and an etcd the three can reach.
-sudo dpkg -i orderbook-dbengine_0.1.0_amd64.deb
+# 1. On every host: install the package (see Install above) and an etcd the three can reach.
 
-# 2. On every host: edit /etc/orderbook/ob.conf. Only four lines differ between them.
+# 2. On every host: edit /etc/orderbook/ob.conf. Three lines differ between them.
 #
 #    node-id               = node-1          # node-2, node-3
 #    mm-node-id            = 1               # 2, 3
+#    advertise-host        = 10.0.0.1        # 10.0.0.2, 10.0.0.3: this host, as the others reach it
 #    mm-replication-port   = 9092            # the same on each host is fine; they differ by address
 #    coordinator-endpoints = http://10.0.0.1:2379,http://10.0.0.2:2379,http://10.0.0.3:2379
 #    multi-master          = true
@@ -106,14 +107,36 @@ sudo systemctl enable --now ob_tcp_server
 printf 'MM_PEERS\nQUIT\n' | nc 10.0.0.1 9090
 ```
 
-Two things that bite here and are not obvious:
+Three things that bite here and are not obvious:
 
+- **`advertise-host` is what each node tells the others to dial, and it defaults to `127.0.0.1`.**
+  Without it every node registers `127.0.0.1:9092`, and a peer on another host that dials it
+  reaches itself: `MM_PEERS` on each node shows the other at `127.0.0.1:9092`, `disconnected`, and
+  each node looks healthy on its own. This document left the line out until #217. A node now says
+  so as it starts - `advertise-host is 127.0.0.1, a loopback address, while the coordinator is at
+  http://10.0.0.1:2379` - and does not dial a peer registered at its own address, saying that
+  once instead (#216). The same address is what a failover group's replicas and a shard map use
+  (`Sharding by symbol`, below).
 - **`mm-replication-port` must be reachable between hosts**, and it is a different port from the one
   clients use. A firewall that allows 9090 and not 9092 gives you three nodes that each accept
   writes and never exchange one — and each looks healthy on its own.
 - **etcd must be reachable from every node, not just from one.** Peer discovery is
   `etcd → PeerRegistry::start_watch → handle_topology_change → connect_to_peer → send_handshake`,
   and a node that cannot read etcd stays alone without saying anything louder than a log line.
+
+What the two hosts showed, with `advertise-host` set (`evidence/2026-10-06-cluster-across-hosts/`):
+a symbol written through one node is on the other byte for byte - 20 000 updates of 10 levels,
+807 181 bytes of `SELECT` answer, in either direction, and the same with authentication and TLS on
+the links; a node stopped while the other took 30 000 rows had every one of them when it started.
+Two writers on the same levels of one symbol leave the same book on both nodes and different
+histories, which `Conflicts, and what counts as one` below explains.
+
+A client on the other host pays the subnet's round trip. `PING` answered in 36 - 69 µs at the median
+across the subnet, against 4 - 7 µs from the same host; pipelined ingest - four connections, batches
+of 64 updates of 20 levels - reached 10.4 - 11.6 million levels a second into the ARM node from the
+x86 host, against 11.9 - 12.6 million from a client beside it, and 14.0 - 15.2 million into the x86
+node, against 16.1 - 17.8 million (`benchmarks/command_latency` and `benchmarks/pipelined_ingest`
+with `OB_HOST`, three rounds each way).
 
 ## Sharding by symbol
 
@@ -916,7 +939,14 @@ Conflict detected: REMOTE wins for BTCUSDT/BINANCE/0/6500000 (origin 2 against 1
 ```
 
 A steady rate of these is the mesh doing what it is for - two writers of one instrument - and the
-counter is the thing to graph. The node that wrote a level last, writing it again, is **not** a
+counter is the thing to graph.
+
+**What each node stores is not the same history.** A remote write that loses is not applied, and a
+node's own writes always are, so two writers on one level leave the same book on every node - the
+latest of each level - and different histories behind: each node holds its own writes and the remote
+ones that won when they arrived. On two hosts, 20 000 updates of 10 levels written to one symbol
+through each node at once left 37 309 and 38 135 of the 40 000 rows, and the same `BOOK` on both
+(#217). `SELECT` over a range two nodes wrote is a question to one node. The node that wrote a level last, writing it again, is **not** a
 conflict: until #182 it was, and a mesh logged one for nearly every replicated update (60 MB of log
 on each receiver for 300 000 writes from one node).
 
@@ -1863,13 +1893,21 @@ authenticates nobody is a deployment problem worth an exception.
 
 ### Turning on cluster authentication
 
-`--cluster-secret-file` protects the replication and multi-master links. It takes a single line:
+`--cluster-secret-file` protects the replication and multi-master links. It takes a single line,
+**the same line on every node**:
 
 ```bash
-openssl rand -hex 32 | sudo tee /etc/orderbook/secrets/cluster >/dev/null
-sudo chown orderbook:orderbook /etc/orderbook/secrets/cluster
-sudo chmod 600 /etc/orderbook/secrets/cluster
+# Once, anywhere: the cluster's secret.
+openssl rand -hex 32 > cluster.secret
+
+# On every node: that file. The directory is not in the package.
+sudo install -d -m 700 -o orderbook -g orderbook /etc/orderbook/secrets
+sudo install -m 600 -o orderbook -g orderbook cluster.secret /etc/orderbook/secrets/cluster
 ```
+
+Generated on each node instead, the secrets differ and every link fails:
+`Peer 2 at 10.0.0.2:9092: failed authentication - disconnecting`. This document had each node
+generate its own, into a directory nothing had created, until #217.
 
 **There is no mixed mode.** Every node in a cluster either has the secret or does not; a node that
 accepted a peer without proof would be the state this exists to remove. So enabling it on a running
@@ -1977,8 +2015,11 @@ tls-peer-names = node-10.0.0.1,node-10.0.0.2,node-10.0.0.3
 ```
 
 An accepted peer's certificate must cover one of those. Entries may be names or addresses; an entry
-that parses as an address is matched against `iPAddress` and everything else against `dNSName`, the
-same rule the dialling end uses. Get it wrong and the cluster does not form, loudly, with a log line
+that parses as an address is matched against `iPAddress` and everything else against `dNSName` -
+or, in a certificate with no `dNSName` at all, against its subject CN, which is OpenSSL's rule and
+the reason `node-10.0.0.1` matches the certificates made above, whose only subjectAltName is the
+address. Names that cover neither certificate keep the mesh from forming, each refusal naming the
+identity presented (checked on the two hosts, #217). Get it wrong and the cluster does not form, loudly, with a log line
 naming the identity that was presented — which is the failure you want rather than the quiet one.
 
 Which mode is in force is in the startup log, not only here:
