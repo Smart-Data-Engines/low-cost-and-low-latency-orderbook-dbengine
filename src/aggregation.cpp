@@ -27,8 +27,15 @@ inline uint32_t effective_n(const SoASide& side, uint32_t n_levels) {
 }
 
 // ── Scalar helpers ────────────────────────────────────────────────────────────
+//
+// Which of these a build reaches depends on what it targets, and a compiler may target more than
+// this file's options ask for: GCC 15 on Ubuntu 26.04 defaults to x86-64-v3, so `__AVX2__` is
+// defined with no flag at all. A helper only some targets reach is unused in the others, which
+// -Werror refuses - and the AVX2 path did not compile for as long as nothing built it. Each says so
+// with [[maybe_unused]] rather than with a second set of #ifs that would have to agree with the
+// dispatch below.
 
-static int64_t scalar_sum_qty(const SoASide& side, uint32_t n) {
+[[maybe_unused]] static int64_t scalar_sum_qty(const SoASide& side, uint32_t n) {
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) {
         sum += static_cast<int64_t>(side.quantities[i]);
@@ -36,7 +43,7 @@ static int64_t scalar_sum_qty(const SoASide& side, uint32_t n) {
     return sum;
 }
 
-static int64_t scalar_min_price(const SoASide& side, uint32_t n) {
+[[maybe_unused]] static int64_t scalar_min_price(const SoASide& side, uint32_t n) {
     int64_t mn = side.prices[0];
     for (uint32_t i = 1; i < n; ++i) {
         if (side.prices[i] < mn) mn = side.prices[i];
@@ -44,7 +51,7 @@ static int64_t scalar_min_price(const SoASide& side, uint32_t n) {
     return mn;
 }
 
-static int64_t scalar_max_price(const SoASide& side, uint32_t n) {
+[[maybe_unused]] static int64_t scalar_max_price(const SoASide& side, uint32_t n) {
     int64_t mx = side.prices[0];
     for (uint32_t i = 1; i < n; ++i) {
         if (side.prices[i] > mx) mx = side.prices[i];
@@ -66,8 +73,12 @@ static std::pair<__int128, int64_t> scalar_vwap_parts(const SoASide& side, uint3
 }
 
 // ── AVX2 accelerated helpers ──────────────────────────────────────────────────
+//
+// AVX2 adds 64-bit integers four at a time and has no 64-bit integer min, max or multiply - those
+// need AVX-512 - so under it only the sum is wider; min and max stay scalar. Compiled only where
+// the dispatch below takes it: a build that targets AVX-512 too takes AVX-512's.
 
-#ifdef __AVX2__
+#if defined(__AVX2__) && !defined(__AVX512F__)
 
 static int64_t avx2_sum_qty(const SoASide& side, uint32_t n) {
     const uint64_t* q = side.quantities;
@@ -88,23 +99,7 @@ static int64_t avx2_sum_qty(const SoASide& side, uint32_t n) {
     return result;
 }
 
-static int64_t avx2_min_price(const SoASide& side, uint32_t n) {
-    const int64_t* p = side.prices;
-    // _mm256_min_epi64 requires AVX-512VL; use scalar for min/max under pure AVX2
-    // (AVX2 does not have 64-bit integer min/max intrinsics)
-    return scalar_min_price(side, n);
-}
-
-static int64_t avx2_max_price(const SoASide& side, uint32_t n) {
-    return scalar_max_price(side, n);
-}
-
-static std::pair<__int128, int64_t> avx2_vwap_parts(const SoASide& side, uint32_t n) {
-    // AVX2 doesn't have 64-bit multiply accumulate; fall back to scalar for correctness
-    return scalar_vwap_parts(side, n);
-}
-
-#endif // __AVX2__
+#endif // __AVX2__ && !__AVX512F__
 
 // ── AVX-512 accelerated helpers ───────────────────────────────────────────────
 
@@ -166,8 +161,6 @@ static int64_t dispatch_sum_qty(const SoASide& side, uint32_t n) {
 static int64_t dispatch_min_price(const SoASide& side, uint32_t n) {
 #ifdef __AVX512F__
     return avx512_min_price(side, n);
-#elif defined(__AVX2__)
-    return avx2_min_price(side, n);
 #else
     return scalar_min_price(side, n);
 #endif
@@ -176,19 +169,15 @@ static int64_t dispatch_min_price(const SoASide& side, uint32_t n) {
 static int64_t dispatch_max_price(const SoASide& side, uint32_t n) {
 #ifdef __AVX512F__
     return avx512_max_price(side, n);
-#elif defined(__AVX2__)
-    return avx2_max_price(side, n);
 #else
     return scalar_max_price(side, n);
 #endif
 }
 
+// Scalar on every target: a price times a quantity needs 128 bits, and neither AVX2 nor AVX-512F
+// multiplies 64-bit integers into more than the low 64.
 static std::pair<__int128, int64_t> dispatch_vwap_parts(const SoASide& side, uint32_t n) {
-#ifdef __AVX2__
-    return avx2_vwap_parts(side, n);
-#else
     return scalar_vwap_parts(side, n);
-#endif
 }
 
 } // anonymous namespace
