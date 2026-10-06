@@ -57,11 +57,34 @@ CLK = 100.0  # USER_HZ; the kernel reports these fields in clock ticks.
 
 # `comm` is truncated to TASK_COMM_LEN-1 = 15 characters. These are the truncated forms, which is
 # what /proc actually holds - matching the full name matches nothing and reads as zero CPU.
+#
+# The engine is not on this list. Its main thread has been named `ob-io-0` since #151, which renamed
+# the process in /proc, and `ob_tcp_server` matched nothing from then on: every run read the
+# engine's CPU as zero and printed `nan` (#218). The harness starts the engine, so it reads that
+# process by its pid; the other two are services, found by name.
 COMMS = {
-    "orderbook": {"ob_tcp_server"},
     "clickhouse": {"clickhouse-serv"},
     "timescaledb": {"postgres"},
 }
+
+
+def process_cpu(pid: int) -> float:
+    """utime+stime+cutime+cstime of one process, every thread of it."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    # The fields after the command's closing parenthesis, which the command itself may contain:
+    # the third field of the line is the first here, so utime (the fourteenth) is index 11.
+    fields = stat.rsplit(")", 1)[1].split()
+    return sum(int(fields[i]) for i in (11, 12, 13, 14)) / CLK
+
+
+def system_cpu(name: str, system) -> float:
+    """The server's CPU: by pid when the harness started it, by name when it is a service."""
+    if hasattr(system, "server_pid"):
+        pid = system.server_pid()
+        # Not started yet: it has spent nothing, as the name-matching read a process that did not
+        # exist.
+        return process_cpu(pid) if pid is not None else 0.0
+    return server_cpu(COMMS[name])
 
 
 def server_cpu(comms: set[str]) -> float:
@@ -167,9 +190,9 @@ def main() -> int:
             if not ok:
                 print(f"{name:13}unavailable: {note[:70]}")
                 continue
-            srv_before, cli_before = server_cpu(COMMS[name]), client_cpu()
+            srv_before, cli_before = system_cpu(name, system), client_cpu()
             loaded = system.load(csv_path)
-            srv_cpu = server_cpu(COMMS[name]) - srv_before
+            srv_cpu = system_cpu(name, system) - srv_before
             cli = client_cpu() - cli_before
             per_cpu = manifest.rows / srv_cpu if srv_cpu > 0 else float("nan")
             print("{:13}{:9.3f}{:13,.0f}{:12.3f}{:12.3f}{:18,.0f}{:12.2f}".format(

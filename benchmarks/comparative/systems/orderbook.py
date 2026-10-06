@@ -172,6 +172,13 @@ class OrderbookSystem:
             rows.append(tuple(int(fields[i]) for i in want))
         return rows
 
+    def server_pid(self) -> int | None:
+        """The engine's process while it runs: started here, so its CPU is read by pid rather than
+        by a name in /proc that the engine has changed once already (#218)."""
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc.pid
+        return None
+
     def teardown(self) -> None:
         if self._raw is not None:
             self._raw.close()
