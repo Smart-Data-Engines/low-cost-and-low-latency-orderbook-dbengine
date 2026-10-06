@@ -62,11 +62,16 @@ The first release. What it contains, by area:
 - Challenge-response authentication of clients, replication links and mesh peers; TLS 1.3 on all
   three, mutual on the node links.
 - Prometheus metrics, a Grafana dashboard and alert rules tested with `promtool`.
-- A configuration file, a systemd unit and a man page; `.deb`, `.rpm` and `.tar.gz` packages.
+- A configuration file, a systemd unit and a man page; `.deb`, `.rpm` and `.tar.gz` packages, whose
+  checks pass on Ubuntu 24.04 and 26.04 (#209).
 - The address each listener binds: `--bind`, `--replication-bind`, `--mm-bind`, `--metrics-bind` (#203).
+- Builds without a warning with GCC 13 to 15 and clang 18, on ARM64 and on x86-64 at any of its
+  levels - including x86-64-v3, the default of GCC 15 on Ubuntu 26.04 - and with the AVX2 and
+  AVX-512 paths of the aggregation engine, which CI builds and tests (#207).
 
 ### Clients
 
-- A C++ client and a C API.
+- A C++ client and a C API. Over TLS the client's calls report a server that has gone as an error;
+  they no longer raise the SIGPIPE that ended the application around them (#208).
 - A Python client over TCP, with a pool mode, a sharded mode and LZ4 session compression, and a
   local mode over the C API library the packages install.
