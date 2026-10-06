@@ -236,6 +236,32 @@ TEST(ColumnCodec, ABlockThatIsNotWhatTheEncoderWritesIsRefused) {
     }
 }
 
+TEST(ColumnCodec, ACompressedBlockMustDecompressToTheLengthItDeclares) {
+    // A ZSTD frame that is whole and sound, under a header declaring one byte more or one less than
+    // it holds: the declared length is what the unpacking is sized by, so it has to be the frame's.
+    std::vector<uint64_t> column;
+    for (uint64_t i = 0; i < 2000; ++i) column.push_back(5'000 + i % 37);
+    std::string block;
+    encode_as(column, Encoding{Transform::kFor, Packing::kNarrow, true}, 3, block);
+    // The header: encoding byte, narrow width, then the count, the anchor and the packed length as
+    // varints - the scale is absent, since the values share no divisor past 1.
+    size_t at = 2;
+    uint64_t count = 0, anchor = 0, packed = 0;
+    ASSERT_TRUE(get_varint(bytes(block), at, count));
+    ASSERT_TRUE(get_varint(bytes(block), at, anchor));
+    const size_t length_at = at;
+    ASSERT_TRUE(get_varint(bytes(block), at, packed));
+    std::vector<uint64_t> out;
+    std::string why;
+    ASSERT_TRUE(decode(bytes(block), column.size(), out, &why)) << why;
+    for (const uint64_t declared : {packed - 1, packed + 1}) {
+        std::string tail;
+        put_varint(tail, declared);
+        std::string changed = block.substr(0, length_at) + tail + block.substr(at);
+        EXPECT_FALSE(decode(bytes(changed), column.size(), out, &why)) << "declared " << declared;
+    }
+}
+
 TEST(ColumnCodec, VarintsGoBothWaysAndRefuseWhatIsNotOne) {
     for (uint64_t v : {uint64_t{0}, uint64_t{1}, uint64_t{127}, uint64_t{128}, uint64_t{300},
                        kInt64Min, kMax}) {
