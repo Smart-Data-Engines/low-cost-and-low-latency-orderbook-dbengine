@@ -94,38 +94,28 @@ static constexpr S8bSelector kSelectors[16] = {
 
 static constexpr uint64_t kFallbackMarker = (1ULL << 60) - 1; // all 60 bits set
 
-// Find the best selector that fits all values in [begin, begin+count).
-// Returns selector index, or -1 if no selector fits (shouldn't happen for sel>=2).
+// The first selector, in the table's order, whose values all fit - a value fits when it is no
+// wider than the selector's bits, and a selector of 0 bits takes only zeros. The widths' running
+// maximum is extended only as far as a selector needs, and no further once it is wider than that
+// selector takes, since a longer prefix is no narrower. The version before this scanned the values
+// again for every selector it tried, up to 240 of them for the first: on a column of wide values
+// that scan was most of what encoding cost (segment format v3 encodes each column several ways).
+// It picks what that version picked, which `test_codec` holds it to.
 static int best_selector(const uint64_t* begin, size_t available) {
+    uint8_t widest[241];   // widest[k]: the widest of the first k values, as far as computed
+    widest[0] = 0;
+    size_t known = 0;
     for (int sel = 0; sel <= 15; ++sel) {
-        uint32_t cnt  = kSelectors[sel].count;
-        uint32_t bits = kSelectors[sel].bits;
-
-        if (cnt > static_cast<uint32_t>(available)) {
-            // Can't fill a full word; only use this selector if it's the last
-            // group and we have fewer values than cnt.
-            // We'll handle partial words by padding with zeros.
+        const size_t use = std::min<size_t>(kSelectors[sel].count, available);
+        const unsigned bits = kSelectors[sel].bits;
+        while (known < use && widest[known] <= bits) {
+            const uint64_t v = begin[known];
+            const auto w = static_cast<uint8_t>(v == 0 ? 0 : 64 - __builtin_clzll(v));
+            widest[known + 1] = std::max(widest[known], w);
+            ++known;
         }
-
-        uint32_t use = static_cast<uint32_t>(
-            cnt < static_cast<uint32_t>(available) ? cnt : available);
-
-        if (bits == 0) {
-            // All values must be 0
-            bool ok = true;
-            for (uint32_t i = 0; i < use; ++i) {
-                if (begin[i] != 0) { ok = false; break; }
-            }
-            if (ok) return sel;
-            continue;
-        }
-
-        uint64_t max_val = (bits == 64) ? UINT64_MAX : ((1ULL << bits) - 1);
-        bool ok = true;
-        for (uint32_t i = 0; i < use; ++i) {
-            if (begin[i] > max_val) { ok = false; break; }
-        }
-        if (ok) return sel;
+        // Stopped short of `use`: the values so far are already wider than this selector takes.
+        if (known >= use && widest[use] <= bits) return sel;
     }
     return -1; // unreachable for valid inputs
 }
