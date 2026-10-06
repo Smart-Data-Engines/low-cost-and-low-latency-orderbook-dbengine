@@ -131,6 +131,13 @@ the links; a node stopped while the other took 30 000 rows had every one of them
 Two writers on the same levels of one symbol leave the same book on both nodes and different
 histories, which `Conflicts, and what counts as one` below explains.
 
+A client on the other host pays the subnet's round trip. `PING` answered in 36 - 69 µs at the median
+across the subnet, against 4 - 7 µs from the same host; pipelined ingest - four connections, batches
+of 64 updates of 20 levels - reached 10.4 - 11.6 million levels a second into the ARM node from the
+x86 host, against 11.9 - 12.6 million from a client beside it, and 14.0 - 15.2 million into the x86
+node, against 16.1 - 17.8 million (`benchmarks/command_latency` and `benchmarks/pipelined_ingest`
+with `OB_HOST`, three rounds each way).
+
 ## Sharding by symbol
 
 Each shard is a node - or a failover group of them - started with the same `--shard-id`, and every

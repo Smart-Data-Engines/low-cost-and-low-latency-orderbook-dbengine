@@ -2561,7 +2561,10 @@ The procedure has the line now, the secret is made once and installed on every n
 section says the CN rule and the history. A node whose advertised address is loopback while a
 coordinator endpoint is on another machine says so at the start
 (`remote_coordinator_for_loopback_advertise()`, tested in `tests/test_cli_config.cpp`), and #216
-keeps it from dialling itself. RUN_ON_HOSTS
+keeps it from dialling itself. On the two hosts again, with packages built from this change: the
+procedure without the line left each node saying both things once and dialling itself 0 times; with
+it the mesh formed; the secret made once and TLS by the section's commands gave the same 807 181
+bytes of answer on both nodes for each writer (`evidence/2026-10-06-cluster-across-hosts/`, s6).
 
 - Effort: S | Impact: a cluster built from the document did not form, and every node looked healthy
 
@@ -2589,7 +2592,11 @@ closes the link at the new address and waits for the reconnect to come back ther
 Mutations: the handler taking only an empty address, and a dial of this node's own address from
 `connect_to_peer()` or from the reconnect loop, are killed; the ERROR said on every event rather than
 once survives, since no test reads the log, and so does the control
-(`evidence/2026-10-06-mesh-address/`).
+(`evidence/2026-10-06-mesh-address/`). On the two hosts, with packages built from this change, the
+race forced: one node started while the other was registered at `127.0.0.1:9092`, and when the
+other registered at its private address it said `Peer 2 now advertises 172.30.25.11:9092, not
+127.0.0.1:9092` and took it, dialling itself 0 times (`evidence/2026-10-06-cluster-across-hosts/`,
+s6).
 
 - Effort: S | Impact: a moved or corrected peer was dialled at its old address until a restart
 
