@@ -4063,6 +4063,13 @@ Learned the hard way. Check here before debugging.
      two of them use an option it removed, whatever the unit asked about says, and the package check
      took every line for a complaint about ours (#209). Keep what names the thing checked, and keep a
      test that a fault in it still fails the check.
+546. **An archive is a list of owners and modes, and root's tar restores them - onto `/` too.**
+     CPack writes the staging files' owner and the builder's umask into the tarball; GNU tar run as
+     root restores both, and gives a directory that already exists its entry's metadata by default.
+     Our documented install handed `/etc`, `/usr` and `/usr/bin` to the builder - uid 1001 in CI's
+     artefact (#210). Check owners and modes in the artefact itself, as an installer reads it.
+     A package built on a newer distribution than it is installed on fails the same quiet way: built
+     on Ubuntu 24.04, every binary asks for glibc 2.38 through `__isoc23_strtol` (#212).
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

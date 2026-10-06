@@ -32,7 +32,8 @@ installs it on every pull request - and on Ubuntu 26.04. The binaries are built 
 whose headers make them ask for glibc 2.38 or newer, so no older glibc runs them: on Amazon Linux
 2023 (glibc 2.34) the tarball's binaries do not start, and the RPM does not install - it asks for
 glibc 2.38 and for the symbol versions of Debian's libcurl, which Amazon Linux's does not carry.
-Packages for RPM systems and older glibc are #212; until then, build from source there.
+Packages for RPM systems and older glibc are #212; until then, build from source there - the
+README's Build section names the compiler and the packages, Amazon Linux 2023's too (#213).
 
 `--no-overwrite-dir` matters. Run as root, GNU tar otherwise gives each directory that already
 exists - `/etc`, `/usr`, `/usr/bin` - the owner and mode of its entry in the archive. Every entry of

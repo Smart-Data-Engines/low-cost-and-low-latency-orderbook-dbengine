@@ -17,6 +17,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ── Compiler ───────────────────────────────────────────────────────────────────
+# C++20 as this code uses it needs GCC 12 or clang 15. An older compiler used to be taken - without
+# the warnings below - and to fail deep in the build: GCC 11, the default on Amazon Linux 2023, on a
+# static_assert in src/tcp_server.cpp that needs C++20's constexpr std::string (#213). It is refused
+# here, saying what to use instead.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "12")
+    message(FATAL_ERROR
+        "GCC ${CMAKE_CXX_COMPILER_VERSION} is older than this engine needs: GCC 12 or newer, or clang 15. "
+        "On Amazon Linux 2023 install gcc14-c++ and configure with CC=gcc14-gcc CXX=gcc14-g++ in a new build directory.")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "15")
+    message(FATAL_ERROR
+        "clang ${CMAKE_CXX_COMPILER_VERSION} is older than this engine needs: clang 15 or newer, or GCC 12.")
+endif()
+
 # ── Compiler warnings ──────────────────────────────────────────────────────────
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12")
     add_compile_options(-Wall -Wextra -Werror)

@@ -63,11 +63,14 @@ The first release. What it contains, by area:
   three, mutual on the node links.
 - Prometheus metrics, a Grafana dashboard and alert rules tested with `promtool`.
 - A configuration file, a systemd unit and a man page; `.deb`, `.rpm` and `.tar.gz` packages, whose
-  checks pass on Ubuntu 24.04 and 26.04 (#209).
+  checks pass on Ubuntu 24.04 and 26.04 (#209): every entry root's and none writable beyond its owner
+  (#210), and the user the unit runs as created by the `.deb` and the RPM (#211). They need glibc 2.38
+  or newer, and the RPM does not install on Amazon Linux 2023 (#212).
 - The address each listener binds: `--bind`, `--replication-bind`, `--mm-bind`, `--metrics-bind` (#203).
 - Builds without a warning with GCC 13 to 15 and clang 18, on ARM64 and on x86-64 at any of its
   levels - including x86-64-v3, the default of GCC 15 on Ubuntu 26.04 - and with the AVX2 and
-  AVX-512 paths of the aggregation engine, which CI builds and tests (#207).
+  AVX-512 paths of the aggregation engine, which CI builds and tests (#207); an older compiler than
+  GCC 12 or clang 15 is refused at configure time, saying what to use (#213).
 
 ### Clients
 

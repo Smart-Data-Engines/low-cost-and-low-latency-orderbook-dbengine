@@ -2522,6 +2522,74 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 213. A compiler older than GCC 12 was taken, and the build failed on a static_assert ✅ **P3**
+
+**Found on the ARM host**, building the RPM for #211's check with Amazon Linux 2023's default
+compiler, GCC 11.5. The tree configured - without `-Werror`, which the warnings block gives only to
+GCC 12 and clang 15 - and then failed in `src/tcp_server.cpp`, on a `static_assert` over a
+`ServerConfig{}` temporary: a type that is not literal there, because GCC 11's `std::string` has no
+constexpr destructor. Nothing had said which compiler the engine needs; the README named none. CMake
+now refuses GCC older than 12 and clang older than 15, saying what to install on Amazon Linux 2023,
+and the README's Build section names the compiler and the development packages for Ubuntu 24.04 -
+what CI installs - and for Amazon Linux 2023, where #212 sends whoever needs the engine today.
+
+### 212. The packages run only where glibc is 2.38 or newer, and the RPM does not install on Amazon Linux 2023 **P2**
+
+**Found on the ARM host**, an m9g.xlarge with Amazon Linux 2023 (glibc 2.34), installing the release
+artefacts for the cluster across hosts. The binaries of master's CI tarball do not start there -
+``version `GLIBC_2.38' not found`` - and `dnf` refuses master's RPM: `nothing provides
+libc.so.6(GLIBC_2.38)(64bit)` and `libcurl.so.4(CURL_OPENSSL_4)(64bit)`. glibc 2.38's headers turn
+`strtol`, `strtoul`, `strtoll`, `strtoull` and `sscanf` into their C23 variants - `__isoc23_strtol`
+and the rest - wherever `_GNU_SOURCE` is defined, and g++ always defines it, so a binary built on
+Ubuntu 24.04 that calls one asks for glibc 2.38: all four of ours do. RPM's dependency generator also
+records the symbol versions the link took from Debian's libcurl, which Amazon Linux's does not carry.
+Its libstdc++ is GCC 14's, so that is not what stops them. `docs/operations.md` says where the packages
+run (#210); making them run on older glibc and install on RPM systems is this item.
+
+- Effort: M | Impact: none of the release's packages runs where glibc is older than 2.38 - Amazon
+  Linux 2023 among them, where its RPM does not install either
+
+### 211. The RPM did not create the user its unit runs as ✅ **P2**
+
+The unit runs as `orderbook`, and only the `.deb`'s postinst created it: master's RPM carries no
+scripts at all (`rpm -qp --scripts` prints nothing), so after an RPM install
+`systemctl enable --now ob_tcp_server` had no user to start as - and `docs/operations.md` did not
+mention one for the tarball. The RPM now runs `packaging/rpm/preinst` (the user and its group, unless
+they exist), `postinst` (`systemctl daemon-reload`) and `preun` (stop and disable on removal, not on
+an upgrade): the `.deb`'s scripts in RPM's terms. `scripts/package_ci.sh` refuses an RPM whose
+scripts do not create the user, and the Install section creates it for the tarball.
+
+### 210. The tarball handed the directories it was extracted over to whoever built it ✅ **P1**
+
+**Found preparing the cluster across hosts.** CPack's archive generators record the owner of the
+staging files - the builder's uid, `runner` (1001) in the CI artefact a release would publish, and on
+a host the builder's umask with it - and CMake, up to 4.2, has no way to choose it.
+`docs/operations.md` had the tarball extracted as root over `/`, and GNU tar run as root restores each
+entry's owner and mode, onto directories that already exist as well. Extracted that way into a fake
+root of `root:root 755` directories, the tarball built on the x86 host left `/etc`, `/usr`, `/usr/bin`,
+`/usr/share` and `/usr/lib/systemd/system` owned by `ubuntu:ubuntu` with mode 775; with the CI
+artefact the owner would have been uid 1001 - whoever that is on the machine. The `.deb` was root's,
+but built under umask 0002 it carried fourteen group-writable directories, `/etc/orderbook` among
+them. Nothing was released.
+
+- Directories the install rules create are 755 whatever the umask
+  (`CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS`, which CPack takes).
+- `packaging/archive_owned_by_root.cmake`, a CPack post-build script, writes each `.tar.gz` again
+  with every entry 0/0 and none writable beyond its owner, keeping the one top-level directory
+  `--strip-components=1` needs.
+- `scripts/verify_package.sh` refuses a tarball or a `.deb` with an entry that is not root's, or
+  that anything but a symlink makes writable for its group or for others; it fails master's CI
+  artefacts.
+- The Install section extracts with `--no-overwrite-dir`, names the files CPack builds and says
+  where the packages run.
+
+On the x86 host with the fix, `scripts/package_ci.sh` passes, every entry of both packages is root's
+and 755 or 644, and the documented extraction leaves the fake root's directories as they were.
+Mutations: the post-build script without the owner flags, the script not run, and the directory
+mode removed are killed; the script without `--mode=go-w` survives, as predicted - the directory mode
+and the explicit file modes already hold what it holds; the control survives
+(`evidence/2026-10-06-packages-install-safely/`).
+
 ### 209. The package check failed on Ubuntu 26.04: it took what systemd 259 says of the distribution's units for complaints about ours ✅ **P3**
 
 **Found on the same host**, packaging the tree for the cluster tests: `scripts/package_ci.sh` built
@@ -13452,7 +13520,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #212.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
