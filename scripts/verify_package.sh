@@ -75,6 +75,23 @@ if [ "$DEB_PATHS" != "$TGZ_PATHS" ]; then
 fi
 ok "the .deb and the tarball contain the same paths"
 
+# ── Owners and modes ──────────────────────────────────────────────────────────
+# An archive records each entry's owner and mode, and tar run as root restores both - onto the
+# directories it lands in as well, since GNU tar overwrites an existing directory's metadata by
+# default. The tarball carried its builder's uid and umask, so extracted over / as
+# docs/operations.md said, it handed /etc, /usr and /usr/bin to that uid, group-writable (#210). Every
+# entry of both packages is root's, and nothing but a symlink is writable by its group or by others.
+not_roots() {   # <listing> <owner field as the listing prints root's>
+    echo "$1" | awk -v root="$2" '$2 != root || ($1 !~ /^l/ && (substr($1, 6, 1) == "w" || substr($1, 9, 1) == "w"))'
+}
+BAD=$(not_roots "$(tar --numeric-owner -tvzf "$TGZ")" "0/0")
+[ -z "$BAD" ] || fail "tarball entries that are not root's, or are writable beyond their owner:
+$(echo "$BAD" | head -5)"
+BAD=$(not_roots "$(dpkg-deb -c "$DEB")" "root/root")
+[ -z "$BAD" ] || fail ".deb entries that are not root's, or are writable beyond their owner:
+$(echo "$BAD" | head -5)"
+ok "every entry of the .deb and the tarball is root's, and none is writable beyond its owner"
+
 # ── The shipped configuration has to start ────────────────────────────────────
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT

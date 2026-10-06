@@ -7,16 +7,38 @@ for specific hardware.
 ## Install
 
 ```bash
-sudo dpkg -i orderbook-dbengine_0.1.0_amd64.deb
-# or, on anything that is not dpkg:
-sudo tar xzf orderbook-dbengine-0.1.0-Linux.tar.gz -C / --strip-components=1
+sudo apt install ./orderbook-dbengine_0.1.0_amd64.deb          # Debian, Ubuntu
+sudo dnf install ./orderbook-dbengine-0.1.0-1.x86_64.rpm       # RPM systems - but see below
+
+# Anything else: the tarball, onto /, leaving the directories it lands in as they are, and the user
+# the unit runs as, which a package creates and a tarball cannot.
+sudo tar xzf orderbook-dbengine-0.1.0-Linux-x86_64.tar.gz -C / --strip-components=1 --no-overwrite-dir
+sudo useradd --system --user-group --home-dir /var/lib/orderbook --no-create-home \
+    --shell /usr/sbin/nologin orderbook
+sudo systemctl daemon-reload
 ```
+
+On ARM the names carry `arm64` (the `.deb`) and `aarch64` (the others). `apt install` rather than
+`dpkg -i`: it installs the libraries the package depends on, which `dpkg -i` only complains about.
 
 The package installs a binary at `/usr/bin/ob_tcp_server`, a configuration file at
 `/etc/orderbook/ob.conf`, a systemd unit, a man page and the headers. It creates the `orderbook`
 system user and **does not enable or start the service**: a database that begins serving on a port
 the moment it is unpacked is a surprise, and the shipped configuration is a single node nobody has
 pointed at anything yet.
+
+**Where these packages run, as of this writing.** The `.deb` installs and runs on Ubuntu 24.04 - CI
+installs it on every pull request - and on Ubuntu 26.04. The binaries are built on Ubuntu 24.04,
+whose headers make them ask for glibc 2.38 or newer, so no older glibc runs them: on Amazon Linux
+2023 (glibc 2.34) the tarball's binaries do not start, and the RPM does not install - it asks for
+glibc 2.38 and for the symbol versions of Debian's libcurl, which Amazon Linux's does not carry.
+Packages for RPM systems and older glibc are #212; until then, build from source there - the
+README's Build section names the compiler and the packages, Amazon Linux 2023's too (#213).
+
+`--no-overwrite-dir` matters. Run as root, GNU tar otherwise gives each directory that already
+exists - `/etc`, `/usr`, `/usr/bin` - the owner and mode of its entry in the archive. Every entry of
+the tarball is root's and none is writable beyond its owner (#210), so it would change nothing on a
+usual system; the flag is what keeps it that way on an unusual one.
 
 ```bash
 sudoedit /etc/orderbook/ob.conf

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Create the system user the unit runs as, before the files are laid down - the user the .deb's
+# postinst creates (#211). /var/lib/orderbook is not created here: systemd's StateDirectory= makes it
+# on every start, owned by this user. A failure here fails the install, which is right: without the
+# user the service cannot start.
+if ! getent passwd orderbook >/dev/null; then
+    if getent group orderbook >/dev/null; then
+        useradd --system --gid orderbook --home-dir /var/lib/orderbook --no-create-home \
+                --shell /usr/sbin/nologin orderbook
+    else
+        useradd --system --user-group --home-dir /var/lib/orderbook --no-create-home \
+                --shell /usr/sbin/nologin orderbook
+    fi
+fi
