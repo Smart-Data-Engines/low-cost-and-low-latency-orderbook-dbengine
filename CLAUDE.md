@@ -4058,6 +4058,11 @@ Learned the hard way. Check here before debugging.
      signal on the calling thread around each call that can write, and take back only one it raised.
      A test that needs the race to go one way is a test of the OpenSSL version: the one that caught
      it passes on OpenSSL 3.0, on the i3-7100U and in CI, and failed 20 of 20 on 3.5.
+545. **A tool asked about one file may answer about the system.** `systemd-analyze verify` of our
+     unit also reports what it finds in the distribution's units; on Ubuntu 26.04 systemd 259 says
+     two of them use an option it removed, whatever the unit asked about says, and the package check
+     took every line for a complaint about ours (#209). Keep what names the thing checked, and keep a
+     test that a fault in it still fails the check.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

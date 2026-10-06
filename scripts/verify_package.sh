@@ -110,9 +110,13 @@ ok "the packaged C API library serves the client's local mode: a write, a flush,
 
 # ── The unit ──────────────────────────────────────────────────────────────────
 # systemd-analyze reports the ExecStart binary as missing unless the package is installed, which it
-# is not. Any *other* message is a real complaint.
+# is not. It also loads the units ours sits beside and reports what it finds in their files: systemd
+# 259 on Ubuntu 26.04 says CPUAccounting= was removed - of xfs_scrub_all.service, a distribution's
+# unit - and this check failed on that (#209). What it says of this unit is a complaint about it;
+# what it says of the distribution's is not.
 UNIT="$WORK/usr/lib/systemd/system/ob_tcp_server.service"
-VERIFY=$(systemd-analyze verify "$UNIT" 2>&1 | grep -v "is not executable: No such file or directory" || true)
+VERIFY=$(systemd-analyze verify "$UNIT" 2>&1 | grep -F "ob_tcp_server.service" \
+             | grep -v "is not executable: No such file or directory" || true)
 [ -z "$VERIFY" ] || fail "systemd-analyze objected to the unit:
 $VERIFY"
 ok "systemd-analyze verify is clean apart from the not-yet-installed binary"

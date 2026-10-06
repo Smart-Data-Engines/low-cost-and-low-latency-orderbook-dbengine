@@ -2522,6 +2522,21 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 209. The package check failed on Ubuntu 26.04: it took what systemd 259 says of the distribution's units for complaints about ours ✅ **P3**
+
+**Found on the same host**, packaging the tree for the cluster tests: `scripts/package_ci.sh` built
+and packaged it, and `scripts/verify_package.sh` failed on its last check. `systemd-analyze verify`
+of `ob_tcp_server.service` printed two lines about `xfs_scrub_all.service` and
+`system-xfs_scrub.slice` - the distribution's units, whose `CPUAccounting=` systemd 259 no longer
+supports - and the check read every line but the one about the binary not yet installed as a
+complaint about ours. What our unit says does not matter: a unit of one line, `ExecStart=/bin/true`,
+gets the same two. The check now keeps the lines that name our unit, by its file or by its name. On
+that host the fixed script passes the package, and fails it at this check, naming the key, when an
+unknown key is put into the extracted unit before `systemd-analyze` runs; the original fails the
+sound package there. `scripts/package_ci.sh` then passes on Ubuntu 26.04 - the `.deb` installed with
+apt and the release accepted from the artefacts - and CI's package jobs run it on Ubuntu 24.04
+(`evidence/2026-10-06-package-check/`).
+
 ### 208. A TLS client could be ended by SIGPIPE: a write to a server that had gone raised it at its default action ✅ **P1**
 
 **Found on the second cluster host, an m8a.xlarge with Ubuntu 26.04 and OpenSSL 3.5**:
