@@ -1803,14 +1803,16 @@ A segment written in format 3 holds its seven columns in one file, `columns.v3`,
 - a transform: each value less the column's minimum, or less the value before it, divided by what
   they all share - a price's tick, a quantity's lot;
 - a packing: Simple8b, runs of equal values, fixed-width blocks, or each value in the bytes it needs;
-- and ZSTD over the packed bytes where that is smaller.
+- and LZ4 or ZSTD over the packed bytes where that is smaller.
 
 Each column carries a CRC32C, checked whenever the column is read. Format 2 wrote the timestamp, the
 order count, the side and the level raw, and the price as one 64-bit word a row.
 
-Choosing costs a search over the nine, so a seal reuses the encodings its symbol's last segment chose
-and searches again every sixteenth segment, while a merge always searches: what it writes is what
-stays.
+The two compressors are two tiers. ZSTD writes the smaller blocks and LZ4 the ones read several times
+faster, so a seal - what queries read most - writes LZ4 or nothing, and a merge, which writes what
+stays, takes ZSTD for a column where it saves at least 10% over LZ4. Choosing costs a search, so a
+seal reuses the encodings its symbol's last segment chose and searches again every sixteenth
+segment, while a merge always searches.
 
 `segment-format = 2|3` (`--segment-format`) says what new segments are written in; `3` is the
 default. Both are read, always. A store written in format 2 is not rewritten: merges write their

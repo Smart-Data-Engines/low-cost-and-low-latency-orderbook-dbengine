@@ -1,12 +1,13 @@
 # Fuzzing the parsers
 
-Three harnesses, one for each place in this engine that reads bytes it did not produce:
+Four harnesses, one for each place in this engine that reads bytes it did not produce:
 
 | Harness | Production code it drives | Reached from |
 |---|---|---|
 | `fuzz_command_parser` | `parse_command`, `parse_minsert` | any client socket, before authentication on the `AUTH` path |
 | `fuzz_mm_frames` | `encode_frame`, `parse_frames` | the multi-master mesh, from a peer |
 | `fuzz_wal_replay` | `WALReplayer::replay_v2`, `replay_after_checkpoint` | the data directory on startup, after a crash |
+| `fuzz_column_block` | `column_codec::decode`, `decode_as` | a segment file in format 3 - the store checks its CRC32C first, but a snapshot brings segments from a peer |
 
 A parser refusing malformed input is a **correct** result and never a finding. A finding is a crash,
 a sanitizer report, a timeout, or one of the harness's own property assertions failing.
@@ -22,7 +23,7 @@ cmake -S . -B build-fuzz \
   -DCMAKE_BUILD_TYPE=Debug \
   -DOB_BUILD_FUZZERS=ON -DOB_ENABLE_ASAN=ON -DOB_BUILD_TESTS=OFF
 cmake --build build-fuzz -j$(nproc) \
-  --target fuzz_command_parser fuzz_mm_frames fuzz_wal_replay
+  --target fuzz_command_parser fuzz_mm_frames fuzz_wal_replay fuzz_column_block
 ```
 
 `OB_BUILD_FUZZERS=OFF` is the default and changes nothing about the ordinary build.
@@ -45,7 +46,7 @@ claims.
 Deterministic, a few seconds, and the half worth running after any parser change:
 
 ```bash
-for h in command_parser mm_frames wal_replay; do
+for h in command_parser mm_frames wal_replay column_block; do
   ./build-fuzz/fuzz/fuzz_$h fuzz/corpus/$h/*
 done
 ```
@@ -121,6 +122,19 @@ that many bytes; the ceiling is `MM_MAX_FRAME_PAYLOAD`, 64 MiB.
 | `max_length` | 67,108,864 (exactly 64 MiB) | at the ceiling, so it must not be refused |
 | `above_max_length` | 67,108,865 | one byte over, so it must be refused |
 | `uint32_max` | 4,294,967,295 | the largest value the field can hold |
+
+`fuzz/corpus/column_block/` is binary and written by `make_column_block_seeds` (in the fuzzing
+build): each seed is the count of values the reader is told (u16, little-endian), the column's type
+(u8: 0 `u64`, 1 `i64`, 2 `u32`, 3 `u16`, 4 `u8`), then a block. Three columns - a price ladder on a
+tick of 10^6, timestamps twenty rows to an instant, random quantities - in every encoding that applies
+to each, as the encoder writes it; and `refuse-*`, three a reader must refuse: a count one more than
+the block holds, a block cut in half, an empty one. Written again after any change to the block's
+layout:
+
+```bash
+cmake --build build-fuzz --target make_column_block_seeds
+rm -f fuzz/corpus/column_block/* && ./build-fuzz/fuzz/make_column_block_seeds fuzz/corpus/column_block
+```
 
 `fuzz/corpus/wal_replay/` is binary. A record is a 24-byte header — `sequence_number` u64,
 `timestamp_ns` u64, `checksum` u32 (CRC32C of the payload), `payload_len` u16, `record_type` u8,
