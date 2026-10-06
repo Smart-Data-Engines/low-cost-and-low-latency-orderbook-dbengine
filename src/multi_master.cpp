@@ -1237,7 +1237,7 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
             conn.connected = false;
             conn.compress  = config_.compress;
             peers_[peer.node_id] = std::move(conn);
-        } else if (!peer.address.empty() && it->second.address != peer.address) {
+        } else if (it->second.address.empty()) {
             it->second.address = peer.address;
         }
         if (peer.address == own_address()) {
