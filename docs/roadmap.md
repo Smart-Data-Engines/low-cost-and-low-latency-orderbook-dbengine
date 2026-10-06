@@ -2522,6 +2522,68 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 215. A replica that is still joining stands for election **P1**
+
+A node rejoining after a failover discards its data, installs a snapshot of the new primary's store
+and catches up from the snapshot's position; until it has, it knows it does not hold the stream, and
+the election does not ask it. A primary lost in that window hands the role to a node without the
+writes since the snapshot - and the node that comes back after it discards its copy. #214 made the
+window the join rather than for ever: 0.30 - 0.39 s on the two cluster hosts, from starting as a
+replica to the primary's `catchup complete`, at 25 - 42 segments. It grows with the store and with a
+replay from zero. Not standing for election while joining trades that for a cluster without a primary
+until a node with the data returns, which is a decision about availability rather than a fix.
+
+- Effort: M | Impact: an unplanned failover inside a rejoin loses every write the joining node has
+  not received - the whole round, before #214, on two hosts
+
+### 214. A replica rejoining under writes never took its snapshot, and a node without the round's writes was promoted ✅ **P1**
+
+**Found on the two cluster hosts** - an m8a.xlarge with Ubuntu 26.04 and an m9g.xlarge with Amazon
+Linux 2023 - killing the primary of a failover group under writes, seven rounds alternating between
+them (`wal-rotate-bytes` 1 MiB, to reach the snapshot path). In the three rounds where the writer ran
+beside the primary, at 115 000 - 120 000 single-level writes a second, the node promoted had none of
+the round's writes - **438 625, 415 875 and 421 299 acknowledged writes lost** - and the old primary,
+rejoining, discarded its copy. Where the writer crossed the network, 13 000 - 19 000 a second, no
+write was lost.
+
+What the two nodes' logs say, in order:
+
+1. The killed primary, restarted, rejoins: its data is not a prefix of the new primary's stream, so
+   it discards it and asks from zero. That file is gone, `ERR WAL_TRUNCATED`, and a snapshot is made
+   on the worker and installed.
+2. Having installed it, the replica ended the connection to ask for the stream from the snapshot's
+   position - after the reconnect loop's delay, five seconds, the one it gives an error. Not
+   connected, it held nothing back from retention, and the file it asked for had been freed.
+3. A second snapshot, and while the worker made it the primary sent the replica live records:
+   `live_record_action()` knew a catch-up and a snapshot transfer, not a snapshot being made. The
+   replica read `WAL 109 52224 136 4` where `SNAPSHOT_BEGIN` belonged, abandoned the bootstrap and
+   waited ten seconds. Under writes every attempt ended so: the replica never joined.
+4. The primary was killed, and the election promoted the node that had none of the stream.
+
+Fixed:
+
+- A replica whose snapshot is being made is in a transfer (`snapshot_preparing`): a live record is
+  dropped for it - it is inside the snapshot, or in the WAL the replica asks for from the snapshot's
+  position - and a heartbeat waits.
+- After installing a snapshot the replica asks for the stream at once; the delay stays for errors.
+- A `HEARTBEAT` before `SNAPSHOT_BEGIN` is skipped, as the wait for `STREAM` already did.
+
+Tests in `tests/test_replication.cpp`: `ALiveRecordDoesNotGoAheadOfSnapshotBegin` holds the worker
+with a gate while a record is broadcast; `NothingGoesAheadOfASnapshotStillBeingMade` is the decision
+itself; `AHeartbeatBeforeSnapshotBeginIsNotTheAnswer` and `AfterASnapshotTheReplicaAsksForTheStreamAtOnce`
+drive the replica from a mock primary. Mutations: each part of the fix removed is killed - the
+decision's branch by the decision test alone, because `transfer_in_progress()` then holds the record
+back instead of dropping it, which the socket test cannot tell apart - and setting the resume
+whether or not the install succeeded survives, since no test fails an install; the control survives.
+
+On the two hosts after the fix, the same seven rounds: every rejoin installed its snapshot and
+reached the stream 0.30 - 0.39 s after starting as a replica, and no bootstrap was abandoned. What an
+unplanned failover still loses is what the primary had not sent: 29, 0, 0, 0, 0 and 1 acknowledged
+writes in the six rounds of 59 000 - 362 000, the 29 at 117 000 writes a second, and none when
+systemd brought the killed primary back - the window #215 and `docs/operations.md`, "What a failover
+keeps", describe (`evidence/2026-10-06-cluster-across-hosts/s4-fixed/`,
+`evidence/2026-10-06-replica-rejoin/`).
+
 ### 213. A compiler older than GCC 12 was taken, and the build failed on a static_assert ✅ **P3**
 
 **Found on the ARM host**, building the RPM for #211's check with Amazon Linux 2023's default
@@ -13520,7 +13582,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #212.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #212, #215.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

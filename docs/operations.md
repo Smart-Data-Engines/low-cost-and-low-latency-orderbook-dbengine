@@ -1271,6 +1271,29 @@ one before it ends, and that is the vector the older build reads. Started on the
 crash instead, the node restores its frontiers as of its last whole vector - behind what it holds -
 and its peers' catch-up sends it again what moved since.
 
+## What a failover keeps
+
+Replication is asynchronous. A write is acknowledged once it is in the primary's WAL, and the
+replicas are sent it after; a primary that dies takes with it what it had not sent. How much that is
+depends on how it ends:
+
+- **A planned `FAILOVER`** loses nothing it acknowledged (#204): the outgoing node closes writes
+  before its stream ends, and the target stands once it holds the stream to that end. Measured on
+  two hosts, an x86 and an ARM node in one subnet, at about 100 000 writes a second: 0 of 457 746.
+- **A primary process killed** takes what it had not yet handed to the kernel. On the same hosts,
+  six rounds of `SIGKILL` under writes lost 29, 0, 0, 0, 0 and 1 acknowledged writes of 59 000 -
+  362 000 a round - the 29 at 117 000 writes a second - and the role moved in 17 - 21 s, the lease
+  and the election wait (#82).
+- **A machine that stops** - power, kernel, network - takes what was in its socket buffers too, which
+  those rounds do not measure.
+
+The node that comes back rejoins the new primary's stream: its data is discarded and replaced by a
+snapshot, and it catches up from the snapshot's position - 0.30 - 0.39 s on those hosts, from
+`starting as REPLICA` to the primary's `catchup complete`. Until it has, it is a replica without the
+stream, and **the election does not know** (#215): a primary lost in that window hands the role to a
+node without the writes since the last failover. Before #214 a rejoin under writes did not finish at
+all, and the next failover lost the whole round.
+
 ## When a replica falls behind
 
 Two gauges again, and the same rule: read the pair.
