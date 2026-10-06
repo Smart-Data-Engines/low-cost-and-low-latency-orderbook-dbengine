@@ -4034,6 +4034,19 @@ Learned the hard way. Check here before debugging.
      what master deferred was sealed after the measurement, and it read 11% faster than the fix that
      sealed as it went. Three times the levels reversed it, 4-7% the other way and the worst batch a
      quarter. Before reading a difference, check that both sides did all their work inside the window.
+541. **A property whose runs are short cannot see an unstable sort.** `scan_by_time()` sorts each
+     segment's rows by time and must keep a tie in the order the segment holds it (#44 step 2); with
+     `std::sort` for `std::stable_sort` the property passed, because libstdc++ sorts up to 16
+     elements by insertion, which is stable, and every run it generated was shorter. A test of 200
+     rows at five times killed it. Where order within ties matters, test a run past the sort's
+     small-case threshold.
+542. **A difference with the same instructions is the binary's layout, and the fix for it may be
+     elsewhere.** Step 2 of #44 made step 1's bucket query 2.6% slower on the m9g.xlarge: `perf stat`
+     counted the same 171.5 M instructions a query in more cycles, all in the row callback it had
+     moved into another function, whose hot path disassembles to the same instructions in other
+     registers. Count instructions and cycles before reading an ABAB difference as work, and look for
+     what costs on each machine: a 64-bit division a row was tens of cycles on the i3-7100U and none
+     of the difference on the ARM - dropping it took the query from 42-49 to 33-40 ms there.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -37,7 +37,9 @@ The first release. What it contains, by area:
   and telling an empty aggregate from a zero.
 - Aggregates over time buckets of the stored rows - `GROUP BY TIME_BUCKET(1m)` with `COUNT`, `FIRST`,
   `LAST`, `MIN`, `MAX`, `SUM`, `AVG` and `VWAP`, the conditions narrowing the rows they read, read by
-  `query_buckets()` in the Python and C++ clients (#44, step 1).
+  `query_buckets()` in the Python and C++ clients (#44, step 1) - and series of the book through
+  them: `OPEN`, `HIGH`, `LOW`, `CLOSE` and the time-weighted `TWAP` of the best bid, the best ask, the
+  mid and the spread, every bucket of the range answered (#44, step 2).
 - `BOOK` for the live book over the wire, and `SUBSCRIBE` for rows pushed as they are written.
 
 ### Replication and availability

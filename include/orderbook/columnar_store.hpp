@@ -511,13 +511,51 @@ public:
     /// `scan()` delivers after it - is not read: its `LevelSet` says which levels it has, and a
     /// segment without one is read always. Rows in the order `scan()` delivers them otherwise:
     /// bids, then asks, each by level.
+    ///
+    /// With `wanted`, the book of those (side, level) pairs only (#44 step 2): a row of any other is
+    /// not the answer's, and a segment none of whose wanted levels can change is not read - so the
+    /// best levels of a deep book are read from the newest segment holding them, not from the
+    /// oldest holding some level.
     struct BookAt {
         std::vector<SnapshotRow> rows;
         size_t segments_read{0};
         size_t segments_skipped{0};
         size_t blocks{0};
     };
-    BookAt latest_per_level(uint64_t at, std::string_view symbol, std::string_view exchange) const;
+    BookAt latest_per_level(uint64_t at, std::string_view symbol, std::string_view exchange,
+                            const LevelSet* wanted = nullptr) const;
+
+    /// The rows of one symbol in [start_ns, end_ns] that `keep` accepts, in the order the book at an
+    /// instant decides by (#44 step 2): by timestamp, and at one timestamp in the order scan()
+    /// delivers them - so the last row of a level at a time is the one the book holds then. `cb`
+    /// returning false ends the read.
+    ///
+    /// Each candidate's kept rows are a run, sorted by time and stable, merged with the others by
+    /// a heap. Segments come in the order of their start and hold no row before it (#166), so
+    /// before a segment starting at W is read every held row before W is final and is handed over:
+    /// what is held at once is the runs of segments overlapping the current time, and the blocks
+    /// not yet sealed - read first, like a segment whose range is not its rows', since neither
+    /// has a start to wait for.
+    struct TimeOrderedCost {
+        size_t candidates{0};
+        size_t blocks{0};
+        uint64_t kept{0};
+        uint64_t delivered{0};
+        /// The most kept rows held - read and not yet handed over - at any one time.
+        uint64_t max_held{0};
+        /// Whether `cb` ended it.
+        bool stopped{false};
+    };
+    TimeOrderedCost scan_by_time(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                                 std::string_view exchange, ColumnSet columns,
+                                 const std::function<bool(const SnapshotRow&)>& keep,
+                                 const std::function<bool(const SnapshotRow&)>& cb) const;
+
+    /// The earliest start and the latest end among one symbol's segments and unsealed blocks, or
+    /// nothing when it has neither (#44 step 2): the range a series without a time condition
+    /// covers.
+    std::optional<std::pair<uint64_t, uint64_t>> time_span(std::string_view symbol,
+                                                           std::string_view exchange) const;
 
     /// Called on startup to rebuild segment index from persisted meta.json files.
     void open_existing();
