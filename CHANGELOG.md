@@ -55,7 +55,10 @@ The first release. What it contains, by area:
   acknowledged write and takes a monitor tick rather than a lease TTL: the outgoing primary closes
   writes and keeps streaming, and its target stands once it holds the stream (#204).
 - Multi-master replication: per-origin numbering, version vectors sent in parts, catch-up, lag in
-  records, conflict resolution by hybrid logical clocks and last-writer-wins.
+  records, conflict resolution by hybrid logical clocks and last-writer-wins. A peer is dialled at
+  the address it last registered, and never at a node's own (#216). The procedure for a mesh across
+  hosts in `docs/operations.md` has been carried out on two hosts and corrected where it failed, and
+  a node says at its start when its advertised address is loopback and its coordinator is not (#217).
 - Sharding by symbol on a consistent-hash ring, and moving a symbol between shards with its rows
   (#196).
 - Rolling upgrades: the previous version's server and this one, side by side, in both directions

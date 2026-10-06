@@ -2522,6 +2522,58 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 217. The documented procedure for a cluster across hosts did not form a cluster ✅ **P2**
+
+**Found carrying it out** on the two cluster hosts - #33 asked for exactly that and had no second
+machine. Followed as written:
+
+- **There was no `advertise-host`.** Every node registered `127.0.0.1:9092`; each dialled the
+  other's registration, reached itself and refused its own id - `Peer on fd=11 claims node id 2,
+  which is this node's own id`, once a second - and `MM_PEERS` showed each peer `disconnected`
+  while each node looked healthy on its own. With the line, the mesh formed.
+- **The cluster secret** was written into `/etc/orderbook/secrets/`, which nothing creates, and,
+  run on each node as the section read, made a secret each: every link failed authentication.
+- **`tls-peer-names`** in the example form, `node-10.0.0.1`, matched - through OpenSSL's fallback to
+  the subject CN for a certificate with no `dNSName`, which the section did not give as the rule. A
+  list covering neither certificate kept the mesh from forming, naming the identity presented.
+- **What two writers leave behind** - the same book and different histories - was nowhere.
+
+The procedure has the line now, the secret is made once and installed on every node, and the
+section says the CN rule and the history. A node whose advertised address is loopback while a
+coordinator endpoint is on another machine says so at the start
+(`remote_coordinator_for_loopback_advertise()`, tested in `tests/test_cli_config.cpp`), and #216
+keeps it from dialling itself. RUN_ON_HOSTS
+
+- Effort: S | Impact: a cluster built from the document did not form, and every node looked healthy
+
+### 216. A mesh node kept a peer's old address after the peer registered at a new one, and dialled its own address when a peer shared it ✅ **P2**
+
+**Found on the two cluster hosts.** A node that started while its peer was being restarted read the
+peer's old registration, `127.0.0.1:9092`, and kept it after the peer registered again at its
+private address: `handle_topology_change()` filled in only an address that was empty, so the record
+went on naming the old one. The link came up the other way, the peer dialling this node, but
+`MM_PEERS` showed the old address until a restart, and had the link dropped this node would have
+gone on dialling itself. Where two nodes advertised one address - both at the default, the
+procedure of #217 - each dialled its own registration once a second, for ever.
+
+- A node takes the address the registry gives for each peer, and says when it changes
+  (`Peer 2 now advertises 10.0.0.2:9092, not 127.0.0.1:9092`).
+- It does not dial a peer registered at its own address - from `connect_to_peer()` or from the
+  reconnect loop - and says so once per peer and address, at ERROR, naming the fix. `MM_PEERS` still
+  lists the peer, at that address.
+- The accept side's refusal of its own id says what it means: this node dialled itself.
+
+Tests in `tests/test_multi_master.cpp`: `APeerThatRegistersAtANewAddressIsDialledThereFromThenOn`
+closes the link at the new address and waits for the reconnect to come back there;
+`APeerRegisteredAtThisNodesOwnAddressIsNotDialled` has the mesh listen on 127.0.0.2 and advertise
+127.0.0.1, where the test listens, beside a peer elsewhere that is dialled - the control.
+Mutations: the handler taking only an empty address, and a dial of this node's own address from
+`connect_to_peer()` or from the reconnect loop, are killed; the ERROR said on every event rather than
+once survives, since no test reads the log, and so does the control
+(`evidence/2026-10-06-mesh-address/`).
+
+- Effort: S | Impact: a moved or corrected peer was dialled at its old address until a restart
+
 ### 215. A replica that is still joining stands for election **P1**
 
 A node rejoining after a failover discards its data, installs a snapshot of the new primary's store

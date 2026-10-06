@@ -63,6 +63,8 @@ struct ThreadCpu {
 
 std::map<int, ThreadCpu> per_thread_cpu(int pid) {
     std::map<int, ThreadCpu> out;
+    // A node on another host (`OB_HOST`, pid 0) has no threads here to read.
+    if (pid <= 0) return out;
     const double tck = static_cast<double>(::sysconf(_SC_CLK_TCK));
     for (const auto& e : std::filesystem::directory_iterator("/proc/" + std::to_string(pid) + "/task")) {
         std::ifstream in(e.path() / "stat");
@@ -101,7 +103,11 @@ int connect_to(int port) {
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons(static_cast<uint16_t>(port));
-    ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    // `OB_HOST` for a node on another host (#217); its resident memory is not readable from here,
+    // so give 0 for the pid there.
+    const char* host = std::getenv("OB_HOST");
+    if (host == nullptr || *host == '\0') host = "127.0.0.1";
+    if (::inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;
     if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return -1;
     std::string banner;
     char buf[4096];

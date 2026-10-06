@@ -22,6 +22,10 @@
 //
 //     ./build-release/benchmarks/command_latency <port> <iterations> <server-pid> <command...>
 //
+// `OB_HOST=<IPv4 address>` measures a node on another host - the round trip a client in another
+// rack pays, beside the loopback one (#217). Its CPU cannot be read from here: give 0 for the pid,
+// and `server_cpu_s` reads -1, the value it always gave for a figure it could not take.
+//
 // One JSON object on stdout: percentiles of the round trip, the server's CPU for the timed loop
 // (read from /proc/<server-pid>/stat), and the size of one answer in bytes and in lines - the
 // second so a driver can check the answer is the shape it asked for, not only that it arrived.
@@ -94,7 +98,12 @@ int main(int argc, char** argv) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(static_cast<uint16_t>(port));
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    const char* host = std::getenv("OB_HOST");
+    if (host == nullptr || *host == '\0') host = "127.0.0.1";
+    if (::inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        std::fprintf(stderr, "OB_HOST is not an IPv4 address: %s\n", host);
+        return 2;
+    }
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         std::perror("connect");
         return 1;

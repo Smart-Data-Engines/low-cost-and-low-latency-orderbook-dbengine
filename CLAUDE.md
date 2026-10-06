@@ -4076,6 +4076,11 @@ Learned the hard way. Check here before debugging.
      stream - the primary sent it live records while its snapshot was being made - promoted with none
      of the round's 415 875 - 438 625 acknowledged writes (#214). Kill under writes, count what the
      client was told, and run it more than once in each direction: the loss was in every other round.
+548. **A procedure nobody has carried out is a guess with a code block.** The mesh across hosts in
+     `docs/operations.md` left out `advertise-host`, so every node advertised 127.0.0.1 and dialled
+     itself, and its secret command made a different secret on each node, into a directory nothing
+     created (#217). Every node looked healthy on its own the whole time. Carry a procedure out
+     literally on the hosts it is for, and write down what had to change.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
