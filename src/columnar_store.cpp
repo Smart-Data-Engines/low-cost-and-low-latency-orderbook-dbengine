@@ -24,6 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ob {
 
@@ -1196,6 +1197,18 @@ void ColumnarStore::write_columns_v3(const std::string& dir) {
         file.append(reinterpret_cast<const char*>(&crc), sizeof crc);   // little-endian hosts only
     }
     for (const std::string& block : blocks) file += block;
+    // What this thread keeps for the next seal is bounded as the codec bounds its own: a seal's
+    // columns fit, and a segment an embedding application sealed after an hour does not stay.
+    const auto keep_small = [](auto& buffer) {
+        using Buffer = std::remove_reference_t<decltype(buffer)>;
+        if (buffer.capacity() * sizeof(typename Buffer::value_type) > column_codec::kEncodeBufferKept) {
+            Buffer().swap(buffer);
+        }
+    };
+    keep_small(cnt);
+    keep_small(side);
+    keep_small(level);
+    for (std::string& block : blocks) keep_small(block);
     write_file_checked(dir + "/" + kColumnsV3File, file.data(), file.size());
 
     OB_LOG_DEBUG("columnar",
@@ -1423,9 +1436,12 @@ struct SegmentReadBuffers {
     std::vector<uint8_t>  sides;
     std::vector<uint16_t> levels;
     std::vector<char>     file;   ///< a format-3 segment's columns.v3, as read
+    /// What decoding format 3's blocks works in. Kept here rather than per thread, so that what
+    /// the decoder grows to is inside the pool's budget too.
+    column_codec::DecodeScratch scratch;
 
     size_t held_bytes() const {
-        return file.capacity() +
+        return file.capacity() + scratch.held_bytes() +
                (timestamps.capacity() + enc_prices.capacity() + enc_qtys.capacity() +
                 enc_seq.capacity() + qtys.capacity() + zigzag_seq.capacity()) * sizeof(uint64_t) +
                (prices.capacity() + seqs.capacity()) * sizeof(int64_t) +
@@ -1668,13 +1684,13 @@ ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet col
         std::string reason;
         bool ok = false;
         switch (c) {
-        case 0:  ok = column_codec::decode_as(block, count, b.timestamps, &reason); break;
-        case 1:  ok = column_codec::decode_as(block, count, b.prices, &reason); break;
-        case 2:  ok = column_codec::decode_as(block, count, b.qtys, &reason); break;
-        case 3:  ok = column_codec::decode_as(block, count, b.counts, &reason); break;
-        case 4:  ok = column_codec::decode_as(block, count, b.sides, &reason); break;
-        case 5:  ok = column_codec::decode_as(block, count, b.levels, &reason); break;
-        default: ok = column_codec::decode_as(block, count, b.seqs, &reason); break;
+        case 0:  ok = column_codec::decode_as(block, count, b.timestamps, b.scratch, &reason); break;
+        case 1:  ok = column_codec::decode_as(block, count, b.prices, b.scratch, &reason); break;
+        case 2:  ok = column_codec::decode_as(block, count, b.qtys, b.scratch, &reason); break;
+        case 3:  ok = column_codec::decode_as(block, count, b.counts, b.scratch, &reason); break;
+        case 4:  ok = column_codec::decode_as(block, count, b.sides, b.scratch, &reason); break;
+        case 5:  ok = column_codec::decode_as(block, count, b.levels, b.scratch, &reason); break;
+        default: ok = column_codec::decode_as(block, count, b.seqs, b.scratch, &reason); break;
         }
         if (!ok) {
             why = std::string("has column ") + kColumnNames[c] + " that cannot be decoded: " + reason;

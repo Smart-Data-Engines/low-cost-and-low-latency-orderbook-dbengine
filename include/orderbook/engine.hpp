@@ -814,17 +814,8 @@ private:
     // searching every sixteenth segment; a merge searches always and takes ZSTD where it saves 10%
     // over LZ4, since what it writes is what stays (segment format v3, design §3). Measured
     // choices, not guesses: kiro-workspace/specs/segment-format-v3/.
-    ColumnarStore::SegmentFormat seal_format_{default_segment_format(0, 0, 16)};
-    ColumnarStore::SegmentFormat merge_format_{default_segment_format(3, 10, 1)};
-    static ColumnarStore::SegmentFormat default_segment_format(int zstd_level, unsigned zstd_margin_pct,
-                                                               uint32_t search_every) {
-        ColumnarStore::SegmentFormat f;
-        f.search.lz4 = true;
-        f.search.zstd_level = zstd_level;
-        f.search.zstd_margin_pct = zstd_margin_pct;
-        f.search_every = search_every;
-        return f;
-    }
+    ColumnarStore::SegmentFormat seal_format_{ColumnarStore::SegmentFormat::seal()};
+    ColumnarStore::SegmentFormat merge_format_{ColumnarStore::SegmentFormat::merge()};
 
     /// Writes admitted at the rate the device takes (#190 step 5). Its interval is the flush
     /// interval, declared above and so initialised before this.

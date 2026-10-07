@@ -7,7 +7,9 @@
 // encoding replaces them was measured, not chosen (kiro-workspace/specs/segment-format-v3/,
 // `benchmarks/segment_encoding_probe`): no single encoding wins on every dataset - fixed-width
 // blocks on random quantities, ZSTD on a book's snapshots, whose levels repeat from one to the
-// next - so every column of every segment is written in the smallest of nine candidates.
+// next - so every column of every segment is written in the smallest of the candidates below that
+// its options try: five without compression, and runs and narrow of each transform under LZ4 and
+// under ZSTD.
 //
 // A candidate is a transform, a packing and, or not, LZ4 or ZSTD over the packed bytes:
 //
@@ -80,6 +82,28 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
 size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int zstd_level,
                  std::string& out);
 
+/// What a thread that encodes keeps of each of its working buffers between calls. A buffer grown
+/// past it - by a merge, or by a segment an embedding application seals after an hour of rows - is
+/// freed when the call returns rather than kept for the thread's life; a seal's columns fit under it.
+inline constexpr size_t kEncodeBufferKept = size_t{1} << 20;
+
+/// What a decode works in besides the column it fills: a payload decompressed, Simple8b's words
+/// aligned, and the values and run lengths before their inverse. A caller that decodes many blocks
+/// keeps one, passes it, and counts what it holds: the store keeps one in each set of its pooled
+/// read buffers, so what reads keep between them is inside the pool's budget however many threads
+/// read. A decode not given one makes one for the call.
+struct DecodeScratch {
+    std::string plain;
+    std::vector<uint64_t> words;
+    std::vector<uint64_t> values;
+    std::vector<uint64_t> lengths;
+
+    size_t held_bytes() const noexcept {
+        return plain.capacity() +
+               (words.capacity() + values.capacity() + lengths.capacity()) * sizeof(uint64_t);
+    }
+};
+
 /// Decodes a block of `count` values into `out`, which then holds exactly them. False, with the
 /// reason in `why`, for bytes that are not such a block: an unknown transform or packing, a header
 /// or payload cut short, a payload that does not decompress to the length it declares or does not
@@ -91,6 +115,11 @@ bool decode(std::span<const char> block, size_t count, std::vector<uint64_t>& ou
 /// value, reinterpreted.
 template <typename T>
 bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, std::string* why);
+
+/// The same, working in `scratch`, which keeps what it grew to for the next decode.
+template <typename T>
+bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, DecodeScratch& scratch,
+               std::string* why);
 
 /// LEB128, as the blocks and the file holding them write their lengths.
 void put_varint(std::string& out, uint64_t v);

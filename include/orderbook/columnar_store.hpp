@@ -29,8 +29,8 @@ namespace ob {
 /// it past a flush. Version 2 stores all seven columns.
 ///
 /// Version 3 (kiro-workspace/specs/segment-format-v3/) stores them in one file, `columns.v3`, each
-/// column in the smallest of nine encodings (column_codec.hpp) and checksummed: version 2 wrote four
-/// of them raw, 25 bytes a row on the comparative dataset where version 3 writes under 2.
+/// column in the smallest of its candidate encodings (column_codec.hpp) and checksummed: version 2
+/// wrote four of them raw, 25 bytes a row on the comparative dataset where version 3 writes under 2.
 inline constexpr uint32_t kColumnarFormatV2 = 2;
 inline constexpr uint32_t kColumnarFormatV3 = 3;
 /// The version a store writes unless told otherwise (`segment-format`).
@@ -380,15 +380,30 @@ public:
     void set_own_origin(uint16_t origin) { own_origin_ = origin; }
 
     /// How this store writes a segment (segment format v3, design §3): the format's version, and
-    /// how a version-3 column's encoding is chosen.
+    /// how a version-3 column's encoding is chosen. What a store is not told is a seal's - LZ4 or
+    /// nothing, each column in the encoding its last segment chose and searched for again every
+    /// sixteenth - so a store an embedding application makes, which no merge ever rewrites, seals as
+    /// the server's do.
     struct SegmentFormat {
         uint32_t version{kColumnarFormatVersion};
-        /// The search over the nine candidates: its ZSTD level and margin.
-        column_codec::EncodeOptions search{};
+        /// The search over the candidates: which compressors it tries, and their margins.
+        column_codec::EncodeOptions search{.lz4 = true, .zstd_level = 0, .compressed_margin_pct = 0,
+                                           .zstd_margin_pct = 0, .hint = nullptr};
         /// A segment reuses the encoding this store's last one chose for each column, and searches
         /// again every this many segments - and always when it has none to reuse. 1: every segment
         /// searches.
-        uint32_t search_every{1};
+        uint32_t search_every{16};
+
+        /// A seal's: what queries read most, so nothing that decodes as slowly as ZSTD.
+        static SegmentFormat seal() { return SegmentFormat{}; }
+        /// A merge's: what stays, so ZSTD(3) where it saves 10% over LZ4, and every segment searched.
+        static SegmentFormat merge() {
+            SegmentFormat f;
+            f.search.zstd_level = 3;
+            f.search.zstd_margin_pct = 10;
+            f.search_every = 1;
+            return f;
+        }
     };
     void set_segment_format(const SegmentFormat& format) {
         segment_format_ = format;
@@ -866,7 +881,7 @@ private:
     /// active state: what flush_segment() and flush_segment_into() share.
     SegmentMeta write_active_segment(const std::string& dir);
     /// The active segment's seven columns as `dir`/columns.v3 (segment format v3): each column in
-    /// the encoding its last segment chose, or in the smallest of the nine when this one searches.
+    /// the encoding its last segment chose, or in the smallest candidate when this one searches.
     void write_columns_v3(const std::string& dir);
 
     /// What reading one segment came to: its rows handed over, or none because a column was

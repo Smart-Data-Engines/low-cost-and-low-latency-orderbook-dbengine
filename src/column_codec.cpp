@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <type_traits>
 
@@ -35,6 +36,12 @@ namespace ob::column_codec {
 //   narrow    each value in `width` bytes, little-endian
 
 namespace {
+
+/// A thread's working buffer, freed when it has grown past what a thread keeps between calls.
+template <typename Buffer>
+void keep_small(Buffer& b) {
+    if (b.capacity() * sizeof(typename Buffer::value_type) > kEncodeBufferKept) Buffer().swap(b);
+}
 
 constexpr uint8_t kScaledBit = 1u << 2;
 constexpr uint8_t kZstdBit = 1u << 5;
@@ -171,6 +178,8 @@ void pack_runs(const std::vector<uint64_t>& v, std::string& out) {
     put_varint(out, value_words.size());
     put_u64_words(out, value_words);
     put_u64_words(out, length_words);
+    keep_small(values);
+    keep_small(lengths);
 }
 
 unsigned block_width(const uint64_t* v, size_t n) {
@@ -250,9 +259,35 @@ bool lz4_compress(const std::string& in, std::string& out) {
     return true;
 }
 
-/// One compression context a thread, kept: a context made per call allocates its tables each time.
+struct FreeCCtx {
+    void operator()(ZSTD_CCtx* c) const noexcept { ZSTD_freeCCtx(c); }
+};
+struct FreeDCtx {
+    void operator()(ZSTD_DCtx* d) const noexcept { ZSTD_freeDCtx(d); }
+};
+
+/// One compression context a thread, kept - a context made per call allocates its tables each
+/// time - and freed with the thread. Null when ZSTD could not make one; asked again next call.
+ZSTD_CCtx* zstd_cctx() {
+    thread_local std::unique_ptr<ZSTD_CCtx, FreeCCtx> cctx;
+    if (!cctx) cctx.reset(ZSTD_createCCtx());
+    return cctx.get();
+}
+
+/// The same for decompression.
+ZSTD_DCtx* zstd_dctx() {
+    thread_local std::unique_ptr<ZSTD_DCtx, FreeDCtx> dctx;
+    if (!dctx) dctx.reset(ZSTD_createDCtx());
+    return dctx.get();
+}
+
 bool zstd_compress(const std::string& in, int level, std::string& out) {
-    thread_local ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx* cctx = zstd_cctx();
+    if (cctx == nullptr) {
+        OB_LOG_WARN("codec", "no ZSTD compression context could be made for %zu bytes", in.size());
+        out.clear();
+        return false;
+    }
     out.resize(ZSTD_compressBound(in.size()));
     const size_t n = ZSTD_compressCCtx(cctx, out.data(), out.size(), in.data(), in.size(), level);
     if (ZSTD_isError(n)) {
@@ -305,14 +340,16 @@ size_t emit(const Stream& s, Packing p, Compressor c, int zstd_level, std::strin
     if (c != Compressor::kNone && compress(c, packed, zstd_level, compressed)) {
         put_header(out, s, p, width, c, packed.size());
         out += compressed;
-        return out.size() - at;
+    } else {
+        if (c != Compressor::kNone) {
+            OB_LOG_WARN("codec", "%s could not compress %zu bytes; the block is written uncompressed",
+                        c == Compressor::kZstd ? "ZSTD" : "LZ4", packed.size());
+        }
+        put_header(out, s, p, width, Compressor::kNone, 0);
+        out += packed;
     }
-    if (c != Compressor::kNone) {
-        OB_LOG_WARN("codec", "%s could not compress %zu bytes; the block is written uncompressed",
-                    c == Compressor::kZstd ? "ZSTD" : "LZ4", packed.size());
-    }
-    put_header(out, s, p, width, Compressor::kNone, 0);
-    out += packed;
+    keep_small(packed);
+    keep_small(compressed);
     return out.size() - at;
 }
 
@@ -323,9 +360,9 @@ bool fail(std::string* why, const char* reason) {
     return false;
 }
 
-bool unpack_simple8b(std::span<const char> p, size_t n, std::vector<uint64_t>& out, std::string* why) {
+bool unpack_simple8b(std::span<const char> p, size_t n, std::vector<uint64_t>& out,
+                     std::vector<uint64_t>& words, std::string* why) {
     if (p.size() % sizeof(uint64_t) != 0) return fail(why, "Simple8b payload is not whole words");
-    thread_local std::vector<uint64_t> words;
     words.resize(p.size() / sizeof(uint64_t));
     if (!words.empty()) std::memcpy(words.data(), p.data(), p.size());
     if (!decode_simple8b_exact(words, n, out)) {
@@ -444,20 +481,20 @@ bool read_header(std::span<const char> block, size_t count, Header& h, std::stri
     return true;
 }
 
-/// The packed payload: the block's own bytes, or - compressed - decompressed into this thread's
-/// buffer, which it is then a view of.
-bool payload_of(std::span<const char> block, const Header& h, std::span<const char>& payload,
-                std::string* why) {
+/// The packed payload: the block's own bytes, or - compressed - decompressed into `plain`, which
+/// it is then a view of.
+bool payload_of(std::span<const char> block, const Header& h, std::string& plain,
+                std::span<const char>& payload, std::string* why) {
     if (h.compressor == Compressor::kNone) {
         payload = block.subspan(h.payload_at);
         return true;
     }
-    thread_local std::string plain;
     plain.resize(static_cast<size_t>(h.packed));
     const char* src = block.data() + h.payload_at;
     const size_t src_size = block.size() - h.payload_at;
     if (h.compressor == Compressor::kZstd) {
-        thread_local ZSTD_DCtx* dctx = ZSTD_createDCtx();
+        ZSTD_DCtx* dctx = zstd_dctx();
+        if (dctx == nullptr) return fail(why, "no ZSTD decompression context could be made");
         const size_t got = ZSTD_decompressDCtx(dctx, plain.data(), plain.size(), src, src_size);
         if (ZSTD_isError(got) || got != h.packed) {
             return fail(why, "ZSTD payload does not decompress to its declared length");
@@ -556,7 +593,8 @@ bool narrow_inverse(const Header& h, const char* p, size_t count, T* o) {
 /// Runs, unpacked straight into the column: a value filled run by run for none and for, and the
 /// running sum stepped by one run's difference at a time for delta.
 template <typename T>
-bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, std::string* why) {
+bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, DecodeScratch& scratch,
+                  std::string* why) {
     size_t at = 0;
     uint64_t runs = 0, value_words = 0;
     if (!get_varint(p, at, runs) || !get_varint(p, at, value_words)) return fail(why, "runs header cut short");
@@ -565,9 +603,14 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
     const size_t rest = p.size() - at;
     if (value_words > rest / sizeof(uint64_t)) return fail(why, "runs' value words past the payload");
     const size_t value_bytes = static_cast<size_t>(value_words) * sizeof(uint64_t);
-    thread_local std::vector<uint64_t> values, lengths;
-    if (!unpack_simple8b(p.subspan(at, value_bytes), static_cast<size_t>(runs), values, why)) return false;
-    if (!unpack_simple8b(p.subspan(at + value_bytes), static_cast<size_t>(runs), lengths, why)) return false;
+    std::vector<uint64_t>& values = scratch.values;
+    std::vector<uint64_t>& lengths = scratch.lengths;
+    if (!unpack_simple8b(p.subspan(at, value_bytes), static_cast<size_t>(runs), values, scratch.words, why)) {
+        return false;
+    }
+    if (!unpack_simple8b(p.subspan(at + value_bytes), static_cast<size_t>(runs), lengths, scratch.words, why)) {
+        return false;
+    }
     // The runs cover the packed values exactly - checked before anything is written.
     size_t total = 0;
     for (size_t r = 0; r < runs; ++r) {
@@ -788,6 +831,15 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     }
     choice.bytes = out.size() - at;
     choice.uncompressed_bytes = light.bytes;
+    for (int k = 0; k < 2; ++k) {
+        keep_small(streams[k].values);
+        keep_small(s8b[k]);
+        keep_small(runs[k]);
+        keep_small(narrow[k]);
+        for (auto& by_packing : compressed) {
+            for (std::string& z : by_packing[k]) keep_small(z);
+        }
+    }
     return choice;
 }
 
@@ -797,10 +849,17 @@ bool decode(std::span<const char> block, size_t count, std::vector<uint64_t>& ou
 
 template <typename T>
 bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, std::string* why) {
+    DecodeScratch scratch;
+    return decode_as(block, count, out, scratch, why);
+}
+
+template <typename T>
+bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, DecodeScratch& scratch,
+               std::string* why) {
     Header h;
     if (!read_header(block, count, h, why)) return false;
     std::span<const char> payload;
-    if (!payload_of(block, h, payload, why)) return false;
+    if (!payload_of(block, h, scratch.plain, payload, why)) return false;
     out.resize(count);
     T* o = out.data();
     bool fits = true;
@@ -821,12 +880,13 @@ bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, s
         break;
     }
     case Packing::kRuns:
-        return runs_inverse<T>(h, payload, count, o, why);
+        return runs_inverse<T>(h, payload, count, o, scratch, why);
     case Packing::kSimple8b:
     case Packing::kBlocks: {
-        thread_local std::vector<uint64_t> values;
-        const bool unpacked = h.packing == Packing::kSimple8b ? unpack_simple8b(payload, h.n, values, why)
-                                                              : unpack_blocks(payload, h.n, values, why);
+        std::vector<uint64_t>& values = scratch.values;
+        const bool unpacked = h.packing == Packing::kSimple8b
+                                  ? unpack_simple8b(payload, h.n, values, scratch.words, why)
+                                  : unpack_blocks(payload, h.n, values, why);
         if (!unpacked) return false;
         const uint64_t* v = values.data();
         fits = apply_inverse<T>(h, count, [v](size_t i) { return v[i]; }, o);
@@ -842,5 +902,15 @@ template bool decode_as<int64_t>(std::span<const char>, size_t, std::vector<int6
 template bool decode_as<uint32_t>(std::span<const char>, size_t, std::vector<uint32_t>&, std::string*);
 template bool decode_as<uint16_t>(std::span<const char>, size_t, std::vector<uint16_t>&, std::string*);
 template bool decode_as<uint8_t>(std::span<const char>, size_t, std::vector<uint8_t>&, std::string*);
+template bool decode_as<uint64_t>(std::span<const char>, size_t, std::vector<uint64_t>&, DecodeScratch&,
+                                  std::string*);
+template bool decode_as<int64_t>(std::span<const char>, size_t, std::vector<int64_t>&, DecodeScratch&,
+                                 std::string*);
+template bool decode_as<uint32_t>(std::span<const char>, size_t, std::vector<uint32_t>&, DecodeScratch&,
+                                  std::string*);
+template bool decode_as<uint16_t>(std::span<const char>, size_t, std::vector<uint16_t>&, DecodeScratch&,
+                                  std::string*);
+template bool decode_as<uint8_t>(std::span<const char>, size_t, std::vector<uint8_t>&, DecodeScratch&,
+                                 std::string*);
 
 }  // namespace ob::column_codec

@@ -98,20 +98,22 @@ void v2_read(size_t c, const std::string& file, size_t rows) {
     }
 }
 
-// Format 3's read of column `c`'s block into the same type.
+// Format 3's read of column `c`'s block into the same type, in a scratch kept from one read to the
+// next as the store keeps one in its read buffers.
 bool v3_read(size_t c, const std::string& block, size_t rows) {
     thread_local std::vector<uint64_t> u64;
     thread_local std::vector<int64_t> i64;
     thread_local std::vector<uint32_t> u32;
     thread_local std::vector<uint8_t> u8;
     thread_local std::vector<uint16_t> u16;
+    thread_local cc::DecodeScratch scratch;
     const std::span<const char> b(block.data(), block.size());
     switch (c) {
-    case 0: case 2: return cc::decode_as(b, rows, u64, nullptr);
-    case 1: case 6: return cc::decode_as(b, rows, i64, nullptr);
-    case 3: return cc::decode_as(b, rows, u32, nullptr);
-    case 4: return cc::decode_as(b, rows, u8, nullptr);
-    case 5: return cc::decode_as(b, rows, u16, nullptr);
+    case 0: case 2: return cc::decode_as(b, rows, u64, scratch, nullptr);
+    case 1: case 6: return cc::decode_as(b, rows, i64, scratch, nullptr);
+    case 3: return cc::decode_as(b, rows, u32, scratch, nullptr);
+    case 4: return cc::decode_as(b, rows, u8, scratch, nullptr);
+    case 5: return cc::decode_as(b, rows, u16, scratch, nullptr);
     default: return false;
     }
 }

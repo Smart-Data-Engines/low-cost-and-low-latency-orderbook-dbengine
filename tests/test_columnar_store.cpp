@@ -10,10 +10,12 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "orderbook/column_codec.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
 
@@ -1134,6 +1136,121 @@ TEST(ColumnarStoreFormat, SegmentFormat2WritesFormat2) {
     const auto at = json.find("\"bid_levels\":\"");
     ASSERT_NE(at, std::string::npos);
     EXPECT_EQ(json.find('"', at + 14) - (at + 14), ob::LevelSet::kLevels / 4) << json;
+}
+
+namespace {
+
+/// The encoding byte of each block of a format-3 segment, in the order of its file's directory.
+std::vector<uint8_t> block_encodings(const std::string& segment_dir) {
+    std::ifstream in(segment_dir + "/" + ob::kColumnsV3File, std::ios::binary);
+    const std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::span<const char> bytes(file.data(), file.size());
+    EXPECT_EQ(file.substr(0, 4), "OBS3");
+    size_t at = 4;
+    uint64_t rows = 0;
+    EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, rows));
+    const size_t columns = static_cast<uint8_t>(file.at(at++));
+    std::vector<uint64_t> lengths;
+    for (size_t c = 0; c < columns; ++c) {
+        ++at;   // the column's id
+        uint64_t length = 0;
+        EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, length));
+        at += 4;   // the block's CRC32C
+        lengths.push_back(length);
+    }
+    std::vector<uint8_t> encodings;
+    for (const uint64_t length : lengths) {
+        encodings.push_back(static_cast<uint8_t>(file.at(at)));
+        at += static_cast<size_t>(length);
+    }
+    EXPECT_EQ(at, file.size());
+    return encodings;
+}
+
+constexpr uint8_t kZstdBit = 0x20;
+constexpr uint8_t kLz4Bit = 0x40;
+constexpr size_t kQuantityColumn = 2;
+
+/// Two hundred snapshots of a book's twenty levels whose quantities repeat from one to the next:
+/// ZSTD keeps the quantities in half of LZ4's bytes, the case on which the two tiers part.
+void fill_repeating_snapshots(ob::ColumnarStore& store) {
+    for (uint64_t s = 0; s < 200; ++s) {
+        for (uint64_t l = 0; l < 20; ++l) {
+            store.append(make_row(1'000'000'000ULL + s * 100'000'000ULL,
+                                  6'000'000'000LL - static_cast<int64_t>(l) * 1'000'000,
+                                  100'000 + l * 7'919 % 5'003, 1, ob::SIDE_BID, static_cast<uint16_t>(l)));
+        }
+    }
+}
+
+}  // namespace
+
+TEST(ColumnarStoreFormat, AStoreNotToldOtherwiseSealsAsTheServerDoesWithoutZstd) {
+    // An application embedding the engine makes its stores without a format, and nothing merges
+    // what they seal: they seal as a server's stores do - LZ4 or nothing, the last encodings reused.
+    TempDir tmp("format_seal_default");
+    ob::ColumnarStore store(tmp.str());
+    EXPECT_EQ(store.segment_format().search.zstd_level, 0);
+    EXPECT_EQ(store.segment_format().search_every, 16u);
+    fill_repeating_snapshots(store);
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    const auto encodings = block_encodings(meta->dir_path);
+    ASSERT_EQ(encodings.size(), 7u);
+    for (size_t c = 0; c < encodings.size(); ++c) {
+        EXPECT_EQ(encodings[c] & kZstdBit, 0) << "column " << c;
+    }
+    EXPECT_NE(encodings[kQuantityColumn] & kLz4Bit, 0) << "the repeating quantities are LZ4's";
+}
+
+TEST(ColumnarStoreFormat, TheMergesFormatTakesZstdWhereItSavesItsMargin) {
+    TempDir tmp("format_merge_policy");
+    ob::ColumnarStore store(tmp.str());
+    store.set_segment_format(ob::ColumnarStore::SegmentFormat::merge());
+    fill_repeating_snapshots(store);
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    const auto encodings = block_encodings(meta->dir_path);
+    ASSERT_EQ(encodings.size(), 7u);
+    EXPECT_NE(encodings[kQuantityColumn] & kZstdBit, 0) << "half of LZ4's bytes passes a margin of 10%";
+    const auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), 4000u);
+    EXPECT_EQ(rows[3999].quantity, 100'000 + 19 * 7'919 % 5'003);
+}
+
+TEST(ColumnarStoreReadBuffers, AFormat3ReadsDecodingScratchIsCountedInWhatThePoolKeeps) {
+    // The decoder's own buffers - here the quantities unpacked from fixed-width blocks before their
+    // inverse - belong to the read's pooled set, so the budget bounds them as it bounds the columns.
+    TempDir tmp("read_buffers_scratch");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    constexpr uint64_t kRows = 4000;
+    uint64_t x = 0x9E3779B97F4A7C15ULL;
+    for (uint64_t i = 0; i < kRows; ++i) {
+        // Quantities of sixteen random bits: blocks of 128 at sixteen bits beat anything LZ4 makes.
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        store.append(make_row(1000 + i, 100'000 + static_cast<int64_t>(i), 1 + (x & 0xFFFF)));
+    }
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    ASSERT_EQ(meta->format_version, ob::kColumnarFormatV3);
+    const auto encodings = block_encodings(meta->dir_path);
+    ASSERT_EQ(encodings.size(), 7u);
+    ASSERT_EQ((encodings[kQuantityColumn] >> 3) & 0x3, 2) << "the quantities are in fixed-width blocks";
+
+    constexpr size_t kBudget = size_t{128} << 20;
+    struct RestoreBudget {
+        ~RestoreBudget() { ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget); }
+    } restore;
+    ob::ColumnarStore::set_read_buffers_limit_for_test(0);   // a fresh set for the read below
+    ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget);
+    ASSERT_EQ(scan_all(store).size(), kRows);
+    // The seven columns decoded, the file as read, and at least the quantities' values in the
+    // decode's scratch.
+    const size_t file_bytes = fs::file_size(meta->dir_path + "/" + ob::kColumnsV3File);
+    EXPECT_GE(ob::ColumnarStore::read_buffers_held(),
+              kRows * (8 + 8 + 8 + 8 + 4 + 1 + 2) + file_bytes + kRows * sizeof(uint64_t));
 }
 
 TEST(ColumnarStoreFormat, SegmentsOfBothFormatsInOneStoreReadAsTheyWereWritten) {

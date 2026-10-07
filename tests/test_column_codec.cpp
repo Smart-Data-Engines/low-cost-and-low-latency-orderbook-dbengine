@@ -7,10 +7,12 @@
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -340,6 +342,47 @@ TEST(ColumnCodec, ACompressedBlockMustDecompressToTheLengthItDeclares) {
             EXPECT_FALSE(decode(bytes(changed), column.size(), out, &why)) << "declared " << declared;
         }
     }
+}
+
+TEST(ColumnCodec, ADecodeInAKeptScratchGivesWhatADecodeOfItsOwnDoes) {
+    // One scratch through every encoding of every edge column, larger after smaller and the other
+    // way round: what an earlier decode left in it never reaches a later one's values.
+    DecodeScratch scratch;
+    for (const auto& column : edge_columns()) {
+        for (const Encoding& e : all_encodings()) {
+            SCOPED_TRACE(e.name());
+            std::string block;
+            encode_as(column, e, 3, block);
+            std::vector<uint64_t> own, kept;
+            std::string why;
+            ASSERT_TRUE(decode(bytes(block), column.size(), own, &why)) << why;
+            ASSERT_TRUE(decode_as(bytes(block), column.size(), kept, scratch, &why)) << why;
+            EXPECT_EQ(kept, own);
+        }
+    }
+    EXPECT_GT(scratch.held_bytes(), 0u) << "the scratch keeps what it grew to, for the caller to count";
+}
+
+TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {
+    // A thread keeps one ZSTD context of each kind while it lives and frees them when it ends: a
+    // migration's threads and an embedding application's come and go. Under the sanitizers job's
+    // leak check, a context an ended thread kept is a leak reported at exit.
+    std::vector<uint64_t> column;
+    for (int s = 0; s < 200; ++s) {
+        for (uint64_t l = 0; l < 20; ++l) column.push_back(100'000 + l * 7'919 % 5'003);
+    }
+    std::atomic<int> wrong{0};
+    for (int round = 0; round < 4; ++round) {
+        std::thread t([&] {
+            std::string block;
+            encode_as(column, Encoding{Transform::kDelta, Packing::kNarrow, Compressor::kZstd}, 3, block);
+            std::vector<uint64_t> back;
+            std::string why;
+            if (!decode(bytes(block), column.size(), back, &why) || back != column) wrong.fetch_add(1);
+        });
+        t.join();
+    }
+    EXPECT_EQ(wrong.load(), 0);
 }
 
 TEST(ColumnCodec, VarintsGoBothWaysAndRefuseWhatIsNotOne) {
