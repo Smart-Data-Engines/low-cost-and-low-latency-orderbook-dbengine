@@ -21,6 +21,7 @@ TimescaleDB's partitioning" would be measuring a claim it never made.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -76,11 +77,15 @@ class TimescaleDbSystem:
     def _start_session(self) -> subprocess.Popen:
         if self._session is not None and self._session.poll() is None:
             return self._session
+        # psql is a Perl wrapper on Debian and Ubuntu, and Perl warns on stderr - merged into the
+        # answers here - when the locale it is given is not installed, which is what an ssh session
+        # forwards from the machine it came from. The warning took the place of the server's
+        # version in every storage measurement of 6 and 7 October.
         self._session = subprocess.Popen(
             ["psql", "-p", str(self._port), "-d", self._database,
              "--no-psqlrc", "-q", "-A", "-t", "-F", "\t"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1)
+            text=True, bufsize=1, env=dict(os.environ, LC_ALL="C"))
         return self._session
 
     def _ask(self, statement: str) -> list[str]:
