@@ -687,9 +687,9 @@ finish one at a term the node handed over.
 
 **Seqlock concurrency** — A single writer can update the orderbook while multiple readers get consistent snapshots without locks. The version counter (odd = writing, even = stable) lets readers detect torn reads and retry.
 
-**Segment-based partitioning** — The columnar store splits data into time-bounded segments. Each segment is a directory containing column files (`price.col`, `qty.col`, `ts.col`, `cnt.col`) and a `meta.json` descriptor. This enables efficient time-range pruning. Since #47 the descriptor also says which (side, level) pairs the segment's rows are of (`bid_levels`, `ask_levels`), and the book at an instant (`AT`) does not read a segment none of whose rows can still be the latest of its level.
+**Segment-based partitioning** — The columnar store splits data into time-bounded segments. Each segment is a directory holding its columns - in format 3 one file, `columns.v3`, every column an encoded and checksummed block; in format 2 a file per column (`price.col`, `qty.col`, `ts.col`, `cnt.col`, `side.col`, `level.col`, `seq.col`) - and a `meta.json` descriptor. This enables efficient time-range pruning. Since #47 the descriptor also says which (side, level) pairs the segment's rows are of (`bid_levels`, `ask_levels`), and the book at an instant (`AT`) does not read a segment none of whose rows can still be the latest of its level.
 
-**Delta+zigzag compression** — Orderbook prices are highly correlated between consecutive levels. Delta encoding followed by zigzag encoding produces small integers that compress well with Simple8b bit-packing.
+**Encoded columns** — In segment format 3 every column is in whichever of a few encodings is smallest for it: less the column's minimum or less the value before it (zigzagged), divided by what the values share - a price's tick, a quantity's lot - then packed as Simple8b, runs, fixed-width blocks or each value's bytes, under LZ4 at a seal and ZSTD at a merge where that pays (`include/orderbook/column_codec.hpp`). Format 2 delta and zigzag encoded the price and packed the quantity and the sequence number in Simple8b, and wrote the other four columns raw.
 
 
 ## Multi-Master Replication

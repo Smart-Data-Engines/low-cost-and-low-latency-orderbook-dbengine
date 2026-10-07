@@ -40,7 +40,7 @@ ctest --test-dir build --output-on-failure -j1
 First configure pulls googletest, google/benchmark, rapidcheck and nlohmann/json via `FetchContent`,
 which needs network access and a few minutes.
 
-System dependencies: `liblz4-dev`, `libcurl4-openssl-dev`.
+System dependencies: `liblz4-dev`, `libzstd-dev` (segment format 3, #219), `libcurl4-openssl-dev`.
 
 Tests that touch coordination need a native `etcd` on PATH (or `OB_ETCD_BINARY`). Installation
 instructions are in [tests/integration/README.md](tests/integration/README.md) and
@@ -4081,6 +4081,34 @@ Learned the hard way. Check here before debugging.
      itself, and its secret command made a different secret on each node, into a directory nothing
      created (#217). Every node looked healthy on its own the whole time. Carry a procedure out
      literally on the hosts it is for, and write down what had to change.
+549. **A restore that keeps the old mtime keeps the mutation.** `cp -p` from the pristine copies
+     gives the restored source its older mtime, so the object built from the mutated file stays newer
+     than its source and ninja keeps it. Within one file it hides - every mutation writes the file
+     whole, with a new mtime - but the first mutation in another file runs with the last one still
+     compiled in, and B1 runs the last mutation of each file: a survivor there passes B1 without the
+     tree having come back (format 3's run, #219; it had also emptied B1 in #214's and #216's).
+     Restore only what differs, with a fresh mtime.
+550. **Simple8b pads its last word with zeros, so the words do not say how many values they hold.**
+     A format-3 block without its count decoded as one value more or one fewer wherever the padding
+     allowed; the test of a count one off passed only once every block's header carried its count
+     (#219).
+551. **A filter by extension decides what a snapshot carries.** Snapshots and backups took `*.col`
+     and `meta.json`, so format 3's `columns.v3` stayed behind and a replica or a restored node had
+     segments that held no rows (#219). `is_segment_file()` is the one place that says which files a
+     segment has; a new segment file goes there or nowhere.
+552. **ClickHouse keeps a merged table's inactive parts for `old_parts_lifetime`, eight minutes.**
+     The table directory's size after `OPTIMIZE ... FINAL` counts them twice over; the allocated
+     bytes are the active parts' paths, summed (`scripts/measure_storage.py`).
+553. **A remote path built by a nested command is expanded on this machine, and its failure is an
+     empty path.** `scp -r "host:$(ssh host cat ~/x)/*"` expanded `~` here, found nothing and began
+     copying the remote's root. Read the value in its own step, check it against the prefix it must
+     have, then copy. The same family: a single-quoted ssh argument ends at the first apostrophe of
+     the script it carries - a comment's "engine's" ran a measurement script on the development
+     machine. Write the script to a file and copy it over.
+554. **A round's status named the head and the server's hash, and the tool beside it was older.**
+     `column_codec_cost` on the x86 host had last been built before the policies it was run for: its
+     output said `zstd1` and `zstd3` where the code says `seal` and `merge`. Build every binary a
+     round runs, at the head it records, as the round's first step.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

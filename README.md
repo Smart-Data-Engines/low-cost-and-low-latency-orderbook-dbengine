@@ -133,13 +133,14 @@ what this compares is the cost of loading the data each way it is loaded, not of
 **Our client burns ten times what our server burns**: this ingest column measures the harness's
 Python as much as the protocol, and a C++ client sends the same updates with a fraction of it - see
 `benchmarks/wire_load.cpp` and [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
-And the engine keeps what it ingests in more bytes than ClickHouse does, and than TimescaleDB once
-its compression has run: on the comparative dataset, 200,000 rows, its segments take 25.34 bytes a
-row against ClickHouse's 4.23 and compressed TimescaleDB's 14.05 (114.81 before compression), by
-[`scripts/measure_storage.py`](scripts/measure_storage.py) on the same machine and versions. Its
-segments write the timestamp, the order count, the side and the level raw - fifteen of the
-twenty-five bytes - and encode only the price, the quantity and the sequence number. Cheaper to load
-is not cheaper to keep, yet.
+And at `3157ce7` the engine kept what it ingested in more bytes than ClickHouse does, and than
+TimescaleDB once its compression has run: on the comparative dataset, 200,000 rows, its segments took
+25.34 bytes a row against ClickHouse's 4.23 and compressed TimescaleDB's 14.05 (114.81 before
+compression), by [`scripts/measure_storage.py`](scripts/measure_storage.py) on the same machine and
+versions. That was segment format 2, which wrote the timestamp, the order count, the side and the
+level raw - fifteen of the twenty-five bytes - and encoded only the price, the quantity and the
+sequence number. Format 3 (#219) encodes every column; the bytes it keeps, and what its seal costs
+the figures above, are measured again on the master that carries it.
 
 Every figure in the query column also includes Python-side parsing for 4000 rows, identical for all
 three systems, because each adapter turns text into tuples. It is **measured in the run** and stated
@@ -157,15 +158,16 @@ installs anything, and a containerised competitor would measure the container.
 
 - **SoA (Struct-of-Arrays) buffer** with seqlock for lock-free concurrent reads
 - **Write-Ahead Log (WAL)** with CRC32C checksums and crash recovery
-- **Columnar storage** with delta+zigzag price compression and Simple8b volume packing
-- **Columnar segments on disk** — time-partitioned, one file per column, written whole when a
-  symbol has enough rows or its oldest are ten seconds old, and merged in the background into
-  segments of up to 262 144 rows, so their number follows the data rather than uptime
+- **Columnar segments on disk** — time-partitioned, every column of a segment in one checksummed
+  file, each in whichever of its candidate encodings is smallest for it (segment format 3, #219);
+  written whole when a symbol has enough rows or its oldest are ten seconds old, and merged in the
+  background into segments of up to 262 144 rows, so their number follows the data rather than
+  uptime
 - **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD,
   reachable over the wire protocol: every result carries its scale factor and distinguishes an empty
   aggregate from a zero
 - **SQL-like query language** with time-range filters and aggregations. A `SELECT` answers the
-  columns it names, in the order it names them, and the server opens only the column files needed
+  columns it names, in the order it names them, and the server decodes only the columns needed
   to answer it — including a column a predicate reads and the answer does not carry
 - **The live book, on the wire** — `BOOK <symbol> <exchange> [depth]` returns the current levels of
   both sides from the structure the engine updates in place, under one seqlock read, bids first and

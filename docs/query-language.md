@@ -97,8 +97,8 @@ twice is answered twice; `SELECT *` is the seven below, in the order of the tabl
 header names them, so a client can tell what it was handed — which is the only reason narrowing a
 `SELECT` is safe and narrowing a `PUSH` is not.
 
-Two consequences worth knowing before writing a query. The server reads only the column files it
-needs, so a narrower question is a cheaper one — including for a column a predicate uses but the
+Two consequences worth knowing before writing a query. The server decodes only the columns it
+needs (in format 2, opens only their files), so a narrower question is a cheaper one — including for a column a predicate uses but the
 answer does not carry: `SELECT quantity ... WHERE price BETWEEN ...` reads `price` and does not
 answer it. And the bundled Python and C++ clients read a row **by position**, so they accept the
 seven and refuse anything narrower by name rather than misreading it; a narrowed query goes over

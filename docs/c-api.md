@@ -63,6 +63,10 @@ Insert one or more price levels. The update is:
 2. Applied to the in-memory SoA buffer
 3. Enqueued for background columnar flush
 
+An embedded engine writes its segments in segment format 3 with a seal's encodings - LZ4 or nothing
+(`docs/operations.md`, "Segment format 3"). Nothing merges an embedded store, so its segments keep
+those encodings rather than a merge's ZSTD, and there is no setting for format 2 yet.
+
 ## Querying
 
 ### ob_query
