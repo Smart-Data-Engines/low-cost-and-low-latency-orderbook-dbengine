@@ -2,7 +2,7 @@
 
 A mesh snapshot named each file by a `uint16_t` in its chunk header, and 0xFFFF was the metadata
 blob's, so `begin_snapshot_send()` refused a manifest of 65 535 files or more with
-`too_many_files`. A segment is eight files, so a node of 8 192 segments could bootstrap no peer -
+`too_many_files`. A segment was eight files, so a node of 8 192 segments could bootstrap no peer -
 not one that joined, and not one too far behind to catch up. And that is not a store a mesh
 reaches only by neglect: part 2b of #165 merges a symbol's segments, but not below one a symbol an
 hour, so 8 192 instruments are past it whatever merging does.
@@ -17,23 +17,29 @@ Since #176 a joiner says in its request that it takes chunks with a 32-bit file 
 1 GiB of metadata, and a peer of the same build sends it both.
 
 The module has its own three-node mesh, as `test_mm_snapshot_bootstrap.py` does, because the test
-adds a fourth node for good and fills every node with 8 200 segments.
+adds a fourth node for good and fills every node with 8 200 segments. Its nodes write segment format
+2, a file per column: in format 3, the default since #219, a segment is two files, and the same
+premise would take four times the segments - the 32-bit file index this test is about is the same
+whichever format the files are of.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 import urllib.request
+from typing import Generator
 
 import pytest
 
-from conftest import node_log_size, node_log_since
+from conftest import ClusterManager, node_log_size, node_log_since
 from orderbook_engine import BookUpdate, OrderbookEngine
 
 pytestmark = pytest.mark.multi_master
 
 # Past 65 535 files at eight a segment, with room: one segment per symbol after one flush.
 SYMBOLS = 8_200
+FILE_INDEX_LIMIT = 65_535
 EXCHANGE = "MANY"
 BASE_TS = 1_700_000_000_000_000_000
 SEGMENTS_TIMEOUT = 120.0
@@ -51,6 +57,29 @@ class NotBootstrapped(AssertionError):
 
 def symbol(i: int) -> str:
     return f"F{i:05d}"
+
+
+@pytest.fixture(scope="module")
+def mm_cluster(request) -> Generator[ClusterManager, None, None]:
+    """conftest's three-node mesh, writing segment format 2 - eight files a segment - and so are
+    the nodes it adds."""
+    cm = ClusterManager()
+    cm.extra_node_args = ["--segment-format", "2"]
+    cm.start_multi_master(node_count=3)
+    cm.wait_for_mm_mesh(timeout=45)
+    if getattr(request.config, "_ob_cluster", None) is None:
+        request.config._ob_cluster = cm
+    yield cm
+    cm.shutdown()
+
+
+def segment_files(node) -> int:
+    """The files of the node's segments: what a snapshot of its store names one by one."""
+    count = 0
+    for _root, _dirs, names in os.walk(node.data_dir):
+        count += sum(1 for name in names
+                     if name.endswith(".col") or name in ("meta.json", "columns.v3"))
+    return count
 
 
 def client_for(node, timeout: float = 30.0) -> OrderbookEngine:
@@ -110,6 +139,9 @@ def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
             time.sleep(1.0)
     assert all(v >= SYMBOLS for v in counts.values()), (
         f"the premise: every node holds {SYMBOLS} segments or more, and they hold {counts}")
+    files = {n.index: segment_files(n) for n in mm_cluster.nodes}
+    assert all(v > FILE_INDEX_LIMIT for v in files.values()), (
+        f"the premise: every node holds more than {FILE_INDEX_LIMIT} files, and they hold {files}")
 
     offsets = {n.index: node_log_size(n) for n in mm_cluster.nodes}
     started = time.monotonic()

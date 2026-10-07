@@ -48,7 +48,7 @@ try:
         for i in range(400):
             eng.insert(f"SYM{i:03d}", "EX", "bid", list(range(100, 300)), [5] * 200)
         eng.flush()
-    segs = sum(1 for _ in Path(primary.data_dir).rglob("*.col"))
+    segs = sum(1 for p in Path(primary.data_dir).rglob("*") if p.suffix == ".col" or p.name == "columns.v3")
     print(f"columnar files on the primary: {segs}")
 
     # The prober: PING on its own connection, every 50 ms, recording round-trip time.

@@ -439,7 +439,10 @@ def test_a_flush_command_does_not_report_success_over_a_failed_sync():
         node.cleanup()
 
 
-SEGMENT_COLUMN = "price.col"   # one column file every segment has; a flush writes it for each
+# The file of a segment's columns: one for each segment a flush writes - `columns.v3` in segment
+# format 3, the default (#219), where format 2 wrote a file per column and the tests aimed at
+# its `price.col`.
+SEGMENT_COLUMN = "columns.v3"
 
 class Refused(Exception):
     """A node answered a `SELECT` with a refusal other than "not found": not an answer about rows."""
@@ -1258,10 +1261,10 @@ def test_a_rollover_the_disk_refuses_mid_drain_appends_no_row_twice():
     drain appends them a second time into storage that never removes a row.
 
     Row 100 is in hour 1, rows 200 and 300 in hour 2, so appending 200 rolls hour 1 over, and the
-    injector refuses that first `price.col`. The first `FLUSH` fails; the second writes both hours;
+    injector refuses that first `columns.v3`. The first `FLUSH` fails; the second writes both hours;
     every row is there once, before a restart and after one.
     """
-    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
                      OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
     base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
     try:
@@ -1284,7 +1287,7 @@ def test_a_rollover_the_disk_refuses_mid_drain_appends_no_row_twice():
 def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
     """#160: one store's refused segment does not take the flush's other segments with it.
 
-    Two symbols in one flush, and the first `price.col` the flush writes is refused - whichever
+    Two symbols in one flush, and the first `columns.v3` the flush writes is refused - whichever
     symbol that is. The other's segment is written **and merged**: an exception out of the loop
     used to skip the merge, and a written segment outside the index is rows no query returns until
     a restart finds them. The refused one's rows stay where they wait, and the next flush writes
@@ -1296,7 +1299,7 @@ def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
     flush, one each after the second. A merge skipped would seal the same block again, and a
     restart would then find its row twice.
     """
-    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
                      OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
     try:
         node.wait_until_answering()
@@ -1520,11 +1523,11 @@ def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
     is written when the store is due, by the seal after the drain; the lock is held for neither.
 
     Here ROLL is made due by rows, so the next tick seals it, and the injector makes that write -
-    the first `price.col` this node writes, because nothing was sealed before - last three seconds.
+    the first `columns.v3` this node writes, because nothing was sealed before - last three seconds.
     Ten writes timed inside it must not wait for it; and after it, every row is there once.
     """
     stall_ms = 3000
-    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write",
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write",
                      OB_FAULT_DELAY_MS=str(stall_ms), OB_FAULT_COUNT="1",
                      OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="3000",
                      OB_FAULT_EXTRA_ARGS="--log-level DEBUG")
@@ -1567,7 +1570,7 @@ def test_rows_written_during_a_ticks_drain_survive_a_crash_after_it():
     Since part 2a of #165 the drain writes nothing and ROLL's rows are readable from their blocks
     before the seal, so the end of the slow tick is read from the disk: the segment whole.
     """
-    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_DELAY_MS="2000",
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write", OB_FAULT_DELAY_MS="2000",
                      OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="4000")
     base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
     try:
@@ -1693,7 +1696,7 @@ def test_a_drain_the_disk_stops_part_way_puts_back_every_chunk_after_it():
     what is after the chunk the drain stopped in loses those, and putting the stopped chunk back
     from its start appends rows 4097-5000 twice.
     """
-    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
                      OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
     base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
     try:

@@ -64,12 +64,13 @@ def rows(port: int, symbol: str) -> int:
 
 
 def store_shape(data_dir: str) -> tuple[int, int]:
-    """(columnar files, WAL bytes). Two numbers because the defect moved both."""
+    """(columnar files, WAL bytes). Two numbers because the defect moved both. A segment's columns
+    are a file each in segment format 2 and one `columns.v3` in format 3 (#219)."""
     cols = 0
     wal = 0
     for root, _dirs, names in os.walk(data_dir):
         for name in names:
-            if name.endswith(".col"):
+            if name.endswith(".col") or name == "columns.v3":
                 cols += 1
             elif name.startswith("wal_") and name.endswith(".bin"):
                 wal += os.path.getsize(os.path.join(root, name))
