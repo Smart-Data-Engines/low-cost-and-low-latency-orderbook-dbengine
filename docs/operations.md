@@ -1816,15 +1816,15 @@ segment, while a merge always searches.
 
 What format 3 costs is decoding. Format 2 read four of its columns as they lay on disk, and format 3
 decodes every column it reads, so a query of segments in the page cache spends more CPU on them. On
-recordings of Binance's books (`scripts/binance_capture_csv.py`), the same queries took 1.04 - 1.73
-times as long as in format 2 on an m9g.xlarge and 1.11 - 2.08 times on an m8a.xlarge - from 0.01 ms
-more to 0.53 ms more - while on a synthetic book of 100 levels an update, read whole by a scan or by
-time buckets, format 3 was 4 - 21% faster (#220, with the queries and the figures). Ingest went the other
+recordings of Binance's books (`scripts/binance_capture_csv.py`), the same queries took 1.06 - 1.93
+times as long as in format 2 on an m9g.xlarge and 1.11 - 2.09 times on an m8a.xlarge - from 0.02 ms
+more to 0.59 ms more - while on a synthetic book of 100 levels an update, read whole by a scan or by
+time buckets, format 3 was 4 - 14% faster (#220, with the queries and the figures). Ingest went the other
 way: a seal writes two files rather than eight, and on both machines the long pipelined runs ingested
 more levels a second in format 3, for a few percent more of the server's CPU (#219). The search a
 seal makes when it has no encodings to reuse - a symbol's first seal after a start, and every
 sixteenth - weighs most where each symbol seals only a few times: two million levels over 50
-symbols in three seconds took the server 38 - 43% more CPU than in format 2, run for run. A node
+symbols in three seconds took the server 37 - 46% more CPU than in format 2, run for run. A node
 that would rather keep format 2's reads than format 3's bytes runs `segment-format = 2`.
 
 `segment-format = 2|3` (`--segment-format`) says what new segments are written in; `3` is the
