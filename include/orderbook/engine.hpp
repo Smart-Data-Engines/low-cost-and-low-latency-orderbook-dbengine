@@ -42,7 +42,7 @@ namespace ob {
 /// The data directory's note that its numbering from before per-origin numbers is closed (#187).
 /// What keeps a later start from closing it again: a node that joined after the close numbers a symbol
 /// from 1, and closing again would take its records below kClosedNumberingBase for ones this node
-/// has. A file, neither .col nor meta.json, so no snapshot carries it: set from the snapshot's vector
+/// has. A file that is not a segment's (is_segment_file()), so no snapshot carries it: set from the snapshot's vector
 /// when one is installed, and by `restore_backup()` from the backup's description (#34).
 inline constexpr const char* kNumberingClosedFile = "numbering_closed";
 
@@ -272,6 +272,15 @@ public:
     /// Whether the flush tick merges small segments (#165 part 2b): on unless `--compaction off`.
     /// Not a tuning knob - a valve on a process that rewrites what is stored. Before open().
     void set_compaction_enabled(bool enabled) { compaction_enabled_ = enabled; }
+
+    /// The format this node writes segments in (`--segment-format`): 3 unless told 2. Before open(),
+    /// so that nothing - a replay's seal included - is written in the other.
+    void set_segment_version(uint32_t version);
+    /// How segments are written: a seal's, and a merge's (segment format v3, design §3).
+    void set_segment_formats(const ColumnarStore::SegmentFormat& seal,
+                             const ColumnarStore::SegmentFormat& merge);
+    const ColumnarStore::SegmentFormat& seal_format() const { return seal_format_; }
+    const ColumnarStore::SegmentFormat& merge_format() const { return merge_format_; }
 
     /// Whether writes are admitted at the rate the device takes once a flush tick shows it behind
     /// (#190 step 5): on unless `--write-admission off`.
@@ -801,6 +810,12 @@ private:
     // moves through five steps across ticks - written, synced, published, synced, inputs removed -
     // and each field is one step's list.
     bool compaction_enabled_{true};
+    // A seal - what queries read most - writes LZ4 or nothing, reusing its store's last choice and
+    // searching every sixteenth segment; a merge searches always and takes ZSTD where it saves 10%
+    // over LZ4, since what it writes is what stays (segment format v3, design §3). Measured
+    // choices, not guesses: kiro-workspace/specs/segment-format-v3/.
+    ColumnarStore::SegmentFormat seal_format_{ColumnarStore::SegmentFormat::seal()};
+    ColumnarStore::SegmentFormat merge_format_{ColumnarStore::SegmentFormat::merge()};
 
     /// Writes admitted at the rate the device takes (#190 step 5). Its interval is the flush
     /// interval, declared above and so initialised before this.

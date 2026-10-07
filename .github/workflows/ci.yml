@@ -85,7 +85,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
 
       # etcd runs natively, like the engine itself. No containers in the test path.
       - name: Install etcd
@@ -183,7 +183,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
 
       # etcd runs natively, like the engine itself. No containers in the test path.
       - name: Install etcd
@@ -317,7 +317,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
 
       - name: Configure (Release, no tests)
         run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
@@ -361,7 +361,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config clang \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
           clang++ --version
 
       # etcd for the handful of C++ tests that talk to a coordinator.
@@ -444,7 +444,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
           python3 -m pip install --quiet gcovr
 
       # etcd for the C++ tests that talk to a coordinator; without it their lines read as uncovered
@@ -574,7 +574,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
 
       # ThreadSanitizer refuses to start when the kernel hands out more ASLR entropy than its
       # shadow mapping allows: "FATAL: ThreadSanitizer: unexpected memory mapping". Ubuntu 24.04
@@ -633,7 +633,7 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev rpm python3-venv
+          sudo apt-get install -y -qq liblz4-dev libzstd-dev libcurl4-openssl-dev rpm python3-venv
           # rpm brings rpmbuild, which is what makes the RPM generator appear. Without it CMake
           # configures DEB and TGZ only - see the note by CPACK_GENERATOR.
 
@@ -661,7 +661,7 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev rpm python3-venv
+          sudo apt-get install -y -qq liblz4-dev libzstd-dev libcurl4-openssl-dev rpm python3-venv
 
       - name: Build, package, check, install and accept
         run: ./scripts/package_ci.sh build-pkg dist
@@ -692,7 +692,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
 
       - name: Install etcd
         run: |
@@ -885,7 +885,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config clang libclang-rt-dev \
-            liblz4-dev libcurl4-openssl-dev libssl-dev
+            liblz4-dev libzstd-dev libcurl4-openssl-dev libssl-dev
           clang++ --version
 
       - name: Configure the fuzzing tree (Clang, libFuzzer, ASan + UBSan)
@@ -899,10 +899,10 @@ jobs:
           -DCMAKE_BUILD_TYPE=Debug
           -DOB_BUILD_FUZZERS=ON -DOB_ENABLE_ASAN=ON -DOB_BUILD_TESTS=OFF
 
-      - name: Build the three harnesses
+      - name: Build the four harnesses
         run: >-
           cmake --build build-fuzz -j$(nproc)
-          --target fuzz_command_parser fuzz_mm_frames fuzz_wal_replay
+          --target fuzz_command_parser fuzz_mm_frames fuzz_wal_replay fuzz_column_block
 
       - name: Verify the instrumentation reached the production parsers
         # A harness whose parser was compiled without coverage instrumentation explores the driver
@@ -916,7 +916,7 @@ jobs:
         # Named separately from the build because "the target was up to date" and "the executable
         # exists" are different claims, and the second one is what the next two steps need.
         run: |
-          for harness in command_parser mm_frames wal_replay; do
+          for harness in command_parser mm_frames wal_replay column_block; do
             test -x "build-fuzz/fuzz/fuzz_$harness"
           done
 
@@ -925,7 +925,7 @@ jobs:
         # the result, and `| tee` or `| grep` would replace it with the exit code of the filter.
         run: |
           mkdir -p build-fuzz/fuzz-logs
-          for harness in command_parser mm_frames wal_replay; do
+          for harness in command_parser mm_frames wal_replay column_block; do
             ./build-fuzz/fuzz/fuzz_$harness fuzz/corpus/$harness/* \
               > "build-fuzz/fuzz-logs/seeds-$harness.log" 2>&1
           done
@@ -933,13 +933,14 @@ jobs:
       - name: Bounded campaign, one harness at a time
         # Sequential, because two fuzzers on one runner share its cores and each would then be
         # measuring the other's RSS against its own limit. Budgets: 60 s per harness, 10 s per
-        # input, 1 GiB RSS. Maximum input 64 KiB for commands and frames; 128 KiB for the WAL,
+        # input, 1 GiB RSS. Maximum input 64 KiB for commands, frames and column blocks; 128 KiB for the WAL,
         # which has to hold a maximum payload plus its header.
         run: |
           mkdir -p build-fuzz/fuzz-logs build-fuzz/artifacts \
                    build-fuzz/fuzz-corpus/command_parser \
                    build-fuzz/fuzz-corpus/mm_frames \
-                   build-fuzz/fuzz-corpus/wal_replay
+                   build-fuzz/fuzz-corpus/wal_replay \
+                   build-fuzz/fuzz-corpus/column_block
           budget="-max_total_time=60 -timeout=10 -rss_limit_mb=1024 -print_final_stats=1"
           ./build-fuzz/fuzz/fuzz_command_parser \
             build-fuzz/fuzz-corpus/command_parser fuzz/corpus/command_parser \
@@ -956,6 +957,11 @@ jobs:
             -max_len=131072 $budget \
             -artifact_prefix=build-fuzz/artifacts/wal_replay- \
             > build-fuzz/fuzz-logs/campaign-wal_replay.log 2>&1
+          ./build-fuzz/fuzz/fuzz_column_block \
+            build-fuzz/fuzz-corpus/column_block fuzz/corpus/column_block \
+            -max_len=65536 $budget \
+            -artifact_prefix=build-fuzz/artifacts/column_block- \
+            > build-fuzz/fuzz-logs/campaign-column_block.log 2>&1
 
       - name: Keep the logs and any reproducer
         # `if: always()`, because the run that matters is the one that failed. A crash leaves the

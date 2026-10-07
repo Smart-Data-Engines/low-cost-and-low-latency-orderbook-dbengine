@@ -90,6 +90,25 @@ target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)
 add_executable(segment_read_cost segment_read_cost.cpp)
 target_link_libraries(segment_read_cost PRIVATE orderbook_columnar)
 
+# ── What each column of a store's segments takes, under each candidate encoding (segment format v3) ──
+#
+# Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
+add_executable(segment_encoding_probe segment_encoding_probe.cpp)
+target_link_libraries(segment_encoding_probe PRIVATE orderbook_codec orderbook_compression)
+target_compile_definitions(segment_encoding_probe PRIVATE OB_PROBE_ZSTD)
+if(TARGET PkgConfig::ZSTD)
+    target_link_libraries(segment_encoding_probe PRIVATE PkgConfig::ZSTD)
+else()
+    target_link_libraries(segment_encoding_probe PRIVATE ${ZSTD_LIBRARY})
+    target_include_directories(segment_encoding_probe PRIVATE ${ZSTD_INCLUDE_DIR})
+endif()
+
+# ── What segment format 3's column blocks cost to write and read, against format 2's read ──
+#
+# Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
+add_executable(column_codec_cost column_codec_cost.cpp)
+target_link_libraries(column_codec_cost PRIVATE orderbook_column_codec)
+
 # ── What a version vector costs to send, receive and compare as it grows (#177) ──
 #
 # Compiled, deliberately not run: it prints a table, and the numbers in the roadmap came from it.

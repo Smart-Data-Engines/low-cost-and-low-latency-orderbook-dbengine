@@ -1,5 +1,7 @@
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/codec.hpp"
+#include "orderbook/column_codec.hpp"
+#include "orderbook/crc32c.hpp"
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
@@ -22,6 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ob {
 
@@ -413,22 +416,29 @@ std::shared_ptr<const LevelSet> LevelSet::from_columns(const std::vector<uint8_t
     return set;
 }
 
-std::string LevelSet::to_hex(const Bits& bits) {
+std::string LevelSet::to_hex(const Bits& bits, bool trimmed) {
     static constexpr char kDigits[] = "0123456789abcdef";
     std::string out(kLevels / 4, '0');
     for (size_t d = 0; d < kLevels / 4; ++d) {
         const unsigned nibble = static_cast<unsigned>((bits[(4 * d) / 64] >> ((4 * d) % 64)) & 0xF);
         out[kLevels / 4 - 1 - d] = kDigits[nibble];
     }
+    if (trimmed) {
+        const size_t first = out.find_first_not_of('0');
+        out.erase(0, first == std::string::npos ? out.size() - 1 : first);
+    }
     return out;
 }
 
 bool LevelSet::from_hex(const std::string& hex, Bits& bits) {
     static_assert(kLevels % 4 == 0, "a digit is four levels");
-    if (hex.size() != kLevels / 4) return false;
+    // Every digit, or - as segment format 3 writes it - without the leading zeros: a shorter string
+    // that begins with a zero is neither, which is what a string cut short of a digit mostly is.
+    if (hex.empty() || hex.size() > kLevels / 4) return false;
+    if (hex.size() < kLevels / 4 && hex.size() > 1 && hex[0] == '0') return false;
     bits.fill(0);
-    for (size_t d = 0; d < kLevels / 4; ++d) {
-        const char c = hex[kLevels / 4 - 1 - d];
+    for (size_t d = 0; d < hex.size(); ++d) {
+        const char c = hex[hex.size() - 1 - d];
         uint64_t nibble = 0;
         if (c >= '0' && c <= '9') {
             nibble = static_cast<uint64_t>(c - '0');
@@ -481,8 +491,12 @@ std::string ColumnarStore::meta_json(const SegmentMeta& meta,
     // #47's, in keys no older reader searches for either; absent is unknown, and a reader then
     // reads the segment whatever the book already holds.
     if (meta.levels != nullptr) {
-        f << ",\"bid_levels\":\"" << LevelSet::to_hex(meta.levels->bid) << "\""
-          << ",\"ask_levels\":\"" << LevelSet::to_hex(meta.levels->ask) << "\"";
+        // Without the leading zeros in format 3: all 250 digits a side were over half of a
+        // meta.json, and a segment of a few thousand rows paid a tenth of a byte a row for them. A
+        // format-2 segment's meta.json keeps every digit, since a build before format 3 reads it.
+        const bool trimmed = meta.format_version >= kColumnarFormatV3;
+        f << ",\"bid_levels\":\"" << LevelSet::to_hex(meta.levels->bid, trimmed) << "\""
+          << ",\"ask_levels\":\"" << LevelSet::to_hex(meta.levels->ask, trimmed) << "\"";
     }
     if (inputs != nullptr && !inputs->empty()) {
         f << ",\"compacted_from\":[";
@@ -1123,6 +1137,91 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment_into(const std::string& 
     return write_active_segment(dir);
 }
 
+// columns.v3 (segment format 3); its layout is described with its reader below.
+namespace {
+
+constexpr char kColumnsMagic[4] = {'O', 'B', 'S', '3'};
+constexpr size_t kColumns = 7;
+constexpr const char* kColumnNames[kColumns] = {"ts", "price", "qty", "cnt", "side", "level", "seq"};
+constexpr QueryColumn kColumnIds[kColumns] = {
+    QueryColumn::TimestampNs, QueryColumn::Price, QueryColumn::Quantity, QueryColumn::OrderCount,
+    QueryColumn::Side,        QueryColumn::Level, QueryColumn::SequenceNumber};
+/// No directory is longer: the magic, a 64-bit varint, the count, and seven entries at their widest.
+constexpr size_t kColumnsHeaderMax = 4 + 10 + 1 + kColumns * (1 + 10 + 4);
+
+}  // namespace
+
+void ColumnarStore::write_columns_v3(const std::string& dir) {
+    const size_t n = ts_buf_.size();
+    // Every column as uint64: the two signed ones reinterpreted, as column_codec.hpp takes them,
+    // and the narrow ones widened.
+    thread_local std::vector<uint64_t> cnt, side, level;
+    cnt.assign(cnt_buf_.begin(), cnt_buf_.end());
+    side.assign(side_buf_.begin(), side_buf_.end());
+    level.assign(level_buf_.begin(), level_buf_.end());
+    const std::array<std::span<const uint64_t>, 7> columns = {
+        std::span<const uint64_t>(ts_buf_),
+        std::span<const uint64_t>(reinterpret_cast<const uint64_t*>(price_buf_.data()), price_buf_.size()),
+        std::span<const uint64_t>(qty_buf_),
+        std::span<const uint64_t>(cnt),
+        std::span<const uint64_t>(side),
+        std::span<const uint64_t>(level),
+        std::span<const uint64_t>(reinterpret_cast<const uint64_t*>(seq_buf_.data()), seq_buf_.size()),
+    };
+    // The encodings this store's last segment chose, unless it is time to look again (design §3).
+    const bool search = !has_last_choice_ || segments_since_search_ + 1 >= segment_format_.search_every;
+
+    thread_local std::array<std::string, 7> blocks;
+    std::array<column_codec::Choice, 7> chosen{};
+    for (size_t c = 0; c < columns.size(); ++c) {
+        if (columns[c].size() != n) {
+            throw std::logic_error("ColumnarStore: a column of " + std::to_string(columns[c].size()) +
+                                   " values in a segment of " + std::to_string(n) + " rows");
+        }
+        column_codec::EncodeOptions options = segment_format_.search;
+        options.hint = search ? nullptr : &last_choice_[c];
+        blocks[c].clear();
+        chosen[c] = column_codec::encode(columns[c], options, blocks[c]);
+        last_choice_[c] = chosen[c].encoding;
+    }
+    has_last_choice_ = true;
+    segments_since_search_ = search ? 0 : segments_since_search_ + 1;
+
+    std::string file(kColumnsMagic, sizeof kColumnsMagic);
+    column_codec::put_varint(file, n);
+    file.push_back(static_cast<char>(kColumns));
+    for (size_t c = 0; c < kColumns; ++c) {
+        file.push_back(static_cast<char>(c));
+        column_codec::put_varint(file, blocks[c].size());
+        const uint32_t crc = crc32c(blocks[c].data(), blocks[c].size());
+        file.append(reinterpret_cast<const char*>(&crc), sizeof crc);   // little-endian hosts only
+    }
+    for (const std::string& block : blocks) file += block;
+    // What this thread keeps for the next seal is bounded as the codec bounds its own: a seal's
+    // columns fit, and a segment an embedding application sealed after an hour does not stay.
+    const auto keep_small = [](auto& buffer) {
+        using Buffer = std::remove_reference_t<decltype(buffer)>;
+        if (buffer.capacity() * sizeof(typename Buffer::value_type) > column_codec::kEncodeBufferKept) {
+            Buffer().swap(buffer);
+        }
+    };
+    keep_small(cnt);
+    keep_small(side);
+    keep_small(level);
+    for (std::string& block : blocks) keep_small(block);
+    write_file_checked(dir + "/" + kColumnsV3File, file.data(), file.size());
+
+    OB_LOG_DEBUG("columnar",
+                 "Segment %s: %zu rows in %zu bytes of columns (%s): ts %s %zu, price %s %zu, "
+                 "qty %s %zu, cnt %s %zu, side %s %zu, level %s %zu, seq %s %zu",
+                 dir.c_str(), n, file.size(), search ? "searched" : "as the last segment",
+                 chosen[0].encoding.name().c_str(), chosen[0].bytes, chosen[1].encoding.name().c_str(),
+                 chosen[1].bytes, chosen[2].encoding.name().c_str(), chosen[2].bytes,
+                 chosen[3].encoding.name().c_str(), chosen[3].bytes, chosen[4].encoding.name().c_str(),
+                 chosen[4].bytes, chosen[5].encoding.name().c_str(), chosen[5].bytes,
+                 chosen[6].encoding.name().c_str(), chosen[6].bytes);
+}
+
 SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     // The range this segment records is its rows' - the earliest and the latest timestamp - and
     // not the period it belongs to and its last row, which is what it was until #166. The two
@@ -1147,56 +1246,73 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
         }
     } partial{dir, false};
 
-    // Encode price column: delta + zigzag
-    auto encoded_prices = encode_prices(price_buf_);
+    uint64_t first_price = 0;
+    bool raw_qty = active_has_raw_qty_;
+    if (segment_format_.version == kColumnarFormatV3) {
+        write_columns_v3(dir);
+        // What format 2 records beside its columns, kept in meta.json for what reads it: the first
+        // price, zigzagged, and whether a quantity is too wide for a Simple8b word - from the
+        // quantities themselves, since append_block() leaves that to the seal (#165 part 2a).
+        if (!price_buf_.empty()) {
+            first_price = encode_prices(std::span<const int64_t>(price_buf_.data(), 1))[0];
+        }
+        constexpr uint64_t kSimple8bMarker = (uint64_t{1} << 60) - 1;
+        raw_qty = raw_qty || std::any_of(qty_buf_.begin(), qty_buf_.end(),
+                                         [](uint64_t q) { return q >= kSimple8bMarker; });
+    } else {
+        // Encode price column: delta + zigzag
+        auto encoded_prices = encode_prices(price_buf_);
 
-    // Encode qty column: Simple8b
-    auto qty_result = encode_simple8b(qty_buf_);
+        // Encode qty column: Simple8b
+        auto qty_result = encode_simple8b(qty_buf_);
 
-    // Write price.col
-    {
-        write_file_checked(dir + "/price.col", encoded_prices.data(), encoded_prices.size() * sizeof(uint64_t));
-    }
+        // Write price.col
+        {
+            write_file_checked(dir + "/price.col", encoded_prices.data(), encoded_prices.size() * sizeof(uint64_t));
+        }
 
-    // Write qty.col
-    {
-        write_file_checked(dir + "/qty.col", qty_result.words.data(), qty_result.words.size() * sizeof(uint64_t));
-    }
+        // Write qty.col
+        {
+            write_file_checked(dir + "/qty.col", qty_result.words.data(), qty_result.words.size() * sizeof(uint64_t));
+        }
 
-    // Write ts.col (raw uint64)
-    {
-        write_file_checked(dir + "/ts.col", ts_buf_.data(), ts_buf_.size() * sizeof(uint64_t));
-    }
+        // Write ts.col (raw uint64)
+        {
+            write_file_checked(dir + "/ts.col", ts_buf_.data(), ts_buf_.size() * sizeof(uint64_t));
+        }
 
-    // Write cnt.col (raw uint32)
-    {
-        write_file_checked(dir + "/cnt.col", cnt_buf_.data(), cnt_buf_.size() * sizeof(uint32_t));
-    }
+        // Write cnt.col (raw uint32)
+        {
+            write_file_checked(dir + "/cnt.col", cnt_buf_.data(), cnt_buf_.size() * sizeof(uint32_t));
+        }
 
-    // Write side.col (raw uint8, one byte per row)
-    {
-        write_file_checked(dir + "/side.col", side_buf_.data(), side_buf_.size() * sizeof(uint8_t));
-    }
+        // Write side.col (raw uint8, one byte per row)
+        {
+            write_file_checked(dir + "/side.col", side_buf_.data(), side_buf_.size() * sizeof(uint8_t));
+        }
 
-    // Write level.col (raw uint16)
-    {
-        write_file_checked(dir + "/level.col", level_buf_.data(), level_buf_.size() * sizeof(uint16_t));
-    }
+        // Write level.col (raw uint16)
+        {
+            write_file_checked(dir + "/level.col", level_buf_.data(), level_buf_.size() * sizeof(uint16_t));
+        }
 
-    // Write seq.col (zigzag-delta, then Simple8b bit-packing).
-    //
-    // Two stages, and both are needed. Zigzag-delta turns "5000000042" into a
-    // small non-negative number, and handles a falling sequence, which happens in
-    // multi-master mode when records from different nodes land in one segment.
-    // Simple8b then packs those small values into shared 64-bit words. Without
-    // the second stage the column costs a full 8 bytes per row regardless of how
-    // small the deltas are, because encode_prices() returns one uint64 each —
-    // measured at 8.00 B/row before this was added, 0.14 B/row after.
-    {
-        auto zigzag_seq = encode_prices(seq_buf_);
-        auto packed_seq = encode_simple8b(zigzag_seq);
-        write_file_checked(dir + "/seq.col", packed_seq.words.data(),
-                           packed_seq.words.size() * sizeof(uint64_t));
+        // Write seq.col (zigzag-delta, then Simple8b bit-packing).
+        //
+        // Two stages, and both are needed. Zigzag-delta turns "5000000042" into a
+        // small non-negative number, and handles a falling sequence, which happens in
+        // multi-master mode when records from different nodes land in one segment.
+        // Simple8b then packs those small values into shared 64-bit words. Without
+        // the second stage the column costs a full 8 bytes per row regardless of how
+        // small the deltas are, because encode_prices() returns one uint64 each —
+        // measured at 8.00 B/row before this was added, 0.14 B/row after.
+        {
+            auto zigzag_seq = encode_prices(seq_buf_);
+            auto packed_seq = encode_simple8b(zigzag_seq);
+            write_file_checked(dir + "/seq.col", packed_seq.words.data(),
+                               packed_seq.words.size() * sizeof(uint64_t));
+        }
+        first_price = encoded_prices.empty() ? 0 : encoded_prices[0];
+        raw_qty = active_has_raw_qty_ || qty_result.has_fallback;
     }
 
     OB_LOG_DEBUG("columnar",
@@ -1213,9 +1329,10 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     meta.last_row_ts_ns     = ts_buf_.back();
     meta.time_range_is_rows = true;
     meta.row_count   = active_row_count_;
+    meta.format_version = segment_format_.version;
     // first_price: store the zigzag-encoded first price as the anchor
-    meta.first_price = encoded_prices.empty() ? 0 : encoded_prices[0];
-    meta.has_raw_qty = active_has_raw_qty_ || qty_result.has_fallback;
+    meta.first_price = first_price;
+    meta.has_raw_qty = raw_qty;
     // Highest, not last: rows are appended in arrival order and a batch can hold numbers
     // from several origins, so the last one is not necessarily the largest.
     meta.max_sequence_number = 0;
@@ -1318,9 +1435,14 @@ struct SegmentReadBuffers {
     std::vector<uint32_t> counts;
     std::vector<uint8_t>  sides;
     std::vector<uint16_t> levels;
+    std::vector<char>     file;   ///< a format-3 segment's columns.v3, as read
+    /// What decoding format 3's blocks works in. Kept here rather than per thread, so that what
+    /// the decoder grows to is inside the pool's budget too.
+    column_codec::DecodeScratch scratch;
 
     size_t held_bytes() const {
-        return (timestamps.capacity() + enc_prices.capacity() + enc_qtys.capacity() +
+        return file.capacity() + scratch.held_bytes() +
+               (timestamps.capacity() + enc_prices.capacity() + enc_qtys.capacity() +
                 enc_seq.capacity() + qtys.capacity() + zigzag_seq.capacity()) * sizeof(uint64_t) +
                (prices.capacity() + seqs.capacity()) * sizeof(int64_t) +
                counts.capacity() * sizeof(uint32_t) + sides.capacity() * sizeof(uint8_t) +
@@ -1442,6 +1564,200 @@ private:
 
 }  // namespace
 
+// ── Segment format 3: columns.v3 ─────────────────────────────────────────────
+//
+//   "OBS3"                  magic
+//   varint                  the segment's rows
+//   u8                      columns (7)
+//   7 x (u8, varint, u32)   the directory: a column's id, its block's length, its block's CRC32C
+//   ...                     the blocks, in the directory's order
+//
+// Ids: 0 ts, 1 price, 2 qty, 3 cnt, 4 side, 5 level, 6 seq; column_codec.hpp has the blocks.
+
+namespace {
+
+struct ColumnsDirectory {
+    uint64_t rows{0};
+    std::array<uint64_t, kColumns> offset{};
+    std::array<uint64_t, kColumns> length{};
+    std::array<uint32_t, kColumns> crc{};
+    uint64_t total_bytes{0};   ///< the directory and every block: what the file's length must be
+};
+
+/// The directory at the head of `bytes`; false, and the reason, for bytes that do not begin with one.
+bool parse_columns_header(std::span<const char> bytes, ColumnsDirectory& d, std::string& why) {
+    if (bytes.size() < sizeof kColumnsMagic || std::memcmp(bytes.data(), kColumnsMagic, sizeof kColumnsMagic) != 0) {
+        why = "does not begin with its magic";
+        return false;
+    }
+    size_t at = sizeof kColumnsMagic;
+    if (!column_codec::get_varint(bytes, at, d.rows) || at >= bytes.size()) {
+        why = "is cut short in its header";
+        return false;
+    }
+    const auto columns = static_cast<uint8_t>(bytes[at++]);
+    if (columns != kColumns) {
+        why = "has " + std::to_string(columns) + " columns where a segment has 7";
+        return false;
+    }
+    std::array<bool, kColumns> seen{};
+    std::array<uint8_t, kColumns> order{};
+    std::array<uint64_t, kColumns> length{};
+    std::array<uint32_t, kColumns> crc{};
+    for (size_t i = 0; i < kColumns; ++i) {
+        if (at >= bytes.size()) {
+            why = "is cut short in its directory";
+            return false;
+        }
+        const auto id = static_cast<uint8_t>(bytes[at++]);
+        if (id >= kColumns || seen[id]) {
+            why = "names a column twice, or one a segment does not have";
+            return false;
+        }
+        seen[id] = true;
+        order[i] = id;
+        if (!column_codec::get_varint(bytes, at, length[i]) || bytes.size() - at < sizeof(uint32_t)) {
+            why = "is cut short in its directory";
+            return false;
+        }
+        std::memcpy(&crc[i], bytes.data() + at, sizeof(uint32_t));   // little-endian, as written
+        at += sizeof(uint32_t);
+    }
+    uint64_t offset = at;
+    for (size_t i = 0; i < kColumns; ++i) {
+        if (length[i] > (uint64_t{1} << 48)) {   // no block of a segment is anywhere near this
+            why = "declares a block longer than any segment holds";
+            return false;
+        }
+        d.offset[order[i]] = offset;
+        d.length[order[i]] = length[i];
+        d.crc[order[i]] = crc[i];
+        offset += length[i];
+    }
+    d.total_bytes = offset;
+    return true;
+}
+
+enum class ColumnsLoad { kOk, kMissing, kBad };
+
+/// `dir`'s columns.v3, the columns `columns` asks for decoded into `b`: each block checked against
+/// its CRC32C and decoded to exactly `rows` values. kBad, and the reason, for a file that is not
+/// what the store writes - a reader holds a format-3 segment to what it says of itself, since a
+/// Simple8b word decodes into other numbers without a sound.
+ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet columns,
+                            SegmentReadBuffers& b, std::string& why) {
+    std::ifstream f(dir + "/" + kColumnsV3File, std::ios::binary);
+    if (!f.is_open()) return ColumnsLoad::kMissing;
+    f.seekg(0, std::ios::end);
+    const auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0, std::ios::beg);
+    b.file.resize(size);
+    f.read(b.file.data(), static_cast<std::streamsize>(size));
+    if (static_cast<size_t>(f.gcount()) != size) {
+        why = "could not be read whole";
+        return ColumnsLoad::kBad;
+    }
+    const std::span<const char> file(b.file.data(), b.file.size());
+    ColumnsDirectory d;
+    if (!parse_columns_header(file, d, why)) return ColumnsLoad::kBad;
+    if (d.rows != rows) {
+        why = "holds " + std::to_string(d.rows) + " rows where its meta.json says " + std::to_string(rows);
+        return ColumnsLoad::kBad;
+    }
+    if (d.total_bytes != file.size()) {
+        why = "is " + std::to_string(file.size()) + " bytes where its directory says " +
+              std::to_string(d.total_bytes);
+        return ColumnsLoad::kBad;
+    }
+    const auto count = static_cast<size_t>(rows);
+    for (size_t c = 0; c < kColumns; ++c) {
+        if (!columns.has(kColumnIds[c])) continue;
+        const auto block = file.subspan(static_cast<size_t>(d.offset[c]), static_cast<size_t>(d.length[c]));
+        const uint32_t crc = crc32c(block.data(), block.size());
+        if (crc != d.crc[c]) {
+            char line[96];
+            std::snprintf(line, sizeof line, "has column %s with checksum %08x where its directory says %08x",
+                          kColumnNames[c], crc, d.crc[c]);
+            why = line;
+            return ColumnsLoad::kBad;
+        }
+        std::string reason;
+        bool ok = false;
+        switch (c) {
+        case 0:  ok = column_codec::decode_as(block, count, b.timestamps, b.scratch, &reason); break;
+        case 1:  ok = column_codec::decode_as(block, count, b.prices, b.scratch, &reason); break;
+        case 2:  ok = column_codec::decode_as(block, count, b.qtys, b.scratch, &reason); break;
+        case 3:  ok = column_codec::decode_as(block, count, b.counts, b.scratch, &reason); break;
+        case 4:  ok = column_codec::decode_as(block, count, b.sides, b.scratch, &reason); break;
+        case 5:  ok = column_codec::decode_as(block, count, b.levels, b.scratch, &reason); break;
+        default: ok = column_codec::decode_as(block, count, b.seqs, b.scratch, &reason); break;
+        }
+        if (!ok) {
+            why = std::string("has column ") + kColumnNames[c] + " that cannot be decoded: " + reason;
+            return ColumnsLoad::kBad;
+        }
+    }
+    return ColumnsLoad::kOk;
+}
+
+/// Whether `dir`'s columns.v3 holds `rows` rows by its directory and is as long as the directory
+/// says - from the file's head alone, since the start asks it of every merged segment.
+bool columns_v3_hold(const std::string& dir, uint64_t rows, std::string& why) {
+    const std::string path = dir + "/" + kColumnsV3File;
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    if (ec) {
+        why = std::string("has no ") + kColumnsV3File;
+        return false;
+    }
+    std::ifstream f(path, std::ios::binary);
+    std::array<char, kColumnsHeaderMax> head{};
+    f.read(head.data(), static_cast<std::streamsize>(head.size()));
+    ColumnsDirectory d;
+    if (!parse_columns_header(std::span<const char>(head.data(), static_cast<size_t>(f.gcount())), d, why)) {
+        why = std::string("its ") + kColumnsV3File + " " + why;
+        return false;
+    }
+    if (d.rows != rows || d.total_bytes != size) {
+        why = std::string("its ") + kColumnsV3File + " holds " + std::to_string(d.rows) + " row(s) in " +
+              std::to_string(size) + " byte(s), where its directory says " + std::to_string(d.total_bytes) +
+              " and its meta.json " + std::to_string(rows) + " row(s)";
+        return false;
+    }
+    return true;
+}
+
+/// Whether a merged segment holds every row it says it does: what the start decides a merge cut
+/// short by (#165 part 2b).
+bool segment_holds_its_rows(const SegmentMeta& meta, std::string& why) {
+    if (meta.format_version == kColumnarFormatV3) return columns_v3_hold(meta.dir_path, meta.row_count, why);
+    std::error_code ec;
+    const auto ts_bytes = fs::file_size(fs::path(meta.dir_path) / "ts.col", ec);
+    if (ec || ts_bytes != meta.row_count * sizeof(uint64_t)) {
+        why = "its ts.col holds " + std::to_string(ec ? 0 : ts_bytes) + " byte(s) for " +
+              std::to_string(meta.row_count) + " row(s)";
+        return false;
+    }
+    return true;
+}
+
+/// A segment's timestamps, whatever its format; false when they cannot be read whole.
+bool read_timestamps(const SegmentMeta& meta, std::vector<uint64_t>& ts) {
+    if (meta.format_version == kColumnarFormatV3) {
+        SegmentReadBuffers b;
+        std::string why;
+        if (load_columns_v3(meta.dir_path, meta.row_count, ColumnSet{}.add(QueryColumn::TimestampNs), b,
+                            why) != ColumnsLoad::kOk) {
+            return false;
+        }
+        ts.swap(b.timestamps);
+        return true;
+    }
+    return read_column_file(meta.dir_path, "ts.col", ts);
+}
+
+}  // namespace
+
 size_t ColumnarStore::read_buffers_held() {
     return ReadBufferPool::instance().held();
 }
@@ -1466,13 +1782,14 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
 
     // A segment written by an older format lacks side, level_index and
     // sequence_number. Reading it anyway would hand back rows with those
-    // fields silently zeroed, which is the defect this version exists to
-    // fix. Refuse it loudly instead.
-    if (meta.format_version != kColumnarFormatVersion) {
+    // fields silently zeroed, which is the defect version 2 exists to
+    // fix. Refuse it loudly instead - and one of a newer format, which this
+    // build cannot decode.
+    if (!columnar_format_readable(meta.format_version)) {
         OB_LOG_ERROR("columnar",
                      "Skipping segment %s: unsupported format_version=%u "
-                     "(this build reads %u)",
-                     dir.c_str(), meta.format_version, kColumnarFormatVersion);
+                     "(this build reads %u and %u)",
+                     dir.c_str(), meta.format_version, kColumnarFormatV2, kColumnarFormatV3);
         return SegmentRead::kUnreadable;
     }
 
@@ -1496,82 +1813,104 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
     if (!want_level) levels.clear();
     if (!want_seq)   { enc_seq.clear(); b.zigzag_seq.clear(); b.seqs.clear(); }
 
-    // A missing file is fatal for the segment only when the query needs that column. Before
-    // the read set existed every column was needed, so a segment missing any one of the seven
-    // was dropped from every query - including queries that would never have looked at it.
-    bool missing = false;
-    bool removed = false;
-    auto need = [&](bool wanted, const char* file, auto& dest) {
-        if (!wanted || removed) return;
-        if (!read_column_file(dir, file, dest)) {
-            // Retention takes a segment out of the index and then deletes its directory
-            // without the lock (#165), so a scan that copied it first can find it going.
-            // Its rows are past the retention, and leaving them out is the right answer.
-            if (mode == ReadMode::kQuery && !still_indexed(dir)) {
-                OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "
-                                         "its rows are past the retention", dir.c_str());
-                removed = true;
-                return;
-            }
-            OB_LOG_ERROR("columnar", "Skipping segment %s: missing column %s",
-                         dir.c_str(), file);
-            missing = true;
-        }
-    };
-    // Every column is opened through the set, the timestamp included - the widening at the
-    // top of scan() is what puts it there. A hardcoded `true` here reads as belt and
-    // braces and is worse than that: it makes that widening unobservable, so a mutation
-    // deleting it survived the test written to catch exactly that.
-    need(columns.has(QueryColumn::TimestampNs), "ts.col", timestamps);
-    need(want_price, "price.col", enc_prices);
-    need(want_qty,   "qty.col",   enc_qtys);
-    need(want_cnt,   "cnt.col",   counts);
-    need(want_side,  "side.col",  sides);
-    need(want_level, "level.col", levels);
-    need(want_seq,   "seq.col",   enc_seq);
-    if (removed) return SegmentRead::kRemoved;
-    if (missing) return SegmentRead::kUnreadable;
-
-    // Decoding follows the set too, and the sequence number is the expensive one: it is
-    // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
-    // four decode passes a segment would otherwise cost.
     std::vector<int64_t>&  prices = b.prices;
     std::vector<uint64_t>& qtys   = b.qtys;
     std::vector<int64_t>&  seqs   = b.seqs;
-    if (want_price) decode_prices_into(enc_prices, prices);
-    if (want_qty)   decode_simple8b_into(enc_qtys, meta.row_count, qtys);
-    if (want_seq) {
-        decode_simple8b_into(enc_seq, meta.row_count, b.zigzag_seq);
-        decode_prices_into(b.zigzag_seq, seqs);
-    }
 
-    // A short column means a truncated or corrupt segment. Emitting the rows
-    // it does have, padded with zeros, is what produced the lost-order-side
-    // defect this format version fixes, so refuse the segment instead. Only the columns
-    // being read can be short here; one that was never opened is empty by construction.
-    const size_t expected = static_cast<size_t>(meta.row_count);
-    if ((want_side  && sides.size()  < expected) ||
-        (want_level && levels.size() < expected) ||
-        (want_seq   && seqs.size()   < expected)) {
-        OB_LOG_ERROR("columnar",
-                     "Skipping segment %s: short column(s) for row_count=%zu "
-                     "(side=%zu level=%zu seq=%zu)",
-                     dir.c_str(), expected,
-                     sides.size(), levels.size(), seqs.size());
-        return SegmentRead::kUnreadable;
-    }
-    // A merge writes every row it reads into a segment that outlives this one, so it reads a
-    // segment whole or not at all (#165 part 2b): the padding below is a query's, and a merged row
-    // with a zero timestamp would widen the merged segment's range to the epoch.
-    if (mode == ReadMode::kMerge &&
-        (timestamps.size() < expected || prices.size() < expected ||
-         qtys.size() < expected || counts.size() < expected)) {
-        OB_LOG_ERROR("columnar",
-                     "segment %s cannot be merged: short column(s) for row_count=%zu "
-                     "(ts=%zu price=%zu qty=%zu cnt=%zu)",
-                     dir.c_str(), expected, timestamps.size(), prices.size(), qtys.size(),
-                     counts.size());
-        return SegmentRead::kUnreadable;
+    if (meta.format_version == kColumnarFormatV3) {
+        // One file, the columns the read asks for decoded from it, each block checked against its
+        // checksum and holding exactly the segment's rows - so nothing below is short.
+        std::string why;
+        const ColumnsLoad loaded = load_columns_v3(dir, meta.row_count, columns, b, why);
+        if (loaded == ColumnsLoad::kMissing) {
+            if (mode == ReadMode::kQuery && !still_indexed(dir)) {
+                OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "
+                                         "its rows are past the retention", dir.c_str());
+                return SegmentRead::kRemoved;
+            }
+            OB_LOG_ERROR("columnar", "Skipping segment %s: missing %s", dir.c_str(), kColumnsV3File);
+            return SegmentRead::kUnreadable;
+        }
+        if (loaded == ColumnsLoad::kBad) {
+            OB_LOG_ERROR("columnar", "Skipping segment %s: its %s %s", dir.c_str(), kColumnsV3File,
+                         why.c_str());
+            return SegmentRead::kUnreadable;
+        }
+    } else {
+        // A missing file is fatal for the segment only when the query needs that column. Before
+        // the read set existed every column was needed, so a segment missing any one of the seven
+        // was dropped from every query - including queries that would never have looked at it.
+        bool missing = false;
+        bool removed = false;
+        auto need = [&](bool wanted, const char* file, auto& dest) {
+            if (!wanted || removed) return;
+            if (!read_column_file(dir, file, dest)) {
+                // Retention takes a segment out of the index and then deletes its directory
+                // without the lock (#165), so a scan that copied it first can find it going.
+                // Its rows are past the retention, and leaving them out is the right answer.
+                if (mode == ReadMode::kQuery && !still_indexed(dir)) {
+                    OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "
+                                             "its rows are past the retention", dir.c_str());
+                    removed = true;
+                    return;
+                }
+                OB_LOG_ERROR("columnar", "Skipping segment %s: missing column %s",
+                             dir.c_str(), file);
+                missing = true;
+            }
+        };
+        // Every column is opened through the set, the timestamp included - the widening at the
+        // top of scan() is what puts it there. A hardcoded `true` here reads as belt and
+        // braces and is worse than that: it makes that widening unobservable, so a mutation
+        // deleting it survived the test written to catch exactly that.
+        need(columns.has(QueryColumn::TimestampNs), "ts.col", timestamps);
+        need(want_price, "price.col", enc_prices);
+        need(want_qty,   "qty.col",   enc_qtys);
+        need(want_cnt,   "cnt.col",   counts);
+        need(want_side,  "side.col",  sides);
+        need(want_level, "level.col", levels);
+        need(want_seq,   "seq.col",   enc_seq);
+        if (removed) return SegmentRead::kRemoved;
+        if (missing) return SegmentRead::kUnreadable;
+
+        // Decoding follows the set too, and the sequence number is the expensive one: it is
+        // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
+        // four decode passes a segment would otherwise cost.
+        if (want_price) decode_prices_into(enc_prices, prices);
+        if (want_qty)   decode_simple8b_into(enc_qtys, meta.row_count, qtys);
+        if (want_seq) {
+            decode_simple8b_into(enc_seq, meta.row_count, b.zigzag_seq);
+            decode_prices_into(b.zigzag_seq, seqs);
+        }
+
+        // A short column means a truncated or corrupt segment. Emitting the rows
+        // it does have, padded with zeros, is what produced the lost-order-side
+        // defect this format version fixes, so refuse the segment instead. Only the columns
+        // being read can be short here; one that was never opened is empty by construction.
+        const size_t expected = static_cast<size_t>(meta.row_count);
+        if ((want_side  && sides.size()  < expected) ||
+            (want_level && levels.size() < expected) ||
+            (want_seq   && seqs.size()   < expected)) {
+            OB_LOG_ERROR("columnar",
+                         "Skipping segment %s: short column(s) for row_count=%zu "
+                         "(side=%zu level=%zu seq=%zu)",
+                         dir.c_str(), expected,
+                         sides.size(), levels.size(), seqs.size());
+            return SegmentRead::kUnreadable;
+        }
+        // A merge writes every row it reads into a segment that outlives this one, so it reads a
+        // segment whole or not at all (#165 part 2b): the padding below is a query's, and a merged row
+        // with a zero timestamp would widen the merged segment's range to the epoch.
+        if (mode == ReadMode::kMerge &&
+            (timestamps.size() < expected || prices.size() < expected ||
+             qtys.size() < expected || counts.size() < expected)) {
+            OB_LOG_ERROR("columnar",
+                         "segment %s cannot be merged: short column(s) for row_count=%zu "
+                         "(ts=%zu price=%zu qty=%zu cnt=%zu)",
+                         dir.c_str(), expected, timestamps.size(), prices.size(), qtys.size(),
+                         counts.size());
+            return SegmentRead::kUnreadable;
+        }
     }
 
     // Emit rows within time range
@@ -2078,14 +2417,10 @@ void ColumnarStore::rebuild_index_locked() {
             // A merged segment is published only once its files are on the device, so a short one
             // is a storage that did not keep what it acknowledged - and its inputs, where they are
             // still here, are what holds the rows. Decided below, once every segment is found.
-            std::error_code ec;
-            const auto ts_bytes = fs::file_size(fs::path(meta.dir_path) / "ts.col", ec);
-            if (ec || ts_bytes != meta.row_count * sizeof(uint64_t)) {
-                OB_LOG_WARN("columnar", "%s names %zu segment(s) it replaced and its ts.col holds %llu "
-                                        "byte(s) for %llu row(s)",
-                            meta.dir_path.c_str(), inputs.size(),
-                            static_cast<unsigned long long>(ec ? 0 : ts_bytes),
-                            static_cast<unsigned long long>(meta.row_count));
+            std::string why;
+            if (!segment_holds_its_rows(meta, why)) {
+                OB_LOG_WARN("columnar", "%s names %zu segment(s) it replaced and %s",
+                            meta.dir_path.c_str(), inputs.size(), why.c_str());
                 short_merges.emplace_back(std::move(meta), std::move(inputs));
                 continue;
             }
@@ -2195,8 +2530,7 @@ void ColumnarStore::repair_ranges_locked(std::vector<SegmentMeta>& found) {
     corrected.reserve(legacy.size());
     for (SegmentMeta* meta : legacy) {
         std::vector<uint64_t> ts;
-        if (!read_column_file(meta->dir_path, "ts.col", ts) || ts.empty() ||
-            ts.size() != meta->row_count) {
+        if (!read_timestamps(*meta, ts) || ts.empty() || ts.size() != meta->row_count) {
             // scan() needs this column for every query, so it skips the segment whatever its
             // range says; there is nothing to correct and nothing a guess would improve.
             ++unreadable;

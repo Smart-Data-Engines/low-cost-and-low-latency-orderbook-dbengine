@@ -129,7 +129,7 @@ def store_shape(path: str) -> dict:
         for name in names:
             size = os.path.getsize(os.path.join(root, name))
             total += size
-            if name.endswith(".col"):
+            if name.endswith(".col") or name == "columns.v3":   # format 2's files, format 3's one
                 cols += 1
             elif name.startswith("wal_") and name.endswith(".bin"):
                 wal_files += 1

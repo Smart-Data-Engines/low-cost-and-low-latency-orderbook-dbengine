@@ -6,7 +6,7 @@ The engine uses three storage layers:
 
 1. **WAL (Write-Ahead Log)** — append-only journal for crash recovery
 2. **SoA Buffer** — in-memory orderbook state (not persisted directly)
-3. **Columnar Store** — time-partitioned segments on disk, one file per column
+3. **Columnar Store** — time-partitioned segments on disk, every column encoded in one file (format 3)
 
 ## WAL Format
 
@@ -40,6 +40,30 @@ Each record:
   `docs/operations.md`, "WAL rotation, and what frees WAL files"
 
 ## Columnar Store Layout
+
+A segment is written in format 3 unless `segment-format = 2` says otherwise, and both formats are
+read, always (`docs/operations.md`, "Segment format 3"):
+
+```
+<data_dir>/
+  <symbol>/
+    <exchange>/
+      <start_ts>_<end_ts>/
+        columns.v3         The seven columns, each an encoded block with its CRC32C
+        meta.json          Segment metadata, "format_version": 3
+```
+
+`columns.v3` is a directory and the blocks it describes: the magic `OBS3`, the row count, and for
+each column its id, its block's length and the block's CRC32C, checked whenever the column is read.
+A block says how it is encoded and how many values it holds, and is decoded only when that is the
+segment's row count. Each column is in whichever of its candidate encodings is smallest for it:
+less the column's minimum or less the value before it, divided by what the values share; packed in
+Simple8b, as runs of equal values, in fixed-width blocks of 128, or each value in the bytes it
+needs; and under LZ4 at a seal, or ZSTD at a merge where that saves 10% over LZ4. The layout,
+byte by byte, is in `include/orderbook/column_codec.hpp` and in the spec,
+`kiro-workspace/specs/segment-format-v3/design.md`.
+
+Format 2, which a node writes with `segment-format = 2` and every node reads:
 
 ```
 <data_dir>/
@@ -82,8 +106,8 @@ numbers:
 | `seq.col` | **0.27** | zigzag-delta + Simple8b |
 | total | 24.38 | against 48 bytes in memory |
 
-`ts.col` and `price.col` are the two remaining candidates for bit-packing: both
-carry values that compress well and both currently cost a full 8 bytes.
+`ts.col` and `price.col` were the two remaining candidates for bit-packing, and four columns were
+raw: 23 of the 24 bytes. Format 3 encodes all seven (#219).
 
 ### meta.json
 
@@ -126,11 +150,13 @@ which is generated on first open and deliberately lives outside every segment di
 that it cannot travel with one. All three are `0` in segments written before this existed;
 recovery falls back to the timestamp comparison for those and says so in the log.
 
-`format_version` is checked on read. A segment carrying any other version is
-**skipped with an error**, not read partially: a missing column would otherwise
+`format_version` is checked on read. A segment carrying a version this build does not read -
+2 and 3 - is **skipped with an error**, not read partially: a missing column would otherwise
 surface as zeroed fields, which is the failure mode this version exists to
 prevent. The same applies to a column file that is absent or shorter than
-`row_count`.
+`row_count`, and in format 3 to a block whose checksum, length or count is not what the directory
+and `meta.json` say. Format 3 writes `bid_levels` and `ask_levels` without leading zeros, and reads
+either form.
 
 ### Segment Rollover
 
@@ -138,6 +164,8 @@ A new segment is created when the timestamp of an incoming row exceeds
 `active_segment_start + segment_duration_ns` (default: 1 hour).
 
 ## Compression
+
+Format 3's encodings are above; this section is format 2's.
 
 ### Price Compression (Delta + Zigzag)
 
@@ -166,11 +194,11 @@ Quantities are packed using Simple8b bit-packing:
 
 With plain `write()` calls whose every result is read, and then one sync before anything claims
 them - and it is worth saying plainly, because this section has said the wrong thing twice. A
-segment is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding seven column files —
-`price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — plus `meta.json`, written last. Each is
-written in full by `write_file_checked()` - a `write()` loop and a checked `close()` - when a flush
-completes, and read back with `std::ifstream`; there is no in-place update and no memory mapping on
-this path. A write the disk refuses fails the flush and removes the directory it began.
+segment is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding `columns.v3` in format 3,
+or seven column files in format 2 — `price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — plus
+`meta.json`, written last. Each is written in full by `write_file_checked()` - a `write()` loop and
+a checked `close()` - when a flush completes, and read back with `std::ifstream`; there is no
+in-place update and no memory mapping on this path. A write the disk refuses fails the flush and removes the directory it began.
 
 Until #161 the writer was `std::ofstream` and nothing read the stream's state: with the disk full,
 `price.col` came out zero bytes beside a complete `meta.json`, every price read back as zero, and the
@@ -199,17 +227,19 @@ client is told about, and what #161 at last made the column files report — so 
 path would have reinstated process death for a full disk, in a form strictly harder to handle than
 the one those items closed.
 
-What this does **not** foreclose: **four** of the seven column files — `ts.col`, `cnt.col`,
+What this does **not** foreclose, in format 2: **four** of the seven column files — `ts.col`, `cnt.col`,
 `side.col` and `level.col` — are raw fixed-width arrays read straight into vectors, so a mapped
 *reader* could in principle skip a copy and an allocation for those. (This paragraph said three
 and named three; `level.col` is a raw `uint16` array like the others and was simply missed.)
 `price.col`, `qty.col` and `seq.col` are delta+zigzag and Simple8b encoded and have to be decoded
 into a buffer however the bytes arrive. That is a question about a reader nobody has written and a
 benchmark nobody has run; the class that was removed was an **appender**, so deleting it says
-nothing either way.
+nothing either way. Format 3 has no raw column left: every block is decoded into a buffer, so a
+mapped reader would save it nothing.
 
 Since #139 there is a cheaper version of the same saving, and it is already taken: a scan is told
-which columns the query needs and does not open the others at all. Not reading a file beats
+which columns the query needs and does not open the others at all - in format 3 it reads the one
+file, and checks and decodes only the blocks of those columns. Not reading a file beats
 reading it without a copy, and it applies to the encoded three as well — a query that does not ask
 for the sequence number skips two of a segment's four decode passes, because `seq.col` is Simple8b
 **and** zigzag-delta.

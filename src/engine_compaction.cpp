@@ -305,7 +305,7 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
         c.start_ts_ns  = m.start_ts_ns;
         c.end_ts_ns    = m.end_ts_ns;
         const compaction::SegmentFacts facts{m.wal_identity, m.time_range_is_rows,
-                                             m.format_version == kColumnarFormatVersion,
+                                             columnar_format_readable(m.format_version),
                                              m.seal_epoch};
         const bool free = taken.count(m.dir_path) == 0 && unmergeable_.count(m.dir_path) == 0;
         c.eligible = free && compaction::may_merge(facts, wal_identity_, vouched_epoch);
@@ -436,6 +436,7 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
     ColumnarStore writer(base_dir_, std::numeric_limits<uint64_t>::max(),
                          ColumnarStore::OwnIndex::kNo);
     writer.set_symbol_exchange(first.symbol, first.exchange);
+    writer.set_segment_format(merge_format_);
     // The inputs' WAL, and the latest position and epoch among them: the replay filter takes a
     // symbol's latest position and a start judges a segment by its epoch, and a merge must change
     // neither answer.

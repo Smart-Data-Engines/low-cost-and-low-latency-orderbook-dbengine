@@ -39,6 +39,7 @@ COVERS = {
     "fuzz_command_parser": ["src/command_parser.cpp"],
     "fuzz_mm_frames":      ["src/mm_framing.cpp"],
     "fuzz_wal_replay":     ["src/wal.cpp"],
+    "fuzz_column_block":   ["src/column_codec.cpp", "src/codec.cpp"],
 }
 
 REQUIRED = {"address", "undefined", "fuzzer-no-link"}

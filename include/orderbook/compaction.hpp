@@ -69,11 +69,13 @@ struct Candidate {
 struct SegmentFacts {
     uint64_t wal_identity{0};
     bool     range_is_rows{false};    ///< its range is its rows' (#166), not repaired from a guess
-    bool     current_format{false};   ///< the format this build writes
+    bool     current_format{false};   ///< a format this build reads, so a merge can read it whole
     uint64_t seal_epoch{0};
 };
 
-/// Whether a segment may be merged now: of a known WAL, its range its rows', of this build's format -
+/// Whether a segment may be merged now: of a known WAL, its range its rows', of a format this build
+/// reads - a merge writes it again in the format this node writes, which is how a store written in
+/// segment format 2 comes to be in 3 -
 /// and, if it is of this node's WAL, vouched for by a checkpoint known to be on the device
 /// (`vouched_epoch`). A merged segment takes its inputs' highest epoch, and a start keeps a segment
 /// of this WAL only if the last checkpoint vouches for its epoch: merging one no checkpoint on the

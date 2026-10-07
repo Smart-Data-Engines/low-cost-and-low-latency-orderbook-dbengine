@@ -118,8 +118,8 @@ ob> query SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 999999
   ── 2 row(s) in 0.11 ms
 
 A select list narrows the answer. `SELECT price, quantity FROM 'BTC-USD'.'BINANCE' WHERE ...`
-returns two columns, in that order, and the server reads only the column files it needs to answer
-it — `SELECT quantity, price` answers in the order asked, and a column named twice is answered
+returns two columns, in that order, and the server decodes only the columns it needs to answer
+it (in format 2, opens only their files) — `SELECT quantity, price` answers in the order asked, and a column named twice is answered
 twice. Naming a column the engine does not have is refused, as it always was.
 
 The column is spelt `timestamp` or `timestamp_ns` in a query; the response header always calls it
@@ -569,6 +569,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--backup-dir` | `<DIR>` | Where `BACKUP` writes this node's backups, one directory each: hard links on the data directory's filesystem, a checked copy on another. Not the data or the WAL directory, inside either or holding either - the start is refused. Without it `BACKUP` is refused (#34; `docs/operations.md`, "Backing up and restoring a node") |
 | `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |
 | `--compaction` | `on\|off` | Whether the flush tick merges a symbol's small segments into bigger ones (default: on). A valve, not a tuning knob: `off` leaves every segment as its seal wrote it, so their number grows with uptime again (#165 part 2b) |
+| `--segment-format` | `2\|3` | The format new segments are written in, merged ones included (default: 3). Format 3 holds a segment's columns in one file, each checksummed and in the smallest of its candidate encodings, under LZ4 or ZSTD where that pays; a build before it cannot read a segment written in it, so `2` is for a cluster being upgraded and for a node that has to keep the way back ("Segment format 3" in `docs/operations.md`). Both are read, always |
 | `--write-admission` | `on\|off` | Whether writes are taken at the rate the device takes them once a flush tick shows it behind (default: on). A flush tick that took twice its interval or longer says how many rows the device took in how long, and from then on each batch of writes waits, after it is written, for its rows' time at that rate - so that writing faster than the device makes writes slower instead of stopping every writer at a full pending queue and refusing them after five seconds. It ends once no batch has waited for ten ticks. Nothing waits while the device keeps up (#190; "Writes faster than the device" in `docs/operations.md`) |
 | `--config` | `<FILE>` | Read `key = value` settings from FILE; command line wins |
 | `--coordinator-endpoints` | `<URLS>` | Comma-separated etcd endpoints for HA and failover |

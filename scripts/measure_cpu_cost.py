@@ -161,6 +161,12 @@ def main() -> int:
                     help="where the engine's own storage goes. Defaults beside the build, because "
                          "/tmp is a tmpfs on a good share of machines and timing one system "
                          "against RAM while the others write to disk is not a comparison.")
+    ap.add_argument("--segment-formats", default="",
+                    help="the engine once for each of these segment formats (3, 2 or 3,2), each a "
+                         "row of its own - one build's two formats compared; by default the engine "
+                         "as it starts")
+    ap.add_argument("--engine-only", action="store_true",
+                    help="leave ClickHouse and TimescaleDB out")
     args = ap.parse_args()
 
     from benchmarks.comparative import hardware
@@ -176,11 +182,13 @@ def main() -> int:
           f"{manifest.rows // args.levels:,} updates of {args.levels} levels")
     print(f"engine storage: {data_dir} on {engine_fs}\n")
 
-    cases = [
-        ("orderbook", OrderbookSystem(args.build_dir / "ob_tcp_server", 19311, data_dir)),
-        ("clickhouse", ClickHouseSystem()),
-        ("timescaledb", TimescaleDbSystem()),
-    ]
+    formats = [f.strip() for f in args.segment_formats.split(",") if f.strip()]
+    cases = ([(f"orderbook-f{f}", OrderbookSystem(args.build_dir / "ob_tcp_server", 19311, data_dir,
+                                                  extra_args=("--segment-format", f)))
+              for f in formats] if formats else
+             [("orderbook", OrderbookSystem(args.build_dir / "ob_tcp_server", 19311, data_dir))])
+    if not args.engine_only:
+        cases += [("clickhouse", ClickHouseSystem()), ("timescaledb", TimescaleDbSystem())]
     header = ("system", "wall s", "levels/s", "srv CPU s", "cli CPU s", "levels/srv-CPU-s",
               "srv cores")
     print("{:13}{:>9}{:>13}{:>12}{:>12}{:>18}{:>12}".format(*header))
@@ -198,6 +206,9 @@ def main() -> int:
             print("{:13}{:9.3f}{:13,.0f}{:12.3f}{:12.3f}{:18,.0f}{:12.2f}".format(
                 name, loaded.seconds, manifest.rows / loaded.seconds, srv_cpu, cli, per_cpu,
                 srv_cpu / loaded.seconds))
+            # Down before the next starts: two of the engine's cases share a port, and a server left
+            # idle is a process the next measurement runs beside.
+            system.teardown()
     finally:
         # `run.py` has had this since it was written and this script did not, so a run that raised
         # - mine did, on an import - left a node holding a port and a data directory with nobody

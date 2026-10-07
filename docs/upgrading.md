@@ -22,7 +22,8 @@ step 4), against this tree.
 | Scenario | Result | Test |
 |---|---|---|
 | A data directory the previous version wrote - segments, and rows only in the WAL after a kill - opened by this one | every row once; writes go on, numbered after them | `test_an_upgrade_in_place_keeps_every_row_once` |
-| A data directory this version wrote, opened by the previous one | every row once (the other permitted answer is a refusal to start; a start with part of the rows is the failure) | `test_a_downgrade_keeps_every_row_once_or_refuses_to_start` |
+| A data directory this version wrote in segment format 2 (`segment-format = 2`), opened by the previous one | every row once (the other permitted answer is a refusal to start; a start with part of the rows is the failure) | `test_a_downgrade_keeps_every_row_once_or_refuses_to_start` |
+| A data directory this version wrote in segment format 3, the default, opened by the previous one | it starts without the rows of format-3 segments, which it cannot decode, saying `Skipping segment ...: unsupported format_version=3 (this build reads 2)` at `ERROR` for each one a query reaches; it removes none, and this version started again holds every row once. A start with part of the rows, which this matrix calls the failure - the row changed with segment format 3, and "Going back" below says what an operator does | `test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing` |
 | A primary of the previous version, a replica of this one | the replica holds every row | `test_a_primary_of_the_previous_version_replicates_to_this_one` |
 | A primary of this version, a replica of the previous one | the replica holds every row | `test_a_primary_of_this_version_replicates_to_the_previous_one` |
 | A failover from a previous-version primary to this version's replica, under etcd | no acknowledged write lost; writes go on at the new primary | `test_a_failover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
@@ -58,10 +59,14 @@ because a failover then lands on an upgraded node.
 **A sharded cluster.** Each shard as a primary with replicas, one shard at a time. The shard map in
 etcd is not versioned by the engine.
 
-**Going back.** The same order, reversed. A data directory this version wrote opens in the previous
-one (the matrix); the sections of `docs/operations.md` named for a particular change say where an
-older build than the previous one reads a newer directory differently ("Going back to a build
-before part 2b of #165", "Downgrading a mesh node across #189").
+**Going back.** The same order, reversed. A data directory this version wrote in segment format 2
+opens in the previous one (the matrix). One it wrote in format 3, the default, does not whole: the
+previous version leaves out the rows of every format-3 segment, and nothing converts them back. So a
+node that has to keep the way back runs `segment-format = 2` from its upgrade until the previous
+version is no longer one to go back to ("Segment format 3" in `docs/operations.md`). The sections
+of `docs/operations.md` named for a particular change say where an older build than the previous
+one reads a newer directory differently ("Going back to a build before part 2b of #165",
+"Downgrading a mesh node across #189").
 
 ## When a change breaks a row
 

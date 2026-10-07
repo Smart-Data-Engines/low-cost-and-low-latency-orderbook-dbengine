@@ -10,10 +10,12 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "orderbook/column_codec.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
 
@@ -68,6 +70,13 @@ static std::vector<ob::SnapshotRow> scan_all(const ob::ColumnarStore& store) {
     store.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(),
                [&](const ob::SnapshotRow& r) { out.push_back(r); });
     return out;
+}
+
+/// Write segments in `version` (segment format v3): what a test of format 2's files asks for.
+static void use_format(ob::ColumnarStore& store, uint32_t version) {
+    auto format = store.segment_format();
+    format.version = version;
+    store.set_segment_format(format);
 }
 
 // Build a ColumnarStore with a known symbol/exchange by using a subdir approach.
@@ -150,6 +159,9 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_segment_append_only, ()) {
     const auto n = *rc::gen::inRange<int>(2, 50);
 
     ob::ColumnarStore store(tmp.str(), seg_dur);
+    // Format 2's files, one a column: what grows with the rows. Format 3's one file is held to what
+    // it says of itself further down.
+    use_format(store, ob::kColumnarFormatV2);
 
     // Track file sizes after each flush
     std::vector<uintmax_t> price_sizes;
@@ -192,6 +204,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_segment_append_only, ()) {
     // Create a second store with 2*n rows
     TempDir tmp2("append_only2");
     ob::ColumnarStore store2(tmp2.str(), seg_dur);
+    use_format(store2, ob::kColumnarFormatV2);
     for (int i = 0; i < n * 2; ++i) {
         store2.append(make_row(static_cast<uint64_t>(i) * 100ULL,
                                10000 + i, static_cast<uint64_t>(i + 1)));
@@ -779,7 +792,7 @@ TEST(ColumnarStoreFields, SegmentWithUnknownFormatVersionIsRejected) {
         std::string meta((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
         in.close();
-        const std::string from = "\"format_version\":2";
+        const std::string from = "\"format_version\":" + std::to_string(ob::kColumnarFormatVersion);
         const auto pos = meta.find(from);
         ASSERT_NE(pos, std::string::npos) << "meta.json is missing format_version";
         meta.replace(pos, from.size(), "\"format_version\":99");
@@ -797,6 +810,7 @@ TEST(ColumnarStoreFields, SegmentWithUnknownFormatVersionIsRejected) {
 TEST(ColumnarStoreFields, SegmentWithMissingColumnIsRejected) {
     TempDir tmp("missing_col");
     ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    use_format(store, ob::kColumnarFormatV2);
     store.append(make_row(1000, 100'000, 10, 1, ob::SIDE_ASK, 2));
     store.flush_segment();
 
@@ -810,9 +824,25 @@ TEST(ColumnarStoreFields, SegmentWithMissingColumnIsRejected) {
         << "a segment missing a column must be skipped, not read with zeros";
 }
 
+TEST(ColumnarStoreFields, AFormat3SegmentWithoutItsColumnsFileIsRejected) {
+    TempDir tmp("missing_col_v3");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    store.append(make_row(1000, 100'000, 10, 1, ob::SIDE_ASK, 2));
+    store.flush_segment();
+
+    const auto dir = store.index().at(0).dir_path;
+    std::error_code ec;
+    ASSERT_TRUE(fs::remove(dir + "/" + ob::kColumnsV3File, ec)) << "columns.v3 should exist";
+
+    ob::ColumnarStore reopened(tmp.str(), 1'000'000'000ULL);
+    reopened.open_existing();
+    EXPECT_TRUE(scan_all(reopened).empty()) << "a segment without its columns was read";
+}
+
 TEST(ColumnarStoreFields, TruncatedColumnIsRejected) {
     TempDir tmp("truncated_col");
     ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    use_format(store, ob::kColumnarFormatV2);
     for (int i = 0; i < 8; ++i) {
         store.append(make_row(1000 + static_cast<uint64_t>(i), 100'000 + i, 10, 1,
                               (i % 2 == 0) ? ob::SIDE_BID : ob::SIDE_ASK,
@@ -829,6 +859,45 @@ TEST(ColumnarStoreFields, TruncatedColumnIsRejected) {
     EXPECT_TRUE(scan_all(reopened).empty())
         << "a truncated column must invalidate the segment; padding with zeros is "
            "how the lost-side defect behaved";
+}
+
+TEST(ColumnarStoreFields, AFormat3SegmentCutShortOrChangedIsRejectedAndTheOthersAreRead) {
+    // Each a segment of its own, one row apart: the damaged one is skipped, the others read.
+    for (const std::string damage : {"cut", "flip"}) {
+        SCOPED_TRACE(damage);
+        TempDir tmp("damaged_v3");
+        ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+        for (uint64_t s = 0; s < 3; ++s) {
+            for (int i = 0; i < 8; ++i) {
+                store.append(make_row(s * 2'000'000'000ULL + 1000 + static_cast<uint64_t>(i),
+                                      100'000 + i, 10, 1, ob::SIDE_BID, static_cast<uint16_t>(i)));
+            }
+            store.flush_segment();
+        }
+        ASSERT_EQ(store.segment_count(), 3u);
+        const std::string file = store.index().at(1).dir_path + "/" + ob::kColumnsV3File;
+        const auto size = fs::file_size(file);
+        if (damage == "cut") {
+            fs::resize_file(file, size - 1);
+        } else {
+            // The last byte is the sequence numbers' block's: its checksum no longer holds.
+            std::fstream f(file, std::ios::in | std::ios::out | std::ios::binary);
+            f.seekg(static_cast<std::streamoff>(size - 1));
+            char c = 0;
+            f.read(&c, 1);
+            c = static_cast<char>(c ^ 0x5A);
+            f.seekp(static_cast<std::streamoff>(size - 1));
+            f.write(&c, 1);
+        }
+        ob::ColumnarStore reopened(tmp.str(), 1'000'000'000ULL);
+        reopened.open_existing();
+        const auto rows = scan_all(reopened);
+        EXPECT_EQ(rows.size(), 16u) << "the damaged segment was read, or another one with it was not";
+        for (const auto& r : rows) {
+            EXPECT_TRUE(r.timestamp_ns < 2'000'000'000ULL || r.timestamp_ns >= 4'000'000'000ULL)
+                << "a row of the damaged segment came back";
+        }
+    }
 }
 
 RC_GTEST_PROP(ColumnarStoreFieldsProperty,
@@ -953,6 +1022,7 @@ TEST(ColumnarStoreProjection, TheTimestampIsReadEvenWhenTheSetLeavesItOut) {
 TEST(ColumnarStoreProjection, AMissingColumnFileOnlyRefusesTheSegmentForQueriesThatNeedIt) {
     TempDir tmp("ut_projection_missing");
     ob::ColumnarStore store(tmp.str());
+    use_format(store, ob::kColumnarFormatV2);
     for (uint64_t i = 1; i <= 5; ++i) store.append(make_row(i * 1'000'000ULL));
     store.flush_segment();
     ASSERT_EQ(scan_all(store).size(), 5u);
@@ -983,6 +1053,241 @@ TEST(ColumnarStoreProjection, AMissingColumnFileOnlyRefusesTheSegmentForQueriesT
     store.scan(0, UINT64_MAX, "", "", with_seq,
                [&](const ob::SnapshotRow& r) { refused.push_back(r); });
     EXPECT_TRUE(refused.empty()) << "narrowing must not weaken the check for a column in the set";
+}
+
+TEST(ColumnarStoreProjection, AFormat3BlockThatFailsItsChecksumOnlyRefusesQueriesThatReadIt) {
+    // Format 3's counterpart of the one above: the columns are blocks of one file, each with its own
+    // checksum, checked only when the column is read.
+    TempDir tmp("ut_projection_crc");
+    ob::ColumnarStore store(tmp.str());
+    for (uint64_t i = 1; i <= 5; ++i) store.append(make_row(i * 1'000'000ULL));
+    store.flush_segment();
+    ASSERT_EQ(scan_all(store).size(), 5u);
+    const std::string file = store.index().at(0).dir_path + "/" + ob::kColumnsV3File;
+    const auto size = fs::file_size(file);
+    {
+        // The last byte is the sequence numbers' block's.
+        std::fstream f(file, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekg(static_cast<std::streamoff>(size - 1));
+        char c = 0;
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(size - 1));
+        f.write(&c, 1);
+    }
+    ob::ColumnSet without_seq;
+    without_seq.add(ob::QueryColumn::Price).add(ob::QueryColumn::Quantity);
+    std::vector<ob::SnapshotRow> ok;
+    store.scan(0, UINT64_MAX, "", "", without_seq, [&](const ob::SnapshotRow& r) { ok.push_back(r); });
+    EXPECT_EQ(ok.size(), 5u) << "a block nobody asked for made the segment unreadable";
+    ob::ColumnSet with_seq;
+    with_seq.add(ob::QueryColumn::SequenceNumber);
+    std::vector<ob::SnapshotRow> refused;
+    store.scan(0, UINT64_MAX, "", "", with_seq, [&](const ob::SnapshotRow& r) { refused.push_back(r); });
+    EXPECT_TRUE(refused.empty()) << "a block whose checksum fails was decoded";
+}
+
+// ── Segment format 3: the files, and both formats in one store ───────────────────────────────
+
+TEST(ColumnarStoreFormat, AFormat3SegmentIsItsMetaAndOneColumnsFile) {
+    TempDir tmp("format3_files");
+    ob::ColumnarStore store(tmp.str());
+    // Levels 0 - 19 of the bids, then of the asks.
+    for (uint64_t i = 0; i < 40; ++i) {
+        store.append(make_row(1'000'000ULL + i, 100'000 + static_cast<int64_t>(i), i + 1, 1,
+                              i < 20 ? ob::SIDE_BID : ob::SIDE_ASK, static_cast<uint16_t>(i % 20)));
+    }
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->format_version, ob::kColumnarFormatV3);
+    std::set<std::string> files;
+    for (const auto& e : fs::directory_iterator(meta->dir_path)) files.insert(e.path().filename().string());
+    EXPECT_EQ(files, (std::set<std::string>{"meta.json", ob::kColumnsV3File}));
+    std::ifstream in(meta->dir_path + "/meta.json");
+    const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_NE(json.find("\"format_version\":3"), std::string::npos) << json;
+    // Levels 0 - 19 of each side: five hex digits, not 250.
+    EXPECT_NE(json.find("\"bid_levels\":\"fffff\""), std::string::npos) << json;
+    EXPECT_NE(json.find("\"ask_levels\":\"fffff\""), std::string::npos) << json;
+    // And it reads back, the level sets included.
+    ob::ColumnarStore reopened(tmp.str());
+    reopened.open_existing();
+    ASSERT_EQ(reopened.index().size(), 1u);
+    ASSERT_NE(reopened.index()[0].levels, nullptr) << "the short level set was not read";
+    EXPECT_EQ(*reopened.index()[0].levels, *meta->levels);
+    EXPECT_EQ(scan_all(reopened).size(), 40u);
+}
+
+TEST(ColumnarStoreFormat, SegmentFormat2WritesFormat2) {
+    TempDir tmp("format2_files");
+    ob::ColumnarStore store(tmp.str());
+    use_format(store, ob::kColumnarFormatV2);
+    store.append(make_row(1'000'000ULL, 100'000, 10, 1, ob::SIDE_BID, 3));
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->format_version, ob::kColumnarFormatV2);
+    for (const char* f : {"ts.col", "price.col", "qty.col", "cnt.col", "side.col", "level.col", "seq.col"}) {
+        EXPECT_TRUE(fs::exists(meta->dir_path + "/" + f)) << f;
+    }
+    EXPECT_FALSE(fs::exists(meta->dir_path + "/" + ob::kColumnsV3File));
+    std::ifstream in(meta->dir_path + "/meta.json");
+    const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // Every digit of the level sets: a build before format 3 reads this meta.json.
+    const auto at = json.find("\"bid_levels\":\"");
+    ASSERT_NE(at, std::string::npos);
+    EXPECT_EQ(json.find('"', at + 14) - (at + 14), ob::LevelSet::kLevels / 4) << json;
+}
+
+namespace {
+
+/// The encoding byte of each block of a format-3 segment, in the order of its file's directory.
+std::vector<uint8_t> block_encodings(const std::string& segment_dir) {
+    std::ifstream in(segment_dir + "/" + ob::kColumnsV3File, std::ios::binary);
+    const std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::span<const char> bytes(file.data(), file.size());
+    EXPECT_EQ(file.substr(0, 4), "OBS3");
+    size_t at = 4;
+    uint64_t rows = 0;
+    EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, rows));
+    const size_t columns = static_cast<uint8_t>(file.at(at++));
+    std::vector<uint64_t> lengths;
+    for (size_t c = 0; c < columns; ++c) {
+        ++at;   // the column's id
+        uint64_t length = 0;
+        EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, length));
+        at += 4;   // the block's CRC32C
+        lengths.push_back(length);
+    }
+    std::vector<uint8_t> encodings;
+    for (const uint64_t length : lengths) {
+        encodings.push_back(static_cast<uint8_t>(file.at(at)));
+        at += static_cast<size_t>(length);
+    }
+    EXPECT_EQ(at, file.size());
+    return encodings;
+}
+
+constexpr uint8_t kZstdBit = 0x20;
+constexpr uint8_t kLz4Bit = 0x40;
+constexpr size_t kQuantityColumn = 2;
+
+/// Two hundred snapshots of a book's twenty levels whose quantities repeat from one to the next:
+/// ZSTD keeps the quantities in half of LZ4's bytes, the case on which the two tiers part.
+void fill_repeating_snapshots(ob::ColumnarStore& store) {
+    for (uint64_t s = 0; s < 200; ++s) {
+        for (uint64_t l = 0; l < 20; ++l) {
+            store.append(make_row(1'000'000'000ULL + s * 100'000'000ULL,
+                                  6'000'000'000LL - static_cast<int64_t>(l) * 1'000'000,
+                                  100'000 + l * 7'919 % 5'003, 1, ob::SIDE_BID, static_cast<uint16_t>(l)));
+        }
+    }
+}
+
+}  // namespace
+
+TEST(ColumnarStoreFormat, AStoreNotToldOtherwiseSealsAsTheServerDoesWithoutZstd) {
+    // An application embedding the engine makes its stores without a format, and nothing merges
+    // what they seal: they seal as a server's stores do - LZ4 or nothing, the last encodings reused.
+    TempDir tmp("format_seal_default");
+    ob::ColumnarStore store(tmp.str());
+    EXPECT_EQ(store.segment_format().search.zstd_level, 0);
+    EXPECT_EQ(store.segment_format().search_every, 16u);
+    fill_repeating_snapshots(store);
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    const auto encodings = block_encodings(meta->dir_path);
+    ASSERT_EQ(encodings.size(), 7u);
+    for (size_t c = 0; c < encodings.size(); ++c) {
+        EXPECT_EQ(encodings[c] & kZstdBit, 0) << "column " << c;
+    }
+    EXPECT_NE(encodings[kQuantityColumn] & kLz4Bit, 0) << "the repeating quantities are LZ4's";
+}
+
+TEST(ColumnarStoreFormat, TheMergesFormatTakesZstdWhereItSavesItsMargin) {
+    TempDir tmp("format_merge_policy");
+    ob::ColumnarStore store(tmp.str());
+    store.set_segment_format(ob::ColumnarStore::SegmentFormat::merge());
+    fill_repeating_snapshots(store);
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    const auto encodings = block_encodings(meta->dir_path);
+    ASSERT_EQ(encodings.size(), 7u);
+    EXPECT_NE(encodings[kQuantityColumn] & kZstdBit, 0) << "half of LZ4's bytes passes a margin of 10%";
+    const auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), 4000u);
+    EXPECT_EQ(rows[3999].quantity, 100'000 + 19 * 7'919 % 5'003);
+}
+
+TEST(ColumnarStoreReadBuffers, AFormat3ReadsDecodingScratchIsCountedInWhatThePoolKeeps) {
+    // The decoder's own buffers - here the quantities unpacked from fixed-width blocks before their
+    // inverse - belong to the read's pooled set, so the budget bounds them as it bounds the columns.
+    TempDir tmp("read_buffers_scratch");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    constexpr uint64_t kRows = 4000;
+    uint64_t x = 0x9E3779B97F4A7C15ULL;
+    for (uint64_t i = 0; i < kRows; ++i) {
+        // Quantities of sixteen random bits: blocks of 128 at sixteen bits beat anything LZ4 makes.
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        store.append(make_row(1000 + i, 100'000 + static_cast<int64_t>(i), 1 + (x & 0xFFFF)));
+    }
+    const auto meta = store.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    ASSERT_EQ(meta->format_version, ob::kColumnarFormatV3);
+    const auto encodings = block_encodings(meta->dir_path);
+    ASSERT_EQ(encodings.size(), 7u);
+    ASSERT_EQ((encodings[kQuantityColumn] >> 3) & 0x3, 2) << "the quantities are in fixed-width blocks";
+
+    constexpr size_t kBudget = size_t{128} << 20;
+    struct RestoreBudget {
+        ~RestoreBudget() { ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget); }
+    } restore;
+    ob::ColumnarStore::set_read_buffers_limit_for_test(0);   // a fresh set for the read below
+    ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget);
+    ASSERT_EQ(scan_all(store).size(), kRows);
+    // The seven columns decoded, the file as read, and at least the quantities' values in the
+    // decode's scratch.
+    const size_t file_bytes = fs::file_size(meta->dir_path + "/" + ob::kColumnsV3File);
+    EXPECT_GE(ob::ColumnarStore::read_buffers_held(),
+              kRows * (8 + 8 + 8 + 8 + 4 + 1 + 2) + file_bytes + kRows * sizeof(uint64_t));
+}
+
+TEST(ColumnarStoreFormat, SegmentsOfBothFormatsInOneStoreReadAsTheyWereWritten) {
+    TempDir tmp("format_both");
+    std::vector<ob::SnapshotRow> written;
+    {
+        ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+        for (uint32_t version : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV2,
+                                 ob::kColumnarFormatV3}) {
+            use_format(store, version);
+            const uint64_t base = written.size() * 1'000'000ULL;
+            for (uint64_t i = 0; i < 50; ++i) {
+                auto r = make_row(base + i * 1000, -5'000 + static_cast<int64_t>(i * 37 % 101),
+                                  1 + i * 7919 % 5000, static_cast<uint32_t>(i % 9),
+                                  i % 3 ? ob::SIDE_ASK : ob::SIDE_BID, static_cast<uint16_t>(i % 25));
+                r.sequence_number = 1'000'000'000ULL + base + i;
+                store.append(r);
+                written.push_back(r);
+            }
+            const auto meta = store.flush_segment();
+            ASSERT_TRUE(meta.has_value());
+            ASSERT_EQ(meta->format_version, version);
+        }
+    }
+    ob::ColumnarStore reopened(tmp.str(), 1'000'000'000ULL);
+    reopened.open_existing();
+    const auto rows = scan_all(reopened);
+    ASSERT_EQ(rows.size(), written.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i].timestamp_ns, written[i].timestamp_ns) << i;
+        EXPECT_EQ(rows[i].price, written[i].price) << i;
+        EXPECT_EQ(rows[i].quantity, written[i].quantity) << i;
+        EXPECT_EQ(rows[i].order_count, written[i].order_count) << i;
+        EXPECT_EQ(rows[i].side, written[i].side) << i;
+        EXPECT_EQ(rows[i].level_index, written[i].level_index) << i;
+        EXPECT_EQ(rows[i].sequence_number, written[i].sequence_number) << i;
+    }
 }
 
 // ── replace_from_staging: a snapshot replaces the store, it does not join it (#142) ──────────
@@ -1295,38 +1600,51 @@ TEST(ColumnarStoreReadBuffers, AReadInsideAnotherOnTheSameThreadGetsBuffersOfIts
 }
 
 TEST(ColumnarStoreReadBuffers, BuffersPastTheBudgetAreFreedRatherThanKept) {
-    TempDir tmp("read_buffers_budget");
-    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
-    fill_tagged(store, 5, 2000);
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+        SCOPED_TRACE(format);
+        TempDir tmp("read_buffers_budget");
+        ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+        use_format(store, format);
+        fill_tagged(store, 5, 2000);
 
-    constexpr size_t kBudget = size_t{128} << 20;
-    struct RestoreBudget {
-        ~RestoreBudget() { ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget); }
-    } restore;
+        constexpr size_t kBudget = size_t{128} << 20;
+        struct RestoreBudget {
+            ~RestoreBudget() { ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget); }
+        } restore;
 
-    // From nothing, whatever the tests before this one left in the pool.
-    ob::ColumnarStore::set_read_buffers_limit_for_test(0);
-    expect_tagged(scan_all(store), 5, 2000);
-    ASSERT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "a set past the budget is freed";
+        // From nothing, whatever the tests before this one left in the pool.
+        ob::ColumnarStore::set_read_buffers_limit_for_test(0);
+        expect_tagged(scan_all(store), 5, 2000);
+        ASSERT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "a set past the budget is freed";
 
-    ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget);
-    expect_tagged(scan_all(store), 5, 2000);
-    const size_t held = ob::ColumnarStore::read_buffers_held();
-    // At least every column of 2000 rows as read and as decoded: the timestamps, the prices both
-    // ways, the quantities and sequence numbers decoded (and the sequence numbers' zigzag deltas),
-    // the counts, sides and levels - all but the Simple8b words, whose number the codec decides. A
-    // floor of the decoded columns alone let a count that left one buffer out pass (the mutation
-    // table of #49's step 2).
-    const size_t every_column = size_t{2000} * (8 + 8 + 8 + 8 + 8 + 8 + 4 + 1 + 2);
-    EXPECT_GE(held, every_column);
-    expect_tagged(scan_all(store), 5, 2000);
-    EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), held)
-        << "the next read takes the same set back and needs no more";
+        ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget);
+        expect_tagged(scan_all(store), 5, 2000);
+        const size_t held = ob::ColumnarStore::read_buffers_held();
+        // At least every column of 2000 rows as read and as decoded. Format 2: the timestamps, the
+        // prices both ways, the quantities and sequence numbers decoded (and the sequence numbers'
+        // zigzag deltas), the counts, sides and levels - all but the Simple8b words, whose number the
+        // codec decides. A floor of the decoded columns alone let a count that left one buffer out pass
+        // (the mutation table of #49's step 2). Format 3: the seven columns decoded, and its file as
+        // read - the largest of the store's.
+        size_t every_column = size_t{2000} * (8 + 8 + 8 + 8 + 8 + 8 + 4 + 1 + 2);
+        if (format == ob::kColumnarFormatV3) {
+            size_t largest_file = 0;
+            for (const auto& m : store.index()) {
+                largest_file = std::max<size_t>(largest_file, fs::file_size(m.dir_path + "/" + ob::kColumnsV3File));
+            }
+            every_column = size_t{2000} * (8 + 8 + 8 + 8 + 4 + 1 + 2) + largest_file;
+        }
+        EXPECT_GE(held, every_column);
+        expect_tagged(scan_all(store), 5, 2000);
+        EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), held)
+            << "the next read takes the same set back and needs no more";
 
-    ob::ColumnarStore::set_read_buffers_limit_for_test(held - 1);
-    EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "a lower budget frees what it cannot hold";
-    expect_tagged(scan_all(store), 5, 2000);
-    EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "and a read's set that would pass it";
+        ob::ColumnarStore::set_read_buffers_limit_for_test(held - 1);
+        EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "a lower budget frees what it cannot hold";
+        expect_tagged(scan_all(store), 5, 2000);
+        EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "and a read's set that would pass it";
+        ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget);
+    }
 }
 
 TEST(ColumnarStoreReadBuffers, ThreadsReadingAtOnceEachHaveASetOfTheirOwn) {

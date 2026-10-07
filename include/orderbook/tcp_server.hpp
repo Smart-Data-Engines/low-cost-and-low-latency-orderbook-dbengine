@@ -211,6 +211,10 @@ struct ServerConfig {
     /// tick shows it behind (#190 step 5), rather than every writer stopping at a full queue.
     bool write_admission{true};
 
+    /// --segment-format 2|3: the format new segments are written in (segment format v3). 2 is for
+    /// a cluster being upgraded, whose nodes of the build before cannot read 3.
+    uint32_t segment_format{3};
+
     // ── Authentication (#30) ──────────────────────────────────────────────────
     //
     // Paths, never secrets. `--print-config` renders every value in this struct, so a secret held

@@ -155,7 +155,19 @@ TEST(LevelSet, HexReadsBackToTheSameLevels) {
     ob::LevelSet::Bits back{};
     ASSERT_TRUE(ob::LevelSet::from_hex(hex, back));
     EXPECT_EQ(back, set.bid);
+    // Without its leading zeros, as segment format 3 writes it: the same levels.
+    const std::string trimmed = ob::LevelSet::to_hex(set.bid, true);
+    EXPECT_EQ(trimmed.front(), '8') << trimmed;   // level 999 is the top digit's highest bit
+    ob::LevelSet::Bits back_trimmed{};
+    ASSERT_TRUE(ob::LevelSet::from_hex(trimmed, back_trimmed));
+    EXPECT_EQ(back_trimmed, set.bid);
+    ob::LevelSet::Bits none{};
+    EXPECT_EQ(ob::LevelSet::to_hex(none, true), "0");
+    ASSERT_TRUE(ob::LevelSet::from_hex("0", back_trimmed));
+    EXPECT_EQ(back_trimmed, none);
+    // A digit short of every digit begins with a zero here, which neither form does.
     EXPECT_FALSE(ob::LevelSet::from_hex(hex.substr(1), back)) << "a digit short";
+    EXPECT_FALSE(ob::LevelSet::from_hex("0" + trimmed, back)) << "a leading zero in a short form";
     std::string bad = hex;
     bad[7] = 'g';
     EXPECT_FALSE(ob::LevelSet::from_hex(bad, back)) << "not a hex digit";

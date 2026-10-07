@@ -21,6 +21,7 @@ TimescaleDB's partitioning" would be measuring a claim it never made.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -57,9 +58,16 @@ CREATE INDEX {TABLE}_symbol_ts ON {TABLE} (symbol, ts_ns DESC);
 class TimescaleDbSystem:
     name = "timescaledb"
 
-    def __init__(self, port: int = PORT, database: str = DATABASE):
+    def __init__(self, port: int = PORT, database: str = DATABASE,
+                 chunk_interval_ns: int = CHUNK_INTERVAL_NS):
+        """`chunk_interval_ns` other than the harness's one second is for a measurement of storage on
+        a dataset longer than ten seconds: TimescaleDB compresses a chunk at a time, and one-second
+        chunks of a ten-minute recording compress each second apart."""
         self._port = port
         self._database = database
+        self._chunk_interval_ns = chunk_interval_ns
+        self._ddl = DDL.replace(f"chunk_time_interval => {CHUNK_INTERVAL_NS}",
+                                f"chunk_time_interval => {chunk_interval_ns}")
         self._session: subprocess.Popen | None = None
         self._prepared = False
         self._version = ""
@@ -69,11 +77,15 @@ class TimescaleDbSystem:
     def _start_session(self) -> subprocess.Popen:
         if self._session is not None and self._session.poll() is None:
             return self._session
+        # psql is a Perl wrapper on Debian and Ubuntu, and Perl warns on stderr - merged into the
+        # answers here - when the locale it is given is not installed, which is what an ssh session
+        # forwards from the machine it came from. The warning took the place of the server's
+        # version in every storage measurement of 6 and 7 October.
         self._session = subprocess.Popen(
             ["psql", "-p", str(self._port), "-d", self._database,
              "--no-psqlrc", "-q", "-A", "-t", "-F", "\t"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1)
+            text=True, bufsize=1, env=dict(os.environ, LC_ALL="C"))
         return self._session
 
     def _ask(self, statement: str) -> list[str]:
@@ -153,14 +165,18 @@ class TimescaleDbSystem:
                            f"WHERE hypertable_name = '{TABLE}'")
         return ("endpoint: 127.0.0.1:%d/%s (one psql session)\n%s\nchunks after load: %s\n"
                 "non-default settings:\n%s" % (
-                    self._port, self._database, DDL.strip(),
+                    self._port, self._database, self._ddl.strip(),
                     chunks[0] if chunks else "?", "\n".join(settings)))
 
     def tuning_applied(self) -> list[str]:
         return [
-            f"create_hypertable(chunk_time_interval => {CHUNK_INTERVAL_NS:,} ns): one second of "
-            f"market time per chunk, which is what a ten-second dataset can support - the module "
-            f"docstring says why that is the dataset's limit and not a setting chosen to hurt",
+            (f"create_hypertable(chunk_time_interval => {CHUNK_INTERVAL_NS:,} ns): one second of "
+             f"market time per chunk, which is what a ten-second dataset can support - the module "
+             f"docstring says why that is the dataset's limit and not a setting chosen to hurt")
+            if self._chunk_interval_ns == CHUNK_INTERVAL_NS else
+            (f"create_hypertable(chunk_time_interval => {self._chunk_interval_ns:,} ns): chunks "
+             f"that hold the whole dataset, for a measurement of storage - TimescaleDB compresses a "
+             f"chunk at a time"),
             "index on (symbol, ts_ns DESC): the time-range query filters on both columns",
             "synchronous_commit = off for the bulk load only: the documented setting for loading, "
             "and restored afterwards so the query workloads run under the server's own default",
@@ -175,7 +191,7 @@ class TimescaleDbSystem:
     def _prepare(self) -> None:
         if self._prepared:
             return
-        for statement in DDL.strip().split(";"):
+        for statement in self._ddl.strip().split(";"):
             if statement.strip():
                 self._ask(statement + ";")
         self._prepared = True

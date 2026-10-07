@@ -308,7 +308,9 @@ def test_a_segment_the_cut_left_short_is_rebuilt_from_the_wal(disk, tmp_path):
         # The case this test is about, on the device: the metadata survived and a column did not.
         survived = segment_metas(data)
         assert survived, "no segment metadata survived the cut: the case did not happen"
-        columns = [c for meta in survived for c in meta.parent.glob("*.col")]
+        # A segment's columns: one `columns.v3` in segment format 3 (#219), a file each in format 2.
+        columns = [c for meta in survived for c in meta.parent.iterdir()
+                   if c.name.endswith(".col") or c.name == "columns.v3"]
         assert any(c.stat().st_size == 0 for c in columns), (
             "every column survived the cut, so there was nothing for the rule to catch: "
             + ", ".join(f"{c.name}={c.stat().st_size}" for c in columns))

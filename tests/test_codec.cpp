@@ -204,6 +204,60 @@ RC_GTEST_PROP(CodecProperty, prop_volume_roundtrip_in_runs_of_widths, ()) {
     RC_ASSERT(ob::decode_simple8b(result.words, values.size()) == values);
 }
 
+// The encoder before segment format v3 sped its selector search up, kept as it was: the search
+// changed how it finds the first selector that fits and nothing else, so it has to write the same
+// words as this did for every input.
+std::vector<uint64_t> reference_encode_simple8b(const std::vector<uint64_t>& values) {
+    static constexpr uint64_t kMarker = (1ULL << 60) - 1;
+    std::vector<uint64_t> out;
+    size_t i = 0;
+    while (i < values.size()) {
+        if (values[i] >= kMarker) {
+            out.push_back((15ULL << 60) | kMarker);
+            out.push_back(values[i]);
+            ++i;
+            continue;
+        }
+        int chosen = -1;
+        for (int sel = 0; sel <= 15 && chosen < 0; ++sel) {
+            const size_t use = std::min<size_t>(kSelectors[sel].count, values.size() - i);
+            const uint32_t bits = kSelectors[sel].bits;
+            const uint64_t max_val = bits == 0 ? 0 : (1ULL << bits) - 1;
+            bool ok = true;
+            for (size_t k = 0; k < use && ok; ++k) ok = values[i + k] <= max_val;
+            if (ok) chosen = sel;
+        }
+        const size_t use = std::min<size_t>(kSelectors[chosen].count, values.size() - i);
+        uint64_t word = static_cast<uint64_t>(chosen) << 60;
+        if (kSelectors[chosen].bits > 0) {
+            for (size_t k = 0; k < use; ++k) word |= values[i + k] << (k * kSelectors[chosen].bits);
+        }
+        out.push_back(word);
+        i += use;
+    }
+    return out;
+}
+
+RC_GTEST_PROP(CodecProperty, prop_simple8b_encode_matches_the_previous_encoder, ()) {
+    // Runs of one width each, as above, so that every selector is chosen and a wider value sits at
+    // every position of the window a narrower selector would take.
+    static constexpr uint64_t kMarker = (1ULL << 60) - 1;
+    std::vector<uint64_t> values;
+    const auto runs = *rc::gen::inRange<size_t>(1, 12);
+    for (size_t r = 0; r < runs; ++r) {
+        const auto bits = *rc::gen::weightedOneOf<unsigned>({
+            {8, rc::gen::resize(100, rc::gen::inRange<unsigned>(0, 61))},
+            {1, rc::gen::just(61u)},
+        });
+        const auto len = *rc::gen::inRange<size_t>(1, 300);
+        const auto value = rc::gen::resize(100, bits <= 60
+            ? rc::gen::inRange<uint64_t>(0, 1ULL << bits)
+            : rc::gen::element(kMarker, kMarker + 1, uint64_t{UINT64_MAX}));
+        for (size_t k = 0; k < len; ++k) values.push_back(*value);
+    }
+    RC_ASSERT(ob::encode_simple8b(values).words == reference_encode_simple8b(values));
+}
+
 // The unrolled decoder answers as the one before it for any words and any count - including words
 // no encoder writes, a fallback marker with nothing after it, and a count that ends inside a word or
 // past what the words hold.

@@ -16,9 +16,13 @@ The first release. What it contains, by area:
 - A write-ahead log with CRC32C on every record and a configurable fsync policy (`--fsync-policy`),
   rotation, and recovery that replays what the last checkpoint does not cover.
 - An in-memory book per symbol in struct-of-arrays buffers read under a seqlock.
-- Columnar segments on disk: time-partitioned, one file per column, prices delta and zigzag encoded,
-  quantities and sequence numbers in Simple8b; sealed without the engine's lock and merged in the
-  background into segments of up to 262 144 rows (#165).
+- Columnar segments on disk: time-partitioned, sealed without the engine's lock and merged in the
+  background into segments of up to 262 144 rows (#165). In segment format 3 (#219) a segment's seven
+  columns are one file, each column checksummed and in whichever of its candidate encodings is
+  smallest - less the column's minimum or the value before it, divided by what the values share, in
+  Simple8b, runs, fixed-width blocks or the bytes each value needs, under LZ4 at a seal and ZSTD at
+  a merge where that pays. Segments written in format 2 are read as they are, and
+  `--segment-format 2` keeps writing them.
 - TTL retention, and segments that survive a power cut (#160).
 - On a device slower than the ingest, writes admitted at the rate it takes rather than refused when
   the pending queue stays full (`--write-admission`, #190), the seal's sync in the background, and

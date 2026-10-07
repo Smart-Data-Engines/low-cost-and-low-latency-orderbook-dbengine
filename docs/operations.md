@@ -1795,6 +1795,68 @@ nothing and replays from the checkpoint record, which would skip the records of 
 waiting — so start the node once with the newer build, let it replay, stop it cleanly, and then go
 back.
 
+## Segment format 3
+
+A segment written in format 3 holds its seven columns in one file, `columns.v3`, beside its
+`meta.json`. Each column is in whichever of its candidate encodings is smallest for it:
+
+- a transform: each value less the column's minimum, or less the value before it, divided by what
+  they all share - a price's tick, a quantity's lot;
+- a packing: Simple8b, runs of equal values, fixed-width blocks, or each value in the bytes it needs;
+- and LZ4 or ZSTD over the packed bytes where that is smaller.
+
+Each column carries a CRC32C, checked whenever the column is read. Format 2 wrote the timestamp, the
+order count, the side and the level raw, and the price as one 64-bit word a row.
+
+The two compressors are two tiers. ZSTD writes the smaller blocks and LZ4 the ones read several times
+faster, so a seal - what queries read most - writes LZ4 or nothing, and a merge, which writes what
+stays, takes ZSTD for a column where it saves at least 10% over LZ4. Choosing costs a search, so a
+seal reuses the encodings its symbol's last segment chose and searches again every sixteenth
+segment, while a merge always searches.
+
+What format 3 costs is decoding. Format 2 read four of its columns as they lay on disk, and format 3
+decodes every column it reads, so a query of segments in the page cache spends more CPU on them. On
+recordings of Binance's books (`scripts/binance_capture_csv.py`), the same queries took 1.04 - 1.73
+times as long as in format 2 on an m9g.xlarge and 1.11 - 2.08 times on an m8a.xlarge - from 0.01 ms
+more to 0.53 ms more - while on a synthetic book of 100 levels an update, read whole by a scan or by
+time buckets, format 3 was 4 - 21% faster (#220, with the queries and the figures). Ingest went the other
+way: a seal writes two files rather than eight, and on both machines the long pipelined runs ingested
+more levels a second in format 3, for a few percent more of the server's CPU (#219). The search a
+seal makes when it has no encodings to reuse - a symbol's first seal after a start, and every
+sixteenth - weighs most where each symbol seals only a few times: two million levels over 50
+symbols in three seconds took the server 38 - 43% more CPU than in format 2, run for run. A node
+that would rather keep format 2's reads than format 3's bytes runs `segment-format = 2`.
+
+`segment-format = 2|3` (`--segment-format`) says what new segments are written in; `3` is the
+default. Both are read, always. A store written in format 2 is not rewritten: merges write their
+segments again in format 3 as they take them.
+
+### A cluster being upgraded to format 3
+
+A snapshot - a replica's bootstrap, a mesh node joining - and a shard migration send segment files
+as they are, so a node of a build before format 3 can receive one it cannot read. Either upgrade
+every node with `segment-format = 2` in its `ob.conf` and set `3` once every node runs this build,
+or upgrade the nodes that receive snapshots before the nodes that send them: replicas before their
+primary, as before.
+
+### Going back to a build before format 3
+
+A build before format 3 reads a format-3 segment's `meta.json` and stops at its version:
+
+```
+Skipping segment <dir>: unsupported format_version=3 (this build reads 2)
+```
+
+at `ERROR`, each time a query reaches the segment, and the segment's rows are missing from that
+build's answers. It does not merge such a segment, and retention judges it by its `meta.json` as it
+judges any other. One case it removes: a merged segment whose inputs are all still beside it - a
+crash between a merge's publication and the removal of its inputs - which it takes for one cut
+short, keeping the inputs that hold the same rows. Started again on this build, every format-3
+segment is read again (`docs/upgrading.md`, the matrix).
+
+Nothing converts a format-3 segment back. A node that has to keep the way back runs
+`segment-format = 2` from its upgrade on.
+
 ## Stopping a node
 
 `SIGTERM` (or `SIGINT`) closes the listening socket **immediately** — a new connection is refused

@@ -2522,6 +2522,157 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 220. Format 3 decodes every column it reads, and on recorded books a query from the page cache takes up to twice as long as in format 2 **P3**
+
+Format 2 read four of its seven columns as they lay on disk; format 3 (#219) decodes every column a
+query reads. `query_cost_ab.py` (`evidence/2026-10-07-segment-format-v3/`) loads one build in each
+format in turn, the order reversed every other round, and asks four queries ten times each after
+three to warm up, over one connection, everything in the page cache: `SELECT *` over the whole range
+with `LIMIT 10` (`scan` - every segment decoded, ten rows answered), one second in the middle
+(`narrow`), the book at the last instant (`AT`) and six aggregates a minute (`buckets`). Medians of
+three rounds' p50, format 2 to format 3, at `1173766`:
+
+| data | host | scan | narrow | `AT` | buckets |
+|---|---|---|---|---|---|
+| Binance, diff stream (10 pairs, 10 min) | m9g.xlarge | 0.178 → 0.282 ms (1.58×) | 0.114 → 0.197 (1.73×) | 0.261 → 0.338 (1.30×) | 0.233 → 0.243 (1.04×) |
+| | m8a.xlarge | 0.158 → 0.257 (1.63×) | 0.093 → 0.193 (2.08×) | 0.218 → 0.310 (1.42×) | 0.194 → 0.216 (1.11×) |
+| Binance, top 20 (the same pairs and minutes) | m9g.xlarge | 1.545 → 1.965 (1.27×) | 0.381 → 0.583 (1.53×) | 0.451 → 0.521 (1.16×) | 2.055 → 2.469 (1.20×) |
+| | m8a.xlarge | 1.231 → 1.736 (1.41×) | 0.328 → 0.551 (1.68×) | 0.286 → 0.404 (1.41×) | 1.648 → 2.177 (1.32×) |
+| synthetic, 100 levels an update, 1,000,000 rows | m9g.xlarge | 7.578 → 6.949 (0.92×) | 0.271 → 0.340 (1.25×) | 0.642 → 0.234 | 10.744 → 10.326 (0.96×) |
+| | m8a.xlarge | 6.144 → 4.834 (0.79×) | 0.337 → 0.319 (0.95×) | 0.708 → 0.719 | 8.481 → 7.888 (0.93×) |
+
+The synthetic book's `AT` moves more between rounds than between formats - 0.11 to 1.27 ms in format
+3 on the m9g.xlarge - and says nothing either way.
+
+The spec's budget (`kiro-workspace/specs/segment-format-v3/`, design §7: no query more than 10%
+slower) does not hold on the recordings, and no choice of encodings makes it hold at a size worth
+having. By `benchmarks/column_codec_cost` on the m9g.xlarge, decoding a seal's blocks costs 3.3, 11.6
+and 6.9 ns a row on the comparative set and the two recordings, against format 2's 3.0, 3.7 and 3.4;
+taking for each column the smallest encoding that decodes no slower than format 2 reads it keeps
+15.7, 21.6 and 13.5 bytes a row, because nothing decodes as fast as a raw array is copied - more than
+ClickHouse takes for the same sets as installed. Format 3 stays the default for what it saves (#219),
+and `segment-format = 2` keeps format 2's reads for a node that would rather have them.
+
+What would close it, in the order it would be tried:
+- **a cache of decoded segments** - a segment read twice decoded once, within a memory budget, and
+  dropped with the segment a merge replaces - which the repeated reads measured here would hit every
+  time;
+- **SIMD unpacking** of Simple8b and narrow blocks (#49);
+- a seal that weighs a block's decoding against its bytes rather than taking the smallest.
+
+- Effort: M | Impact: a query of recent data costs up to half a millisecond more on a real book
+
+### 219. A row took 25 bytes on disk where ClickHouse as installed takes 4, because four of a segment's seven columns were written raw ✅ **P2**
+
+**Found measuring what the engine costs beside ClickHouse and TimescaleDB** for the README (#218's
+run): on the comparative dataset the engine's segments took 25.34 bytes a row, ClickHouse 4.23 and
+TimescaleDB after compression 14.05. Segment format 2 wrote the timestamp, the order count, the side
+and the level raw, and the price as one zigzagged delta in a 64-bit word - 23 of the 25 bytes. The
+comment beside `seq.col` described the same mistake, fixed for the sequence numbers alone.
+
+**Segment format 3** (spec `kiro-workspace/specs/segment-format-v3/`) holds a segment's seven columns
+in one file, `columns.v3`, each column in whichever of its candidate encodings is smallest for it:
+
+- less the column's minimum, or less the value before it and zigzagged, and divided by what the
+  values share - a price's tick, a quantity's lot;
+- packed as Simple8b, as runs of equal values, in fixed-width blocks of 128, or each value in the
+  bytes it needs;
+- under LZ4 at a seal, and at a merge under ZSTD(3) where that saves 10% over LZ4: ZSTD decodes
+  several times slower, and what a seal writes is what queries read most (#220). A seal reuses the
+  encodings its store's last segment chose and searches again every sixteenth segment.
+
+The candidates and the two tiers were measured rather than argued: `benchmarks/segment_encoding_probe`
+encodes real segments under every candidate, and `benchmarks/column_codec_cost` prices each one's
+encoding and decoding on both hosts. A block says how it is encoded and how many values it holds,
+and the file's directory carries each block's CRC32C, checked whenever the column is read - format
+2 had no checksum, and a damaged Simple8b block decoded silently into other numbers.
+
+Format 2 is read as before, and `segment-format = 2` keeps writing it for a cluster being upgraded
+and for a node that keeps the way back (`docs/operations.md`, "Segment format 3"; `docs/upgrading.md`).
+A build before format 3 skips a format-3 segment with an `ERROR` naming it and deletes nothing, which
+`test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing` holds against the previous
+build.
+
+Bytes on disk a row on the m8a.xlarge (Ubuntu 26.04, ext4), measured in the night of 6 to 7 October
+by `scripts/measure_storage.py` at `1173766`: each dataset loaded, `FLUSH`ed and left 90 s; the
+engine in both formats from one build; ClickHouse 26.9.12.8 with the harness's table and with five
+codec sets an expert might choose; TimescaleDB 2.30.2 compressed, in one chunk spanning the data.
+
+| dataset | rows | format 2 | **format 3** | ClickHouse as installed | ClickHouse, the best of five codec sets | TimescaleDB, compressed |
+|---|---|---|---|---|---|---|
+| comparative (synthetic, 50 symbols) | 200,000 | 25.34 | **1.89** | 4.23 | 1.87 - `DoubleDelta`, `T64`, `Delta` and `ZSTD(9)` | 7.86 |
+| Binance diff stream, 10 pairs, 10 minutes | 266,717 | 28.81 | **3.78** | 7.04 | 4.31 - `GCD`, the same and `ZSTD(3)` | 17.29 |
+| Binance top 20, the same pairs and minutes | 1,347,400 | 29.62 | **0.53** | 1.17 | 0.87 - `ZSTD(1)` | 12.45 |
+
+As the file system allocates them, format 3 takes 3.07, 3.99 and 0.61 bytes a row against
+ClickHouse's best 2.09, 4.47 and 0.95: the comparative set's 50 segments of 4,000 rows each pay a
+4 KiB block twice over. The figures are a seal's. Each symbol's data is one segment here, so nothing
+merges, and a merge's ZSTD tier takes the two recordings to 2.94 and 0.33 bytes a row on the same
+segments (`column_codec_cost`).
+
+What it costs, measured ABAB in Release on both cluster hosts (`evidence/2026-10-07-segment-format-v3/`):
+
+- **Ingest goes faster.** `pipelined_ingest`, four connections, three rounds each: 12.71 - 12.97
+  million levels a second against 10.47 - 10.53 million on the m9g.xlarge, and 18.38 - 18.58 million
+  against 10.51 - 10.59 million on the m8a.xlarge; a batch's p999 8.6 - 8.9 ms against 50.8 - 52.5,
+  and 11.8 - 13.4 against 69.5 - 73.1. A seal writes two files rather than eight. The server spends
+  3.2 - 4.3% (ARM) and 5.1 - 6.9% (x86) more CPU for the same levels, round for round.
+- **A seal's search costs CPU where it is most of the work.** `scripts/measure_cpu_cost.py
+  --engine-only`, two million levels over 50 symbols in three seconds, five runs on the m8a.xlarge:
+  0.40 - 0.41 s of server CPU against 0.28 - 0.29 s, 38 - 43% more run for run - each symbol seals a
+  few times, and a seal without encodings to reuse searches all of them.
+- **Reads decode** what format 2 read raw: on the recordings, cached queries take 1.04 - 2.08 times
+  as long. That is #220.
+
+Found on the way, each fixed here:
+
+- **Snapshots and backups took a segment's files by extension**, `*.col` and `meta.json`, so a
+  format-3 segment travelled as its `meta.json` alone, and a replica or a restored node held segments
+  with no rows. `is_segment_file()` is the one place that says which files a segment has.
+- **Simple8b pads its last word with zeros**, so a block without its count decoded as one value more
+  or one fewer. Every block says its count, and one whose count is not the segment's is refused.
+- **Format 3's `has_raw_qty` came from `append()`'s flag** and missed quantities past Simple8b's range
+  appended as a block; it is read from the quantities (`RowBlocksProperty`).
+- **`from_hex` took a level set a digit short for another set.** Format 3 writes level sets without
+  leading zeros, and the reader accepts the canonical forms only.
+- **The TimescaleDB adapter's `psql` merged Perl's locale warning into its answers**, and the warning
+  took the place of the server's version in every storage measurement; `psql` runs under `LC_ALL=C`.
+
+Found by a review of the code before the merge, each fixed here:
+
+- **The decoder's working buffers were per thread and outside the read buffers' budget**, which says
+  what reads keep is bounded by the pool and not by the number of threads: a thread that had read a
+  merged segment kept megabytes of them. They are a `DecodeScratch` in each set of the pooled read
+  buffers now, counted in what the pool keeps (`AFormat3ReadsDecodingScratchIsCountedInWhatThePoolKeeps`),
+  and an encoding thread frees a buffer grown past 1 MiB when its call returns.
+- **ZSTD's contexts were never freed and never checked**: one a thread, leaked when the thread ended,
+  and a null one passed on if ZSTD could not make it. They are freed with their thread, and a context
+  that cannot be made is a refusal (`AThreadThatUsedZstdLeavesNoContextBehind`, under the sanitizers
+  job's leak check).
+- **A store made without a format - the C API's, and the Python package's on it - sealed with ZSTD**
+  and searched at every seal, which is neither tier. A store not told otherwise seals as the
+  server's do (`AStoreNotToldOtherwiseSealsAsTheServerDoesWithoutZstd`); nothing merges an embedded
+  store, so its segments stay in a seal's encodings, and the C API has no setting for format 2 yet.
+
+Found by the integration battery at the code-final head, the same ten failures on both cluster
+hosts, each a test that looked only for format 2's files: eight storage-fault tests aimed their
+injected failures at `price.col`, which format 3 does not write, and two replica-restart tests
+counted `*.col` files. Two more looked for format 2's files without failing there: the power-cut
+test, which CI runs on dm-flakey, and `test_mm_snapshot_many_files.py`, whose 8,200 segments were
+past 65,535 files only at format 2's eight a segment. The first three look for `columns.v3` as well;
+the last writes format 2 and asserts the file count it stands on.
+
+Tests: `tests/test_column_codec.cpp` - every encoding inverts the edge columns and random ones, a
+block that is not what the encoder writes is refused, the choice takes the smallest within its
+margins, and a hint is written in unless the options leave its compressor out; the store's tests over
+both formats and both side by side; the downgrade against the previous build in
+`tests/integration/test_mixed_versions.py`; and a fuzz target, `fuzz_column_block`, whose first
+campaign ran 881,879 inputs in 60 s under ASan and UBSan without a finding. Mutations: verdicts
+written before each run, in `evidence/2026-10-07-segment-format-v3/plan-mutations.md`.
+
+- Effort: L | Impact: the engine kept a book in four to twenty-five times the bytes ClickHouse as
+  installed did, and keeps a recorded one in less than ClickHouse with any codec set measured
+
 ### 218. `scripts/measure_cpu_cost.py` read the engine's CPU as zero from #151 on ✅ **P3**
 
 **Found measuring on the x86 cluster host**: five runs of five printed the engine's server CPU as
@@ -13660,7 +13811,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #212, #215.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #212, #215, #220.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

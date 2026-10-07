@@ -43,7 +43,7 @@ namespace {
 /// The data directory's note of where its WAL lives, when that is not the data directory itself
 /// (#186): what lets a start without --wal-dir, or with another one, see that the WAL is elsewhere
 /// rather than begin an empty one. Not a directory, so no sweep of the data directory removes it,
-/// and neither .col nor meta.json, so no snapshot carries it.
+/// and not a segment's file (is_segment_file()), so no snapshot carries it.
 constexpr const char* kWalLocationFile = "wal_location";
 
 /// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
@@ -2010,15 +2010,14 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
             const auto& path = entry.path();
             const auto filename = path.filename().string();
 
-            // Include every columnar file plus its metadata.
+            // Include every file of a segment, in either format.
             //
-            // Matched by extension rather than by an allowlist of names: the
-            // allowlist version silently dropped side.col, level.col and seq.col
-            // when they were added, which would have shipped replicas segments
-            // the reader then rejects as incomplete. One place to forget is
-            // better than two.
-            const bool is_column_file = path.extension() == ".col";
-            if (!is_column_file && filename != "meta.json") {
+            // Matched by what a segment's files are rather than by an allowlist of
+            // names: the allowlist version silently dropped side.col, level.col and
+            // seq.col when they were added, and matching `*.col` alone then left out
+            // segment format 3's columns.v3 - both shipped replicas segments the reader
+            // rejects as incomplete. is_segment_file() is the one place to change.
+            if (!is_segment_file(filename)) {
                 continue;
             }
 
@@ -3084,6 +3083,25 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     return ref;
 }
 
+void Engine::set_segment_version(uint32_t version) {
+    if (!columnar_format_readable(version)) {
+        throw std::invalid_argument("segment format " + std::to_string(version) + " is not one this build writes");
+    }
+    seal_format_.version = version;
+    merge_format_.version = version;
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto& [key, store] : stores_) store->set_segment_format(seal_format_);
+    OB_LOG_INFO("engine", "new segments are written in format %u", version);
+}
+
+void Engine::set_segment_formats(const ColumnarStore::SegmentFormat& seal,
+                                 const ColumnarStore::SegmentFormat& merge) {
+    seal_format_ = seal;
+    merge_format_ = merge;
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto& [key, store] : stores_) store->set_segment_format(seal_format_);
+}
+
 ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
                                             const std::string& exchange, bool mtx_held) {
     const std::string key = symbol + "." + exchange;
@@ -3097,6 +3115,7 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
     store->set_symbol_exchange(symbol, exchange);
     // Whose rows are its own (#184): the segments it seals record their highest number.
     store->set_own_origin(mm_config_.enabled ? mm_config_.node_id : 0);
+    store->set_segment_format(seal_format_);
     auto& ref = *store;
     if (mtx_held) {
         stores_[key] = std::move(store);
