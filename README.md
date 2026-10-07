@@ -97,50 +97,66 @@ Wall-clock on a four-core box conflates "faster per core" with "uses more cores"
 name contains a claim about cost. Measured over 2,000,000 levels by
 [`scripts/measure_cpu_cost.py`](scripts/measure_cpu_cost.py), counting each server's
 `utime+stime+cutime+cstime` and each client's own CPU including its live children, in five runs on an
-**Amazon EC2 m8a.xlarge** (4 vCPU, AMD EPYC 9R45, Ubuntu 26.04, GCC 15.2, ext4) on **6 October 2026**,
-master `3157ce7`, against ClickHouse 26.9.12.8 and TimescaleDB 2.30.2 on PostgreSQL 16.15, installed
+**Amazon EC2 m8a.xlarge** (4 vCPU, AMD EPYC 9R45, Ubuntu 26.04, GCC 15.2, ext4) on **7 October 2026**,
+master `96d1dd9`, against ClickHouse 26.9.12.8 and TimescaleDB 2.30.2 on PostgreSQL 16.15, installed
 natively and tuned as [`benchmarks/install_competitors.md`](benchmarks/install_competitors.md) says.
 Each cell is the range of the five:
 
 | system | wall | levels/s | server CPU | client CPU | **levels per server CPU-second** | server cores |
 |---|---|---|---|---|---|---|
-| orderbook | 3.027 - 3.075 s | 650,505 - 660,763 | 0.290 s | 3.004 - 3.053 s | **6,896,552** | **0.09 - 0.10** |
-| clickhouse | 0.356 - 0.373 s | 5,356,117 - 5,621,269 | 0.890 - 0.980 s | 0.025 - 0.030 s | **2,040,816 - 2,247,191** | **2.42 - 2.63** |
-| timescaledb | 4.158 - 4.331 s | 461,830 - 480,993 | 3.180 - 3.220 s | 0.043 - 0.063 s | 621,118 - 628,931 | 0.74 - 0.77 |
+| orderbook | 3.149 - 3.223 s | 620,633 - 635,186 | 0.400 - 0.410 s | 3.158 - 3.229 s | **4,878,049 - 5,000,000** | **0.13** |
+| clickhouse | 0.357 - 0.410 s | 4,875,006 - 5,601,321 | 0.890 - 1.220 s | 0.026 - 0.028 s | **1,639,344 - 2,247,191** | **2.44 - 2.97** |
+| timescaledb | 4.064 - 4.523 s | 442,143 - 492,164 | 3.160 - 3.200 s | 0.043 - 0.063 s | 625,000 - 632,911 | 0.71 - 0.79 |
 
-The engine's server CPU was 0.290 s in all five runs, which the kernel counts in 10 ms ticks: the
-figure stands for 0.285 - 0.295 s, a 3.4% resolution, and its levels per CPU-second for 6.78 - 7.02
+The engine's server CPU was 0.400 or 0.410 s in every run, which the kernel counts in 10 ms ticks: the
+figures stand for 0.395 - 0.415 s, a 2.5% resolution, and its levels per CPU-second for 4.82 - 5.06
 million. Its lowest against each competitor's highest, per server CPU-second the engine ingests
-**3.07 times** what ClickHouse does and **10.97 times** what TimescaleDB does. This is a different
+**2.17 times** what ClickHouse does and **7.71 times** what TimescaleDB does. This is a different
 script from the comparative run above and carries no floor of its own, so it is given as the figures
 and their ratio rather than borrowed into the vocabulary that run owns.
 
-**Where it was before.** On 19 September, on the m9g.xlarge the table above was measured on, the
-same script put the two at 2,272,727 against 1,754,386, a ratio of 1.30, and TimescaleDB at 484,262.
-It was not run again until 6 October, and then it read the engine's CPU as zero in five runs of five:
-since #151 the engine's main thread is named `ob-io-0`, which renames the process in `/proc`, and the
-script looked for `ob_tcp_server` (#218). It reads the engine by its pid now. Between the two, the
-machine changed - the m9g.xlarge's ARM cores for the m8a.xlarge's x86 ones - and so did the engine;
-the figures say what each costs on the machine named, not how much of the change is which.
+**Where it was before.** On 6 October, at `3157ce7`, the same script on the same machine put the
+engine's server CPU at 0.290 s in all five runs - 6,896,552 levels per CPU-second, 3.07 times
+ClickHouse's best - in segment format 2. Format 3 (#219) spends the difference at a seal, which
+searches for each column's smallest encoding: a seal with no encodings to reuse searches all of them,
+and in this three-second run each of the 50 symbols seals only a few times, so that cost is nearly
+all of it - 37 - 46% more server CPU than format 2, run for run. Over long runs, which reuse what a
+symbol's last seal chose, the server spent 3.5 - 7.5% more CPU than format 2 for the same levels and
+ingested them faster, with a batch's p999 a sixth of format 2's (#219). On 19 September, on an
+m9g.xlarge, the script had put the engine at 2,272,727 against ClickHouse's 1,754,386; it read the
+engine's CPU as zero from #151 until #218.
 
-ClickHouse still wins the clock, by spending **2.42 - 2.63 cores** where the engine spends **0.09 -
-0.10**: about twenty-five times the parallelism for about eight times the throughput. TimescaleDB
-costs **11 times** the CPU per level of the engine.
+ClickHouse still wins the clock, by spending **2.44 - 2.97 cores** where the engine spends **0.13**:
+about twenty times the parallelism for eight to nine times the throughput. TimescaleDB costs **7.7 -
+8.0 times** the CPU per level of the engine.
 
 Three things belong beside that rather than after it. ClickHouse is doing **more** work per level -
 parsing text and building compressed parts where the engine receives binary frames and appends - so
 what this compares is the cost of loading the data each way it is loaded, not of the same work.
-**Our client burns ten times what our server burns**: this ingest column measures the harness's
+**Our client burns eight times what our server burns**: this ingest column measures the harness's
 Python as much as the protocol, and a C++ client sends the same updates with a fraction of it - see
 `benchmarks/wire_load.cpp` and [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
-And at `3157ce7` the engine kept what it ingested in more bytes than ClickHouse does, and than
-TimescaleDB once its compression has run: on the comparative dataset, 200,000 rows, its segments took
-25.34 bytes a row against ClickHouse's 4.23 and compressed TimescaleDB's 14.05 (114.81 before
-compression), by [`scripts/measure_storage.py`](scripts/measure_storage.py) on the same machine and
-versions. That was segment format 2, which wrote the timestamp, the order count, the side and the
-level raw - fifteen of the twenty-five bytes - and encoded only the price, the quantity and the
-sequence number. Format 3 (#219) encodes every column; the bytes it keeps, and what its seal costs
-the figures above, are measured again on the master that carries it.
+And the bytes it keeps: by [`scripts/measure_storage.py`](scripts/measure_storage.py) on the same
+machine, versions and day, each dataset loaded, flushed and left 90 s for the merges, bytes on disk a
+row - the engine's segments, ClickHouse's table as the harness creates it and with five codec sets
+an expert might choose, TimescaleDB's hypertable compressed, in one chunk spanning the data:
+
+| dataset | rows | **orderbook** | ClickHouse as installed | ClickHouse, the best of five codec sets | TimescaleDB, compressed |
+|---|---|---|---|---|---|
+| Binance, diff stream: 10 pairs, 10 minutes | 266,717 | **3.78** | 7.04 | 4.31 - `GCD` before `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(3)` | 17.29 |
+| Binance, top 20 snapshots: the same pairs and minutes | 1,347,400 | **0.53** | 1.17 | 0.87 - `ZSTD(1)`, `DoubleDelta` on the time | 12.45 |
+| the comparative dataset: 50 synthetic symbols | 200,000 | **1.89** | 4.23 | 1.87 - `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(9)` | 7.86 |
+
+On the two recordings of real books the engine keeps **45 - 54%** of what ClickHouse keeps as
+installed, and **61 - 88%** of what it keeps under the best of the five codec sets measured for each;
+on the comparative dataset's random walks it is level with that best (1.89 against 1.87) and keeps
+45% of ClickHouse as installed. These are a seal's bytes: each symbol's data is one segment here, so
+nothing merges, and a merge's ZSTD tier takes the recordings to about 2.94 and 0.33 bytes a row (#219).
+As the file system allocates them, the comparative dataset's fifty segments of 4,000 rows pay a 4 KiB
+block twice each - 3.07 bytes a row against ClickHouse's best 2.09 - where the recordings' larger
+segments take 3.99 and 0.61 against 4.47 and 0.95. The figures come with their reading cost: a format-3
+read decodes every column format 2 read raw, and on the recordings a query from the page cache takes
+up to twice format 2's time (#220).
 
 Every figure in the query column also includes Python-side parsing for 4000 rows, identical for all
 three systems, because each adapter turns text into tuples. It is **measured in the run** and stated

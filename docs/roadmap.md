@@ -2530,19 +2530,29 @@ format in turn, the order reversed every other round, and asks four queries ten 
 three to warm up, over one connection, everything in the page cache: `SELECT *` over the whole range
 with `LIMIT 10` (`scan` - every segment decoded, ten rows answered), one second in the middle
 (`narrow`), the book at the last instant (`AT`) and six aggregates a minute (`buckets`). Medians of
-three rounds' p50, format 2 to format 3, at `1173766`:
+three rounds' p50, format 2 to format 3, of master `96d1dd9`'s code - on the m9g.xlarge its own build
+(`evidence/2026-10-07-format-3-costs/read-ab-arm/`), on the m8a.xlarge a build of `1ebc925`, the
+same tree (`evidence/2026-10-07-segment-format-v3/final-x86/round/`):
 
 | data | host | scan | narrow | `AT` | buckets |
 |---|---|---|---|---|---|
-| Binance, diff stream (10 pairs, 10 min) | m9g.xlarge | 0.178 → 0.282 ms (1.58×) | 0.114 → 0.197 (1.73×) | 0.261 → 0.338 (1.30×) | 0.233 → 0.243 (1.04×) |
-| | m8a.xlarge | 0.158 → 0.257 (1.63×) | 0.093 → 0.193 (2.08×) | 0.218 → 0.310 (1.42×) | 0.194 → 0.216 (1.11×) |
-| Binance, top 20 (the same pairs and minutes) | m9g.xlarge | 1.545 → 1.965 (1.27×) | 0.381 → 0.583 (1.53×) | 0.451 → 0.521 (1.16×) | 2.055 → 2.469 (1.20×) |
-| | m8a.xlarge | 1.231 → 1.736 (1.41×) | 0.328 → 0.551 (1.68×) | 0.286 → 0.404 (1.41×) | 1.648 → 2.177 (1.32×) |
-| synthetic, 100 levels an update, 1,000,000 rows | m9g.xlarge | 7.578 → 6.949 (0.92×) | 0.271 → 0.340 (1.25×) | 0.642 → 0.234 | 10.744 → 10.326 (0.96×) |
-| | m8a.xlarge | 6.144 → 4.834 (0.79×) | 0.337 → 0.319 (0.95×) | 0.708 → 0.719 | 8.481 → 7.888 (0.93×) |
+| Binance, diff stream (10 pairs, 10 min) | m9g.xlarge | 0.174 → 0.295 ms (1.70×) | 0.111 → 0.214 (1.93×) | 0.259 → 0.362 (1.40×) | 0.231 → 0.253 (1.10×) |
+| | m8a.xlarge | 0.158 → 0.266 (1.68×) | 0.097 → 0.203 (2.09×) | 0.216 → 0.314 (1.45×) | 0.190 → 0.211 (1.11×) |
+| Binance, top 20 (the same pairs and minutes) | m9g.xlarge | 1.461 → 2.003 (1.37×) | 0.369 → 0.601 (1.63×) | 0.463 → 0.492 (1.06×) | 2.008 → 2.495 (1.24×) |
+| | m8a.xlarge | 1.236 → 1.823 (1.47×) | 0.348 → 0.599 (1.72×) | 0.299 → 0.414 (1.38×) | 1.630 → 2.183 (1.34×) |
+| synthetic, 100 levels an update, 1,000,000 rows | m9g.xlarge | 7.482 → 6.917 (0.92×) | 0.282 → 0.358 (1.27×) | 0.634 → 0.200 | 10.807 → 10.395 (0.96×) |
+| | m8a.xlarge | 6.230 → 5.342 (0.86×) | 0.384 → 0.287 (0.75×) | 0.675 → 0.835 | 8.395 → 8.072 (0.96×) |
 
-The synthetic book's `AT` moves more between rounds than between formats - 0.11 to 1.27 ms in format
-3 on the m9g.xlarge - and says nothing either way.
+The synthetic book's `AT` moves more between rounds than between formats and says nothing either way.
+At `1173766`, before #219's review moved the decoder's buffers from each thread into the pooled read
+buffers, the recordings took 1.04 - 1.73 times format 2's on the m9g.xlarge and 1.11 - 2.08 on the
+m8a.xlarge: within what two builds' layouts alone move (pitfall 542), so no change this item claims.
+
+One guess was measured and refuted. Runs share the scratch's value buffer with every other packing,
+so a runs column leaves it at its count of runs and the next column's resize zeroes it back up; runs
+were given buffers of their own and the two builds alternated on the m9g.xlarge, three rounds each.
+Format 3 was 3 - 11% slower on the diff stream with them, format 2's control within 2% - slower, not
+faster, so the buffer stays shared.
 
 The spec's budget (`kiro-workspace/specs/segment-format-v3/`, design §7: no query more than 10%
 slower) does not hold on the recordings, and no choice of encodings makes it hold at a size worth
@@ -2560,7 +2570,7 @@ What would close it, in the order it would be tried:
 - **SIMD unpacking** of Simple8b and narrow blocks (#49);
 - a seal that weighs a block's decoding against its bytes rather than taking the smallest.
 
-- Effort: M | Impact: a query of recent data costs up to half a millisecond more on a real book
+- Effort: M | Impact: a query of recent data costs up to 0.6 ms more on a real book
 
 ### 219. A row took 25 bytes on disk where ClickHouse as installed takes 4, because four of a segment's seven columns were written raw ✅ **P2**
 
@@ -2593,16 +2603,18 @@ A build before format 3 skips a format-3 segment with an `ERROR` naming it and d
 `test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing` holds against the previous
 build.
 
-Bytes on disk a row on the m8a.xlarge (Ubuntu 26.04, ext4), measured in the night of 6 to 7 October
-by `scripts/measure_storage.py` at `1173766`: each dataset loaded, `FLUSH`ed and left 90 s; the
-engine in both formats from one build; ClickHouse 26.9.12.8 with the harness's table and with five
-codec sets an expert might choose; TimescaleDB 2.30.2 compressed, in one chunk spanning the data.
+Bytes on disk a row on the m8a.xlarge (Ubuntu 26.04, ext4), measured on 7 October by
+`scripts/measure_storage.py` at master `96d1dd9`, which merged this - the same to two decimals as at
+`1173766` the night before, since the encoder did not change between: each dataset loaded,
+`FLUSH`ed and left 90 s; the engine in both formats from one build; ClickHouse 26.9.12.8 with the
+harness's table and with five codec sets an expert might choose; TimescaleDB 2.30.2 on PostgreSQL
+16.15 compressed, in one chunk spanning the data.
 
 | dataset | rows | format 2 | **format 3** | ClickHouse as installed | ClickHouse, the best of five codec sets | TimescaleDB, compressed |
 |---|---|---|---|---|---|---|
-| comparative (synthetic, 50 symbols) | 200,000 | 25.34 | **1.89** | 4.23 | 1.87 - `DoubleDelta`, `T64`, `Delta` and `ZSTD(9)` | 7.86 |
-| Binance diff stream, 10 pairs, 10 minutes | 266,717 | 28.81 | **3.78** | 7.04 | 4.31 - `GCD`, the same and `ZSTD(3)` | 17.29 |
-| Binance top 20, the same pairs and minutes | 1,347,400 | 29.62 | **0.53** | 1.17 | 0.87 - `ZSTD(1)` | 12.45 |
+| comparative (synthetic, 50 symbols) | 200,000 | 25.34 | **1.89** | 4.23 | 1.87 - `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(9)` | 7.86 |
+| Binance diff stream, 10 pairs, 10 minutes | 266,717 | 28.81 | **3.78** | 7.04 | 4.31 - `GCD` before `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(3)` | 17.29 |
+| Binance top 20, the same pairs and minutes | 1,347,400 | 29.62 | **0.53** | 1.17 | 0.87 - `ZSTD(1)`, `DoubleDelta` on the time | 12.45 |
 
 As the file system allocates them, format 3 takes 3.07, 3.99 and 0.61 bytes a row against
 ClickHouse's best 2.09, 4.47 and 0.95: the comparative set's 50 segments of 4,000 rows each pay a
@@ -2610,18 +2622,21 @@ ClickHouse's best 2.09, 4.47 and 0.95: the comparative set's 50 segments of 4,00
 merges, and a merge's ZSTD tier takes the two recordings to 2.94 and 0.33 bytes a row on the same
 segments (`column_codec_cost`).
 
-What it costs, measured ABAB in Release on both cluster hosts (`evidence/2026-10-07-segment-format-v3/`):
+What it costs, measured ABAB in Release on both cluster hosts at `1ebc925`, the tree master
+`96d1dd9` merged (`evidence/2026-10-07-segment-format-v3/final-*`):
 
-- **Ingest goes faster.** `pipelined_ingest`, four connections, three rounds each: 12.71 - 12.97
-  million levels a second against 10.47 - 10.53 million on the m9g.xlarge, and 18.38 - 18.58 million
-  against 10.51 - 10.59 million on the m8a.xlarge; a batch's p999 8.6 - 8.9 ms against 50.8 - 52.5,
-  and 11.8 - 13.4 against 69.5 - 73.1. A seal writes two files rather than eight. The server spends
-  3.2 - 4.3% (ARM) and 5.1 - 6.9% (x86) more CPU for the same levels, round for round.
+- **Ingest goes faster.** `pipelined_ingest`, four connections, three rounds each: 11.22 - 12.85
+  million levels a second against 10.51 - 10.57 million on the m9g.xlarge, and 18.17 - 18.49 million
+  against 10.50 - 10.58 million on the m8a.xlarge; a batch's p999 9.0 - 9.3 ms against 51.3 - 51.7,
+  and 10.8 - 12.6 against 71.3 - 73.9. A seal writes two files rather than eight. The server spends
+  3.5 - 3.7% (ARM) and 5.6 - 7.5% (x86) more CPU for the same levels, round for round.
 - **A seal's search costs CPU where it is most of the work.** `scripts/measure_cpu_cost.py
   --engine-only`, two million levels over 50 symbols in three seconds, five runs on the m8a.xlarge:
-  0.40 - 0.41 s of server CPU against 0.28 - 0.29 s, 38 - 43% more run for run - each symbol seals a
-  few times, and a seal without encodings to reuse searches all of them.
-- **Reads decode** what format 2 read raw: on the recordings, cached queries take 1.04 - 2.08 times
+  0.40 - 0.41 s of server CPU against 0.28 - 0.30 s, 37 - 46% more run for run - each symbol seals a
+  few times, and a seal without encodings to reuse searches all of them. With ClickHouse and
+  TimescaleDB beside it, the README's "What it costs" puts master at 4.88 - 5.00 million levels per
+  server CPU-second, 2.17 times ClickHouse's best and 7.71 times TimescaleDB's.
+- **Reads decode** what format 2 read raw: on the recordings, cached queries take 1.06 - 2.09 times
   as long. That is #220.
 
 Found on the way, each fixed here:
@@ -2654,7 +2669,7 @@ Found by a review of the code before the merge, each fixed here:
   server's do (`AStoreNotToldOtherwiseSealsAsTheServerDoesWithoutZstd`); nothing merges an embedded
   store, so its segments stay in a seal's encodings, and the C API has no setting for format 2 yet.
 
-Found by the integration battery at the code-final head, the same ten failures on both cluster
+Found by the integration battery at `f06ef10`, the same ten failures on both cluster
 hosts, each a test that looked only for format 2's files: eight storage-fault tests aimed their
 injected failures at `price.col`, which format 3 does not write, and two replica-restart tests
 counted `*.col` files. Two more looked for format 2's files without failing there: the power-cut
