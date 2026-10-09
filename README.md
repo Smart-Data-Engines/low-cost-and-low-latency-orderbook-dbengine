@@ -155,8 +155,10 @@ nothing merges, and a merge's ZSTD tier takes the recordings to about 2.94 and 0
 As the file system allocates them, the comparative dataset's fifty segments of 4,000 rows pay a 4 KiB
 block twice each - 3.07 bytes a row against ClickHouse's best 2.09 - where the recordings' larger
 segments take 3.99 and 0.61 against 4.47 and 0.95. The figures come with their reading cost: a format-3
-read decodes every column format 2 read raw, and on the recordings a query from the page cache takes
-up to twice format 2's time (#220).
+read decodes every column format 2 read raw. A segment's decoded columns are then held between
+queries (`--decoded-cache-mb`, #220). A query asked again on the recordings takes 0.20 - 0.85 of format
+2's time from the page cache on the m9g.xlarge and the m8a.xlarge (medians of three rounds' p50).
+A segment's first read takes 1.25 - 1.55 times format 2's (#223).
 
 Every figure in the query column also includes Python-side parsing for 4000 rows, identical for all
 three systems, because each adapter turns text into tuples. It is **measured in the run** and stated

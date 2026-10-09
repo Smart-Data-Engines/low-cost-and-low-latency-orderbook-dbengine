@@ -2522,6 +2522,18 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 224. A compaction test read a gauge the merge had not yet set, and failed on a fast runner ✅ **P3**
+
+**Found in CI** on a pull request that changed only the README: `Compaction.AStoreDiscardedWhileAMergesInputsWaitKeepsWhatIsWrittenAfterIt`
+waited for `ob_compactions_total` to reach 1 and then read `ob_segments_awaiting_removal` at once,
+expecting the eight inputs a scan held. The merge counts itself inside its publication loop and sets
+the gauge after the loop (`publish_staged_merges()`), so the test can read 0 in between. The same run's
+log shows the inputs did wait - the resync after it says "8 replaced segment(s) are not removed" -
+so the engine was right and the test was racing it. The test now waits for the gauge as it waits
+for the counter, and says what it found if the inputs did not wait.
+
+- Effort: S | Impact: a required check failed at random on pull requests that changed nothing it tests
+
 ### 223. A segment's first read in format 3 costs 1.25 - 1.55 times format 2's **P3**
 
 **Found closing #220.** Once a segment's decoded columns are held, every query after the first reads
