@@ -4,8 +4,9 @@ The row path used to parse a select list, check the names in it, and never read 
 every row query was `SELECT *`. A client that asked for one column got seven and had no way to
 tell, because the header it was handed named seven and was correct about the bytes under it.
 
-Over the raw protocol on purpose: both of our clients read a row **by position**, so neither can
-read a narrowed answer, and the tests for that are the refusals at the bottom of this file.
+Over the raw protocol on purpose: the C++ client and the Python client's `query()` read a row **by
+position**, so neither can read a narrowed answer, and the tests for that are the refusals below.
+The Python client's `query_rows()` reads one by the names in its header (#229), tested last.
 """
 from __future__ import annotations
 
@@ -117,3 +118,47 @@ def test_the_python_client_refuses_an_answer_it_would_read_wrongly(cluster, book
         assert rows[0].price == PRICE and rows[0].quantity == QTY
     finally:
         client.close()
+
+
+# ── query_rows(): the Python client reading an answer by its header (#229) ─────────────────────────
+
+@pytest.fixture
+def client(cluster):
+    engine = OrderbookEngine(host="127.0.0.1", port=cluster.primary().tcp_port)
+    yield engine
+    engine.close()
+
+
+def test_query_rows_reads_a_narrowed_answer_by_name(client, book):
+    """The question `query()` refuses, in an order of its own and with a column twice."""
+    answer = client.query_rows(f"SELECT quantity, price, price FROM '{book}'.'{EXCHANGE}' {WHERE}")
+    assert answer.columns == ("quantity", "price", "price")
+    assert answer.rows == [(QTY, PRICE, PRICE)]
+
+
+def test_query_rows_answers_select_star_as_query_does(client, book):
+    """The same row both ways: the seven columns, `side` the wire's 0 for bid."""
+    answer = client.query_rows(f"SELECT * FROM '{book}'.'{EXCHANGE}' {WHERE}")
+    rows = client.query(f"SELECT * FROM '{book}'.'{EXCHANGE}' {WHERE}")
+    assert answer.columns == ("timestamp_ns", "price", "quantity", "order_count", "side", "level",
+                              "sequence_number")
+    assert len(answer.rows) == len(rows) == 1
+    r = rows[0]
+    assert answer.rows[0] == (r.timestamp_ns, r.price, r.quantity, r.order_count,
+                              0 if r.side == "bid" else 1, r.level, r.sequence_number)
+
+
+def test_query_rows_answers_no_row_with_the_columns_named(client, book):
+    answer = client.query_rows(f"SELECT quantity FROM '{book}'.'{EXCHANGE}' {WHERE} "
+                               f"AND price BETWEEN {PRICE + 1000} AND {PRICE + 2000}")
+    assert answer.columns == ("quantity",)
+    assert answer.rows == []
+
+
+def test_query_rows_refuses_what_is_not_rows_and_names_what_reads_it(client, book):
+    """An aggregate's three columns and a bucket's would both parse as integers-and-names, which is
+    the silent wrong answer `query()` refuses too."""
+    with pytest.raises(OrderbookError, match="query_agg"):
+        client.query_rows(f"SELECT SPREAD(*) FROM '{book}'.'{EXCHANGE}'")
+    with pytest.raises(OrderbookError, match="query_buckets"):
+        client.query_rows(f"SELECT COUNT(*) FROM '{book}'.'{EXCHANGE}' GROUP BY TIME_BUCKET(1m)")
