@@ -850,6 +850,9 @@ bool segment_order_less(const SegmentMeta& a, const SegmentMeta& b) {
 
 bool ColumnarStore::insert_locked(SegmentMeta meta) {
     if (!indexed_dirs_.insert(meta.dir_path).second) return false;
+    // A slot of its own, whatever the meta carried: an entry is a segment as indexed now, and one
+    // that comes back - retention returning a segment it could not remove - starts empty (#220).
+    meta.decoded = decoded_budget_ ? std::make_shared<DecodedColumns>(decoded_budget_) : nullptr;
     SymbolIndex& si = by_symbol_[index_key(meta.symbol, meta.exchange)];
     // A range that ends before it starts - a segment #166's repair could not read - is as wide as
     // nothing, and is found by its start as it always was.
@@ -1148,6 +1151,8 @@ constexpr QueryColumn kColumnIds[kColumns] = {
     QueryColumn::Side,        QueryColumn::Level, QueryColumn::SequenceNumber};
 /// No directory is longer: the magic, a 64-bit varint, the count, and seven entries at their widest.
 constexpr size_t kColumnsHeaderMax = 4 + 10 + 1 + kColumns * (1 + 10 + 4);
+static_assert(kColumns == DecodedColumns::kSlots,
+              "a segment's held columns are format 3's, slot for slot (#220)");
 
 }  // namespace
 
@@ -1645,7 +1650,8 @@ enum class ColumnsLoad { kOk, kMissing, kBad };
 /// what the store writes - a reader holds a format-3 segment to what it says of itself, since a
 /// Simple8b word decodes into other numbers without a sound.
 ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet columns,
-                            SegmentReadBuffers& b, std::string& why) {
+                            SegmentReadBuffers& b, std::string& why,
+                            std::array<DecodedColumns::Column, kColumns>* fresh = nullptr) {
     std::ifstream f(dir + "/" + kColumnsV3File, std::ios::binary);
     if (!f.is_open()) return ColumnsLoad::kMissing;
     f.seekg(0, std::ios::end);
@@ -1683,14 +1689,35 @@ ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet col
         }
         std::string reason;
         bool ok = false;
-        switch (c) {
-        case 0:  ok = column_codec::decode_as(block, count, b.timestamps, b.scratch, &reason); break;
-        case 1:  ok = column_codec::decode_as(block, count, b.prices, b.scratch, &reason); break;
-        case 2:  ok = column_codec::decode_as(block, count, b.qtys, b.scratch, &reason); break;
-        case 3:  ok = column_codec::decode_as(block, count, b.counts, b.scratch, &reason); break;
-        case 4:  ok = column_codec::decode_as(block, count, b.sides, b.scratch, &reason); break;
-        case 5:  ok = column_codec::decode_as(block, count, b.levels, b.scratch, &reason); break;
-        default: ok = column_codec::decode_as(block, count, b.seqs, b.scratch, &reason); break;
+        if (fresh != nullptr) {
+            // Into a column of its own, which the segment's slot can then hold (#220): the pool's
+            // buffers are the next read's.
+            auto values = std::make_shared<ColumnValues>();
+            const auto into = [&](auto type) {
+                using T = decltype(type);
+                return column_codec::decode_as(block, count, values->values.emplace<std::vector<T>>(),
+                                               b.scratch, &reason);
+            };
+            switch (c) {
+            case 0:  ok = into(uint64_t{}); break;
+            case 1:  ok = into(int64_t{}); break;
+            case 2:  ok = into(uint64_t{}); break;
+            case 3:  ok = into(uint32_t{}); break;
+            case 4:  ok = into(uint8_t{}); break;
+            case 5:  ok = into(uint16_t{}); break;
+            default: ok = into(int64_t{}); break;
+            }
+            if (ok) (*fresh)[c] = std::move(values);
+        } else {
+            switch (c) {
+            case 0:  ok = column_codec::decode_as(block, count, b.timestamps, b.scratch, &reason); break;
+            case 1:  ok = column_codec::decode_as(block, count, b.prices, b.scratch, &reason); break;
+            case 2:  ok = column_codec::decode_as(block, count, b.qtys, b.scratch, &reason); break;
+            case 3:  ok = column_codec::decode_as(block, count, b.counts, b.scratch, &reason); break;
+            case 4:  ok = column_codec::decode_as(block, count, b.sides, b.scratch, &reason); break;
+            case 5:  ok = column_codec::decode_as(block, count, b.levels, b.scratch, &reason); break;
+            default: ok = column_codec::decode_as(block, count, b.seqs, b.scratch, &reason); break;
+            }
         }
         if (!ok) {
             why = std::string("has column ") + kColumnNames[c] + " that cannot be decoded: " + reason;
@@ -1768,6 +1795,36 @@ void ColumnarStore::set_read_buffers_limit_for_test(size_t bytes) {
                 bytes, was);
 }
 
+void ColumnarStore::set_decoded_columns_budget(size_t bytes) {
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
+    decoded_budget_ = bytes > 0 ? std::make_shared<DecodedColumnsBudget>(bytes) : nullptr;
+    // Every entry a new slot under the new budget, or none: a slot of the old one keeps its columns
+    // only for the reads that copied it, and gives its bytes back to the budget it was charged to.
+    size_t entries = 0;
+    for (auto& [key, si] : by_symbol_) {
+        for (auto& tier : si.tiers) {
+            for (auto& meta : tier.segments) {
+                meta.decoded = decoded_budget_ ? std::make_shared<DecodedColumns>(decoded_budget_)
+                                               : nullptr;
+                ++entries;
+            }
+        }
+    }
+    if (decoded_budget_) {
+        OB_LOG_INFO("columnar", "decoded columns: held between queries within %zu bytes (%zu MiB); "
+                                "%zu indexed segment(s) given a slot",
+                    bytes, bytes >> 20, entries);
+    } else {
+        OB_LOG_INFO("columnar", "decoded columns: not held between queries (budget 0); every read "
+                                "decodes what it reads");
+    }
+}
+
+DecodedColumnsBudget::Stats ColumnarStore::decoded_columns_stats() const {
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    return decoded_budget_ ? decoded_budget_->stats() : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0};
+}
+
 ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
         const std::function<void(const SnapshotRow&)>& cb, ReadMode mode) const {
@@ -1791,6 +1848,9 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
                      "(this build reads %u and %u)",
                      dir.c_str(), meta.format_version, kColumnarFormatV2, kColumnarFormatV3);
         return SegmentRead::kUnreadable;
+    }
+    if (meta.format_version == kColumnarFormatV3 && mode == ReadMode::kQuery && meta.decoded) {
+        return read_held_columns(meta, columns, start_ns, end_ns, cb);
     }
 
     // A set of buffers from the pool, holding an earlier read's columns. Every column this read uses
@@ -1929,6 +1989,83 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         if (want_price) row.price           = (i < prices.size()) ? prices[i] : 0;
         if (want_qty)   row.quantity        = (i < qtys.size())   ? qtys[i]   : 0;
         if (want_cnt)   row.order_count     = (i < counts.size()) ? counts[i] : 0;
+        cb(row);
+    }
+    return SegmentRead::kRead;
+}
+
+ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
+        const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
+        const std::function<void(const SnapshotRow&)>& cb) const {
+    DecodedColumns& slot = *meta.decoded;
+    const std::string& dir = meta.dir_path;
+
+    // What the slot holds of the columns asked for; the rest is read from the file below.
+    std::array<DecodedColumns::Column, kColumns> held{};
+    ColumnSet missing;
+    for (size_t c = 0; c < kColumns; ++c) {
+        if (!columns.has(kColumnIds[c])) continue;
+        held[c] = slot.get(c);
+        if (!held[c]) missing.add(kColumnIds[c]);
+    }
+    if (missing.count() > 0) {
+        // The file as a read without a slot reads it - every check the same - and the missing
+        // columns decoded into columns of their own. Nothing is held from a file that fails a check.
+        ReadBuffersLease lease;
+        std::array<DecodedColumns::Column, kColumns> fresh{};
+        std::string why;
+        const ColumnsLoad loaded = load_columns_v3(dir, meta.row_count, missing, lease.buffers(), why,
+                                                   &fresh);
+        if (loaded == ColumnsLoad::kMissing) {
+            if (!still_indexed(dir)) {
+                OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "
+                                         "its rows are past the retention", dir.c_str());
+                return SegmentRead::kRemoved;
+            }
+            OB_LOG_ERROR("columnar", "Skipping segment %s: missing %s", dir.c_str(), kColumnsV3File);
+            return SegmentRead::kUnreadable;
+        }
+        if (loaded == ColumnsLoad::kBad) {
+            OB_LOG_ERROR("columnar", "Skipping segment %s: its %s %s", dir.c_str(), kColumnsV3File,
+                         why.c_str());
+            return SegmentRead::kUnreadable;
+        }
+        for (size_t c = 0; c < kColumns; ++c) {
+            if (fresh[c]) held[c] = slot.put(c, std::move(fresh[c]), dir);
+        }
+    }
+
+    // The rows within the range, as read_segment_rows() emits them, from the held columns - each
+    // exactly `row_count` long, as a format-3 block decodes or not at all.
+    const auto column = [&](size_t c, auto type) {
+        using T = decltype(type);
+        return held[c] ? held[c]->as<T>() : std::span<const T>{};
+    };
+    const std::span<const uint64_t> timestamps = column(0, uint64_t{});
+    const std::span<const int64_t>  prices     = column(1, int64_t{});
+    const std::span<const uint64_t> qtys       = column(2, uint64_t{});
+    const std::span<const uint32_t> counts     = column(3, uint32_t{});
+    const std::span<const uint8_t>  sides      = column(4, uint8_t{});
+    const std::span<const uint16_t> levels     = column(5, uint16_t{});
+    const std::span<const int64_t>  seqs       = column(6, int64_t{});
+    const bool want_price = columns.has(QueryColumn::Price);
+    const bool want_qty   = columns.has(QueryColumn::Quantity);
+    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
+    const bool want_side  = columns.has(QueryColumn::Side);
+    const bool want_level = columns.has(QueryColumn::Level);
+    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
+    const size_t n = meta.row_count;
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t ts = (i < timestamps.size()) ? timestamps[i] : 0;
+        if (ts < start_ns || ts > end_ns) continue;
+        SnapshotRow row{};
+        row.timestamp_ns = ts;
+        if (want_seq)   row.sequence_number = static_cast<uint64_t>(seqs[i]);
+        if (want_side)  row.side            = sides[i];
+        if (want_level) row.level_index     = levels[i];
+        if (want_price) row.price           = prices[i];
+        if (want_qty)   row.quantity        = qtys[i];
+        if (want_cnt)   row.order_count     = counts[i];
         cb(row);
     }
     return SegmentRead::kRead;
