@@ -155,6 +155,40 @@ TEST(DecodedColumnsBudget, TheFirstColumnPutIsTheOneHeld) {
     EXPECT_EQ(budget->held(), first->bytes()) << "the column was counted twice";
 }
 
+TEST(DecodedColumnsBudget, ColumnsPutAtOnceAreHeldAndCountedOnce) {
+    // Two reads decoding the same column at once both pass the check before the charge; the one
+    // after it is what keeps the second from replacing the first and counting its bytes again. Only
+    // a race reaches it, so the threads are released together onto a fresh segment, many times.
+    auto budget = std::make_shared<ob::DecodedColumnsBudget>(size_t{1} << 30);
+    for (int round = 0; round < 200; ++round) {
+        auto seg = std::make_shared<ob::DecodedColumns>(budget);
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<ob::DecodedColumns::Column> got(8);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&, t] {
+                const auto mine = column_of(1000, static_cast<uint64_t>(t) * 10'000);
+                ready.fetch_add(1);
+                while (!go.load()) {
+                }
+                got[static_cast<size_t>(t)] = seg->put(0, mine, "seg");
+            });
+        }
+        while (ready.load() < 8) {
+        }
+        go.store(true);
+        for (auto& th : threads) th.join();
+        const auto held = seg->get(0);
+        ASSERT_NE(held, nullptr);
+        for (const auto& g : got) {
+            ASSERT_EQ(g, held) << "round " << round << ": a read got a column other than the one held";
+        }
+        ASSERT_EQ(seg->bytes(), held->bytes()) << "round " << round << ": the column was counted twice";
+    }
+    EXPECT_EQ(budget->held(), 0u) << "what the segments held did not go back with them";
+}
+
 TEST(DecodedColumnsBudget, AColumnLargerThanTheBudgetIsNotHeldButAnswersItsRead) {
     auto budget = std::make_shared<ob::DecodedColumnsBudget>(1000);
     auto seg = std::make_shared<ob::DecodedColumns>(budget);
