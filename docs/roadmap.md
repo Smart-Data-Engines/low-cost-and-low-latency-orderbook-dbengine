@@ -2522,6 +2522,31 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 223. A segment's first read in format 3 costs 1.25 - 1.55 times format 2's **P3**
+
+**Found closing #220.** Once a segment's decoded columns are held, every query after the first reads
+them from memory, faster than format 2 read its files. The first read still decodes every column it
+reads, as format 3 always did, and it now also takes the memory the held columns live in. The first
+`scan` after a load, the median of three rounds against master's format 2
+(`evidence/2026-10-09-decoded-columns/summary.md`):
+- 1.25 and 1.40 times on the Binance recordings (m9g.xlarge);
+- 1.31 and 1.28 on the m8a.xlarge;
+- 1.55 and 1.31 on the synthetic set, whose segments are the largest.
+
+On the synthetic set most of the difference from a read without holding is the allocation. The first
+scan took 9,640 minor faults where it takes 3,700 - 3,860 without, which is about 23 MB of fresh
+pages for 1,000,000 rows. It took 12.1 ms against 8.2 (`cold_faults.py`, m8a.xlarge). Every scan
+after it took 3.5 ms against 5.4.
+
+What would bring it down, in the order it would be tried:
+- **memory eviction gives back**, decoded into rather than freed, so a node past its first reads
+  allocates nothing fresh;
+- **SIMD unpacking** of Simple8b and narrow blocks (#49);
+- a seal that weighs a block's decoding against its bytes rather than taking the smallest.
+
+- Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
+  repeated one costs less than format 2's
+
 ### 222. A known command with an argument the parser could not read was answered `unknown command` ✅ **P3**
 
 **Found installing #212's packages.** The acceptance's own client sent `INSERT FRESH TEST bid 100.5 3`
@@ -2582,7 +2607,7 @@ with GCC 12.3, which prints those two warnings and no other.
 
 - Effort: S | Impact: a build with GCC 12, which the README named as enough, failed
 
-### 220. Format 3 decodes every column it reads, and on recorded books a query from the page cache takes up to twice as long as in format 2 **P3**
+### 220. Format 3 decodes every column it reads, and on recorded books a query from the page cache takes up to twice as long as in format 2 ✅ **P3**
 
 Format 2 read four of its seven columns as they lay on disk; format 3 (#219) decodes every column a
 query reads. `query_cost_ab.py` (`evidence/2026-10-07-segment-format-v3/`) loads one build in each
@@ -2629,6 +2654,51 @@ What would close it, in the order it would be tried:
   time;
 - **SIMD unpacking** of Simple8b and narrow blocks (#49);
 - a seal that weighs a block's decoding against its bytes rather than taking the smallest.
+
+**Closed by holding the decoded columns between queries**, the first of the three ways above (spec
+`kiro-workspace/specs/decoded-segment-cache/`).
+- **Where they live.** A query's decoded columns stay with the segment's entry in the index. The
+  slot is given at the only door into it, `insert_locked()`, so a merge, retention, a drop, a
+  snapshot installed under the same paths or a rebuild takes the columns with it, and a path that
+  comes back starts empty. Nothing is keyed by a path.
+- **The budget.** `--decoded-cache-mb` sets it, 256 MiB by default; 0 holds none. Eviction is
+  CLOCK: a segment read once goes first, and one read again since it was held is passed over once.
+- **What does not hold.** Merges, migrations and format-2 segments read as before.
+
+Tests: the reads compared with and without holding; a held column read with its file gone; every
+removal route; a file that fails a check leaving nothing; eight threads under eviction.
+
+Mutations, with verdicts written before (`evidence/2026-10-09-decoded-columns/plan-mutations.md`):
+- of the 21 tried, two did not build and were rewritten;
+- every one that built died;
+- one of them first survived. It removed a check only a race reaches, which showed the race had no
+  test; it now has one;
+- the four controls survived.
+
+Measured with `decoded_ab.py`:
+- the four queries of the table above, on the same three datasets;
+- three rounds, the variants' order reversed every other round, behind a quiet gate, on both
+  hosts;
+- master `f3cfd31` in formats 2 and 3, and this change (`db04e3e`) in format 3 with its columns held
+  and with `--decoded-cache-mb 0`.
+
+Medians of the rounds' p50, master's format 2 → format 3 with the columns held:
+
+| data | host | scan | narrow | `AT` | buckets |
+|---|---|---|---|---|---|
+| Binance, diff stream | m9g.xlarge | 0.176 → 0.086 ms (0.49×) | 0.111 → 0.032 (0.29×) | 0.259 → 0.176 (0.68×) | 0.231 → 0.172 (0.74×) |
+| | m8a.xlarge | 0.159 → 0.076 (0.48×) | 0.097 → 0.020 (0.21×) | 0.217 → 0.149 (0.69×) | 0.192 → 0.164 (0.85×) |
+| Binance, top 20 | m9g.xlarge | 1.455 → 0.689 (0.47×) | 0.366 → 0.111 (0.30×) | 0.431 → 0.272 (0.63×) | 1.972 → 1.437 (0.73×) |
+| | m8a.xlarge | 1.246 → 0.607 (0.49×) | 0.344 → 0.070 (0.20×) | 0.313 → 0.199 (0.64×) | 1.661 → 1.243 (0.75×) |
+| synthetic, 1,000,000 rows | m9g.xlarge | 7.506 → 4.059 (0.54×) | 0.184 → 0.075 (0.41×) | 0.878 → 0.420 (0.48×) | 10.765 → 8.431 (0.78×) |
+| | m8a.xlarge | 6.237 → 3.554 (0.57×) | 0.289 → 0.098 (0.34×) | 1.331 → 0.604 (0.45×) | 8.503 → 8.171 (0.96×) |
+
+The spec's budget was no query more than 10% slower than format 2. Every repeated query is now
+faster than format 2 read it, on both hosts. With `--decoded-cache-mb 0` the change reads as master's
+format 3 does, at 0.94 - 1.02 of its times. The exception is the synthetic book's `AT` and narrow read
+(0.67 - 1.17), which moved as much between rounds before.
+
+A segment's first read is what is left, #223.
 
 - Effort: M | Impact: a query of recent data costs up to 0.6 ms more on a real book
 
@@ -13924,7 +13994,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #215, #220.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #215, #223.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
