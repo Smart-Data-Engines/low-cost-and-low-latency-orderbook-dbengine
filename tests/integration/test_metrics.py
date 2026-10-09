@@ -7,6 +7,7 @@ work, not merely that the endpoint answers.
 from __future__ import annotations
 
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -130,6 +131,39 @@ def test_segment_count_gauge_tracks_flushed_segments(primary_client: OrderbookEn
     assert after is not None and after >= before, (
         f"segment count went backwards: {before} -> {after}")
     assert after > 0, "no segments registered after an explicit flush"
+
+
+def test_a_query_asked_again_reads_its_columns_from_memory(primary_client: OrderbookEngine,
+                                                           cluster):
+    """#220: a format-3 segment's decoded columns are held between queries, so the same query
+    asked again reads its columns from memory - and the counters an operator sizes the budget by
+    say so. They are fed after each flush tick, so the test waits for them to move rather than
+    reading them once."""
+    port = cluster.primary().metrics_port
+    assert metric_value(scrape(port), "ob_decoded_columns_budget_bytes") == 256 * 2**20, (
+        "the default budget is not 256 MiB, or the gauge is not exposed")
+
+    book = "METRICS-DECODED"
+    primary_client.insert(book, "BINANCE", "bid", [700_000, 700_001, 700_002], [1, 2, 3])
+    primary_client.flush()   # a sealed format-3 segment, not rows in memory
+    sql = (f"SELECT * FROM '{book}'.'BINANCE' "
+           f"WHERE timestamp BETWEEN 0 AND 9999999999999999999")
+    first = primary_client.query(sql)
+    assert sorted((r.price, r.quantity) for r in first) == [(700_000, 1), (700_001, 2),
+                                                            (700_002, 3)]
+
+    def hits() -> float:
+        return metric_value(scrape(port), "ob_decoded_columns_hits_total") or 0.0
+
+    time.sleep(0.5)   # the first query's misses published by a tick, so they cannot pass for hits
+    before = hits()
+    second = primary_client.query(sql)
+    assert sorted((r.price, r.quantity) for r in second) == sorted(
+        (r.price, r.quantity) for r in first), "the second answer differs from the first"
+    deadline = time.monotonic() + 5.0
+    while hits() <= before and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert hits() > before, "the same query asked again read no column from memory"
 
 
 def test_status_reports_no_refused_segment_merges(primary_client: OrderbookEngine):

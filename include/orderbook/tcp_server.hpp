@@ -215,6 +215,11 @@ struct ServerConfig {
     /// a cluster being upgraded, whose nodes of the build before cannot read 3.
     uint32_t segment_format{3};
 
+    /// --decoded-cache-mb N: what the decoded columns of format-3 segments may hold between queries,
+    /// in MiB (#220). A query reading a column held reads neither its file nor its checksum and
+    /// decodes nothing; 0 holds none.
+    uint32_t decoded_cache_mb{256};
+
     // ── Authentication (#30) ──────────────────────────────────────────────────
     //
     // Paths, never secrets. `--print-config` renders every value in this struct, so a secret held

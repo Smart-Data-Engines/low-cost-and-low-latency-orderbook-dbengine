@@ -1864,6 +1864,35 @@ segment is read again (`docs/upgrading.md`, the matrix).
 Nothing converts a format-3 segment back. A node that has to keep the way back runs
 `segment-format = 2` from its upgrade on.
 
+### Decoded columns held between queries
+
+A query reading a format-3 segment decodes the columns it asks for; format 2 read four of its seven
+as they lay on disk. So the decoded columns stay in memory after the query, for the next one to
+read without the file, its checksums or a decode (#220): `decoded-cache-mb` (`--decoded-cache-mb`,
+256 by default) bounds what they hold, and `0` holds none - every query then decodes what it reads,
+as before this build.
+
+- **What makes room.** A segment read once is the first to go; one a query read again since it was
+  held is passed over once. A month's scan does not push out the last hour a dashboard keeps
+  asking for.
+- **What takes columns with it.** A segment's columns belong to its entry in the index: a merge
+  that replaces it, retention, a drop, a snapshot installed over the store and a restart all take
+  them, once the queries that were reading the segment finish. A query that began before a segment
+  was removed may still read it from memory, as it reads the inputs of a merge that published
+  under it.
+- **What it does not hold.** Merges and symbol migrations read a segment once and whole, so they
+  neither take columns from memory nor leave any; format-2 segments are read as they always were,
+  until a merge rewrites them in format 3.
+- **Memory.** The budget bounds what is held, and making room takes the columns from memory, not
+  from a query reading them: what the process holds can pass the budget by the columns of the
+  queries in progress, and never by more. A segment holds at most 262 144 rows, 39 bytes a row
+  decoded - about 10 MB.
+
+`ob_decoded_columns_hits_total` and `ob_decoded_columns_misses_total` count columns read from
+memory and from files, `ob_decoded_columns_evictions_total` segments whose columns made room, and
+`ob_decoded_columns_bytes` against `ob_decoded_columns_budget_bytes` what is held. Misses that keep
+pace with hits on a node whose queries repeat say the budget is smaller than what they read.
+
 ## Stopping a node
 
 `SIGTERM` (or `SIGINT`) closes the listening socket **immediately** — a new connection is refused
