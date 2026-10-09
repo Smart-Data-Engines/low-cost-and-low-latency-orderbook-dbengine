@@ -156,3 +156,23 @@ def test_side_and_level_narrow_rows(cluster, primary_client, request):
 def test_a_side_past_its_type_is_refused(cluster, three):
     lines = raw_query(cluster.primary().tcp_port, f"SELECT * FROM '{three}'.'{EXCHANGE}' WHERE side = 256")
     assert lines and lines[0].startswith("ERR") and "out of range for side" in lines[0], lines
+
+
+def test_a_price_condition_over_many_segments_answers_every_row_of_its_band(cluster, primary_client,
+                                                                          request):
+    """#47 step 2: a segment whose price range a condition leaves out is not read, a row that fails
+    it is not built, and LIMIT ends the read - and none of it changes an answer. Four flushes, four
+    segments, each a band of prices of its own; the condition takes the two in the middle and the
+    edge of a third, and LIMIT the first rows of that answer in the order they came."""
+    symbol = own_symbol(request)
+    bands = [1_000_000 + 100_000 * b for b in range(4)]
+    for base in bands:
+        primary_client.insert(symbol, EXCHANGE, "bid", [base + i for i in range(5)], [1] * 5)
+        primary_client.flush()   # a segment of this band
+    lo, hi = bands[1], bands[3] + 1
+    expected = [p for base in bands for p in range(base, base + 5) if lo <= p <= hi]
+    assert prices(cluster, symbol, f"price BETWEEN {lo} AND {hi}") == sorted(expected)
+    in_order = rows(cluster, symbol, f"price BETWEEN {lo} AND {hi}")
+    first = rows(cluster, symbol, f"price BETWEEN {lo} AND {hi} LIMIT 3")
+    assert first == in_order[:3], "LIMIT answered rows other than the first of the same answer"
+    assert rows(cluster, symbol, f"price BETWEEN {lo} AND {hi} LIMIT 0") == []
