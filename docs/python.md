@@ -191,7 +191,8 @@ for ts, price in answer.rows:
 ```
 
 The whole answer is converted at once - split, `map(int)` and `zip`, loops that run in C - rather
-than row by row into objects. An aggregate or a time-bucket answer is refused with the method that
+than row by row into objects: on an Amazon EC2 m8a.xlarge, 4000 rows of `SELECT *` in 1.17 ms where
+`query()` took 2.66 (#229). An aggregate or a time-bucket answer is refused with the method that
 reads it. TCP and pool mode only: the local library answers the seven columns of every row.
 
 #### engine.query_all(symbol, exchange, limit=None) → List[OrderbookRow]
