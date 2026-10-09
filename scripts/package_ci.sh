@@ -17,6 +17,10 @@
 # workstation, `--no-install` runs everything else and accepts the release from the extracted
 # tarball instead (release_acceptance.py --root), which tests all of it but where the client looks
 # for the library by itself.
+#
+# The packages are held to glibc 2.34, the release's promise (#212), so a workstation with a newer
+# glibc fails that check - rightly: what it builds would not run where the release's packages do.
+# OB_GLIBC_FLOOR=<its glibc>, 2.39 on Ubuntu 24.04, builds packages for that system and newer alone.
 set -euo pipefail
 
 BUILD=${1:-build-pkg}
@@ -27,6 +31,7 @@ case "${3:-}" in
     *)            echo "usage: $0 [build dir] [dist dir] [--no-install]" >&2; exit 2 ;;
 esac
 VERSION=$(python3 scripts/release.py version | cut -d= -f2)
+GLIBC_FLOOR=${OB_GLIBC_FLOOR:-2.34}
 step() { echo; echo "── $*"; }
 
 step "build, natively ($(uname -m)), version $VERSION"
@@ -40,8 +45,10 @@ step "what the packaged binaries ask of the system they run on (#212)"
 # glibc 2.34 is Amazon Linux 2023's and RHEL 9's. A build on a glibc of 2.38 or newer fails here
 # whatever it links: its headers redirect strtol and sscanf to C23 variants, and its libstdc++
 # reaches for arc4random (2.36) - so the packages are built on Ubuntu 22.04, with its gcc-12.
-python3 scripts/check_glibc_floor.py --floor 2.34 \
-    "$BUILD/ob_tcp_server" "$BUILD/ob_restore" "$BUILD/ob_backup" "$BUILD/liborderbook_shared.so"
+python3 scripts/check_glibc_floor.py --floor "$GLIBC_FLOOR" \
+    "$BUILD/ob_tcp_server" "$BUILD/ob_restore" "$BUILD/ob_backup" "$BUILD/liborderbook_shared.so" \
+    || { echo "The release's packages are built on Ubuntu 22.04 to hold glibc 2.34. To package for this"
+         echo "system alone: OB_GLIBC_FLOOR=$(ldd --version | head -1 | awk '{print $NF}') $0 $*"; exit 1; }
 
 step "packages"
 (cd "$BUILD" && cpack)
@@ -65,13 +72,16 @@ if command -v rpm > /dev/null; then
     echo "$SCRIPTS" | grep -q "useradd .*orderbook" \
         || { echo "FAIL: the RPM does not create the orderbook user its unit runs as"; exit 1; }
     echo "  ok: the RPM: every entry root's and none writable beyond its owner, and it creates the orderbook user"
-    # What dnf will be asked for (#212): no glibc past 2.34, no libstdc++, and libcurl by its soname -
+    # What dnf will be asked for (#212): no glibc past the floor, no libstdc++, and libcurl by its soname -
     # not by the symbol versions of the build host's libcurl, which RPM distributions do not declare.
     REQUIRES=$(rpm -qp --requires "$RPM")
-    TOO_NEW=$(echo "$REQUIRES" | grep -E "GLIBC_2\.(3[5-9]|[4-9][0-9])|GLIBCXX|CXXABI|libstdc\+\+|CURL_" || true)
-    [ -z "$TOO_NEW" ] || { echo "FAIL: the RPM requires what Amazon Linux 2023 and RHEL 9 do not provide:"; echo "$TOO_NEW"; exit 1; }
+    NEWEST=$(echo "$REQUIRES" | grep -oE "GLIBC_[0-9]+(\.[0-9]+)+" | cut -d_ -f2 | sort -V | tail -1)
+    [ "$(printf '%s\n%s\n' "${NEWEST:-0}" "$GLIBC_FLOOR" | sort -V | tail -1)" = "$GLIBC_FLOOR" ] \
+        || { echo "FAIL: the RPM requires glibc $NEWEST, past $GLIBC_FLOOR:"; echo "$REQUIRES" | grep "GLIBC_$NEWEST"; exit 1; }
+    FOREIGN=$(echo "$REQUIRES" | grep -E "GLIBCXX|CXXABI|libstdc\+\+|CURL_" || true)
+    [ -z "$FOREIGN" ] || { echo "FAIL: the RPM requires what Amazon Linux 2023 and RHEL 9 do not provide:"; echo "$FOREIGN"; exit 1; }
     echo "$REQUIRES" | grep -q "^libcurl.so.4()" || { echo "FAIL: the RPM does not require libcurl.so.4"; exit 1; }
-    echo "  ok: the RPM requires glibc 2.34 at most, no libstdc++, and libcurl by its soname"
+    echo "  ok: the RPM requires glibc ${NEWEST:-none} (at most $GLIBC_FLOOR), no libstdc++, and libcurl by its soname"
 fi
 
 step "the Python client's wheel and sdist"
