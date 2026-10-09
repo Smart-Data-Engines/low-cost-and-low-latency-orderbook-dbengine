@@ -1298,7 +1298,7 @@ and getting data into their existing Python stack without a copy.
 - Arrow IPC / Flight result format, zero-copy into pandas, polars and DuckDB
 - Effort: M | Impact: Drops the integration cost for analytics teams to near zero
 
-### 47. Zone maps and columnar indexes
+### 47. Zone maps and columnar indexes ✅
 - Per-segment min/max and count for timestamp and price, so range scans skip segments
 - Effort: M | Impact: Query latency on large ranges
 
@@ -1346,6 +1346,50 @@ What it does not change: a level that only older segments hold makes them read -
 oldest - and a book in which every segment holds a level no later one does is read whole, as
 before. Conditions on price, a segment's minimum and maximum, are a later step of #47; #44's step 2,
 the series of the book, reads through this.
+
+**Step 2: a query's conditions narrow the read, not only the answer** (spec
+`kiro-workspace/specs/conditions-narrow-the-read/`). The price, side and level conditions of a
+`SELECT` (#199, #200) were checked on rows the scan had already built and handed over. Every segment
+of the time range was opened, every column decoded, every row built and passed through a
+`std::function`, and then dropped. `LIMIT` ended the answer, not the read. Now:
+- a segment records the range of its prices, in `meta.json` as `min_price` and `max_price`, written
+  by the seal, the rollover and the merge through the one function that writes a segment's metadata.
+  A segment of an older build has none and is read, and an older build reads the new `meta.json`;
+- a scan given a `RowFilter` does not open a segment whose price range is disjoint from the
+  condition's, or whose level set (step 1) holds no pair of the sides and levels it allows;
+- a row the filter fails is not built. The check runs on the decoded columns, in the one loop both
+  reads now emit through, the pool's and the held columns' (#220);
+- the reader ends the scan. A `SELECT` with `LIMIT n` stops at its `n`th row and opens no further
+  segment, `LIMIT 0` reads nothing, and a bucket query past its ceiling stops reading.
+
+`SELECT`, step 1 of #44's buckets and step 2's series (level 0 of either side) read through it, and
+`row_allowed()` stays where the rows arrive, as a belt. No answer changes. A property test holds a
+filtered scan to the scan without it, filtered after: row for row and in order, over segments with
+their metadata and without, and over blocks. A reader that ends it after k rows gets the first k
+(3 000 cases in a run of its own). Mutations, verdicts written before
+(`evidence/2026-10-09-scan-pushdown/plan-mutations.md`): the 15 died and the three controls
+survived.
+
+Measured with `scripts/measure_scan_pushdown.py` on both hosts against the branch it is built on,
+#220's held columns, with the columns held and with `--decoded-cache-mb 0`. Three rounds, the order
+reversed every other round, behind a quiet gate (`evidence/2026-10-09-scan-pushdown/`). The data:
+one symbol, 5 000 instants of both sides' 100 levels over two hours, 1 000 000 rows, the mid
+drifting up by a tenth. Medians of the rounds' p50 in ms, before → after:
+
+| query | m9g.xlarge, held | without | m8a.xlarge, held | without |
+|---|---|---|---|---|
+| `WHERE level = 0` (10 000 rows) | 7.80 → 4.84 | 11.09 → 7.18 | 6.17 → 3.28 | 8.06 → 4.99 |
+| a price band the mid passes once (20 100 rows) | 8.90 → 4.56 | 11.96 → 5.02 | 6.39 → 2.92 | 8.75 → 3.75 |
+| `LIMIT 100` | 4.14 → 0.031 | 6.80 → 0.42 | 3.55 → 0.018 | 5.53 → 0.50 |
+| the best bid's prices a minute | 5.50 → 2.90 | 7.17 → 4.41 | 4.70 → 2.07 | 5.83 → 3.19 |
+| the mid's bars a minute (a series) | 4.00 → 3.32 | 5.52 → 4.78 | 3.69 → 2.40 | 4.81 → 3.41 |
+| one minute, no other condition | 1.74 → 1.76 | 1.79 → 1.79 | 0.99 → 1.02 | 1.57 → 1.34 |
+
+Every variant gave the same answers. The read no condition narrows did not move, but for the m8a.xlarge
+without held columns, which was faster after in every round: 1.50 - 1.77 ms before, 1.22 - 1.47 after.
+This step did not set out to change that, and no measurement here explains it. What a condition still
+does not skip is the inside of a segment: its blocks are decoded whole, and the rows a condition
+leaves out are found one at a time.
 
 ### 48. Cost-based scan planning
 - Decide live-buffer versus columnar scan versus both from segment statistics rather than a fixed rule

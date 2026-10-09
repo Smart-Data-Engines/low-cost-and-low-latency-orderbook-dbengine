@@ -158,6 +158,12 @@ prevent. The same applies to a column file that is absent or shorter than
 and `meta.json` say. Format 3 writes `bid_levels` and `ask_levels` without leading zeros, and reads
 either form.
 
+`min_price` and `max_price` are the lowest and the highest price of the segment's rows (#47 step 2),
+written by the seal, the rollover and the merge alike. A scan with a price condition does not open a
+segment whose range is disjoint from it. A segment written before them, or one whose pair does not
+parse or is the wrong way round, has an unknown range and is read. A build before them reads the new
+`meta.json`, whose keys it does not search for.
+
 ### Segment Rollover
 
 A new segment is created when the timestamp of an incoming row exceeds
