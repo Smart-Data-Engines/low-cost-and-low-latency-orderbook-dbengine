@@ -211,3 +211,23 @@ def test_the_runner_reports_a_system_without_its_client_instead_of_timing_it():
     assert "entries.append" in body and '"available": False' in body and "why" in body, (
         "a system whose client is missing is not recorded as not measured, with the reason")
     assert "continue" in body, "a system whose client is missing is still timed"
+
+
+def test_the_engine_adapter_reads_its_columns_by_name_and_refuses_a_ragged_reply(tmp_path,
+                                                                                 monkeypatch):
+    # The parse splits the whole body at once, so the header is what says which value is which,
+    # and a reply whose values do not make whole rows is refused rather than cut short by `zip`.
+    system = orderbook.OrderbookSystem(tmp_path / "ob_tcp_server", 1, tmp_path)
+    reordered = ("OK\nprice\ttimestamp_ns\tquantity\n"
+                 + "".join(f"{p}\t{t}\t{q}\n" for t, p, q in ANSWER) + "\n").encode()
+    monkeypatch.setattr(system, "_reply", lambda query: reordered)
+    assert system._raw_rows("SELECT") == ANSWER
+    ragged = b"OK\ntimestamp_ns\tprice\tquantity\n1\t2\t3\n4\t5\n\n"
+    monkeypatch.setattr(system, "_reply", lambda query: ragged)
+    with pytest.raises(RuntimeError, match="do not make rows"):
+        system._raw_rows("SELECT")
+    refused = b"ERR unknown symbol\n\n"
+    monkeypatch.setattr(system, "_reply", lambda query: refused)
+    with pytest.raises(RuntimeError, match="ERR unknown symbol"):
+        system._raw_rows("SELECT")
+    system.teardown()

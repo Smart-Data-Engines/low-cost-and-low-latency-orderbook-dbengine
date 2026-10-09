@@ -103,6 +103,11 @@ class OrderbookSystem:
             "`OrderbookEngine.query()`: measured on 4000 rows, the client's row objects cost p50 "
             "15.5 ms against 5.3 ms for the same bytes parsed as tuples, and no other adapter here "
             "pays that - it is a real cost to a Python user and not a property of the engine",
+            "the reply parsed with `split()`, `map(int)` and `zip`: the fastest of three pure-Python "
+            "parses measured on an Amazon EC2 m8a.xlarge with this harness's dataset on 9 October "
+            "2026 - 0.64 ms for 4000 rows, against 0.72 for a loop reading fixed indices and 1.48 "
+            "for the loop this adapter had until #226, when the competitors' clients were chosen "
+            "the same way",
         ] + ([f"{' '.join(self._extra_args)}: set for this measurement"] if self._extra_args else [])
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -167,21 +172,31 @@ class OrderbookSystem:
         protocol that grows a column - as it did in #65, which added `sequence_number` - must make
         this fail rather than silently read the wrong field.
         """
-        lines = self._reply(query).decode().split("\n")
-        if not lines or lines[0] != "OK":
-            raise RuntimeError(f"the server refused the query: {lines[0] if lines else '(nothing)'}")
-        columns = lines[1].split("\t")
+        status, _, rest = self._reply(query).partition(b"\n")
+        if status != b"OK":
+            raise RuntimeError(f"the server refused the query: "
+                               f"{status.decode(errors='replace') or '(nothing)'}")
+        header, _, body = rest.partition(b"\n")
+        columns = header.decode().split("\t")
         try:
             want = [columns.index(name) for name in ("timestamp_ns", "price", "quantity")]
         except ValueError as exc:
             raise RuntimeError(f"the response header does not name the columns this adapter reads "
                                f"({columns}): {exc}") from exc
-        rows = []
-        for line in lines[2:]:
-            if not line:
-                break
-            fields = line.split("\t")
-            rows.append(tuple(int(fields[i]) for i in want))
+        # Every column a row can carry is an integer, so the body is integers between whitespace:
+        # split once, convert with `map(int)` and cut into rows with `zip`, each loop in C. The
+        # fastest of three pure-Python parses measured on an Amazon EC2 m8a.xlarge, 9 October 2026,
+        # over this harness's 4000 rows: 0.64 ms, against 0.72 for a loop over the lines reading
+        # fixed indices and 1.48 for the loop building each tuple from a generator, which is what
+        # this was until #226 - while the competitors were asked through their slowest clients.
+        values = list(map(int, body.split()))
+        if len(values) % len(columns):
+            raise RuntimeError(f"the reply's {len(values)} values do not make rows of "
+                               f"{len(columns)} columns")
+        cells = iter(values)
+        rows = list(zip(*[cells] * len(columns)))
+        if want != list(range(len(columns))):
+            rows = [tuple(row[i] for i in want) for row in rows]
         return rows
 
     def server_pid(self) -> int | None:
