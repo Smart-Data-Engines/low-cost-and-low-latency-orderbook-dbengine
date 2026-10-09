@@ -387,8 +387,13 @@ TEST(Compaction, AStoreDiscardedWhileAMergesInputsWaitKeepsWhatIsWrittenAfterIt)
     // EXPECT, not ASSERT, from here to the join: a test that returned with the scan still held
     // would end the process.
     EXPECT_TRUE(eventually([&] { return engine.registry().counter_value("ob_compactions_total") == 1; }));
-    EXPECT_EQ(engine.registry().gauge_value("ob_segments_awaiting_removal"),
-              static_cast<int64_t>(ob::compaction::kFanIn));
+    // Waited for too: the merge counts itself inside its publication and the inputs it retired after
+    // it, so a test that read the gauge the moment the counter moved could find it still 0 (#224).
+    EXPECT_TRUE(eventually([&] {
+        return engine.registry().gauge_value("ob_segments_awaiting_removal") ==
+               static_cast<int64_t>(ob::compaction::kFanIn);
+    })) << "the merge's inputs did not wait for the scan holding them: "
+        << engine.registry().gauge_value("ob_segments_awaiting_removal");
 
     // A resync discards the store; the same writes then give their segments the very directory names
     // the waiting inputs had - their times are the same.
