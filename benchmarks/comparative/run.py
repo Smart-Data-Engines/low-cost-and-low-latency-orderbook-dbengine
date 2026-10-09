@@ -489,6 +489,21 @@ def main(argv: list[str] | None = None) -> int:
         floor = resolution.verdict_for(floor, largest)
         print(f"Comparison: {len(wins)} {resolution.FASTER}, {len(losses)} {resolution.SLOWER}, "
               f"{ties} inside the floor (largest difference {largest:.4f})")
+
+        # How long the engine's reply takes to arrive, read and not parsed: the part of its query
+        # figure that is the engine and the wire rather than its client (#226). Beside the table,
+        # not in it: a competitor's driver builds its rows as it reads, so no other system can be
+        # split the same way.
+        engine_query = next((e["workloads"]["time_range"] for e in entries
+                             if e.get("name") == reference_name and e.get("available")
+                             and "value" in e["workloads"].get("time_range", {})), None)
+        if engine_query is not None:
+            replies = sorted(reference.reply_seconds(span_start, span_end)
+                             for _ in range(max(args.rounds, 1) * 10))
+            engine_query["reply_seconds"] = replies[len(replies) // 2]
+            print(f"{reference_name}: the time-range reply arrives in "
+                  f"{engine_query['reply_seconds'] * 1000:.3f} ms median of {len(replies)}, "
+                  f"unparsed")
     finally:
         for system in systems:
             system.teardown()
@@ -511,6 +526,12 @@ def main(argv: list[str] | None = None) -> int:
          and e["workloads"]["time_range"].get("rows")),
         0)
     wide_s, narrow_s = parse_cost(rows=query_rows) if query_rows else (0.0, 0.0)
+    reply_s = next(
+        (e["workloads"]["time_range"]["reply_seconds"] for e in entries
+         if e.get("name") == reference_name and isinstance(e.get("workloads"), dict)
+         and isinstance(e["workloads"].get("time_range"), dict)
+         and e["workloads"]["time_range"].get("reply_seconds")),
+        None)
     fills = {
         "in_process": in_process_sentence(args.build_dir, wire_levels, args.levels),
         "parsing": ("the query column's Python-side parsing cost is not measured in this run: "
@@ -518,7 +539,9 @@ def main(argv: list[str] | None = None) -> int:
         if not query_rows else (
             f"every figure in the query column runs to the answer as rows of Python ints, each "
             f"system through the fastest Python client measured for it (#226). The engine's reply "
-            f"is text parsed in Python, which alone takes a measured {narrow_s * 1000:.3f} ms for "
+            + (f"arrives in a measured {reply_s * 1000:.3f} ms, read and not parsed, and "
+               if reply_s else "")
+            + f"is text parsed in Python, which alone takes a measured {narrow_s * 1000:.3f} ms for "
             f"{query_rows} three-column rows ({wide_s * 1000:.3f} ms when it answered with seven, "
             f"before #139); TimescaleDB's rows are built by psycopg from its binary results and "
             f"ClickHouse's by clickhouse-driver from its native blocks. Until #226 the competitors' "

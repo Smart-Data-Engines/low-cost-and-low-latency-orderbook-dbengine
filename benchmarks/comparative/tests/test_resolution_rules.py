@@ -289,7 +289,10 @@ def test_the_runner_reports_an_untuned_system_instead_of_stopping():
 
 def test_the_engine_adapter_uses_the_span_it_is_given():
     source = (Path(__file__).resolve().parents[1] / "systems/orderbook.py").read_text()
-    body = source.split("def query_time_range", 1)[1].split("def ", 1)[0]
+    method = source.split("def query_time_range", 1)[1].split("def ", 1)[0]
+    assert "self._time_range_query(start_ns, end_ns)" in method, (
+        "the time-range workload does not ask the query built from the span it was handed")
+    body = source.split("def _time_range_query", 1)[1].split("def ", 1)[0]
     assert "BETWEEN {start_ns} AND {end_ns}" in body, (
         "the time-range workload is not asking for the span it was handed, so the four systems are "
         "not being asked the same question")

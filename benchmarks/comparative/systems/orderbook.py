@@ -148,13 +148,8 @@ class OrderbookSystem:
             self._raw = sock
         return self._raw
 
-    def _raw_rows(self, query: str) -> list[tuple]:
-        """Send one query, read to the blank line that ends an `OK` response, return tuples.
-
-        The column indices come from the header the server sends rather than from constants: a
-        protocol that grows a column - as it did in #65, which added `sequence_number` - must make
-        this fail rather than silently read the wrong field.
-        """
+    def _reply(self, query: str) -> bytes:
+        """Send one query and read to the blank line that ends an `OK` response."""
         sock = self._raw_socket()
         sock.sendall((query + "\n").encode())
         buf = b""
@@ -163,8 +158,16 @@ class OrderbookSystem:
             if not chunk:
                 raise RuntimeError("the server closed the connection mid-response")
             buf += chunk
+        return buf
 
-        lines = buf.decode().split("\n")
+    def _raw_rows(self, query: str) -> list[tuple]:
+        """Send one query, read to the blank line that ends an `OK` response, return tuples.
+
+        The column indices come from the header the server sends rather than from constants: a
+        protocol that grows a column - as it did in #65, which added `sequence_number` - must make
+        this fail rather than silently read the wrong field.
+        """
+        lines = self._reply(query).decode().split("\n")
         if not lines or lines[0] != "OK":
             raise RuntimeError(f"the server refused the query: {lines[0] if lines else '(nothing)'}")
         columns = lines[1].split("\t")
@@ -309,13 +312,7 @@ class OrderbookSystem:
         self._ensure_running()
         assert self._engine is not None
         started = time.perf_counter()
-        # Three columns since #139, which is what makes the question the **same** as the others:
-        # TimescaleDB already asks for `ts_ns, price_ticks, size_lots` and we were the only system
-        # receiving seven. Not an optimisation of ours — the removal of an asymmetry that was
-        # costing us.
-        rows = self._raw_rows(
-            f"SELECT timestamp, price, quantity FROM 'SYM0000'.'EX' "
-            f"WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
+        rows = self._raw_rows(self._time_range_query(start_ns, end_ns))
         elapsed = time.perf_counter() - started
         # The first version of this mapped `r.timestamp` and `r.size`, which do not exist -
         # `OrderbookRow` names them `timestamp_ns` and `quantity`. It raised `AttributeError` from
@@ -324,6 +321,25 @@ class OrderbookSystem:
         # touched a row. Two defects in three lines, each hiding the other, and part one's
         # published noise floor was measured through this method.
         return QueryResult(rows=rows, seconds=elapsed)
+
+    @staticmethod
+    def _time_range_query(start_ns: int, end_ns: int) -> str:
+        # Three columns since #139, which is what makes the question the **same** as the others:
+        # TimescaleDB already asks for `ts_ns, price_ticks, size_lots` and we were the only system
+        # receiving seven. Not an optimisation of ours — the removal of an asymmetry that was
+        # costing us.
+        return (f"SELECT timestamp, price, quantity FROM 'SYM0000'.'EX' "
+                f"WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
+
+    def reply_seconds(self, start_ns: int, end_ns: int) -> float:
+        """The time-range query's reply, read and not parsed: the part of the engine's figure that
+        is the engine and the wire rather than its client parsing text in Python (#226). No other
+        adapter can say this of itself - a driver builds its rows as it reads - so it is reported
+        beside the table rather than as a column of it."""
+        self._ensure_running()
+        started = time.perf_counter()
+        self._reply(self._time_range_query(start_ns, end_ns))
+        return time.perf_counter() - started
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:
         """Over the live book, which is a **different question** from the SQL equivalents.
