@@ -34,6 +34,15 @@ endif()
 # ── Compiler warnings ──────────────────────────────────────────────────────────
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12")
     add_compile_options(-Wall -Wextra -Werror)
+    # GCC 12 - the floor above - misreads libstdc++'s own inline code at -O2: 12.3, Ubuntu 22.04's,
+    # reports -Wrestrict on assigning a string literal to a std::string, and 12.3 and 12.4 report
+    # -Wmaybe-uninitialized on copying a std::optional's value after has_value(). A Release build
+    # with GCC 12 - what the README's Build section and the packages use - failed on both (#221).
+    # Under GCC 12 the two stay warnings without failing the build; under GCC 13 and later, which
+    # report neither on the same code, and under clang, every warning still fails it.
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
+        add_compile_options(-Wno-error=restrict -Wno-error=maybe-uninitialized)
+    endif()
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
     add_compile_options(-Wall -Wextra -Werror)
 endif()
