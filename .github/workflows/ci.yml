@@ -623,9 +623,15 @@ jobs:
   # an aarch64 package is built must not be the day of a release. One script, scripts/package_ci.sh,
   # for both jobs and for release.yml's, so the three cannot drift apart. Two jobs rather than a
   # matrix because the ruleset requires `package` by name, and has since long before aarch64.
+  #
+  # On Ubuntu 22.04, with its gcc-12, so that the packages run where glibc is 2.34 - Amazon Linux 2023
+  # and RHEL 9 among them (#212). Built on 24.04 they asked for glibc 2.38: its headers turn strtol
+  # and sscanf into C23 variants wherever _GNU_SOURCE is defined, which g++ always does, and its
+  # libstdc++ reaches for arc4random (2.36). scripts/check_glibc_floor.py holds every packaged binary
+  # to 2.34, so a runner that moves on fails the job rather than the packages.
   package:
     name: package
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -633,11 +639,15 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libzstd-dev libcurl4-openssl-dev rpm python3-venv
+          sudo apt-get install -y -qq g++-12 liblz4-dev libzstd-dev libcurl4-openssl-dev libssl-dev rpm python3-venv
           # rpm brings rpmbuild, which is what makes the RPM generator appear. Without it CMake
-          # configures DEB and TGZ only - see the note by CPACK_GENERATOR.
+          # configures DEB and TGZ only - see the note by CPACK_GENERATOR. g++-12: 22.04's default is
+          # GCC 11, below the floor CMakeLists.txt holds (#213).
 
       - name: Build, package, check, install and accept
+        env:
+          CC: gcc-12
+          CXX: g++-12
         run: ./scripts/package_ci.sh build-pkg dist
 
       - name: Upload the packages
@@ -653,7 +663,7 @@ jobs:
 
   package-arm64:
     name: package-arm64
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -661,9 +671,12 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libzstd-dev libcurl4-openssl-dev rpm python3-venv
+          sudo apt-get install -y -qq g++-12 liblz4-dev libzstd-dev libcurl4-openssl-dev libssl-dev rpm python3-venv
 
       - name: Build, package, check, install and accept
+        env:
+          CC: gcc-12
+          CXX: g++-12
         run: ./scripts/package_ci.sh build-pkg dist
 
       - name: Upload the packages

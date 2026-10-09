@@ -2522,6 +2522,26 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 221. GCC 12, the oldest compiler the build takes, had never built it, and its Release build failed on warnings about libstdc++'s own code ✅ **P3**
+
+**Found building #212's packages** with Ubuntu 22.04's gcc-12. Since #213 CMake refuses GCC older
+than 12, and nothing built with 12: CI's builds use GCC 13 and clang 18. Under `-Werror`, GCC 12.3
+failed the Release build of `src/query_engine.cpp` twice, both times in libstdc++'s code inlined
+into ours: `-Wrestrict` on a `memcpy` in `char_traits`, reached by assigning a string literal to a
+`std::string`, and `-Wmaybe-uninitialized` on copying a `std::optional`'s value right after
+`has_value()` said there is one. GCC 12.4 reports the second and not the first, and three
+`-Wvolatile` in `tests/test_mm_snapshot.cpp` - a compound assignment to a `volatile`, which C++20
+deprecates. GCC 13 to 15 report none of them under the same flags.
+
+For GCC older than 13 the two classes of libstdc++'s stay warnings - `-Wno-error=restrict` and
+`-Wno-error=maybe-uninitialized`, nothing silenced and every other warning still an error - and the
+test assigns the sum rather than adding to the `volatile`. The whole tree then builds with GCC 12.4,
+and its ctest passes, 1806 of 1806 (`evidence/2026-10-09-packages-older-glibc/local-gcc12/`). The
+floor is built on every pull request from now on: CI's two package jobs build the shipped binaries
+with GCC 12.3, which prints those two warnings and no other.
+
+- Effort: S | Impact: a build with GCC 12, which the README named as enough, failed
+
 ### 220. Format 3 decodes every column it reads, and on recorded books a query from the page cache takes up to twice as long as in format 2 **P3**
 
 Format 2 read four of its seven columns as they lay on disk; format 3 (#219) decodes every column a
@@ -2839,7 +2859,7 @@ now refuses GCC older than 12 and clang older than 15, saying what to install on
 and the README's Build section names the compiler and the development packages for Ubuntu 24.04 -
 what CI installs - and for Amazon Linux 2023, where #212 sends whoever needs the engine today.
 
-### 212. The packages run only where glibc is 2.38 or newer, and the RPM does not install on Amazon Linux 2023 **P2**
+### 212. The packages run only where glibc is 2.38 or newer, and the RPM does not install on Amazon Linux 2023 ✅ **P2**
 
 **Found on the ARM host**, an m9g.xlarge with Amazon Linux 2023 (glibc 2.34), installing the release
 artefacts for the cluster across hosts. The binaries of master's CI tarball do not start there -
@@ -2849,11 +2869,49 @@ libc.so.6(GLIBC_2.38)(64bit)` and `libcurl.so.4(CURL_OPENSSL_4)(64bit)`. glibc 2
 and the rest - wherever `_GNU_SOURCE` is defined, and g++ always defines it, so a binary built on
 Ubuntu 24.04 that calls one asks for glibc 2.38: all four of ours do. RPM's dependency generator also
 records the symbol versions the link took from Debian's libcurl, which Amazon Linux's does not carry.
-Its libstdc++ is GCC 14's, so that is not what stops them. `docs/operations.md` says where the packages
-run (#210); making them run on older glibc and install on RPM systems is this item.
+Its libstdc++ is GCC 14's, so that is not what stops them.
 
-- Effort: M | Impact: none of the release's packages runs where glibc is older than 2.38 - Amazon
-  Linux 2023 among them, where its RPM does not install either
+**Fixed by building where the floor is** rather than by working around a newer glibc's headers. The
+package jobs of CI and of the release run on Ubuntu 22.04 (`ubuntu-22.04`, `ubuntu-22.04-arm`) with
+its gcc-12, and `OB_STATIC_LIBSTDCXX` links libstdc++ into the server, the backup tools and the C
+API library - the library keeping its copy out of what it exports (`--exclude-libs`), so it never
+stands in for an application's own. Linking it in on Ubuntu 24.04 was tried first and does not
+hold: GCC 13's libstdc++ reaches for `arc4random`, glibc 2.36's. Built on 22.04 (glibc 2.35), the
+four ask for glibc 2.34 at most and for no `GLIBCXX_` or `CXXABI_` version. The RPM no longer
+records libcurl's symbol versions (`__requires_exclude`, written with brackets because CMake and
+CPack each eat a backslash), so it asks for `libcurl.so.4()` by its soname: Amazon Linux 2023's
+libcurl declares none.
+
+`scripts/check_glibc_floor.py` reads what each binary asks for with `objdump -T`, and
+`scripts/package_ci.sh` refuses a build that asks for a glibc past 2.34 or for any libstdc++ symbol
+version, and an RPM that requires either or a symbol version of libcurl. A build on Ubuntu 24.04 or
+26.04 fails it, naming `__isoc23_strtol` and `arc4random`, and says how to package for that system
+alone: `OB_GLIBC_FLOOR=<its glibc>`, which CI never sets
+(`evidence/2026-10-09-packages-older-glibc/workstation-ubuntu-26.04/`).
+
+The packages of the pull request's CI run, at `f7695f1`, installed on the two cluster hosts after
+removing what the cluster's packages had left - the package, its user and group, the state
+directory - so that each install started from a system that had never had the engine
+(`evidence/2026-10-09-packages-older-glibc/`):
+
+| host | glibc | installed with | then |
+|---|---|---|---|
+| m9g.xlarge, Amazon Linux 2023, ARM64 | 2.34 | `dnf install` the RPM | the user and group made by the package; the unit started with the install message's command, as `orderbook`, with the state directory made by systemd; a write, a flush and the write back over port 9090; stopped |
+| m8a.xlarge, Ubuntu 26.04, x86-64 | 2.43 | `apt install` the `.deb` | the same |
+
+On both the tarball's binaries ran where they were extracted, and the release's acceptance
+(`scripts/release_acceptance.py`) passed from the artefacts; CI installs the `.deb` and runs the
+same acceptance on Ubuntu 22.04, on both architectures, for every pull request. On Amazon Linux 2023
+each binary prints `no version information available` for libcurl as it starts - the loader binding
+symbols the binary asks for by version from a library that declares none - and that is all it
+costs: under `LD_BIND_NOW=1` every symbol of the three binaries and the library binds at load, and
+the server campaigned through a local etcd, which is what it uses libcurl for, became primary and
+revoked its lease when stopped. RHEL 9 has the same glibc and has not been tried.
+
+Building the floor found #221: GCC 12 had never built the tree.
+
+- Effort: M | Impact: none of the release's packages ran where glibc is older than 2.38 - Amazon
+  Linux 2023 among them, where its RPM did not install either
 
 ### 211. The RPM did not create the user its unit runs as ✅ **P2**
 
@@ -13826,7 +13884,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #212, #215, #220.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #215, #220.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

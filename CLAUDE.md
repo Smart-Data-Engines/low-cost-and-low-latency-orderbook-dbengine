@@ -4069,7 +4069,7 @@ Learned the hard way. Check here before debugging.
      Our documented install handed `/etc`, `/usr` and `/usr/bin` to the builder - uid 1001 in CI's
      artefact (#210). Check owners and modes in the artefact itself, as an installer reads it.
      A package built on a newer distribution than it is installed on fails the same quiet way: built
-     on Ubuntu 24.04, every binary asks for glibc 2.38 through `__isoc23_strtol` (#212).
+     on Ubuntu 24.04, every binary asks for glibc 2.38 through `__isoc23_strtol` (#212, pitfall 555).
 547. **A failover test that waits for replication before the kill measures replication, not
      failover.** `test_acknowledged_data_survives_a_kill` sleeps 1.5 s before the kill. On two hosts,
      killing the primary while a writer still wrote found a rejoining replica that never reached the
@@ -4109,6 +4109,26 @@ Learned the hard way. Check here before debugging.
      `column_codec_cost` on the x86 host had last been built before the policies it was run for: its
      output said `zstd1` and `zstd3` where the code says `seal` and `merge`. Build every binary a
      round runs, at the head it records, as the round's first step.
+555. **A newer glibc's headers raise a binary's floor without a line of ours changing.** With
+     `_GNU_SOURCE`, which g++ always defines, glibc 2.38 turns `strtol`, `strtoul`, `strtoll`,
+     `strtoull` and `sscanf` into `__isoc23_*`, so everything built on Ubuntu 24.04 that calls one -
+     nlohmann/json too - asks for 2.38. Linking libstdc++ in does not take the floor down with it:
+     GCC 13's `libstdc++.a` calls `arc4random`, glibc 2.36's. Build on the oldest system the packages
+     promise (Ubuntu 22.04 for 2.34) and read what the binaries ask for, `scripts/check_glibc_floor.py`
+     (#212).
+556. **CMake and CPack each eat a backslash, so a regex handed through both to rpmbuild loses its
+     escapes.** `__requires_exclude` written with two backslashes and then four matched nothing, and
+     the RPM still required libcurl's symbol versions; brackets survive both - `^libcurl[.]so[.]4[(]CURL_`
+     (#212). Judge the filter by `rpm -qp --requires` of the package, not by the spec.
+557. **A floor nobody builds is a claim.** #213 made CMake refuse GCC older than 12, and the README
+     named 12 as enough; nothing built with 12 until #212's packages did, and its Release build failed
+     on two of GCC 12's readings of libstdc++'s inlined code (#221). The compiler the build states as
+     its floor is one a CI job compiles - now the package jobs, with gcc-12.
+558. **The server's main thread names itself `ob-io-0`, which renames the process.** `ps -C
+     ob_tcp_server` and `pgrep -x ob_tcp_server` find nothing while it runs; `pidof ob_tcp_server`,
+     which also reads `argv[0]`, finds it, and so do the unit's `MainPID` and `pgrep -f` with a
+     bracket pattern (pitfall 526). The fresh-install check of #212 printed no owner for the process
+     until it asked systemd.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

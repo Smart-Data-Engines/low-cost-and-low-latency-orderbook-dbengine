@@ -34,6 +34,15 @@ endif()
 # ── Compiler warnings ──────────────────────────────────────────────────────────
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12")
     add_compile_options(-Wall -Wextra -Werror)
+    # GCC 12 - the floor above - misreads libstdc++'s own inline code at -O2: 12.3, Ubuntu 22.04's,
+    # reports -Wrestrict on assigning a string literal to a std::string, and 12.3 and 12.4 report
+    # -Wmaybe-uninitialized on copying a std::optional's value after has_value(). A Release build
+    # with GCC 12 - what the README's Build section and the packages use - failed on both (#221).
+    # Under GCC 12 the two stay warnings without failing the build; under GCC 13 and later, which
+    # report neither on the same code, and under clang, every warning still fails it.
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
+        add_compile_options(-Wno-error=restrict -Wno-error=maybe-uninitialized)
+    endif()
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
     add_compile_options(-Wall -Wextra -Werror)
 endif()
@@ -588,6 +597,28 @@ set_target_properties(orderbook_shared PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+# ── Packages that run beyond the machine that built them (#212) ──────────────────
+#
+# A binary asks for the libstdc++ symbol versions of the compiler that built it: GCC 12's for
+# GLIBCXX_3.4.30, which RHEL 9 and its rebuilds, on GCC 11's libstdc++, do not have. The packaging
+# build links libstdc++ statically into the four things the packages install, so the C++ runtime they
+# need is the one inside them; the C library, libgcc_s and the libraries the packages name as
+# dependencies stay shared. The C API library keeps the libstdc++ inside it to itself
+# (--exclude-libs), so a process that loads it - a Python interpreter, perhaps beside another C++
+# library - sees the C API and nothing else.
+option(OB_STATIC_LIBSTDCXX "Link libstdc++ statically into the packaged binaries and library (#212)" OFF)
+if(OB_STATIC_LIBSTDCXX)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "OB_STATIC_LIBSTDCXX links GCC's libstdc++, and this is ${CMAKE_CXX_COMPILER_ID}")
+    endif()
+    foreach(packaged ob_tcp_server ob_restore ob_backup orderbook_shared)
+        target_link_options(${packaged} PRIVATE -static-libstdc++)
+    endforeach()
+    target_link_options(orderbook_shared PRIVATE -Wl,--exclude-libs,libstdc++.a)
+    message(STATUS "OB_STATIC_LIBSTDCXX: libstdc++ linked into ob_tcp_server, ob_restore, ob_backup "
+                   "and liborderbook_shared")
+endif()
+
 # ── Install rules ─────────────────────────────────────────────────────────────
 #
 # Destinations are **explicitly relative** and the packaging prefix is `/`, so the .deb and the
@@ -683,6 +714,15 @@ if(RPMBUILD_EXECUTABLE)
     set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/rpm/postinst")
     set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/rpm/preun")
     set(CPACK_RPM_PACKAGE_REQUIRES_PRE "/usr/sbin/useradd, /usr/bin/getent")
+    # rpmbuild's dependency generator records each symbol version the link took, and libcurl's are
+    # Debian's - CURL_OPENSSL_4 - which no RPM distribution's libcurl declares: dnf refused the
+    # package on Amazon Linux 2023 for it (#212). The loader does not ask for them of a libcurl that
+    # defines no versions, which Amazon Linux's does not; the soname dependency,
+    # libcurl.so.4()(64bit), stays.
+    # No backslash in it: between this file, the configuration CMake writes for cpack and rpm's macro
+    # expansion, backslashes were taken away - written two and four deep, the filter still matched
+    # nothing. A bracket matches its character literally in any regex dialect.
+    set(CPACK_RPM_SPEC_MORE_DEFINE "%global __requires_exclude ^libcurl[.]so[.]4[(]CURL_")
 endif()
 # The archive generators record the staging files' owner - the builder's uid, `runner` (1001) on a
 # CI runner - and no CMake up to 4.2 lets a project choose it, so this script writes each .tar.gz

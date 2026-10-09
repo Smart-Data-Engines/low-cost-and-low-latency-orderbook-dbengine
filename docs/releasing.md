@@ -63,7 +63,7 @@ On a tag, `release.yml`:
 | Job | What |
 |---|---|
 | `gate` | `release.py check`; the tag is `vX.Y.Z`, equal to `CMakeLists.txt`'s version, `CHANGELOG.md` has its section, and the commit is an ancestor of `master` |
-| `packages` (`ubuntu-24.04`, `ubuntu-24.04-arm`) | `scripts/package_ci.sh`, as on a pull request, and the artefacts uploaded |
+| `packages` (`ubuntu-22.04`, `ubuntu-22.04-arm`) | `scripts/package_ci.sh`, as on a pull request - on Ubuntu 22.04 with gcc-12, so the packages run where glibc is 2.34 (#212) - and the artefacts uploaded |
 | `github-release` | `SHA256SUMS`, attestations, the release with `CHANGELOG.md`'s section as its notes |
 | `publish-pypi` | trusted publishing, after the `pypi` environment's reviewer approves |
 

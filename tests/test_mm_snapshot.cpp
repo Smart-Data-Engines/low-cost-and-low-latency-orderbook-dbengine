@@ -1498,7 +1498,7 @@ TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
             const auto& path = e.path();
             if (path.extension() != ".col" && path.filename() != "meta.json") continue;
             auto rel = std::filesystem::relative(path, dir).string();
-            benchmarkish_sink += rel.size();
+            benchmarkish_sink = benchmarkish_sink + rel.size();
         }
         auto t1c = std::chrono::steady_clock::now();
 
@@ -1509,7 +1509,7 @@ TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
             if (path.extension() != ".col" && path.filename() != "meta.json") continue;
             const std::string full = path.string();
             std::string rel = (full.size() > dir.size() + 1) ? full.substr(dir.size() + 1) : full;
-            benchmarkish_sink += rel.size();
+            benchmarkish_sink = benchmarkish_sink + rel.size();
         }
         auto t2 = std::chrono::steady_clock::now();
 
@@ -1528,7 +1528,7 @@ TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
                 crc = ob::crc32c_update(crc, buf.data(), static_cast<size_t>(n));
             }
             ::close(fd);
-            benchmarkish_sink += ob::crc32c_finish(crc);
+            benchmarkish_sink = benchmarkish_sink + ob::crc32c_finish(crc);
         }
         auto t3 = std::chrono::steady_clock::now();
 
