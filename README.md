@@ -223,8 +223,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-It needs GCC 12 or newer, or clang 15, and the development packages of liblz4, libcurl and OpenSSL 3;
-CMake refuses an older compiler, saying so (#213). On Ubuntu 24.04:
+It needs GCC 12 or newer, or clang 15, and the development packages of liblz4, libzstd, libcurl and
+OpenSSL 3; CMake refuses an older compiler, saying so (#213), and CI builds the packages with GCC 12
+(#221). On Ubuntu 24.04:
 `sudo apt install build-essential cmake pkg-config liblz4-dev libzstd-dev libcurl4-openssl-dev libssl-dev` - what CI
 installs, with OpenSSL named rather than taken as libcurl's dependency. On Amazon Linux
 2023, whose default compiler is GCC 11:

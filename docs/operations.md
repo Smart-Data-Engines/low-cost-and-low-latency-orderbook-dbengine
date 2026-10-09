@@ -8,7 +8,7 @@ for specific hardware.
 
 ```bash
 sudo apt install ./orderbook-dbengine_0.1.0_amd64.deb          # Debian, Ubuntu
-sudo dnf install ./orderbook-dbengine-0.1.0-1.x86_64.rpm       # RPM systems - but see below
+sudo dnf install ./orderbook-dbengine-0.1.0-1.x86_64.rpm       # Amazon Linux 2023, other RPM systems
 
 # Anything else: the tarball, onto /, leaving the directories it lands in as they are, and the user
 # the unit runs as, which a package creates and a tarball cannot.
@@ -27,13 +27,20 @@ system user and **does not enable or start the service**: a database that begins
 the moment it is unpacked is a surprise, and the shipped configuration is a single node nobody has
 pointed at anything yet.
 
-**Where these packages run, as of this writing.** The `.deb` installs and runs on Ubuntu 24.04 - CI
-installs it on every pull request - and on Ubuntu 26.04. The binaries are built on Ubuntu 24.04,
-whose headers make them ask for glibc 2.38 or newer, so no older glibc runs them: on Amazon Linux
-2023 (glibc 2.34) the tarball's binaries do not start, and the RPM does not install - it asks for
-glibc 2.38 and for the symbol versions of Debian's libcurl, which Amazon Linux's does not carry.
-Packages for RPM systems and older glibc are #212; until then, build from source there - the
-README's Build section names the compiler and the packages, Amazon Linux 2023's too (#213).
+**Where these packages run: wherever glibc is 2.34 or newer** (#212). They are built on Ubuntu
+22.04 with its gcc-12 and carry their own C++ runtime - libstdc++ is linked in - so what they ask of
+a system is its glibc and the libraries their dependencies name, and `scripts/package_ci.sh` refuses
+a build that asks for more. CI installs the `.deb` on Ubuntu 22.04, x86-64 and ARM64, on every pull
+request, and its packages have been installed on hosts that had never had the engine - the RPM
+with `dnf` on Amazon Linux 2023 (ARM64), the `.deb` with `apt` on Ubuntu 26.04 (x86-64) - where the
+unit started as the install message says, took a write and gave it back. RHEL 9 and its rebuilds
+have Amazon Linux 2023's glibc and have not been tried.
+
+On Amazon Linux 2023 each binary prints `/lib64/libcurl.so.4: no version information available` as
+it starts, and that is all it costs: the system's libcurl declares no symbol versions, the binaries
+were linked against one that does, and the loader binds the symbols without them. Every symbol
+binds at load there under `LD_BIND_NOW=1`, and a node campaigned through etcd - what the engine
+uses libcurl for - and became primary. It is also why the RPM asks for libcurl by its soname alone.
 
 `--no-overwrite-dir` matters. Run as root, GNU tar otherwise gives each directory that already
 exists - `/etc`, `/usr`, `/usr/bin` - the owner and mode of its entry in the archive. Every entry of
