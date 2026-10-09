@@ -133,6 +133,7 @@ TEST(DecodedColumnsBudget, HoldsWhatFitsAndCountsHitsAndMisses) {
     auto seg = std::make_shared<ob::DecodedColumns>(budget);
     EXPECT_EQ(seg->get(0), nullptr);
     const auto col = column_of(1000);
+    EXPECT_GE(col->bytes(), 1000 * sizeof(uint64_t)) << "a column's cost leaves out its values";
     const auto held = seg->put(0, col, "seg");
     EXPECT_EQ(held, col);
     EXPECT_EQ(seg->get(0), col) << "a column that fits was not held";
