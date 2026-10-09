@@ -244,6 +244,13 @@ reading it without a copy, and it applies to the encoded three as well — a que
 for the sequence number skips two of a segment's four decode passes, because `seq.col` is Simple8b
 **and** zigzag-delta.
 
+And a format-3 column decoded once is not decoded again while it is held (#220): a query's decoded
+columns stay with the segment's entry in the index, within `--decoded-cache-mb` (256 MiB by
+default), so the next query that asks for them reads neither the file nor its checksums. They go
+with the entry - a merge that replaces the segment, retention, a drop, a snapshot install - and a
+segment read once is the first to make room for another. Merges and migrations read as before, the
+file whole, and hold nothing ("Decoded columns held between queries" in `docs/operations.md`).
+
 ## SoA Buffer (In-Memory)
 
 The live orderbook state per symbol/exchange:
