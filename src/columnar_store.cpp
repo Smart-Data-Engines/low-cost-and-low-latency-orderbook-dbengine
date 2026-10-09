@@ -1888,7 +1888,7 @@ struct RowColumns {
     std::span<const int64_t>  seq;
 };
 
-/// Rows the selection pass marks at a time (#224): its masks stay in L1 between the column passes.
+/// Rows the selection pass marks at a time (#225): its masks stay in L1 between the column passes.
 constexpr size_t kSelectChunk = 2048;
 
 /// AND into `mask` whether each of `len` values from `v` is within [lo, hi]: one loop with no branch
@@ -1928,7 +1928,7 @@ bool emit_rows(size_t n, const RowColumns& c, ColumnSet columns, uint64_t start_
         return row;
     };
 
-    // The selection pass (#224), when the time and every column the filter reads hold the segment's
+    // The selection pass (#225), when the time and every column the filter reads hold the segment's
     // rows - a format-3 segment always, a format-2 one unless a short file was padded. The rows are
     // chosen first, a chunk at a time, by one loop over each column with no branch and no bounds
     // check, and only the chosen are built; a condition that keeps one row in a hundred costs the

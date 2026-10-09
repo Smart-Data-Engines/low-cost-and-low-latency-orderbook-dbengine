@@ -301,7 +301,7 @@ TEST(ScanPushdown, ATimeOrderedScanLeavesASegmentWithoutItsLevelsUnread) {
     EXPECT_EQ(cost.kept, 1u);
 }
 
-// ── The selection pass (#224) ──────────────────────────────────────────────────────────
+// ── The selection pass (#225) ──────────────────────────────────────────────────────────
 
 TEST(ScanPushdown, ASelectionAcrossChunksStopsAndCountsAsTheRowByRowLoopDid) {
     // 5 000 rows - the selection's chunks are 2 048 - level 0 and level 1 by turns.
