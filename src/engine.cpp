@@ -3094,6 +3094,23 @@ void Engine::set_segment_version(uint32_t version) {
     OB_LOG_INFO("engine", "new segments are written in format %u", version);
 }
 
+void Engine::set_decoded_columns_budget(size_t bytes) {
+    combined_store_.set_decoded_columns_budget(bytes);
+    registry_.set_gauge("ob_decoded_columns_budget_bytes", static_cast<int64_t>(bytes));
+    OB_LOG_INFO("engine", "decoded columns held between queries: %zu MiB%s", bytes >> 20,
+                bytes == 0 ? " (off)" : "");
+}
+
+void Engine::publish_decoded_columns() {
+    const DecodedColumnsBudget::Stats s = combined_store_.decoded_columns_stats();
+    publish_counter_delta("ob_decoded_columns_hits_total", s.hits, published_decoded_hits_);
+    publish_counter_delta("ob_decoded_columns_misses_total", s.misses, published_decoded_misses_);
+    publish_counter_delta("ob_decoded_columns_evictions_total", s.evictions,
+                          published_decoded_evictions_);
+    registry_.set_gauge("ob_decoded_columns_bytes", static_cast<int64_t>(s.held_bytes));
+    registry_.set_gauge("ob_decoded_columns_budget_bytes", static_cast<int64_t>(s.limit_bytes));
+}
+
 void Engine::set_segment_formats(const ColumnarStore::SegmentFormat& seal,
                                  const ColumnarStore::SegmentFormat& merge) {
     seal_format_ = seal;
@@ -3210,6 +3227,7 @@ void Engine::flush_loop() {
         try {
             registry_.increment_counter("ob_flush_ticks_total");
             flush_tick();
+            publish_decoded_columns();
             if (consecutive_flush_failures_ > 0) {
                 OB_LOG_INFO("engine", "flush_loop: flushing again after %llu failed tick(s)",
                             static_cast<unsigned long long>(consecutive_flush_failures_));

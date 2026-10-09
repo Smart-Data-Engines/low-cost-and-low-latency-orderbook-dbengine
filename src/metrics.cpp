@@ -111,6 +111,15 @@ MetricsRegistry::MetricsRegistry() {
     // Backups into --backup-dir (#34), registered in the change that writes them. The pair is what
     // an alert reads: failures that are not zero, and successes that stopped.
     counters_.push_back(make_counter("ob_backups_total", "Backups completed into --backup-dir"));
+    // Format 3's decoded columns held between queries (#220), registered in the change that writes
+    // them: a hit is a column a query read without its file, a miss one it read and decoded, and an
+    // eviction a segment whose columns made room for another's.
+    counters_.push_back(make_counter("ob_decoded_columns_hits_total",
+                                     "Columns queries read from the decoded columns held between them"));
+    counters_.push_back(make_counter("ob_decoded_columns_misses_total",
+                                     "Columns queries read from a segment's file and decoded"));
+    counters_.push_back(make_counter("ob_decoded_columns_evictions_total",
+                                     "Segments whose held columns were evicted to make room"));
     counters_.push_back(make_counter("ob_backup_failures_total",
                                      "Backups that failed, and left nothing that looks like one"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
@@ -224,6 +233,10 @@ MetricsRegistry::MetricsRegistry() {
                                  "0 while admission is off (#190)"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
+    gauges_.push_back(make_gauge("ob_decoded_columns_bytes",
+                                 "Bytes of decoded columns held between queries (#220)"));
+    gauges_.push_back(make_gauge("ob_decoded_columns_budget_bytes",
+                                 "What the decoded columns may hold; 0 with holding off (#220)"));
     // #165 part 2a: rows drained into blocks that no seal has written yet, and how many seals ran.
     gauges_.push_back(make_gauge("ob_unsealed_rows",
                                  "Rows drained and readable but not yet written to a segment"));

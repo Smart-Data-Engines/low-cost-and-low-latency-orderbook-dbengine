@@ -2,6 +2,7 @@
 
 #include "orderbook/column_codec.hpp"
 #include "orderbook/data_model.hpp"
+#include "orderbook/decoded_columns.hpp"
 #include "orderbook/query_columns.hpp"
 
 #include <array>
@@ -152,6 +153,11 @@ struct SegmentMeta {
     /// written before this was recorded, or one with a row no set can hold. Shared: copies of a
     /// meta are many, and the set does not change once the segment is written.
     std::shared_ptr<const LevelSet> levels;
+    /// The segment's decoded columns, held between queries (#220): given by `insert_locked()` to
+    /// the index's entry, and shared by every copy a query takes of it, so they live as long as the
+    /// entry and the reads that copied it - and a segment that later takes this path starts with its
+    /// own. Null outside the index and with holding off. Never written to meta.json.
+    std::shared_ptr<DecodedColumns> decoded;
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
@@ -411,6 +417,16 @@ public:
         has_last_choice_ = false;
     }
     const SegmentFormat& segment_format() const { return segment_format_; }
+
+    /// What the decoded columns of this store's format-3 segments may hold between queries (#220):
+    /// a query reading a column held reads neither the file nor its checksum, and decodes nothing.
+    /// 0 holds none, and every read decodes what it reads, as before. Every segment in the index
+    /// gets an empty slot under the new budget - or loses its slot, with 0 - and so does every one
+    /// indexed later.
+    void set_decoded_columns_budget(size_t bytes);
+    /// Hits and misses in columns, evictions in segments, and the bytes held against the limit; all
+    /// zero with holding off.
+    DecodedColumnsBudget::Stats decoded_columns_stats() const;
 
     /// What the next segment written records as its own highest number instead of what its rows
     /// say (#184) - for a merge, whose rows are its inputs' and whose answer is theirs: the highest
@@ -860,6 +876,10 @@ private:
     // Protects the index for concurrent scan() (shared) vs merge_segments()/open_existing() (exclusive)
     mutable std::shared_mutex index_mtx_;
 
+    /// What every slot `insert_locked()` gives belongs to; null with holding off (#220). Guarded by
+    /// `index_mtx_`.
+    std::shared_ptr<DecodedColumnsBudget> decoded_budget_;
+
     // What the last rebuild read to repair ranges written before #166. Guarded by index_mtx_.
     size_t last_rebuild_ranges_read_{0};
     // And what it removed (#165 part 2b). Guarded by index_mtx_.
@@ -893,6 +913,11 @@ private:
     SegmentRead read_segment_rows(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
                                   uint64_t end_ns, const std::function<void(const SnapshotRow&)>& cb,
                                   ReadMode mode) const;
+    /// A format-3 query read of a segment with a slot: the columns held, the rest read, decoded
+    /// and held (#220).
+    SegmentRead read_held_columns(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
+                                  uint64_t end_ns,
+                                  const std::function<void(const SnapshotRow&)>& cb) const;
 
     // Helpers
     /// Rebuild `index_` from the `meta.json` files under `base_dir_`. Caller holds `index_mtx_`

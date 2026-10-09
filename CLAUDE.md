@@ -4133,6 +4133,24 @@ Learned the hard way. Check here before debugging.
      side says nothing.** In #222's probe a parser WARN printed under the run whose parser no
      longer logs it; captured into two files on the host, it was the next run's. When the order
      of a remote's output matters, write each stream to a file there and read them apart.
+560. **A held column costs its memory on its first read.** #220 decodes a column into a vector of its
+     own, which the segment's slot then holds; a read that holds nothing decodes into the pool's
+     buffers, the same few from read to read. On 1,000,000 rows the first scan took 9,640 minor
+     faults held and 3,700 - 3,860 without - 12.1 ms against 8.2 - and every scan after it 3.5 ms
+     against 5.4 (`evidence/2026-10-09-decoded-columns/cold_faults.py`). Time the first read apart
+     from the repeated ones, or what holding costs is invisible (#223).
+561. **The field-usage check reads one line at a time.** `seg->referenced_.exchange(false, ...)` on the
+     second line of an `if` condition read as a write whose value was discarded, and
+     `FieldUsage.NoMemberIsWrittenAndNeverRead` failed for a field the code reads. A value-returning
+     call on a member goes on its own line, into a name.
+562. **A mutation that leaves a name unused does not build under `-Werror`, and that is not a kill.**
+     #220's M4 and M7 replaced the only use of `prices` and of `charging`; both failed to compile,
+     which a harness counting build failures as kills reads as two verdicts held. Count it void,
+     rewrite it so the name is still used (`+ 0 * prices[i]`, `&& false`), and run it again.
+563. **A mutation that crashes the test binary names no witness.** #220's M4b read `qtys[i]` from an
+     empty span wherever a query had not asked for the quantity, and the binary died before any test
+     reported: the verdict held and no test could be named. M4c, the same mutation where the
+     quantity was read, died in the tests predicted.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

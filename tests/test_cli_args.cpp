@@ -285,3 +285,20 @@ TEST(CliArgsDeath, AnAddressThatDoesNotParseIsARefusalNotEveryInterface) {
                 "--replication-bind expects an IPv4 address");
     EXPECT_EXIT(parse({"--mm-bind", ""}), ::testing::ExitedWithCode(1), "--mm-bind expects an IPv4 address");
 }
+
+// ── #220: what the decoded columns may hold between queries ──────────────────────────────
+
+TEST(CliArgs, TheDecodedColumnsBudgetIsInMiBAndZeroIsAccepted) {
+    EXPECT_EQ(parse({}).decoded_cache_mb, 256u) << "the default the documents name";
+    EXPECT_EQ(parse({"--decoded-cache-mb", "0"}).decoded_cache_mb, 0u) << "0 holds none";
+    EXPECT_EQ(parse({"--decoded-cache-mb", "4096"}).decoded_cache_mb, 4096u);
+}
+
+TEST(CliArgsDeath, ADecodedColumnsBudgetThatIsNotAWholeNumberIsRefused) {
+    EXPECT_EXIT(parse({"--decoded-cache-mb", "-1"}), ::testing::ExitedWithCode(1),
+                "--decoded-cache-mb expects a non-negative integer");
+    EXPECT_EXIT(parse({"--decoded-cache-mb", "1.5"}), ::testing::ExitedWithCode(1),
+                "--decoded-cache-mb expects a non-negative integer");
+    EXPECT_EXIT(parse({"--decoded-cache-mb", "4294967296"}), ::testing::ExitedWithCode(1),
+                "--decoded-cache-mb expects a value in range");
+}

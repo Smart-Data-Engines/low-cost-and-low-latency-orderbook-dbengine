@@ -276,6 +276,13 @@ public:
     /// The format this node writes segments in (`--segment-format`): 3 unless told 2. Before open(),
     /// so that nothing - a replay's seal included - is written in the other.
     void set_segment_version(uint32_t version);
+    /// What the decoded columns of format-3 segments may hold between queries (#220,
+    /// `--decoded-cache-mb`): 0 holds none, and every query decodes what it reads. Off unless set -
+    /// the server sets it from its configuration, 256 MiB by default.
+    void set_decoded_columns_budget(size_t bytes);
+    DecodedColumnsBudget::Stats decoded_columns_stats() const {
+        return combined_store_.decoded_columns_stats();
+    }
     /// How segments are written: a seal's, and a merge's (segment format v3, design §3).
     void set_segment_formats(const ColumnarStore::SegmentFormat& seal,
                              const ColumnarStore::SegmentFormat& merge);
@@ -1386,6 +1393,14 @@ private:
     /// The clock owns the number because the excursion is observed there, and it has no registry
     /// to publish to — `liborderbook_hlc` links nothing, deliberately (#120).
     uint64_t published_drift_excursions_{0};
+
+    /// The decoded columns' hits, misses and evictions already published (#220), by the same shape:
+    /// the store keeps the totals, and a new budget starts them again from zero.
+    uint64_t published_decoded_hits_{0};
+    uint64_t published_decoded_misses_{0};
+    uint64_t published_decoded_evictions_{0};
+    /// The decoded columns' counters and gauges, from the store's totals; after every flush tick.
+    void publish_decoded_columns();
 
     /// Consecutive failed ticks, so the log reports an episode rather than one line per interval.
     ///

@@ -263,6 +263,11 @@ ob_add_columnar_test(test_compaction_store
     test_compaction_store.cpp
 )
 
+# #220: format 3's decoded columns held between queries - the budget, and the store holding them.
+ob_add_columnar_test(test_decoded_columns
+    test_decoded_columns.cpp
+)
+
 # #165 part 2b: which segments merge, as a pure function.
 add_executable(test_compaction_policy test_compaction_policy.cpp)
 target_link_libraries(test_compaction_policy PRIVATE orderbook_compaction GTest::gtest_main rapidcheck rapidcheck_gtest)
