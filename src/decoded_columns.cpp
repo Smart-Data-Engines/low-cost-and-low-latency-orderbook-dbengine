@@ -135,15 +135,20 @@ bool DecodedColumnsBudget::charge(size_t bytes, const DecodedColumns* charging) 
         for (size_t step = 0; held() + bytes > limit_ && !ring_.empty() && step < max_steps; ++step) {
             if (hand_ >= ring_.size()) hand_ = 0;
             std::shared_ptr<DecodedColumns> seg = ring_[hand_].lock();
-            if (!seg || seg.get() == charging ||
-                seg->referenced_.exchange(false, std::memory_order_relaxed)) {
-                if (!seg) {
-                    ring_[hand_] = std::move(ring_.back());   // dead: its bytes went with it
-                    ring_.pop_back();
-                } else {
-                    ++hand_;
-                }
-                if (seg) passed.push_back(std::move(seg));
+            if (!seg) {
+                ring_[hand_] = std::move(ring_.back());   // dead: its bytes went with it
+                ring_.pop_back();
+                continue;
+            }
+            if (seg.get() == charging) {
+                ++hand_;
+                passed.push_back(std::move(seg));
+                continue;
+            }
+            const bool read_again = seg->referenced_.exchange(false, std::memory_order_relaxed);
+            if (read_again) {   // passed over once, its bit cleared
+                ++hand_;
+                passed.push_back(std::move(seg));
                 continue;
             }
             const size_t got = seg->evict();
