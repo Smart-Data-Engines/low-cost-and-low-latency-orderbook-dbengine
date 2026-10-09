@@ -484,13 +484,17 @@ TEST(BackupRunner, MergesAfterALinkedBackupDoNotChangeIt) {
     write(*engine, "A", 100);
     engine->flush_incremental();
     ASSERT_TRUE(eventually([&] {
-        return engine->registry().counter_value("ob_compactions_total") >= 1 &&
-               engine->registry().gauge_value("ob_segments_awaiting_removal") == 0;
+        return engine->registry().counter_value("ob_compactions_total") >= 1;
     })) << "the seals were not merged, so this test did not test what it says";
-    // The data directory's names of the seven are gone; the backup's links still hold them.
+    // The data directory's names of the seven go once the merge's inputs are removed; the backup's
+    // links still hold them. Waited for as such: the removal gauge read 0 here before the merge had
+    // set it, which the merge does after it counts itself (#228, as #224).
     size_t still_named = 0;
-    for (const auto& f : d.files) still_named += fs::exists(dir.path + "/" + f.path) ? 1 : 0;
-    EXPECT_EQ(still_named, 0u);
+    EXPECT_TRUE(eventually([&] {
+        still_named = 0;
+        for (const auto& f : d.files) still_named += fs::exists(dir.path + "/" + f.path) ? 1 : 0;
+        return still_named == 0;
+    })) << still_named << " of the backup's files are still named in the data directory";
     EXPECT_TRUE(ob::verify_backup(backup, d).empty());
     engine->close();
 }
