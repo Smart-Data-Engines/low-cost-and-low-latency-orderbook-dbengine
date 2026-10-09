@@ -4129,6 +4129,10 @@ Learned the hard way. Check here before debugging.
      which also reads `argv[0]`, finds it, and so do the unit's `MainPID` and `pgrep -f` with a
      bracket pattern (pitfall 526). The fresh-install check of #212 printed no owner for the process
      until it asked systemd.
+559. **ssh carries a remote command's stdout and stderr on two channels, so their order on this
+     side says nothing.** In #222's probe a parser WARN printed under the run whose parser no
+     longer logs it; captured into two files on the host, it was the next run's. When the order
+     of a remote's output matters, write each stream to a file there and read them apart.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
