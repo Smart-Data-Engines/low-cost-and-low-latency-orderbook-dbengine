@@ -69,8 +69,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One axis, the runner; the architecture is the runner's (`runner.arch`).
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        # One axis, the runner; the architecture is the runner's (`runner.arch`). Ubuntu 22.04, as in
+        # ci.yml's package jobs, so the packages run where glibc is 2.34 (#212).
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -79,9 +80,12 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libzstd-dev libcurl4-openssl-dev rpm python3-venv
+          sudo apt-get install -y -qq g++-12 liblz4-dev libzstd-dev libcurl4-openssl-dev libssl-dev rpm python3-venv
 
       - name: Build, package, check, install and accept - as on every pull request
+        env:
+          CC: gcc-12
+          CXX: g++-12
         run: ./scripts/package_ci.sh build-pkg dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -95,7 +99,7 @@ jobs:
 
       # The wheel and the sdist are the same on both runners - pure Python - so one of them uploads.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        if: matrix.runner == 'ubuntu-24.04'
+        if: matrix.runner == 'ubuntu-22.04'
         with:
           name: python-dist
           path: dist/
