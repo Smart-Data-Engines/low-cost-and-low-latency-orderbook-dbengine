@@ -127,9 +127,10 @@ class KdbSystem:
         started = time.perf_counter()
         out = subprocess.run([self._binary, "-q"], input=script, capture_output=True, text=True,
                              timeout=600, check=True)
-        elapsed = time.perf_counter() - started
+        # The clock stops once the answer is rows, where the engine adapter's stops (#226).
         rows = [tuple(int(cell) for cell in line.split("\t"))
                 for line in out.stdout.strip().splitlines() if line]
+        elapsed = time.perf_counter() - started
         return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:

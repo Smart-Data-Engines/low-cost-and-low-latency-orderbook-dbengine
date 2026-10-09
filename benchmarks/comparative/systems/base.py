@@ -32,6 +32,10 @@ class QueryResult:
 
     Without them there is nothing to check equivalence against, and two different queries time just
     as cleanly as two equivalent ones. `equivalence.py` compares these before anything is timed.
+
+    `seconds` runs from the request to the answer parsed into `rows`, in every adapter. Until #226
+    the engine's adapter stopped its clock after the parse and the three others before it, so the
+    engine's figure alone carried the parse.
     """
     rows: list[tuple]
     seconds: float

@@ -195,9 +195,12 @@ class ClickHouseSystem:
                  f"WHERE symbol = 'SYM0000' AND ts_ns BETWEEN {start_ns} AND {end_ns}")
         started = time.perf_counter()
         out = self._ask(query)
-        elapsed = time.perf_counter() - started
+        # The clock stops once the answer is rows, where the engine adapter's stops: until #226 it
+        # stopped before the parse here, so the parse the note under the table says every figure
+        # includes was in the engine's figure alone.
         rows = [tuple(int(cell) for cell in line.split("\t"))
                 for line in out.strip().splitlines() if line]
+        elapsed = time.perf_counter() - started
         return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:

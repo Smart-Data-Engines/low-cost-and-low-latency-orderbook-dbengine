@@ -235,8 +235,9 @@ class TimescaleDbSystem:
                  f"WHERE symbol = 'SYM0000' AND ts_ns BETWEEN {start_ns} AND {end_ns}")
         started = time.perf_counter()
         out = self._ask(query)
-        elapsed = time.perf_counter() - started
+        # The clock stops once the answer is rows, where the engine adapter's stops (#226).
         rows = [tuple(int(cell) for cell in line.split("\t")) for line in out]
+        elapsed = time.perf_counter() - started
         return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:
