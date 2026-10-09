@@ -52,6 +52,14 @@ class System(Protocol):
         a skip nobody can see reads as a pass, which is the lesson the CI skip gate came from.
         """
 
+    def client_available(self) -> tuple[bool, str]:
+        """(True, "") or (False, reason), for the Python client the queries are timed through.
+
+        Each system is asked through the fastest Python client measured for it (#226), and a
+        missing one makes the system NOT MEASURED rather than timed through a slower one - a slower
+        client is the same flattering number an untuned competitor is.
+        """
+
     def version(self) -> str:
         """Read from the running system, never from documentation or a constant."""
 

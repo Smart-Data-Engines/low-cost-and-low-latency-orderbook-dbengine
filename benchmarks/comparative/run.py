@@ -394,6 +394,14 @@ def main(argv: list[str] | None = None) -> int:
                 entries.append({"name": system.name, "available": False, "reason": why})
                 continue
 
+            # The Python client the queries are timed through, which is each system's fastest
+            # measured one (#226): a system without it is not measured rather than measured slower.
+            ok, why = system.client_available()
+            if not ok:
+                print(f"{system.name}: NOT MEASURED ({why})")
+                entries.append({"name": system.name, "available": False, "reason": why})
+                continue
+
             try:
                 tuning = require_tuning(system)
             except NoTuningDeclared as exc:

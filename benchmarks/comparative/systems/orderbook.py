@@ -61,6 +61,11 @@ class OrderbookSystem:
             return False, f"{self._binary} is not built"
         return True, ""
 
+    def client_available(self) -> tuple[bool, str]:
+        """This adapter is the engine's fastest Python client: the socket read and parsed into
+        tuples, which `tuning_applied()` measures against the shipped client's row objects."""
+        return True, ""
+
     def version(self) -> str:
         """Asked of the running node, which is now a question it can answer.
 
