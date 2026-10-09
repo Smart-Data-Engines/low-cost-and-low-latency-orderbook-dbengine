@@ -469,6 +469,73 @@ TEST(WriteFieldRefusals, ABlockThatIsNotAMinsertIsStillJustUnknown) {
                                    << cmd.error;
 }
 
+// ── Every known command says what it could not read (#222) ────────────────────
+//
+// The same silence beyond the writes: FAILOVER without a node, COMPRESS without LZ4, MIGRATE and
+// ADOPT without their arguments or with an action ADOPT does not have, BACKUP with a word that is not
+// STATUS and UNSUBSCRIBE with an id that is not a number were all `unknown command`. The rule is held
+// across the grammar table, so a command added later is held to it too.
+
+TEST(KnownCommandRefusals, NoKnownCommandIsAnsweredAsAnUnknownOne) {
+    size_t refusals = 0;
+    for (const auto& g : command_grammar()) {
+        // AUTH by its own design: a line that is not its shape is not the protocol, and the parser
+        // says nothing to whoever sent it (pinned below). MINSERT reaches the parser as a block,
+        // header and level lines, and WriteFieldRefusals holds it to the rule as one.
+        if (g.keyword == "AUTH" || g.keyword == "MINSERT") continue;
+        const std::string k(g.keyword);
+        for (const std::string& line : {k, k + " ?", k + " ? ?", k + " ? ? ?"}) {
+            const Command cmd = parse_command(line);
+            if (cmd.type != CommandType::UNKNOWN) continue;
+            ++refusals;
+            EXPECT_FALSE(cmd.error.empty()) << "`" << line << "` would be answered `unknown command`";
+            EXPECT_TRUE(mentions(cmd.error, g.keyword)) << line << ": " << cmd.error;
+            EXPECT_TRUE(mentions(cmd.error, g.usage)) << line << ": " << cmd.error;
+        }
+    }
+    // The guard: a table the loop does not read refuses nothing and passes.
+    EXPECT_GE(refusals, 25u) << "only " << refusals << " lines were refused - the table is not being read";
+}
+
+TEST(KnownCommandRefusals, EachSaysWhatItCouldNotRead) {
+    struct Case {
+        const char* line;
+        const char* says;
+    };
+    const Case cases[] = {
+        {"FAILOVER",                  "FAILOVER needs the node to hand the role to"},
+        {"COMPRESS",                  "COMPRESS needs a codec"},
+        {"COMPRESS zstd",             "not 'zstd'"},
+        {"MIGRATE AAA.EX",            "MIGRATE needs a symbol and the shard to move it to"},
+        {"ADOPT AAA.EX",              "ADOPT needs a symbol and BEGIN, END or ABANDON"},
+        {"ADOPT AAA.EX START shard-0", "ADOPT action is not BEGIN, END or ABANDON: 'START'"},
+        {"ADOPT AAA.EX BEGIN",        "ADOPT BEGIN needs the shard the symbol comes from"},
+        {"BACKUP NOW",                "not 'NOW'"},
+        {"UNSUBSCRIBE seven",         "UNSUBSCRIBE id is not a number: 'seven'"},
+    };
+    for (const Case& c : cases) {
+        const Command cmd = parse_command(c.line);
+        EXPECT_EQ(cmd.type, CommandType::UNKNOWN) << c.line;
+        EXPECT_TRUE(mentions(cmd.error, c.says)) << c.line << ": " << cmd.error;
+    }
+    // The controls are the canonical lines at the top of this file, every one of them parsed by
+    // EveryCommandStillParsesInItsCanonicalForm; and these, beside the refusals they neighbour.
+    EXPECT_EQ(parse_command("COMPRESS lz4").type, CommandType::COMPRESS);
+    EXPECT_EQ(parse_command("ADOPT AAA.EX begin shard-0").type, CommandType::ADOPT);
+    EXPECT_EQ(parse_command("BACKUP status").type, CommandType::BACKUP);
+    EXPECT_EQ(parse_command("UNSUBSCRIBE 0").type, CommandType::UNSUBSCRIBE);
+}
+
+TEST(KnownCommandRefusals, AnAuthLineOfTheWrongShapeStillSaysNothing) {
+    // Its two-token and bad-response shapes stay `unknown command` with nothing of the parser's -
+    // the exception this item keeps, written down so that a change to it is a decision.
+    for (const char* line : {"AUTH alice", "AUTH alice not-hex"}) {
+        const Command cmd = parse_command(line);
+        EXPECT_EQ(cmd.type, CommandType::UNKNOWN) << line;
+        EXPECT_TRUE(cmd.error.empty()) << line << " said: " << cmd.error;
+    }
+}
+
 // ── The other shape of the same silence ───────────────────────────────────────
 
 TEST(CommandArity, AMmConflictsLimitThatIsNotANumberIsRefusedRatherThanDefaulted) {

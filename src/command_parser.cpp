@@ -222,19 +222,21 @@ static bool read_event_time(Command& cmd, std::string_view token, std::string_vi
     return true;
 }
 
-// ── A write's fields (#222) ────────────────────────────────────────────────────
+// ── What a known command could not read (#222) ───────────────────────────────
 //
-// A write with a field the parser could not read used to come back `unknown command`, about a
-// command the server has - #107's silence in its other shape. Found when a client sent a decimal
-// price, `INSERT FRESH TEST bid 100.5 3`: prices are integers in the instrument's smallest sub-unit,
-// and nothing said so. Each refusal names the field and the token, and says what the command takes.
-// The messages are built only when refusing, so a write that parses costs no string.
+// A known command with an argument the parser could not read used to come back `unknown command`,
+// about a command the server has - #107's silence in its other shape. Found when a client sent a
+// decimal price, `INSERT FRESH TEST bid 100.5 3`: prices are integers in the instrument's smallest
+// sub-unit, and nothing said so. Each refusal names what it could not read - the field and the
+// token, or what is missing - and says what the command takes. The messages are built only when
+// refusing, so a command that parses costs no string. AUTH is the exception, by its own design: a
+// line that is not its shape is not the protocol, and it says nothing to whoever sent it.
 
 static constexpr std::string_view kLevelLineUsage = "<price> <qty> [count]";
 static constexpr std::string_view kPriceUnit = " - prices are integers in the smallest sub-unit";
 
-/// Refuse a write with `what`, followed by what the command takes.
-static Command& refuse_write(Command& cmd, CommandType of, std::string what) {
+/// Refuse a command with `what`, followed by what the command takes.
+static Command& refuse_with_usage(Command& cmd, CommandType of, std::string what) {
     const CommandGrammar& g = grammar_of(of);
     what += "; ";
     what.append(g.keyword);
@@ -278,7 +280,7 @@ static bool read_write_field(Command& cmd, std::string_view token, T& out, Comma
     what += '\'';
     what.append(hint);
     if (level_line == 0) {
-        refuse_write(cmd, of, std::move(what));
+        refuse_with_usage(cmd, of, std::move(what));
     } else {
         what += "; a level line takes: ";
         what.append(kLevelLineUsage);
@@ -291,7 +293,7 @@ static bool read_write_field(Command& cmd, std::string_view token, T& out, Comma
 static bool read_side(Command& cmd, std::string_view token, uint8_t& out, CommandType of) {
     if (iequals(token, "bid")) { out = 0; return true; }
     if (iequals(token, "ask")) { out = 1; return true; }
-    refuse_write(cmd, of, std::string(grammar_of(of).keyword) + " side is neither bid nor ask: '" +
+    refuse_with_usage(cmd, of, std::string(grammar_of(of).keyword) + " side is neither bid nor ask: '" +
                               std::string(token) + "'");
     return false;
 }
@@ -329,7 +331,7 @@ Command parse_command(std::string_view line) {
     if (iequals(first, "INSERT")) {
         // Need at least 6 tokens: INSERT symbol exchange side price qty
         if (tokens.size() < 6) {
-            return refuse_write(cmd, CommandType::INSERT,
+            return refuse_with_usage(cmd, CommandType::INSERT,
                                 "INSERT needs a symbol, an exchange, a side, a price and a quantity");
         }
 
@@ -372,7 +374,10 @@ Command parse_command(std::string_view line) {
     if (iequals(first, "QUIT"))   { cmd.type = CommandType::QUIT;   return cmd; }
 
     if (iequals(first, "FAILOVER")) {
-        if (tokens.size() < 2) return cmd; // need target_node_id
+        if (tokens.size() < 2) {
+            return refuse_with_usage(cmd, CommandType::FAILOVER,
+                                     "FAILOVER needs the node to hand the role to");
+        }
         cmd.type = CommandType::FAILOVER;
         cmd.target_node_id = std::string(tokens[1]);
         return cmd;
@@ -407,7 +412,12 @@ Command parse_command(std::string_view line) {
             cmd.type = CommandType::COMPRESS;
             return cmd;
         }
-        return cmd; // UNKNOWN
+        if (tokens.size() < 2) {
+            return refuse_with_usage(cmd, CommandType::COMPRESS, "COMPRESS needs a codec");
+        }
+        return refuse_with_usage(cmd, CommandType::COMPRESS,
+                                 "COMPRESS knows one codec, LZ4, and not '" +
+                                     std::string(tokens[1]) + "'");
     }
 
     if (iequals(first, "SHARD_MAP")) {
@@ -424,7 +434,10 @@ Command parse_command(std::string_view line) {
 
     if (iequals(first, "MIGRATE")) {
         // MIGRATE <symbol_key> <target_shard_id>
-        if (tokens.size() < 3) return cmd; // UNKNOWN — missing arguments
+        if (tokens.size() < 3) {
+            return refuse_with_usage(cmd, CommandType::MIGRATE,
+                                     "MIGRATE needs a symbol and the shard to move it to");
+        }
         cmd.type = CommandType::MIGRATE;
         cmd.migrate_symbol = std::string(tokens[1]);
         cmd.migrate_target_shard = std::string(tokens[2]);
@@ -436,11 +449,21 @@ Command parse_command(std::string_view line) {
     if (iequals(first, "ADOPT")) {
         // ADOPT <symbol_key> BEGIN <source_shard_id> | END | ABANDON - the target's half of a
         // migration (#196), sent by the shard the symbol moves from.
-        if (tokens.size() < 3) return cmd; // UNKNOWN — missing arguments
+        if (tokens.size() < 3) {
+            return refuse_with_usage(cmd, CommandType::ADOPT,
+                                     "ADOPT needs a symbol and BEGIN, END or ABANDON");
+        }
         std::string action(tokens[2]);
         for (char& c : action) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (action != "BEGIN" && action != "END" && action != "ABANDON") return cmd;
-        if (action == "BEGIN" && tokens.size() < 4) return cmd;   // BEGIN names the source
+        if (action != "BEGIN" && action != "END" && action != "ABANDON") {
+            return refuse_with_usage(cmd, CommandType::ADOPT,
+                                     "ADOPT action is not BEGIN, END or ABANDON: '" +
+                                         std::string(tokens[2]) + "'");
+        }
+        if (action == "BEGIN" && tokens.size() < 4) {   // BEGIN names the source
+            return refuse_with_usage(cmd, CommandType::ADOPT,
+                                     "ADOPT BEGIN needs the shard the symbol comes from");
+        }
         cmd.type = CommandType::ADOPT;
         cmd.migrate_symbol = std::string(tokens[1]);
         cmd.adopt_action = action;
@@ -453,7 +476,11 @@ Command parse_command(std::string_view line) {
 
     if (iequals(first, "BACKUP")) {
         // BACKUP | BACKUP STATUS (#34). No path: the server writes where its --backup-dir says.
-        if (tokens.size() >= 2 && !iequals(tokens[1], "STATUS")) return cmd; // UNKNOWN
+        if (tokens.size() >= 2 && !iequals(tokens[1], "STATUS")) {
+            return refuse_with_usage(cmd, CommandType::BACKUP,
+                                     "BACKUP's one argument is STATUS, not '" +
+                                         std::string(tokens[1]) + "'");
+        }
         cmd.type = CommandType::BACKUP;
         cmd.backup_status = tokens.size() >= 2;
         OB_LOG_DEBUG("cmd_parser", "Parsed command: BACKUP%s", cmd.backup_status ? " STATUS" : "");
@@ -548,13 +575,14 @@ Command parse_command(std::string_view line) {
             auto sv = tokens[1];
             auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), id_val);
             if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
-                // A malformed id is UNKNOWN rather than "cancel everything". Silently widening a
-                // typo into "all of them" is the shape of the argument-parser defect in #36: a flag
-                // that did not parse started the server anyway.
-                cmd.type = CommandType::UNKNOWN;
-                OB_LOG_WARN("cmd_parser", "UNSUBSCRIBE with an id that is not a number: %.*s",
-                            static_cast<int>(sv.size()), sv.data());
-                return cmd;
+                // A malformed id is refused rather than read as "cancel everything". Silently
+                // widening a typo into "all of them" is the shape of the argument-parser defect in
+                // #36: a flag that did not parse started the server anyway. Refused like every other
+                // line rather than with a WARN of its own: a refusal is reachable before
+                // authentication, so the server says it once a connection and counts the rest.
+                return refuse_with_usage(cmd, CommandType::UNSUBSCRIBE,
+                                         "UNSUBSCRIBE id is not a number: '" + std::string(sv) +
+                                             "'");
             }
             cmd.unsubscribe_id = id_val;
         }
@@ -603,7 +631,7 @@ Command parse_minsert(std::string_view block) {
     auto header_tokens = tokenize(lines[0]);
     if (header_tokens.empty() || !iequals(header_tokens[0], "MINSERT")) return cmd;
     if (header_tokens.size() < 5) {
-        return refuse_write(cmd, CommandType::MINSERT,
+        return refuse_with_usage(cmd, CommandType::MINSERT,
                             "MINSERT needs a symbol, an exchange, a side and a number of levels");
     }
 
