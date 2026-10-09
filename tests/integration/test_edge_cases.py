@@ -65,6 +65,9 @@ def test_malformed_insert_is_rejected(cluster):
     finally:
         conn.close()
     assert "ERR" in reply.upper(), f"malformed INSERT was accepted: {reply!r}"
+    # Said as what INSERT needs, not as `unknown command` about a command the server has (#222).
+    assert "INSERT needs" in reply and "INSERT takes:" in reply, (
+        f"the refusal does not say what INSERT needs: {reply!r}")
 
 
 def test_unknown_command_is_rejected(cluster):
@@ -84,6 +87,8 @@ def test_invalid_side_is_rejected(cluster):
         conn.close()
     assert "ERR" in reply.upper(), (
         f"a side that is neither bid nor ask was accepted: {reply!r}")
+    assert "INSERT side" in reply and "'sideways'" in reply, (
+        f"the refusal does not name the side it could not read (#222): {reply!r}")
 
 
 def test_non_numeric_price_is_rejected(cluster):
@@ -93,6 +98,36 @@ def test_non_numeric_price_is_rejected(cluster):
     finally:
         conn.close()
     assert "ERR" in reply.upper(), f"a non-numeric price was accepted: {reply!r}"
+    assert "INSERT price" in reply and "'abc'" in reply, (
+        f"the refusal does not name the price it could not read (#222): {reply!r}")
+
+
+def test_a_decimal_price_is_named_and_stores_nothing(cluster):
+    """The line #222 was found with: a client's decimal price, answered `unknown command`.
+
+    Prices are integers in the instrument's smallest sub-unit, and the refusal says so - the likely
+    mistake gets the answer that fixes it. The control in the same session is the same write in
+    sub-units, and the count says the refused line left nothing behind.
+    """
+    conn = Conn(cluster.primary().tcp_port)
+    try:
+        refused = conn.send("INSERT EDGE-DECIMAL BINANCE bid 100.5 3\n")
+        assert "ERR" in refused.upper(), f"a decimal price was accepted: {refused!r}"
+        assert "unknown command" not in refused, (
+            f"answered as if INSERT were not a command (#222): {refused!r}")
+        assert "INSERT price" in refused and "'100.5'" in refused, (
+            f"the refusal does not name the price: {refused!r}")
+        assert "smallest sub-unit" in refused, (
+            f"the refusal does not say what a price is: {refused!r}")
+
+        accepted = conn.send("INSERT EDGE-DECIMAL BINANCE bid 1005 3\n")
+        assert "ERR" not in accepted.upper(), f"the same write in sub-units was refused: {accepted!r}"
+
+        conn.send("FLUSH\n", settle=0.6)
+        assert _rows_for(conn, "EDGE-DECIMAL") == 1, (
+            "the refused line left a row behind, or the accepted one did not")
+    finally:
+        conn.close()
 
 
 def test_session_survives_a_rejected_command(cluster):

@@ -2522,6 +2522,46 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 222. A known command with an argument the parser could not read was answered `unknown command` ✅ **P3**
+
+**Found installing #212's packages.** The acceptance's own client sent `INSERT FRESH TEST bid 100.5 3`
+- a decimal price, where prices are integers in the instrument's smallest sub-unit - and the server
+answered `ERR unknown command`, about a command it has. #107 made a token a command has no place for
+name itself; a field the parser could not read, or an argument missing, still came back as the word
+for a command that does not exist, and in more than the writes. The same lines over a live server,
+built with master's parser and with this change (`evidence/2026-10-09-write-field-refusals/answers.md`,
+the usage each refusal ends with left out here):
+
+| sent | master | now |
+|---|---|---|
+| `INSERT FRESH TEST bid 100.5 3` | `ERR unknown command` | `ERR INSERT price is not a 64-bit integer: '100.5' - prices are integers in the smallest sub-unit` |
+| `INSERT AAA EX buy 100 3` | `ERR unknown command` | `ERR INSERT side is neither bid nor ask: 'buy'` |
+| `INSERT AAA EX bid 100` | `ERR unknown command` | `ERR INSERT needs a symbol, an exchange, a side, a price and a quantity` |
+| `MINSERT AAA EX bid 2`, `100 5`, `100.5 5` | `ERR unknown command` | `ERR price on level line 2 is not a 64-bit integer: '100.5' - ...` |
+| `FAILOVER` | `ERR unknown command` | `ERR FAILOVER needs the node to hand the role to` |
+| `COMPRESS zstd` | `ERR unknown command` | `ERR COMPRESS knows one codec, LZ4, and not 'zstd'` |
+| `UNSUBSCRIBE seven` | `ERR unknown command` | `ERR UNSUBSCRIBE id is not a number: 'seven'` |
+| `FROBNICATE`, `AUTH alice` | `ERR unknown command` | the same |
+
+And likewise a quantity or a count that is not a whole number, MIGRATE and ADOPT without their
+arguments or with an action ADOPT does not have, and BACKUP with a word that is not STATUS. Each
+refusal names what it could not read - the field and the token, or what is missing - and ends with
+what the command takes. A price's says what a price is, and what a field had to be comes from its
+type, "a non-negative 32-bit integer", so a number past the field's range is answered as well. The
+messages are built only when refusing. UNSUBSCRIBE's malformed id had a WARN of its own on every line,
+reachable before authentication - #95's shape - and is refused like the rest now, which the server
+says once a connection and counts. AUTH keeps its silence by its own design, a line that is not its
+shape not being the protocol, and a test pins it as a decision.
+
+A test over the grammar table holds the rule for every command but AUTH and MINSERT, a block the
+write tests hold: of the 54 lines it refuses, master's parser gave 15 no words. Mutations of the fix,
+21 and three controls, verdicts written before: each died in the tests named for it, and the
+controls survived. ctest 1817 of 1817 on the m8a.xlarge; `tests/integration/test_edge_cases.py`
+reads the refusal's words now, and four of its fourteen tests fail against master's parser.
+
+- Effort: S | Impact: a mistake in a client's write - a decimal price the likeliest - was answered as
+  if the command did not exist
+
 ### 221. GCC 12, the oldest compiler the build takes, had never built it, and its Release build failed on warnings about libstdc++'s own code ✅ **P3**
 
 **Found building #212's packages** with Ubuntu 22.04's gcc-12. Since #213 CMake refuses GCC older

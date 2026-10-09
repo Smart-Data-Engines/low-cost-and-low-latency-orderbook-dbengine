@@ -88,6 +88,10 @@ The first release. What it contains, by area:
 
 ### Clients
 
+- The wire protocol names what it cannot read: a token a command has no place for (#107), and an
+  argument it could not read or one missing - the field, the token and what the command takes
+  (#222). `unknown command` is for a word that is not a command, and for an `AUTH` line of the
+  wrong shape.
 - A C++ client and a C API. Over TLS the client's calls report a server that has gone as an error;
   they no longer raise the SIGPIPE that ended the application around them (#208).
 - A Python client over TCP, with a pool mode, a sharded mode and LZ4 session compression, and a

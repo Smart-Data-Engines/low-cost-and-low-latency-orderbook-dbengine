@@ -396,7 +396,7 @@ Four things worth knowing before writing a client:
   first: taking back bytes the client has partly read would truncate its input instead of
   disconnecting it.
 - **`UNSUBSCRIBE` with no id cancels every subscription of that connection** and answers with the
-  count. A malformed id is rejected as an unknown command rather than widened into "all of them".
+  count. A malformed id is refused, by name, rather than widened into "all of them" (#222).
 
 There is a limit per session (`--max-subscriptions-per-session`, 16 by default), because without one
 a single connection can order an unbounded amount of work onto every other client's write path.
