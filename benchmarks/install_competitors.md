@@ -54,11 +54,13 @@ clickhouse-client --port 9000 --query "SELECT version()"    # 26.8.2.7 here
 curl -s 127.0.0.1:8123 --data "SELECT version()"           # the adapter's endpoint
 ```
 
-The adapter uses the HTTP interface on 8123 with one kept-alive connection, and that is measured
-rather than preferred: `clickhouse-client` costs **80 ms** of process start per invocation — forty
-times the query it carries — and with `clickhouse-driver` installed for the experiment the native
-protocol came out at p50 **5.777 ms** against HTTP's **4.980 ms** on the 2000-row workload. HTTP
-needs no driver, so the harness has no dependency to install.
+The adapter loads over the HTTP interface on 8123 and asks the time-range query over the native
+protocol on 9000, each through one connection kept open: `clickhouse-client` costs **80 ms** of
+process start per invocation, forty times the query it carries. The query goes through
+`clickhouse-driver` because it is the fastest of three Python clients measured, to rows of Python
+ints on an m8a.xlarge with the harness's dataset: **1.29 ms**, against 1.98 through
+`clickhouse-connect` and 2.59 over HTTP with the TSV parsed in Python. An earlier measurement put
+HTTP ahead, with HTTP's clock stopped before its parse and the driver's after its rows (#226).
 
 ## TimescaleDB on a native PostgreSQL
 
@@ -89,11 +91,25 @@ psql -p 5433 -d ob_bench -c "CREATE EXTENSION IF NOT EXISTS timescaledb"
 psql -p 5433 -d ob_bench -Atc "SELECT extversion FROM pg_extension WHERE extname='timescaledb'"
 ```
 
-The adapter drives **one long-lived `psql` session** on stdin rather than `psql -c` per statement,
-and for the same measured reason as ClickHouse: a fresh `psql` costs 40-60 ms against queries of a
-few milliseconds. `\copy` loads the CSV from the client side, because the dataset lives under a home
-directory the `postgres` user cannot traverse and a server-side `COPY` fails with a permission error
-that reads like a harness bug.
+The adapter drives **one long-lived `psql` session** on stdin for the DDL and the load rather than
+`psql -c` per statement, and for the same measured reason as ClickHouse: a fresh `psql` costs
+40-60 ms against queries of a few milliseconds. `\copy` loads the CSV from the client side, because
+the dataset lives under a home directory the `postgres` user cannot traverse and a server-side `COPY`
+fails with a permission error that reads like a harness bug. The time-range query goes through
+psycopg 3 with binary results, the fastest of the ways measured to rows of Python ints: **0.64 ms**,
+against 0.81 with text results and 2.22 through `psql` with its output parsed in Python (#226).
+
+## The Python clients the queries are timed through
+
+Into the environment the harness runs in, which is a venv (PEP 668):
+
+```bash
+pip install 'psycopg[binary]' clickhouse-driver
+```
+
+Without them the harness reports TimescaleDB and ClickHouse as `NOT MEASURED` and says which client
+is missing, rather than timing either through a slower one: a slower client is the same flattering
+number an untuned competitor is.
 
 ## kdb+
 

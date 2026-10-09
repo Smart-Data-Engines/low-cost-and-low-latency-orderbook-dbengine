@@ -282,10 +282,11 @@ What the harness does that a manual comparison cannot:
   table quotes the run it came from;
 - **checks that two systems answered the same question before timing them.** Rows, by value, not by
   checksum — a checksum says "different" and a value says *which column*;
-- **stops every system's clock at the same point**, once the answer has been parsed into rows. Until
-  #226 the competitors' adapters stopped theirs before the parse and the engine's after it, so the
-  parse was in the engine's figure alone. A test now makes the parse the only thing that moves the
-  clock, for every adapter;
+- **stops every system's clock at the same point**, once the answer is rows of Python ints, and asks
+  each system through the fastest Python client measured for it. Until #226 the competitors'
+  adapters stopped theirs before the parse and the engine's after it, and asked through the slowest
+  clients measured for them. A test now makes building the rows the only thing that moves the clock,
+  for every adapter;
 - **refuses a competitor that declares no tuning**, because an untuned competitor measures our
   effort rather than its engine and produces a flattering number that looks exactly like a fair one;
 - **reports an absent system as a row**, never as a blank cell;
