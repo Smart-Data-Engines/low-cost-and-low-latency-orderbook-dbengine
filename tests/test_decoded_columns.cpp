@@ -187,6 +187,21 @@ TEST(DecodedColumnsBudget, TheHandEvictsASegmentNotReadAgainBeforeOneThatWas) {
     EXPECT_LE(budget->held(), budget->limit());
 }
 
+TEST(DecodedColumnsBudget, ASegmentReadAgainIsPassedOverOnceNotForever) {
+    // The hand clears the bit it passes: a segment read since it was held is spared one turn, and
+    // evicted on the next if nothing read it again - or a segment read twice would be held for good.
+    const auto col_a = column_of(1000, 1);
+    auto budget = std::make_shared<ob::DecodedColumnsBudget>(col_a->bytes() + col_a->bytes() / 2);
+    auto a = std::make_shared<ob::DecodedColumns>(budget);
+    auto b = std::make_shared<ob::DecodedColumns>(budget);
+    a->put(0, col_a, "a");
+    ASSERT_EQ(a->get(0), col_a);   // read again
+    const auto col_b = column_of(1000, 2);
+    EXPECT_EQ(b->put(0, col_b, "b"), col_b);
+    EXPECT_EQ(b->get(0), col_b) << "the hand never cleared the bit, so nothing could be evicted";
+    EXPECT_EQ(a->get(0), nullptr);
+}
+
 TEST(DecodedColumnsBudget, AReadKeepsAColumnEvictedUnderIt) {
     const auto col_a = column_of(1000, 7);
     auto budget = std::make_shared<ob::DecodedColumnsBudget>(col_a->bytes() + col_a->bytes() / 2);
