@@ -281,6 +281,26 @@ TEST(ScanPushdown, AScanEndedByItsReaderOpensNoFurtherSegment) {
     EXPECT_TRUE(cost.stopped);
 }
 
+TEST(ScanPushdown, ATimeOrderedScanLeavesASegmentWithoutItsLevelsUnread) {
+    // The series' read (#44 step 2): level 0 of either side, by time.
+    Fixture f;
+    f.segment({row(kBase + 1 * kSec, ob::SIDE_BID, 3, 10), row(kBase + 2 * kSec, ob::SIDE_ASK, 4, 11)});
+    f.segment({row(kBase + 3 * kSec, ob::SIDE_BID, 0, 12), row(kBase + 4 * kSec, ob::SIDE_ASK, 1, 13)});
+    ob::RowFilter level0;
+    level0.level_lo = level0.level_hi = 0;
+    std::vector<ob::SnapshotRow> got;
+    const auto cost = f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), level0,
+                                           [&](const ob::SnapshotRow& r) {
+                                               got.push_back(r);
+                                               return true;
+                                           });
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0].price, 12);
+    EXPECT_EQ(cost.skipped, 1u) << "the segment of levels 3 and 4 was read";
+    EXPECT_EQ(cost.rows_filtered, 1u) << "the level-1 row was built and then dropped";
+    EXPECT_EQ(cost.kept, 1u);
+}
+
 // ── The price range in meta.json ──────────────────────────────────────────────────────
 
 TEST(ScanPushdown, ASegmentsPriceRangeGoesToMetaJsonAndComesBack) {
