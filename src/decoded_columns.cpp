@@ -73,7 +73,9 @@ DecodedColumns::Column DecodedColumns::put(size_t slot, Column values, std::stri
         bytes_ += bytes;
         held_now = bytes_;
     }
-    referenced_.store(true, std::memory_order_relaxed);
+    // Not marked as used: a segment read once - a scan over a month - is the first the hand evicts,
+    // and one read again since it was held is passed over once. A one-off scan cannot push out what
+    // queries keep coming back to.
     // Into the ring only now that it holds the column, so the hand never finds it between the
     // charge and the column - and if it is evicted between these two lines, the ring just holds
     // a segment of nothing until the hand passes.

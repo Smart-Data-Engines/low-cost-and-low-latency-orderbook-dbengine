@@ -74,7 +74,8 @@ private:
     mutable std::mutex mtx_;
     std::array<Column, kSlots> columns_{};
     size_t bytes_{0};
-    /// CLOCK's bit: set by a hit and by a put, cleared by the hand passing over it.
+    /// CLOCK's bit: set by a hit - not by a put, so a segment read once goes first - and cleared by
+    /// the hand passing over it.
     mutable std::atomic<bool> referenced_{false};
     /// Whether the budget's ring holds this segment. The budget's mutex guards it.
     bool in_ring_{false};
