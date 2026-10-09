@@ -162,3 +162,25 @@ def test_query_rows_refuses_what_is_not_rows_and_names_what_reads_it(client, boo
         client.query_rows(f"SELECT SPREAD(*) FROM '{book}'.'{EXCHANGE}'")
     with pytest.raises(OrderbookError, match="query_buckets"):
         client.query_rows(f"SELECT COUNT(*) FROM '{book}'.'{EXCHANGE}' GROUP BY TIME_BUCKET(1m)")
+
+
+# The parse itself, on answers no server sends: a reply whose values do not make whole rows, or
+# carry something that is not an integer, is refused rather than cut short or misread.
+@pytest.mark.parametrize("raw, refusal", [
+    ("OK\nprice\tquantity\n1\t2\n3\n\n", "do not make whole rows"),
+    ("OK\nprice\n1\nx\n\n", "not an integer"),
+    ("ERR unknown symbol\n", "unknown symbol"),
+    ("PONG\n", "expected a row response"),
+])
+def test_query_rows_refuses_an_answer_it_cannot_read(raw, refusal):
+    from orderbook_engine import _parse_query_rows
+    with pytest.raises(OrderbookError, match=refusal):
+        _parse_query_rows(raw)
+
+
+def test_query_rows_reads_a_header_without_rows_and_values_of_every_sign():
+    from orderbook_engine import _parse_query_rows
+    assert _parse_query_rows("OK\nprice\tlevel\n\n").rows == []
+    answer = _parse_query_rows("OK\nprice\tlevel\n-5\t0\n9223372036854775807\t999\n\n")
+    assert answer.columns == ("price", "level")
+    assert answer.rows == [(-5, 0), (9223372036854775807, 999)]
