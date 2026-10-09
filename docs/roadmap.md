@@ -2566,6 +2566,26 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 228. A backup test read the same gauge before the merge had set it, as #224's did ✅ **P3**
+
+**Found in CI** on #47 step 2's pull request, in the coverage job:
+`BackupRunner.MergesAfterALinkedBackupDoNotChangeIt` found all 14 files of the seven merged segments
+still named in the data directory. It had waited for `ob_compactions_total` to reach 1 and
+`ob_segments_awaiting_removal` to read 0. A merge counts itself before it sets that gauge
+(`publish_staged_merges()`), so the 0 it read was the gauge's value before the merge - the race #224
+found in a compaction test, in a second test. The log of the same run has the files removed at
+`close()`.
+
+Made deterministic and checked (`evidence/2026-10-10-backup-test-race/`, m8a.xlarge, Debug): with a
+200 ms sleep between the counter and the gauge, the test failed five runs of five, with the 14 files
+of the CI log; waiting instead for the files to go, it passed five of five. Without the sleep both
+passed five of five.
+
+The test waits for what it checks, the files. Every other test that reads this gauge waits for the
+files on the disk first or for the gauge to reach the inputs it expects.
+
+- Effort: S | Impact: a required check failed at random on pull requests that changed nothing it tests
+
 ### 224. A compaction test read a gauge the merge had not yet set, and failed on a fast runner ✅ **P3**
 
 **Found in CI** on a pull request that changed only the README: `Compaction.AStoreDiscardedWhileAMergesInputsWaitKeepsWhatIsWrittenAfterIt`
