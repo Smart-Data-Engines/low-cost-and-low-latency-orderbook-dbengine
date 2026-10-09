@@ -1933,9 +1933,10 @@ bool emit_rows(size_t n, const RowColumns& c, ColumnSet columns, uint64_t start_
     // chosen first, a chunk at a time, by one loop over each column with no branch and no bounds
     // check, and only the chosen are built; a condition that keeps one row in a hundred costs the
     // passes over its columns rather than a check of every row's optional ends.
-    const bool whole = c.ts.size() == n && (!filter.has_price() || c.price.size() == n) &&
-                       (!filter.has_side() || c.side.size() == n) &&
-                       (!filter.has_level() || c.level.size() == n);
+    const auto holds = [n](bool read, size_t rows) { return !read || rows == n; };
+    const bool whole = c.ts.size() == n && holds(filter.has_price(), c.price.size()) &&
+                       holds(filter.has_side(), c.side.size()) &&
+                       holds(filter.has_level(), c.level.size());
     if (check && whole) {
         const int64_t  price_lo = filter.price_lo.value_or(std::numeric_limits<int64_t>::min());
         const int64_t  price_hi = filter.price_hi.value_or(std::numeric_limits<int64_t>::max());
