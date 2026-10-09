@@ -337,7 +337,13 @@ RC_GTEST_PROP(ScanByTimeProperty, TheRowsAreTheScansSortedByTimeStably, ()) {
     const uint64_t from = kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 25)) * (kSec / 2);
     const uint64_t to = from + static_cast<uint64_t>(*rc::gen::inRange(0, 30)) * (kSec / 2);
     const bool level0 = *rc::gen::inRange(0, 2) == 0;
-    const auto keep = [&](const ob::SnapshotRow& r) { return !level0 || r.level_index == 0; };
+    // The series' own condition when `level0`, through the filter the scan applies (#47 step 2).
+    ob::RowFilter filter;
+    if (level0) {
+        filter.level_lo = 0;
+        filter.level_hi = 0;
+    }
+    const auto keep = [&](const ob::SnapshotRow& r) { return filter.keeps(r.price, r.side, r.level_index); };
 
     std::vector<ob::SnapshotRow> expected;
     f.store.scan(from, to, "BK", "EX", ob::ColumnSet::all(), [&](const ob::SnapshotRow& r) {
@@ -349,7 +355,7 @@ RC_GTEST_PROP(ScanByTimeProperty, TheRowsAreTheScansSortedByTimeStably, ()) {
                      });
 
     std::vector<ob::SnapshotRow> got;
-    const auto cost = f.store.scan_by_time(from, to, "BK", "EX", ob::ColumnSet::all(), keep,
+    const auto cost = f.store.scan_by_time(from, to, "BK", "EX", ob::ColumnSet::all(), filter,
                                            [&](const ob::SnapshotRow& r) {
                                                got.push_back(r);
                                                return true;
@@ -366,7 +372,7 @@ RC_GTEST_PROP(ScanByTimeProperty, TheRowsAreTheScansSortedByTimeStably, ()) {
     if (!expected.empty()) {
         const size_t stop_after = static_cast<size_t>(*rc::gen::inRange<size_t>(1, expected.size() + 1));
         std::vector<ob::SnapshotRow> part;
-        const auto ended = f.store.scan_by_time(from, to, "BK", "EX", ob::ColumnSet::all(), keep,
+        const auto ended = f.store.scan_by_time(from, to, "BK", "EX", ob::ColumnSet::all(), filter,
                                                 [&](const ob::SnapshotRow& r) {
                                                     part.push_back(r);
                                                     return part.size() < stop_after;
@@ -391,7 +397,7 @@ TEST(ScanByTime, SegmentsApartInTimeAreHeldOneAtATime) {
     }
     uint64_t seen = 0;
     const auto cost = f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
-                                           [](const ob::SnapshotRow&) { return true; },
+                                           ob::RowFilter{},
                                            [&](const ob::SnapshotRow&) { ++seen; return true; });
     EXPECT_EQ(seen, 500u);
     EXPECT_EQ(cost.candidates, 10u);
@@ -408,7 +414,7 @@ TEST(ScanByTime, ARunOfManyTiesKeepsTheOrderItHoldsThemIn) {
     f.segment(rows);
     std::vector<int64_t> prices;
     f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
-                         [](const ob::SnapshotRow&) { return true; },
+                         ob::RowFilter{},
                          [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
     ASSERT_EQ(prices.size(), 200u);
     for (size_t i = 0; i < 200; ++i) {
@@ -425,7 +431,7 @@ TEST(ScanByTime, ABlockIsMergedWithTheSegmentsByTime) {
     f.block({row(kBase + 1 * kSec, 0, 0, 1)});
     std::vector<int64_t> prices;
     f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
-                         [](const ob::SnapshotRow&) { return true; },
+                         ob::RowFilter{},
                          [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
     EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3}));
 }
@@ -439,7 +445,7 @@ TEST(ScanByTime, ASegmentWhoseRangeIsNotItsRowsIsReadFirst) {
                                         7 * static_cast<int64_t>(kSec));
     std::vector<int64_t> prices;
     f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
-                         [](const ob::SnapshotRow&) { return true; },
+                         ob::RowFilter{},
                          [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
     EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3}));
 }
@@ -456,7 +462,7 @@ TEST(ScanByTime, ABlocksRowAtTheNextSegmentsStartWaitsForIt) {
     f.block({row(t, 0, 0, 4)});
     std::vector<int64_t> prices;
     f.store.scan_by_time(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
-                         [](const ob::SnapshotRow&) { return true; },
+                         ob::RowFilter{},
                          [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
     EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3, 4, 5}));
 }

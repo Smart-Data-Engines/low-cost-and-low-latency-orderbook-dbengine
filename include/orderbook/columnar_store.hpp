@@ -86,6 +86,33 @@ struct LevelSet {
     static bool from_hex(const std::string& hex, Bits& bits);
 };
 
+/// The conditions a scan applies before it builds a row (#47 step 2): closed ranges, as the query
+/// language's are (#199, #200), an end left unset open. What a segment's metadata proves no row of
+/// it meets leaves it unread; what a row's columns fail leaves it unbuilt.
+struct RowFilter {
+    std::optional<int64_t>  price_lo, price_hi;
+    std::optional<uint8_t>  side_lo, side_hi;
+    std::optional<uint16_t> level_lo, level_hi;
+
+    bool has_price() const { return price_lo.has_value() || price_hi.has_value(); }
+    bool has_side() const { return side_lo.has_value() || side_hi.has_value(); }
+    bool has_level() const { return level_lo.has_value() || level_hi.has_value(); }
+    bool empty() const { return !has_price() && !has_side() && !has_level(); }
+    bool keeps(int64_t price, uint8_t side, uint16_t level) const {
+        return (!price_lo || price >= *price_lo) && (!price_hi || price <= *price_hi) &&
+               (!side_lo || side >= *side_lo) && (!side_hi || side <= *side_hi) &&
+               (!level_lo || level >= *level_lo) && (!level_hi || level <= *level_hi);
+    }
+    /// The columns it reads, which a scan reads whether or not its caller asked for them.
+    ColumnSet columns() const {
+        ColumnSet c;
+        if (has_price()) c.add(QueryColumn::Price);
+        if (has_side()) c.add(QueryColumn::Side);
+        if (has_level()) c.add(QueryColumn::Level);
+        return c;
+    }
+};
+
 struct SegmentMeta {
     uint32_t format_version{kColumnarFormatVersion};
     uint64_t start_ts_ns;   ///< earliest timestamp in this segment
@@ -158,6 +185,12 @@ struct SegmentMeta {
     /// entry and the reads that copied it - and a segment that later takes this path starts with its
     /// own. Null outside the index and with holding off. Never written to meta.json.
     std::shared_ptr<DecodedColumns> decoded;
+    /// The lowest and the highest price of its rows (#47 step 2), so a scan with a price condition
+    /// can leave it unread; `has_price_range` false when unknown - a segment written before this
+    /// was recorded - and the segment is then read whatever the condition.
+    bool    has_price_range{false};
+    int64_t min_price{0};
+    int64_t max_price{0};
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
@@ -562,16 +595,38 @@ public:
     /// compared with the range, and the candidates among them - those whose recorded range meets
     /// it, whose files it then opens. The first is what the index costs a query; what it compared
     /// and did not need is bounded per width tier (`WidthTier`).
+    ///
+    /// With a `RowFilter` (#47 step 2) a candidate whose metadata proves no row of it meets the
+    /// filter - its price range, its levels - is not read, and a row that fails it is not built:
+    /// the rows handed over are those of the scan without it that the filter keeps, in the same
+    /// order. `cb` returning false ends the scan; a segment after it is not opened.
     struct ScanCost {
         size_t compared{0};
         size_t candidates{0};
         /// Published blocks whose range met the query, read from memory (#165 part 2a).
         size_t blocks{0};
+        /// The candidates opened, and those the filter's proof left unread (#47 step 2).
+        size_t segments_read{0};
+        size_t skipped_by_price{0};
+        size_t skipped_by_levels{0};
+        /// Rows in the range the filter failed before they were built.
+        uint64_t rows_filtered{0};
+        /// Whether `cb` ended it.
+        bool stopped{false};
     };
     ScanCost scan(uint64_t start_ns, uint64_t end_ns,
                   std::string_view symbol, std::string_view exchange,
                   ColumnSet columns,
                   std::function<void(const SnapshotRow&)> cb) const;
+    ScanCost scan(uint64_t start_ns, uint64_t end_ns,
+                  std::string_view symbol, std::string_view exchange,
+                  ColumnSet columns, const RowFilter& filter,
+                  const std::function<bool(const SnapshotRow&)>& cb) const;
+
+    /// Whether a segment's metadata proves no row of it meets `filter` (#47 step 2): its price
+    /// range disjoint from the filter's, or its levels holding no pair the filter's sides and
+    /// levels allow. False whenever what it would need is unknown; `by_price` says which proof it was.
+    static bool cannot_hold(const SegmentMeta& meta, const RowFilter& filter, bool* by_price = nullptr);
 
     /// The book of one symbol at `at` (#47): for each (side, level), the row with the latest
     /// timestamp at or before `at`, a tie going to the row `scan()` delivers later - the answer of
@@ -617,10 +672,16 @@ public:
         uint64_t max_held{0};
         /// Whether `cb` ended it.
         bool stopped{false};
+        /// Candidates the filter's proof left unread, and rows it failed before they were built
+        /// (#47 step 2).
+        size_t skipped{0};
+        uint64_t rows_filtered{0};
     };
+    /// A segment the filter's proof leaves unread is not read here either (#47 step 2), and a row
+    /// that fails it is not built.
     TimeOrderedCost scan_by_time(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
                                  std::string_view exchange, ColumnSet columns,
-                                 const std::function<bool(const SnapshotRow&)>& keep,
+                                 const RowFilter& filter,
                                  const std::function<bool(const SnapshotRow&)>& cb) const;
 
     /// The earliest start and the latest end among one symbol's segments and unsealed blocks, or
@@ -910,14 +971,19 @@ private:
     /// A query's read may find its segment removed by retention, and pads a short column the way it
     /// always has; a merge's finds nothing removed under it and takes a segment whole or not at all.
     enum class ReadMode { kQuery, kMerge };
+    /// `filter` is checked on the decoded columns before a row is built (#47 step 2) - the columns
+    /// it reads are in `columns`, which the scans make sure of - and its failures are counted into
+    /// `filtered`; `cb` returning false ends the read, which `stopped` then says.
     SegmentRead read_segment_rows(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
-                                  uint64_t end_ns, const std::function<void(const SnapshotRow&)>& cb,
-                                  ReadMode mode) const;
+                                  uint64_t end_ns, const RowFilter& filter,
+                                  const std::function<bool(const SnapshotRow&)>& cb, ReadMode mode,
+                                  uint64_t* filtered = nullptr, bool* stopped = nullptr) const;
     /// A format-3 query read of a segment with a slot: the columns held, the rest read, decoded
     /// and held (#220).
     SegmentRead read_held_columns(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
-                                  uint64_t end_ns,
-                                  const std::function<void(const SnapshotRow&)>& cb) const;
+                                  uint64_t end_ns, const RowFilter& filter,
+                                  const std::function<bool(const SnapshotRow&)>& cb,
+                                  uint64_t* filtered, bool* stopped) const;
 
     // Helpers
     /// Rebuild `index_` from the `meta.json` files under `base_dir_`. Caller holds `index_mtx_`

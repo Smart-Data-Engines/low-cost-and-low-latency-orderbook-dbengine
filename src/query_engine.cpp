@@ -995,6 +995,31 @@ namespace {
 /// Whether a row is inside every condition of `ast` (#199, #200): its time, price, side and level,
 /// each a range inclusive at both ends. One predicate for the row scan, a snapshot's levels and a
 /// subscription's pushes, which kept three copies of the time and price checks between them.
+/// Level 0 of either side: the rows a series of the book is made of (#44 step 2), as a filter the
+/// scan applies before it builds a row (#47 step 2) - and leaves a segment without them unread.
+static RowFilter level0_of_either_side() {
+    RowFilter f;
+    f.side_lo  = SIDE_BID;
+    f.side_hi  = SIDE_ASK;
+    f.level_lo = 0;
+    f.level_hi = 0;
+    return f;
+}
+
+/// The conditions of a query a scan applies before it builds a row (#47 step 2): its price, side and
+/// level ranges. The time range is the scan's own; `row_allowed()` stays where the rows arrive, as a
+/// belt that costs a compare a row.
+static RowFilter filter_of(const QueryAST& ast) {
+    RowFilter f;
+    f.price_lo = ast.price_lo;
+    f.price_hi = ast.price_hi;
+    f.side_lo  = ast.side_lo;
+    f.side_hi  = ast.side_hi;
+    f.level_lo = ast.level_lo;
+    f.level_hi = ast.level_hi;
+    return f;
+}
+
 static bool row_allowed(const QueryAST& ast, const SnapshotRow& row) {
     const auto in = [](auto v, const auto& lo, const auto& hi) {
         return (!lo.has_value() || v >= *lo) && (!hi.has_value() || v <= *hi);
@@ -1516,22 +1541,33 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     if (ast.level_lo.has_value() || ast.level_hi.has_value()) filtered.add(QueryColumn::Level);
     const ColumnSet to_read = columns_to_read(shape.columns, filtered);
 
-    store_.scan(ts_start, ts_end, ast.symbol, ast.exchange, to_read,
-                [&](const SnapshotRow& row) {
-                    if (count >= lim) return;
-                    if (!row_allowed(ast, row)) return;
+    // LIMIT 0 asks for no row, and reads none (#47 step 2).
+    if (lim == 0) return {};
+    const ColumnarStore::ScanCost cost = store_.scan(
+        ts_start, ts_end, ast.symbol, ast.exchange, to_read, filter_of(ast),
+        [&](const SnapshotRow& row) {
+            if (!row_allowed(ast, row)) return true;
 
-                    QueryResult qr{};
-                    qr.timestamp_ns    = row.timestamp_ns;
-                    qr.sequence_number = row.sequence_number;
-                    qr.price           = row.price;
-                    qr.quantity        = row.quantity;
-                    qr.order_count     = row.order_count;
-                    qr.side            = row.side;
-                    qr.level           = row.level_index;
-                    cb(qr);
-                    ++count;
-                });
+            QueryResult qr{};
+            qr.timestamp_ns    = row.timestamp_ns;
+            qr.sequence_number = row.sequence_number;
+            qr.price           = row.price;
+            qr.quantity        = row.quantity;
+            qr.order_count     = row.order_count;
+            qr.side            = row.side;
+            qr.level           = row.level_index;
+            cb(qr);
+            ++count;
+            // The answer is whole at LIMIT rows: the scan opens nothing more (#47 step 2). The rows
+            // are the first LIMIT the scan delivers, as they were when the rest was read and dropped.
+            return count < lim;
+        });
+    OB_LOG_DEBUG("query", "SELECT %s.%s: %llu row(s); %zu segment(s) read, %zu left unread by "
+                          "their metadata, %llu row(s) filtered before they were built%s",
+                 ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(count),
+                 cost.segments_read, cost.skipped_by_price + cost.skipped_by_levels,
+                 static_cast<unsigned long long>(cost.rows_filtered),
+                 cost.stopped ? "; LIMIT ended the read" : "");
 
     return {};
 }
@@ -1699,21 +1735,25 @@ bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from,
     // bucket's start is a 64-bit division, tens of cycles a row on the i3-7100U.
     BucketState* last = nullptr;
     uint64_t last_start = 0;
-    store.scan(from, to, ast.symbol, ast.exchange, to_read, [&](const SnapshotRow& row) {
-        if (too_many || !row_allowed(ast, row)) return;
+    store.scan(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast), [&](const SnapshotRow& row) {
+        if (!row_allowed(ast, row)) return true;
         if (last != nullptr && row.timestamp_ns - last_start < width) {
             last->add(row);
             ++rows;
-            return;
+            return true;
         }
         const uint64_t start = row.timestamp_ns - row.timestamp_ns % width;
         if (last == nullptr || start != last_start) {
             auto it = buckets.find(start);
             if (it == buckets.end()) {
                 // Rows do not arrive in time order - segments by their start, a segment's rows as
-                // appended, and a client's own event times anywhere (#105) - so neither LIMIT nor
-                // the ceiling can end the scan early; past the ceiling the rest of it only counts.
-                if (buckets.size() >= ceiling) { too_many = true; return; }
+                // appended, and a client's own event times anywhere (#105) - so LIMIT cannot end the
+                // scan early. The ceiling can (#47 step 2): past it the query is refused, whatever
+                // the rest of the range holds.
+                if (buckets.size() >= ceiling) {
+                    too_many = true;
+                    return false;
+                }
                 it = buckets.emplace(start, BucketState{}).first;
             }
             last = &it->second;
@@ -1721,6 +1761,7 @@ bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from,
         }
         last->add(row);
         ++rows;
+        return true;
     });
     return !too_many;
 }
@@ -2079,10 +2120,7 @@ std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& 
     columns.add(QueryColumn::Price);
     bool going = true;
     const ColumnarStore::TimeOrderedCost cost = store_.scan_by_time(
-        lo, read_to, ast.symbol, ast.exchange, columns,
-        [](const SnapshotRow& r) {
-            return r.level_index == 0 && (r.side == SIDE_BID || r.side == SIDE_ASK);
-        },
+        lo, read_to, ast.symbol, ast.exchange, columns, level0_of_either_side(),
         [&](const SnapshotRow& r) {
             if (pending && r.timestamp_ns != at_ts) {
                 pending = false;

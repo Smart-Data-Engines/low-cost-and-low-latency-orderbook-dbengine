@@ -335,7 +335,7 @@ TEST(DecodedColumnsStore, ReadsWithAndWithoutHoldingAnswerTheSame) {
         EXPECT_TRUE(same_rows(holding.latest_per_level(at, "A", "EX").rows,
                               plain.latest_per_level(at, "A", "EX").rows));
         std::vector<ob::SnapshotRow> a, b;
-        const auto keep = [](const ob::SnapshotRow&) { return true; };
+        const ob::RowFilter keep{};
         holding.scan_by_time(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), keep,
                              [&](const ob::SnapshotRow& r) { a.push_back(r); return true; });
         plain.scan_by_time(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), keep,
