@@ -320,6 +320,155 @@ TEST(CommandArity, ASessionAnnouncesOnlyItsFirstRefusal) {
     EXPECT_TRUE(other.first_refusal());
 }
 
+// ── A write whose field cannot be read (#222) ─────────────────────────────────
+//
+// Found installing #212's packages: the acceptance's own client sent `INSERT FRESH TEST bid 100.5 3`
+// - a decimal price, where prices are integers in the instrument's smallest sub-unit - and the
+// server answered `unknown command`, about a command it has. Every field of a write the parser could
+// not read was answered that way: the side, the price, the quantity, the count, a field missing, and
+// on a MINSERT the header's side and every field of a level line. The refusal names the field and
+// the token now, and says what the command takes - the three things #107's arity refusals say. Each
+// refusal has its control beside it: a parser that refused every write would pass the first half.
+
+namespace {
+
+std::string usage_of(std::string_view keyword) {
+    for (const auto& g : command_grammar()) {
+        if (g.keyword == keyword) return std::string(g.usage);
+    }
+    ADD_FAILURE() << "no grammar row for " << keyword;
+    return "<no usage>";
+}
+
+constexpr std::string_view kLevelLineTakes = "a level line takes: <price> <qty> [count]";
+
+/// What a refusal of a write's field carries: the field, the token, quoted, and what is accepted.
+void expect_field_refused(const Command& cmd, std::string_view field, std::string_view token,
+                          std::string_view takes) {
+    EXPECT_EQ(cmd.type, CommandType::UNKNOWN) << "took a write it could not read";
+    EXPECT_FALSE(cmd.error.empty())
+        << "refused without a word, so the server answers `unknown command` about a known command";
+    EXPECT_TRUE(mentions(cmd.error, field)) << "does not name the field '" << field << "': "
+                                            << cmd.error;
+    EXPECT_TRUE(mentions(cmd.error, "'" + std::string(token) + "'"))
+        << "does not quote the token '" << token << "': " << cmd.error;
+    EXPECT_TRUE(mentions(cmd.error, takes)) << "does not say what is accepted: " << cmd.error;
+}
+
+} // namespace
+
+TEST(WriteFieldRefusals, ADecimalPriceIsNamedRatherThanAnsweredAsAnUnknownCommand) {
+    // The line #222 was found with.
+    const Command cmd = parse_command("INSERT FRESH TEST bid 100.5 3");
+    expect_field_refused(cmd, "INSERT price", "100.5", usage_of("INSERT"));
+    EXPECT_TRUE(mentions(cmd.error, "smallest sub-unit"))
+        << "a decimal price is the likely mistake, and the unit is what answers it: " << cmd.error;
+    // What the token had to be, from the field's type - which covers a number past its range too.
+    EXPECT_TRUE(mentions(cmd.error, "is not a 64-bit integer")) << cmd.error;
+
+    const Command control = parse_command("INSERT FRESH TEST bid 10050 3");
+    ASSERT_EQ(control.type, CommandType::INSERT) << control.error;
+    EXPECT_EQ(control.insert_args.price, 10050);
+    EXPECT_EQ(control.insert_args.qty, 3u);
+
+    // A price may be negative - a spread, a rate - and that is not this refusal's business.
+    const Command negative = parse_command("INSERT FRESH TEST ask -5 3");
+    ASSERT_EQ(negative.type, CommandType::INSERT) << negative.error;
+    EXPECT_EQ(negative.insert_args.price, -5);
+}
+
+TEST(WriteFieldRefusals, ASideThatIsNeitherBidNorAskIsNamed) {
+    expect_field_refused(parse_command("INSERT AAA EX buy 100 3"), "INSERT side", "buy",
+                         usage_of("INSERT"));
+
+    const Command control = parse_command("INSERT AAA EX ASK 100 3");
+    ASSERT_EQ(control.type, CommandType::INSERT) << control.error;
+    EXPECT_EQ(control.insert_args.side, 1);
+}
+
+TEST(WriteFieldRefusals, AQuantityThatIsNotAWholeNumberIsNamed) {
+    expect_field_refused(parse_command("INSERT AAA EX bid 100 -3"), "INSERT quantity", "-3",
+                         usage_of("INSERT"));
+    const Command fraction = parse_command("INSERT AAA EX bid 100 3.5");
+    expect_field_refused(fraction, "INSERT quantity", "3.5", usage_of("INSERT"));
+    EXPECT_TRUE(mentions(fraction.error, "is not a non-negative 64-bit integer")) << fraction.error;
+    EXPECT_FALSE(mentions(fraction.error, "sub-unit")) << "a price's hint on a quantity: "
+                                                       << fraction.error;
+
+    const Command control = parse_command("INSERT AAA EX bid 100 0");
+    ASSERT_EQ(control.type, CommandType::INSERT)
+        << "zero is how an L2 feed removes a level, and a write like any other: " << control.error;
+    EXPECT_EQ(control.insert_args.qty, 0u);
+}
+
+TEST(WriteFieldRefusals, ACountThatIsNotAWholeNumberIsNamed) {
+    const Command many = parse_command("INSERT AAA EX bid 100 3 many");
+    expect_field_refused(many, "INSERT count", "many", usage_of("INSERT"));
+    EXPECT_TRUE(mentions(many.error, "is not a non-negative 32-bit integer")) << many.error;
+
+    const Command control = parse_command("INSERT AAA EX bid 100 3 2");
+    ASSERT_EQ(control.type, CommandType::INSERT) << control.error;
+    EXPECT_EQ(control.insert_args.count, 2u);
+}
+
+TEST(WriteFieldRefusals, AnInsertMissingAFieldSaysWhatItNeeds) {
+    for (const char* line : {"INSERT AAA EX bid 100", "INSERT AAA", "INSERT"}) {
+        const Command cmd = parse_command(line);
+        EXPECT_EQ(cmd.type, CommandType::UNKNOWN) << line;
+        EXPECT_TRUE(mentions(cmd.error, "INSERT needs")) << line << ": " << cmd.error;
+        EXPECT_TRUE(mentions(cmd.error, usage_of("INSERT"))) << line << ": " << cmd.error;
+    }
+}
+
+TEST(WriteFieldRefusals, AMinsertHeaderNamesItsSideAndWhatItLacks) {
+    expect_field_refused(parse_minsert("MINSERT AAA EX buy 1\n100\t5\n"), "MINSERT side", "buy",
+                         usage_of("MINSERT"));
+
+    const Command short_header = parse_minsert("MINSERT AAA EX bid\n100\t5\n");
+    EXPECT_EQ(short_header.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(short_header.error, "MINSERT needs")) << short_header.error;
+    EXPECT_TRUE(mentions(short_header.error, usage_of("MINSERT"))) << short_header.error;
+
+    const Command control = parse_minsert("MINSERT AAA EX bid 1\n100\t5\n");
+    ASSERT_EQ(control.type, CommandType::MINSERT) << control.error;
+    EXPECT_EQ(control.minsert_args.side, 0);
+}
+
+TEST(WriteFieldRefusals, ALevelLineNamesItsFieldAndItsLine) {
+    const Command price = parse_minsert("MINSERT AAA EX bid 2\n100\t5\n100.5\t5\n");
+    expect_field_refused(price, "price", "100.5", kLevelLineTakes);
+    EXPECT_TRUE(mentions(price.error, "level line 2")) << price.error;
+    EXPECT_TRUE(mentions(price.error, "smallest sub-unit")) << price.error;
+
+    const Command qty = parse_minsert("MINSERT AAA EX bid 2\n100\t-5\n101\t5\n");
+    expect_field_refused(qty, "quantity", "-5", kLevelLineTakes);
+    EXPECT_TRUE(mentions(qty.error, "level line 1")) << qty.error;
+
+    const Command count = parse_minsert("MINSERT AAA EX bid 1\n100\t5\tmany\n");
+    expect_field_refused(count, "count", "many", kLevelLineTakes);
+    EXPECT_TRUE(mentions(count.error, "level line 1")) << count.error;
+
+    const Command lone = parse_minsert("MINSERT AAA EX bid 2\n100\t5\n101\n");
+    EXPECT_EQ(lone.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(lone.error, "level line 2 needs a price and a quantity")) << lone.error;
+    EXPECT_TRUE(mentions(lone.error, kLevelLineTakes)) << lone.error;
+
+    const Command control = parse_minsert("MINSERT AAA EX bid 2\n100\t5\n-101\t6\t2\n");
+    ASSERT_EQ(control.type, CommandType::MINSERT) << control.error;
+    ASSERT_EQ(control.minsert_args.levels.size(), 2u);
+    EXPECT_EQ(control.minsert_args.levels[1].price, -101);
+    EXPECT_EQ(control.minsert_args.levels[1].count, 2u);
+}
+
+TEST(WriteFieldRefusals, ABlockThatIsNotAMinsertIsStillJustUnknown) {
+    // The header's keyword is checked before its length, so a multi-line block of something else
+    // is not told what MINSERT needs.
+    const Command cmd = parse_minsert("PING\nPING\n");
+    EXPECT_EQ(cmd.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(cmd.error.empty()) << "told a block that is not a MINSERT what MINSERT needs: "
+                                   << cmd.error;
+}
+
 // ── The other shape of the same silence ───────────────────────────────────────
 
 TEST(CommandArity, AMmConflictsLimitThatIsNotANumberIsRefusedRatherThanDefaulted) {

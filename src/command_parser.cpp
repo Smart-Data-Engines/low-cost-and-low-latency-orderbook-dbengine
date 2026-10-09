@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace ob {
@@ -221,6 +222,80 @@ static bool read_event_time(Command& cmd, std::string_view token, std::string_vi
     return true;
 }
 
+// ── A write's fields (#222) ────────────────────────────────────────────────────
+//
+// A write with a field the parser could not read used to come back `unknown command`, about a
+// command the server has - #107's silence in its other shape. Found when a client sent a decimal
+// price, `INSERT FRESH TEST bid 100.5 3`: prices are integers in the instrument's smallest sub-unit,
+// and nothing said so. Each refusal names the field and the token, and says what the command takes.
+// The messages are built only when refusing, so a write that parses costs no string.
+
+static constexpr std::string_view kLevelLineUsage = "<price> <qty> [count]";
+static constexpr std::string_view kPriceUnit = " - prices are integers in the smallest sub-unit";
+
+/// Refuse a write with `what`, followed by what the command takes.
+static Command& refuse_write(Command& cmd, CommandType of, std::string what) {
+    const CommandGrammar& g = grammar_of(of);
+    what += "; ";
+    what.append(g.keyword);
+    what += " takes: ";
+    what.append(g.usage);
+    return refuse(cmd, std::move(what));
+}
+
+/// "a 64-bit integer", "a non-negative 32-bit integer": what the field's type holds, which is what
+/// the token had to be - out of range included. Derived from the type, so a field that changes width
+/// changes its refusal with it.
+template <typename T>
+static std::string integer_kind() {
+    return std::string(std::is_signed_v<T> ? "a " : "a non-negative ") +
+           std::to_string(sizeof(T) * 8) + "-bit integer";
+}
+
+/// Read one integer field of an INSERT or of a MINSERT level line (`level_line`, from 1), or refuse
+/// naming it. `hint` follows the token: what a price is, for a price.
+template <typename T>
+static bool read_write_field(Command& cmd, std::string_view token, T& out, CommandType of,
+                             std::string_view field, size_t level_line = 0,
+                             std::string_view hint = {}) {
+    auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), out);
+    if (ec == std::errc{} && ptr == token.data() + token.size()) return true;
+
+    std::string what;
+    if (level_line == 0) {
+        what.append(grammar_of(of).keyword);
+        what += ' ';
+        what.append(field);
+    } else {
+        what.append(field);
+        what += " on level line ";
+        what += std::to_string(level_line);
+    }
+    what += " is not ";
+    what += integer_kind<T>();
+    what += ": '";
+    what.append(token);
+    what += '\'';
+    what.append(hint);
+    if (level_line == 0) {
+        refuse_write(cmd, of, std::move(what));
+    } else {
+        what += "; a level line takes: ";
+        what.append(kLevelLineUsage);
+        refuse(cmd, std::move(what));
+    }
+    return false;
+}
+
+/// `bid` or `ask`, in either case, or refuse naming the token.
+static bool read_side(Command& cmd, std::string_view token, uint8_t& out, CommandType of) {
+    if (iequals(token, "bid")) { out = 0; return true; }
+    if (iequals(token, "ask")) { out = 1; return true; }
+    refuse_write(cmd, of, std::string(grammar_of(of).keyword) + " side is neither bid nor ask: '" +
+                              std::string(token) + "'");
+    return false;
+}
+
 // ── parse_command ──────────────────────────────────────────────────────────────
 
 Command parse_command(std::string_view line) {
@@ -253,41 +328,29 @@ Command parse_command(std::string_view line) {
 
     if (iequals(first, "INSERT")) {
         // Need at least 6 tokens: INSERT symbol exchange side price qty
-        if (tokens.size() < 6) return cmd;
+        if (tokens.size() < 6) {
+            return refuse_write(cmd, CommandType::INSERT,
+                                "INSERT needs a symbol, an exchange, a side, a price and a quantity");
+        }
 
         InsertArgs args;
         args.symbol   = std::string(tokens[1]);
         args.exchange = std::string(tokens[2]);
 
-        // side: bid → 0, ask → 1
-        if (iequals(tokens[3], "bid")) {
-            args.side = 0;
-        } else if (iequals(tokens[3], "ask")) {
-            args.side = 1;
-        } else {
-            return cmd; // UNKNOWN
+        if (!read_side(cmd, tokens[3], args.side, CommandType::INSERT)) return cmd;
+        if (!read_write_field(cmd, tokens[4], args.price, CommandType::INSERT, "price", 0,
+                              kPriceUnit)) {
+            return cmd;
+        }
+        if (!read_write_field(cmd, tokens[5], args.qty, CommandType::INSERT, "quantity")) {
+            return cmd;
         }
 
-        // price (int64)
-        {
-            auto sv = tokens[4];
-            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), args.price);
-            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
-        }
-
-        // qty (uint64)
-        {
-            auto sv = tokens[5];
-            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), args.qty);
-            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
-        }
-
-        // optional count (uint32, default 1)
+        // optional count (default 1)
         args.count = 1;
-        if (tokens.size() >= 7) {
-            auto sv = tokens[6];
-            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), args.count);
-            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        if (tokens.size() >= 7 &&
+            !read_write_field(cmd, tokens[6], args.count, CommandType::INSERT, "count")) {
+            return cmd;
         }
 
         // optional event time (#105). Last and optional is the only shape in which an old client
@@ -536,9 +599,13 @@ Command parse_minsert(std::string_view block) {
     if (lines.empty()) return cmd;
 
     // ── Parse header ──────────────────────────────────────────────────────
+    // The keyword before the length: a block of something else is unknown, not a short MINSERT.
     auto header_tokens = tokenize(lines[0]);
-    if (header_tokens.size() < 5) return cmd;
-    if (!iequals(header_tokens[0], "MINSERT")) return cmd;
+    if (header_tokens.empty() || !iequals(header_tokens[0], "MINSERT")) return cmd;
+    if (header_tokens.size() < 5) {
+        return refuse_write(cmd, CommandType::MINSERT,
+                            "MINSERT needs a symbol, an exchange, a side and a number of levels");
+    }
 
     // The header's arity comes from the same table as every single-line command, because the field
     // #105 will add is a header field - and a batch that carried it to a server too old to know it
@@ -553,14 +620,7 @@ Command parse_minsert(std::string_view block) {
     args.symbol   = std::string(header_tokens[1]);
     args.exchange = std::string(header_tokens[2]);
 
-    // side
-    if (iequals(header_tokens[3], "bid")) {
-        args.side = 0;
-    } else if (iequals(header_tokens[3], "ask")) {
-        args.side = 1;
-    } else {
-        return cmd;
-    }
+    if (!read_side(cmd, header_tokens[3], args.side, CommandType::MINSERT)) return cmd;
 
     // n_levels
     {
@@ -587,7 +647,11 @@ Command parse_minsert(std::string_view block) {
     toks.reserve(kMinsertLevelTokens + 1);
     for (uint16_t i = 0; i < args.n_levels; ++i) {
         tokenize_into(lines[1 + i], toks);
-        if (toks.size() < 2) return cmd;
+        if (toks.size() < 2) {
+            return refuse(cmd, "level line " + std::to_string(i + 1) +
+                                   " needs a price and a quantity; a level line takes: " +
+                                   std::string(kLevelLineUsage));
+        }
         // A level line is not a command and has no row, but it has the same grammar and the same
         // silence: `100\t5\t1\tnotanumber` stored a level and answered `OK`. The refusal names the
         // line number too, because a batch is up to MAX_LEVELS lines and "somewhere in there" is
@@ -595,28 +659,17 @@ Command parse_minsert(std::string_view block) {
         if (toks.size() > kMinsertLevelTokens) {
             return refuse(cmd, "unexpected token '" + std::string(toks[kMinsertLevelTokens]) +
                                    "' on level line " + std::to_string(i + 1) +
-                                   "; a level line takes: <price> <qty> [count]");
+                                   "; a level line takes: " + std::string(kLevelLineUsage));
         }
 
         MinsertArgs::Level lvl{0, 0, 1};
-
-        // price (int64)
-        {
-            auto sv = toks[0];
-            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lvl.price);
-            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
-        }
-        // qty (uint64)
-        {
-            auto sv = toks[1];
-            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lvl.qty);
-            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
-        }
-        // optional count (uint32, default 1)
-        if (toks.size() >= 3) {
-            auto sv = toks[2];
-            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lvl.count);
-            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        const size_t line = static_cast<size_t>(i) + 1;
+        if (!read_write_field(cmd, toks[0], lvl.price, CommandType::MINSERT, "price", line,
+                              kPriceUnit) ||
+            !read_write_field(cmd, toks[1], lvl.qty, CommandType::MINSERT, "quantity", line) ||
+            (toks.size() >= 3 &&
+             !read_write_field(cmd, toks[2], lvl.count, CommandType::MINSERT, "count", line))) {
+            return cmd;
         }
 
         args.levels.push_back(lvl);
