@@ -76,8 +76,10 @@ def parse_cost(rows: int, samples: int = 9) -> tuple[float, float]:
     """Seconds to turn `rows` lines of tab-separated text into tuples, seven columns and three.
 
     Every query figure in the table includes this, for all three systems, because each adapter
-    receives text. It was stated as "about 4.8 ms" - measured once, on the workstation this harness
-    was written on, and then printed inside every report generated anywhere since.
+    receives text - and since #226 because each adapter's clock stops after it. Until then the
+    engine's adapter alone did, and this sentence was true of one figure in three. It was stated
+    as "about 4.8 ms" - measured once, on the workstation this harness was written on, and then
+    printed inside every report generated anywhere since.
 
     On the first machine that was not that one, the same table's fastest query median came out at
     1.47 ms: a constant declared to be *included* in every figure while being larger than the
@@ -505,11 +507,12 @@ def main(argv: list[str] | None = None) -> int:
                     "the time-range query returned no rows")
         if not query_rows else (
             f"every figure in the query column includes a measured {narrow_s * 1000:.3f} ms of "
-            f"Python-side parsing for {query_rows} three-column rows, and since #139 that really "
-            f"is the same work for all three systems - the engine used to answer this query with "
-            f"seven columns and pay {wide_s * 1000:.3f} ms for it, which made the constant ours "
-            f"alone. What separates the systems is what is left after it, stated here rather than "
-            f"subtracted from the table"),
+            f"Python-side parsing for {query_rows} three-column rows. It is the same work for all "
+            f"three systems since #139 - the engine used to answer this query with seven columns "
+            f"and pay {wide_s * 1000:.3f} ms for it - and inside every system's clock since #226: "
+            f"until then the engine's adapter alone stopped its clock after the parse. What "
+            f"separates the systems is what is left after it, stated here rather than subtracted "
+            f"from the table"),
         "prose_machine": PROSE_FIGURES_MACHINE,
     }
 
