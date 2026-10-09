@@ -99,9 +99,13 @@ struct RowFilter {
     bool has_level() const { return level_lo.has_value() || level_hi.has_value(); }
     bool empty() const { return !has_price() && !has_side() && !has_level(); }
     bool keeps(int64_t price, uint8_t side, uint16_t level) const {
-        return (!price_lo || price >= *price_lo) && (!price_hi || price <= *price_hi) &&
-               (!side_lo || side >= *side_lo) && (!side_hi || side <= *side_hi) &&
-               (!level_lo || level >= *level_lo) && (!level_hi || level <= *level_hi);
+        return within(price, price_lo, price_hi) && within(side, side_lo, side_hi) &&
+               within(level, level_lo, level_hi);
+    }
+    /// A closed range with either end open, as each of the three conditions is.
+    template <typename T>
+    static bool within(T value, const std::optional<T>& lo, const std::optional<T>& hi) {
+        return (!lo || value >= *lo) && (!hi || value <= *hi);
     }
     /// The columns it reads, which a scan reads whether or not its caller asked for them.
     ColumnSet columns() const {
