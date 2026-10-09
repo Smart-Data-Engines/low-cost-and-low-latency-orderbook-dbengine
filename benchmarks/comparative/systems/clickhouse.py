@@ -45,6 +45,12 @@ TABLE = "book"
 # One insert rather than a hundred: the CSV is handed over as a single block.
 MAX_INSERT_BLOCK_SIZE = 1_000_000
 
+# Decompressed blocks kept between queries: the cache ClickHouse documents for short queries asked
+# again, and what the engine has done with its decoded columns since #220. Off by default, so raised
+# here in ClickHouse's favour (#226). Measured on the m8a.xlarge with this harness's dataset and
+# query: 2.51 ms with it and 2.58 ms without, every round of ten faster with it.
+TIMED_QUERY_SETTINGS = "?use_uncompressed_cache=1"
+
 DDL = f"""
 CREATE DATABASE IF NOT EXISTS {DATABASE};
 DROP TABLE IF EXISTS {DATABASE}.{TABLE};
@@ -143,6 +149,10 @@ class ClickHouseSystem:
             "distinct values between them",
             "one kept-alive HTTP connection for every timed request: measured, a fresh "
             "`clickhouse-client` process costs 80 ms, which is 40 times the query it carries",
+            "use_uncompressed_cache = 1 for the time-range query: decompressed blocks kept between "
+            "queries, the counterpart of the engine's decoded columns held between queries, and off "
+            "by default. The query cache is not set: it keeps whole answers, and the engine keeps "
+            "none",
         ]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -194,7 +204,7 @@ class ClickHouseSystem:
         query = (f"SELECT ts_ns, price_ticks, size_lots FROM {DATABASE}.{TABLE} "
                  f"WHERE symbol = 'SYM0000' AND ts_ns BETWEEN {start_ns} AND {end_ns}")
         started = time.perf_counter()
-        out = self._ask(query)
+        out = self._ask(query, settings=TIMED_QUERY_SETTINGS)
         # The clock stops once the answer is rows, where the engine adapter's stops: until #226 it
         # stopped before the parse here, so the parse the note under the table says every figure
         # includes was in the engine's figure alone.

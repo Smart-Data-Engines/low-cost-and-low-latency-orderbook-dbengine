@@ -107,3 +107,21 @@ def test_every_adapter_times_the_parse_of_its_answer(adapter, tmp_path, monkeypa
         f"{system.name}'s query clock read {result.seconds:g} ticks over an answer of {CELLS} "
         f"cells, where every adapter's reads one a cell: its clock does not stop where the others' "
         f"do, so the parse is charged to some systems' figures and not to others'")
+
+
+def test_clickhouse_keeps_decompressed_blocks_as_the_engine_keeps_decoded_columns(monkeypatch):
+    # The engine holds a segment's decoded columns between queries by default since #220. ClickHouse
+    # has the same kind of cache, off by default; a time-range query asked again without it would
+    # time ClickHouse decompressing what the engine keeps.
+    sent: list[str] = []
+    system = clickhouse.ClickHouseSystem()
+    system._prepared = True
+    monkeypatch.setattr(system, "_ask",
+                        lambda query, **kwargs: sent.append(kwargs.get("settings", "")) or tsv(ANSWER))
+    system.query_time_range(ANSWER[0][0], ANSWER[-1][0])
+    assert sent == ["?use_uncompressed_cache=1"], (
+        f"ClickHouse's time-range query was sent with settings {sent}, not with its uncompressed "
+        f"cache on")
+    assert any(line.startswith("use_uncompressed_cache = 1") for line in system.tuning_applied()), (
+        "the setting is applied but not declared, and the report lists what was raised in each "
+        "system's favour")
