@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1887,6 +1888,18 @@ struct RowColumns {
     std::span<const int64_t>  seq;
 };
 
+/// Rows the selection pass marks at a time (#225): its masks stay in L1 between the column passes.
+constexpr size_t kSelectChunk = 2048;
+
+/// AND into `mask` whether each of `len` values from `v` is within [lo, hi]: one loop with no branch
+/// and no bounds check, which the compiler vectorizes.
+template <typename T>
+void select_within(const T* v, size_t len, T lo, T hi, uint8_t* mask) {
+    for (size_t k = 0; k < len; ++k) {
+        mask[k] = static_cast<uint8_t>(mask[k] & static_cast<uint8_t>((v[k] >= lo) & (v[k] <= hi)));
+    }
+}
+
 /// The rows of one segment within [start_ns, end_ns] that `filter` keeps, built field by field from
 /// what `columns` names and handed to `cb` in the segment's order; false once `cb` has said to stop
 /// (#47 step 2). A row the filter fails is counted into `filtered` and never built. The one loop
@@ -1901,6 +1914,82 @@ bool emit_rows(size_t n, const RowColumns& c, ColumnSet columns, uint64_t start_
     const bool want_level = columns.has(QueryColumn::Level);
     const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
     const bool check = !filter.empty();
+    const auto build = [&](size_t i, uint64_t ts) {
+        // Value-initialised, so a field whose column was not read is zero rather than whatever
+        // the last row left there.
+        SnapshotRow row{};
+        row.timestamp_ns = ts;
+        if (want_seq)   row.sequence_number = static_cast<uint64_t>(c.seq[i]);
+        if (want_side)  row.side            = c.side[i];
+        if (want_level) row.level_index     = c.level[i];
+        if (want_price) row.price           = (i < c.price.size()) ? c.price[i] : 0;
+        if (want_qty)   row.quantity        = (i < c.qty.size())   ? c.qty[i]   : 0;
+        if (want_cnt)   row.order_count     = (i < c.cnt.size())   ? c.cnt[i]   : 0;
+        return row;
+    };
+
+    // The selection pass (#225), when the time and every column the filter reads hold the segment's
+    // rows - a format-3 segment always, a format-2 one unless a short file was padded. The rows are
+    // chosen first, a chunk at a time, by one loop over each column with no branch and no bounds
+    // check, and only the chosen are built; a condition that keeps one row in a hundred costs the
+    // passes over its columns rather than a check of every row's optional ends.
+    const auto holds = [n](bool read, size_t rows) { return !read || rows == n; };
+    const bool whole = c.ts.size() == n && holds(filter.has_price(), c.price.size()) &&
+                       holds(filter.has_side(), c.side.size()) &&
+                       holds(filter.has_level(), c.level.size());
+    if (check && whole) {
+        const int64_t  price_lo = filter.price_lo.value_or(std::numeric_limits<int64_t>::min());
+        const int64_t  price_hi = filter.price_hi.value_or(std::numeric_limits<int64_t>::max());
+        const uint8_t  side_lo  = filter.side_lo.value_or(0);
+        const uint8_t  side_hi  = filter.side_hi.value_or(std::numeric_limits<uint8_t>::max());
+        const uint16_t level_lo = filter.level_lo.value_or(0);
+        const uint16_t level_hi = filter.level_hi.value_or(std::numeric_limits<uint16_t>::max());
+        uint8_t in_range[kSelectChunk];
+        uint8_t keep[kSelectChunk];
+        for (size_t from = 0; from < n; from += kSelectChunk) {
+            const size_t len = std::min(kSelectChunk, n - from);
+            const uint64_t* ts = c.ts.data() + from;
+            size_t ranged = 0;
+            for (size_t k = 0; k < len; ++k) {
+                in_range[k] = static_cast<uint8_t>((ts[k] >= start_ns) & (ts[k] <= end_ns));
+                ranged += in_range[k];
+            }
+            if (ranged == 0) continue;
+            std::memcpy(keep, in_range, len);
+            if (filter.has_price()) select_within(c.price.data() + from, len, price_lo, price_hi, keep);
+            if (filter.has_side()) select_within(c.side.data() + from, len, side_lo, side_hi, keep);
+            if (filter.has_level()) select_within(c.level.data() + from, len, level_lo, level_hi, keep);
+            size_t kept = 0;
+            for (size_t k = 0; k < len;) {
+                // Eight unchosen rows at a time: a selective condition leaves most of the mask zero.
+                if (k + 8 <= len) {
+                    uint64_t eight = 0;
+                    std::memcpy(&eight, keep + k, sizeof eight);
+                    if (eight == 0) {
+                        k += 8;
+                        continue;
+                    }
+                }
+                if (keep[k] == 0) {
+                    ++k;
+                    continue;
+                }
+                ++kept;
+                if (!cb(build(from + k, ts[k]))) {
+                    // Counted as the row-by-row loop counts them: the rows in the range the filter
+                    // failed before the one the reader stopped at.
+                    size_t ranged_before = 0;
+                    for (size_t j = 0; j <= k; ++j) ranged_before += in_range[j];
+                    filtered += ranged_before - kept;
+                    return false;
+                }
+                ++k;
+            }
+            filtered += ranged - kept;
+        }
+        return true;
+    }
+
     for (size_t i = 0; i < n; ++i) {
         const uint64_t ts = (i < c.ts.size()) ? c.ts[i] : 0;
         if (ts < start_ns || ts > end_ns) continue;
@@ -1915,17 +2004,7 @@ bool emit_rows(size_t n, const RowColumns& c, ColumnSet columns, uint64_t start_
                 continue;
             }
         }
-        // Value-initialised, so a field whose column was not read is zero rather than whatever
-        // the last row left there.
-        SnapshotRow row{};
-        row.timestamp_ns = ts;
-        if (want_seq)   row.sequence_number = static_cast<uint64_t>(c.seq[i]);
-        if (want_side)  row.side            = c.side[i];
-        if (want_level) row.level_index     = c.level[i];
-        if (want_price) row.price           = (i < c.price.size()) ? c.price[i] : 0;
-        if (want_qty)   row.quantity        = (i < c.qty.size())   ? c.qty[i]   : 0;
-        if (want_cnt)   row.order_count     = (i < c.cnt.size())   ? c.cnt[i]   : 0;
-        if (!cb(row)) return false;
+        if (!cb(build(i, ts))) return false;
     }
     return true;
 }

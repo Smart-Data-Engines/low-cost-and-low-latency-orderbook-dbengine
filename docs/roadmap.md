@@ -2566,6 +2566,72 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 228. A backup test read the same gauge before the merge had set it, as #224's did ✅ **P3**
+
+**Found in CI** on #47 step 2's pull request, in the coverage job:
+`BackupRunner.MergesAfterALinkedBackupDoNotChangeIt` found all 14 files of the seven merged segments
+still named in the data directory. It had waited for `ob_compactions_total` to reach 1 and
+`ob_segments_awaiting_removal` to read 0. A merge counts itself before it sets that gauge
+(`publish_staged_merges()`), so the 0 it read was the gauge's value before the merge - the race #224
+found in a compaction test, in a second test. The log of the same run has the files removed at
+`close()`.
+
+Made deterministic and checked (`evidence/2026-10-10-backup-test-race/`, m8a.xlarge, Debug): with a
+200 ms sleep between the counter and the gauge, the test failed five runs of five, with the 14 files
+of the CI log; waiting instead for the files to go, it passed five of five. Without the sleep both
+passed five of five.
+
+The test waits for what it checks, the files. Every other test that reads this gauge waits for the
+files on the disk first or for the gauge to reach the inputs it expects.
+
+- Effort: S | Impact: a required check failed at random on pull requests that changed nothing it tests
+
+### 225. A filtered read checked every row's conditions one at a time through their optional ends, 96% of a repeated bucket query ✅ **P3**
+
+**Found profiling repeated queries after #220 and #47 step 2**
+(`evidence/2026-10-10-first-read-profile/`). With the columns held, the best bid's prices a minute
+over 1 000 000 rows took 2.1 ms, 96% of it in `emit_rows()`. Every row of every segment the filter
+could not leave unread was checked one at a time: the time, then the price, side and level through
+their optional ends, each column read behind a bounds check, for the 1% kept. The mid's series spent
+90% the same way. A loop like that does not vectorize.
+
+Now, when the time and every column the filter reads hold the segment's rows, as a format-3
+segment's always do, the rows are chosen first:
+- 2 048 at a time, by one loop over each column into a mask, with no branch and no bounds check,
+  which the compiler vectorizes;
+- only the chosen rows are built, and eight unchosen ones are passed at a time;
+- the row-by-row loop stays, for a format-2 column a short file left short;
+- the rows filtered are counted as before, a reader's stop inside a chunk included.
+
+Measured (`evidence/2026-10-10-filter-selection/`): #47 step 2's queries, data and method, against it.
+Medians of three rounds' p50, ms:
+
+| query | m9g.xlarge, held | without | m8a.xlarge, held | without |
+|---|---|---|---|---|
+| the best bid's prices a minute | 2.90 → 0.65 | 4.33 → 2.15 | 2.19 → 0.42 | 3.04 → 1.43 |
+| the mid's bars a minute (a series) | 3.32 → 0.83 | 4.62 → 2.19 | 2.39 → 0.56 | 3.38 → 1.59 |
+| `WHERE level = 0` | 4.82 → 2.50 | 7.19 → 4.76 | 3.27 → 1.36 | 4.95 → 3.06 |
+| a price band | 4.53 → 4.27 | 4.97 → 4.70 | 2.65 → 2.30 | 3.70 → 3.18 |
+| one minute, no condition | 1.75 → 1.73 | 1.79 → 1.77 | 1.03 → 1.02 | 1.47 → 1.37 |
+
+Every variant answered the same lines, and the measured tree is `782f781`: after it, the condition
+that chooses the pass was split into parts CodeQL can read, which was not measured again. A price
+band builds and hands over 20 100 rows, so it gains least. `LIMIT 100` reads nothing through the selection, and its rounds overlap: 0.38 - 0.40 ms before
+and 0.39 - 0.43 after on the m9g.xlarge without held columns, 0.49 - 0.58 and 0.49 - 0.56 on the
+m8a.xlarge.
+
+Mutations, verdicts written before (`plan-mutations.md` there): every one died but the pass switched
+off. That one survived as written: the fallback answers the same, and only this measurement tells
+them apart.
+
+One edge case from #47 step 2, found writing this item's tests. A format-2 segment whose price column
+a short file cut short reads zeros past its end, outside the range its `meta.json` records. A price
+condition below that range leaves the segment unread, so those zeros, which no row ever held, are no
+longer answered. Every other answer is the scan's.
+
+- Effort: S | Impact: a repeated query with a selective condition spent its time checking rows it did
+  not keep
+
 ### 224. A compaction test read a gauge the merge had not yet set, and failed on a fast runner ✅ **P3**
 
 **Found in CI** on a pull request that changed only the README: `Compaction.AStoreDiscardedWhileAMergesInputsWaitKeepsWhatIsWrittenAfterIt`

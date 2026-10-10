@@ -301,6 +301,64 @@ TEST(ScanPushdown, ATimeOrderedScanLeavesASegmentWithoutItsLevelsUnread) {
     EXPECT_EQ(cost.kept, 1u);
 }
 
+// ── The selection pass (#225) ──────────────────────────────────────────────────────────
+
+TEST(ScanPushdown, ASelectionAcrossChunksStopsAndCountsAsTheRowByRowLoopDid) {
+    // 5 000 rows - the selection's chunks are 2 048 - level 0 and level 1 by turns.
+    Fixture f;
+    std::vector<ob::SnapshotRow> rows;
+    for (int i = 0; i < 5000; ++i) {
+        rows.push_back(row(kBase + static_cast<uint64_t>(i) * (kSec / 10), ob::SIDE_BID,
+                           static_cast<uint16_t>(i % 2), i));
+    }
+    f.segment(rows);
+    ob::RowFilter level0;
+    level0.level_lo = level0.level_hi = 0;
+    ob::ColumnarStore::ScanCost cost;
+    const auto all = f.filtered(0, UINT64_MAX, level0, SIZE_MAX, &cost);
+    ASSERT_EQ(all.size(), 2500u);
+    EXPECT_EQ(all[1249].price, 2498);
+    EXPECT_EQ(all[1250].price, 2500) << "a row was lost or doubled at a chunk's edge";
+    EXPECT_EQ(cost.rows_filtered, 2500u);
+    // Stopped by the reader in the second chunk: the rows the filter failed before it, no more.
+    const auto first = f.filtered(0, UINT64_MAX, level0, 1500, &cost);
+    ASSERT_EQ(first.size(), 1500u);
+    EXPECT_EQ(first.back().price, 2998);
+    EXPECT_TRUE(cost.stopped);
+    EXPECT_EQ(cost.rows_filtered, 1499u);
+    // And a time range that cuts the chunks: the rows of [1000, 3999] the filter keeps.
+    const auto middle = f.filtered(kBase + 1000 * (kSec / 10), kBase + 3999 * (kSec / 10), level0);
+    ASSERT_EQ(middle.size(), 1500u);
+    EXPECT_EQ(middle.front().price, 1000);
+    EXPECT_EQ(middle.back().price, 3998);
+}
+
+TEST(ScanPushdown, AFormat2SegmentWithItsPriceCutShortIsFilteredRowByRowAsBefore) {
+    // A price column a short file left short is padded with zeros, and the selection pass needs
+    // whole columns: this read goes through the loop it falls back to, and answers as the scan
+    // filtered after does.
+    Fixture f;
+    auto format = f.store.segment_format();
+    format.version = ob::kColumnarFormatV2;
+    f.store.set_segment_format(format);
+    std::vector<ob::SnapshotRow> rows;
+    for (int i = 0; i < 300; ++i) {
+        rows.push_back(row(kBase + static_cast<uint64_t>(i) * kSec, ob::SIDE_ASK, 0, 100 + i));
+    }
+    const auto meta = f.segment(rows);
+    ASSERT_EQ(meta.format_version, ob::kColumnarFormatV2);
+    const std::string price = meta.dir_path + "/price.col";
+    fs::resize_file(price, fs::file_size(price) / 2);
+    ob::RowFilter low;
+    low.price_hi = 150;   // keeps the padded zeros as well as the prices up to 150
+    ob::ColumnarStore::ScanCost cost;
+    const auto got = f.filtered(0, UINT64_MAX, low, SIZE_MAX, &cost);
+    const auto expected = kept(f.scanned(0, UINT64_MAX), low);
+    ASSERT_FALSE(expected.empty());
+    EXPECT_TRUE(same_rows(got, expected));
+    EXPECT_EQ(cost.rows_filtered, f.scanned(0, UINT64_MAX).size() - expected.size());
+}
+
 // ── The price range in meta.json ──────────────────────────────────────────────────────
 
 TEST(ScanPushdown, ASegmentsPriceRangeGoesToMetaJsonAndComesBack) {
