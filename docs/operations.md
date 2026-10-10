@@ -1867,14 +1867,19 @@ Nothing converts a format-3 segment back. A node that has to keep the way back r
 ### Decoded columns held between queries
 
 A query reading a format-3 segment decodes the columns it asks for; format 2 read four of its seven
-as they lay on disk. So the decoded columns stay in memory after the query, for the next one to
-read without the file, its checksums or a decode (#220): `decoded-cache-mb` (`--decoded-cache-mb`,
-256 by default) bounds what they hold, and `0` holds none - every query then decodes what it reads,
-as before this build.
+as they lay on disk. So from a segment's second read the decoded columns stay in memory after the
+query, for the next one to read without the file, its checksums or a decode (#220):
+`decoded-cache-mb` (`--decoded-cache-mb`, 256 by default) bounds what they hold, and `0` holds none -
+every query then decodes what it reads, as before this build.
 
-- **What makes room.** A segment read once is the first to go; one a query read again since it was
-  held is passed over once. A month's scan does not push out the last hour a dashboard keeps
-  asking for.
+- **What is held, and from when.** A segment's first read decodes into the buffers a read without
+  held columns uses and holds nothing; its second holds what it decodes (#223). Holding what is read
+  once allocates memory for a segment perhaps never read again, and that allocation was most of what
+  a first read cost over format 2's. The second read pays it instead, and the reads after it read
+  from memory.
+- **What makes room.** A segment held and not read since is the first to go; one a query read again
+  since it was held is passed over once. A month's scan, read once, holds nothing, so it pushes out
+  nothing a dashboard keeps asking for.
 - **What takes columns with it.** A segment's columns belong to its entry in the index: a merge
   that replaces it, retention, a drop, a snapshot installed over the store and a restart all take
   them, once the queries that were reading the segment finish. A query that began before a segment
@@ -1889,8 +1894,10 @@ as before this build.
   decoded - about 10 MB.
 
 `ob_decoded_columns_hits_total` and `ob_decoded_columns_misses_total` count columns read from
-memory and from files, `ob_decoded_columns_evictions_total` segments whose columns made room, and
-`ob_decoded_columns_bytes` against `ob_decoded_columns_budget_bytes` what is held. Misses that keep
+memory and from files by the reads that hold, `ob_decoded_columns_first_reads_total` the segments
+queries read for the first time, holding nothing, `ob_decoded_columns_evictions_total` segments whose
+columns made room, and `ob_decoded_columns_bytes` against `ob_decoded_columns_budget_bytes` what is
+held. Misses that keep
 pace with hits on a node whose queries repeat say the budget is smaller than what they read.
 
 ## Stopping a node

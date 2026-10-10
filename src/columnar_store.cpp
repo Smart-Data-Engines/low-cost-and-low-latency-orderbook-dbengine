@@ -1869,7 +1869,7 @@ void ColumnarStore::set_decoded_columns_budget(size_t bytes) {
 
 DecodedColumnsBudget::Stats ColumnarStore::decoded_columns_stats() const {
     std::shared_lock<std::shared_mutex> lock(index_mtx_);
-    return decoded_budget_ ? decoded_budget_->stats() : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0};
+    return decoded_budget_ ? decoded_budget_->stats() : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0, 0};
 }
 
 namespace {
@@ -1958,7 +1958,16 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         return SegmentRead::kUnreadable;
     }
     if (meta.format_version == kColumnarFormatV3 && mode == ReadMode::kQuery && meta.decoded) {
-        return read_held_columns(meta, columns, start_ns, end_ns, filter, cb, filtered, stopped);
+        // From a segment's second read (#223). Its first decodes into the pool's buffers below, as a
+        // read without held columns does: holding what a query reads once allocates its rows' size
+        // for a segment perhaps never read again, and #223 measured that allocation as most of what
+        // a first read cost over format 2's.
+        if (meta.decoded->read_before()) {
+            return read_held_columns(meta, columns, start_ns, end_ns, filter, cb, filtered, stopped);
+        }
+        OB_LOG_DEBUG("columnar", "segment %s read for the first time: decoded into the pool's buffers, "
+                                 "held from its next read",
+                     dir.c_str());
     }
 
     // A set of buffers from the pool, holding an earlier read's columns. Every column this read uses

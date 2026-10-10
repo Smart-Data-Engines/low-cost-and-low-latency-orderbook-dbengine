@@ -64,6 +64,13 @@ public:
     /// What this segment's held columns cost.
     size_t bytes() const;
 
+    /// Whether a query read this segment before (#223): false the first time it is asked, true from
+    /// then on. A segment's first read decodes into the pool's buffers and holds nothing - an
+    /// allocation of its rows' size for a segment perhaps never read again - and its second holds
+    /// what it decodes. The mark outlives an eviction: a segment read again after one has been
+    /// read twice already.
+    bool read_before();
+
 private:
     friend class DecodedColumnsBudget;
 
@@ -79,6 +86,8 @@ private:
     mutable std::atomic<bool> referenced_{false};
     /// Whether the budget's ring holds this segment. The budget's mutex guards it.
     bool in_ring_{false};
+    /// Set by the first query that reads this segment (#223).
+    std::atomic<bool> read_before_{false};
     std::shared_ptr<DecodedColumnsBudget> budget_;
 };
 
@@ -97,6 +106,7 @@ public:
         uint64_t hits;        ///< columns a read took from memory
         uint64_t misses;      ///< columns a read had to read and decode
         uint64_t evictions;   ///< segments whose columns were evicted to make room
+        uint64_t first_reads; ///< segments a query read for the first time, holding nothing (#223)
         size_t   held_bytes;
         size_t   limit_bytes;
     };
@@ -106,6 +116,7 @@ public:
 
     void count_hit()  { hits_.fetch_add(1, std::memory_order_relaxed); }
     void count_miss() { misses_.fetch_add(1, std::memory_order_relaxed); }
+    void count_first_read() { first_reads_.fetch_add(1, std::memory_order_relaxed); }
 
 private:
     friend class DecodedColumns;
@@ -125,7 +136,7 @@ private:
     size_t hand_{0};
     std::atomic<size_t> held_{0};
     const size_t limit_;
-    std::atomic<uint64_t> hits_{0}, misses_{0}, evictions_{0};
+    std::atomic<uint64_t> hits_{0}, misses_{0}, evictions_{0}, first_reads_{0};
 };
 
 } // namespace ob

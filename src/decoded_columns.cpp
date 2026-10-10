@@ -35,6 +35,12 @@ DecodedColumns::~DecodedColumns() {
     if (budget_ && bytes_ > 0) budget_->release(bytes_);
 }
 
+bool DecodedColumns::read_before() {
+    const bool before = read_before_.exchange(true, std::memory_order_relaxed);
+    if (!before && budget_) budget_->count_first_read();
+    return before;
+}
+
 DecodedColumns::Column DecodedColumns::get(size_t slot) const {
     Column held;
     {
@@ -112,7 +118,8 @@ DecodedColumnsBudget::DecodedColumnsBudget(size_t limit_bytes) : limit_(limit_by
 
 DecodedColumnsBudget::Stats DecodedColumnsBudget::stats() const {
     return Stats{hits_.load(std::memory_order_relaxed), misses_.load(std::memory_order_relaxed),
-                 evictions_.load(std::memory_order_relaxed), held(), limit_};
+                 evictions_.load(std::memory_order_relaxed),
+                 first_reads_.load(std::memory_order_relaxed), held(), limit_};
 }
 
 bool DecodedColumnsBudget::charge(size_t bytes, const DecodedColumns* charging) {

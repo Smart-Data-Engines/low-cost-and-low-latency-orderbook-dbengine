@@ -3107,6 +3107,8 @@ void Engine::publish_decoded_columns() {
     publish_counter_delta("ob_decoded_columns_misses_total", s.misses, published_decoded_misses_);
     publish_counter_delta("ob_decoded_columns_evictions_total", s.evictions,
                           published_decoded_evictions_);
+    publish_counter_delta("ob_decoded_columns_first_reads_total", s.first_reads,
+                          published_decoded_first_reads_);
     registry_.set_gauge("ob_decoded_columns_bytes", static_cast<int64_t>(s.held_bytes));
     registry_.set_gauge("ob_decoded_columns_budget_bytes", static_cast<int64_t>(s.limit_bytes));
 }

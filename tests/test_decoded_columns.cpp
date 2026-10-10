@@ -275,6 +275,41 @@ TEST(DecodedColumnsBudget, ASegmentIsNotEvictedToMakeRoomForItself) {
 
 // ── The store ──────────────────────────────────────────────────────────────────────────
 
+// #223: holding what a query reads once allocates its rows' size for a segment perhaps never read
+// again, and that allocation was most of what a first read cost over format 2's. So a segment's
+// first read decodes into the pool's buffers and holds nothing, its second holds, and its third
+// reads from memory - each answering what a store holding nothing answers.
+TEST(DecodedColumnsStore, ASegmentsFirstReadHoldsNothingItsSecondHoldsAndItsThirdReadsMemory) {
+    TempDir dir;
+    written(dir.str(), rows_from(kBase, 1000, 100));
+    written(dir.str(), rows_from(kBase + 10'000 * kSec, 1000, 5000, /*shuffled=*/true));
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    const auto expected = read(plain, ob::ColumnSet::all());
+    ASSERT_EQ(expected.size(), 2000u);
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(64 * kMiB);
+    store.open_existing();
+
+    EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all()), expected));
+    auto stats = store.decoded_columns_stats();
+    EXPECT_EQ(stats.first_reads, 2u) << "a first read a segment, and no more";
+    EXPECT_EQ(stats.held_bytes, 0u) << "a segment's first read held its columns";
+    EXPECT_EQ(stats.hits + stats.misses, 0u) << "a first read asked the slot";
+
+    EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all()), expected));
+    stats = store.decoded_columns_stats();
+    EXPECT_EQ(stats.first_reads, 2u) << "a second read counted as a first";
+    EXPECT_EQ(stats.misses, 2u * ob::DecodedColumns::kSlots) << "the second read did not decode every column";
+    EXPECT_GT(stats.held_bytes, 0u) << "a segment's second read held nothing";
+
+    EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all()), expected));
+    stats = store.decoded_columns_stats();
+    EXPECT_EQ(stats.hits, 2u * ob::DecodedColumns::kSlots) << "the third read did not read from memory";
+    EXPECT_EQ(stats.misses, 2u * ob::DecodedColumns::kSlots);
+}
+
 TEST(DecodedColumnsStore, ASecondReadOfAHeldSegmentReadsNoFile) {
     TempDir dir;
     const auto seg = written(dir.str(), rows_from(kBase, 1000, 100));
@@ -284,6 +319,9 @@ TEST(DecodedColumnsStore, ASecondReadOfAHeldSegmentReadsNoFile) {
     const auto ts_price = set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::Price});
     const auto first = read(store, ts_price);
     ASSERT_EQ(first.size(), 1000u);
+    // Held from its second read (#223).
+    ASSERT_TRUE(same_rows(read(store, ts_price), first));
+    ASSERT_GT(store.decoded_columns_stats().held_bytes, 0u);
 
     // The file gone - and a read of what is held still answers, and the same.
     const std::string file = seg.dir_path + "/" + ob::kColumnsV3File;
@@ -322,7 +360,9 @@ TEST(DecodedColumnsStore, ReadsWithAndWithoutHoldingAnswerTheSame) {
     for (const auto& columns : sets) {
         const auto expected = read(plain, columns);
         ASSERT_EQ(expected.size(), 11'001u);
-        // Twice: the first decodes and holds, the second answers from what is held.
+        // Three times: a segment's first read holds nothing (#223), its second decodes and holds,
+        // and the third answers from what is held.
+        EXPECT_TRUE(same_rows(read(holding, columns), expected));
         EXPECT_TRUE(same_rows(read(holding, columns), expected));
         EXPECT_TRUE(same_rows(read(holding, columns), expected));
         // And a range inside one segment, across the out-of-order rows.
@@ -356,6 +396,7 @@ TEST(DecodedColumnsStore, AMergeTakesItsInputsColumnsWithIt) {
     store.open_existing();
     const auto before = read(store, ob::ColumnSet::all());
     ASSERT_EQ(before.size(), 200u);
+    ASSERT_TRUE(same_rows(read(store, ob::ColumnSet::all()), before));   // held from the second (#223)
     ASSERT_GT(store.decoded_columns_stats().held_bytes, 0u);
 
     // The merge, as the engine writes and publishes one: its output read from the inputs.
@@ -381,6 +422,9 @@ TEST(DecodedColumnsStore, AMergeTakesItsInputsColumnsWithIt) {
     ASSERT_EQ(result.outcome, ob::ColumnarStore::Replaced::kYes);
     EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u)
         << "the inputs' columns outlived their segments, with no read holding them";
+    // The merged segment is a segment no query has read: its first read holds nothing (#223).
+    EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all()), before));
+    EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u) << "the merged segment's first read held";
     EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all()), before));
     EXPECT_GT(store.decoded_columns_stats().held_bytes, 0u) << "the merged segment's columns not held";
 }
@@ -394,6 +438,7 @@ TEST(DecodedColumnsStore, RetentionAndADropTakeTheirSegmentsColumnsWithThem) {
     store.set_decoded_columns_budget(64 * kMiB);
     store.open_existing();
     ASSERT_EQ(read(store, ob::ColumnSet::all()).size(), 300u);
+    ASSERT_EQ(read(store, ob::ColumnSet::all()).size(), 300u);   // held from the second read (#223)
     const size_t all_three = store.decoded_columns_stats().held_bytes;
     ASSERT_GT(all_three, 0u);
 
@@ -426,6 +471,9 @@ TEST(DecodedColumnsStore, ASnapshotInstalledUnderTheSamePathsIsReadNotTheColumns
     const auto before = read(store, ob::ColumnSet::all(), "SYM");
     ASSERT_EQ(before.size(), 50u);
     ASSERT_EQ(before.front().price, 100);
+    // Held from its second read (#223), so there are columns the install could fail to take.
+    ASSERT_TRUE(same_rows(read(store, ob::ColumnSet::all(), "SYM"), before));
+    ASSERT_GT(store.decoded_columns_stats().held_bytes, 0u);
 
     ASSERT_TRUE(store.replace_from_staging(
         staging.str(), {(rel / "meta.json").string(), (rel / ob::kColumnsV3File).string()}));
@@ -434,6 +482,8 @@ TEST(DecodedColumnsStore, ASnapshotInstalledUnderTheSamePathsIsReadNotTheColumns
     EXPECT_EQ(after.front().price, 9000) << "the columns of the segment the snapshot replaced were "
                                             "answered for the one it installed under the same path";
     EXPECT_EQ(after.back().price, 9049);
+    // And its second read, the one that holds, holds its own.
+    EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all(), "SYM"), after));
 }
 
 TEST(DecodedColumnsStore, ARebuildStartsEverySegmentEmpty) {
@@ -443,12 +493,16 @@ TEST(DecodedColumnsStore, ARebuildStartsEverySegmentEmpty) {
     store.set_decoded_columns_budget(64 * kMiB);
     store.open_existing();
     ASSERT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
+    ASSERT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);   // held from the second read (#223)
     ASSERT_GT(store.decoded_columns_stats().held_bytes, 0u);
     store.open_existing();
     EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u) << "a rebuilt index kept the old columns";
-    const uint64_t misses_before = store.decoded_columns_stats().misses;
+    // A rebuilt entry has not been read: its next read is a first read, which holds nothing.
+    const uint64_t first_reads_before = store.decoded_columns_stats().first_reads;
     EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
-    EXPECT_GT(store.decoded_columns_stats().misses, misses_before) << "the rebuilt entry was not read";
+    EXPECT_EQ(store.decoded_columns_stats().first_reads, first_reads_before + 1)
+        << "the rebuilt entry kept the mark of the reads before it";
+    EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u);
 }
 
 TEST(DecodedColumnsStore, AFileThatFailsACheckLeavesNothingHeld) {
@@ -470,9 +524,11 @@ TEST(DecodedColumnsStore, AFileThatFailsACheckLeavesNothingHeld) {
         f.write(&c, 1);
     }
     const auto with_seq = set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::SequenceNumber});
+    // The first read holds nothing whatever the file says (#223); the second is the one that holds.
     EXPECT_TRUE(read(store, with_seq).empty()) << "a block whose checksum fails was decoded";
+    EXPECT_TRUE(read(store, with_seq).empty()) << "a block whose checksum fails was decoded and held";
     EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u) << "a file that failed a check left columns";
-    EXPECT_TRUE(read(store, with_seq).empty()) << "the second read was answered from memory";
+    EXPECT_TRUE(read(store, with_seq).empty()) << "the third read was answered from memory";
     // The control: the columns whose blocks hold are read, and held.
     const auto ts_price = set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::Price});
     EXPECT_EQ(read(store, ts_price).size(), 50u);
@@ -493,7 +549,12 @@ TEST(DecodedColumnsStore, AMergesReadNeitherTakesNorLeavesColumns) {
     const auto stats = store.decoded_columns_stats();
     EXPECT_EQ(stats.held_bytes, 0u) << "a merge's read held what it read";
     EXPECT_EQ(stats.hits + stats.misses, 0u) << "a merge's read asked the slot";
-    // The control: a query's read of the same segment holds.
+    EXPECT_EQ(stats.first_reads, 0u) << "a merge's read counted as a query's";
+    // The control: a query's first read of the same segment is its first (#223), and its second
+    // holds - so the merge's read did not mark the segment as read.
+    EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
+    EXPECT_EQ(store.decoded_columns_stats().first_reads, 1u);
+    EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u);
     EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
     EXPECT_GT(store.decoded_columns_stats().held_bytes, 0u);
     (void)seg;
@@ -509,13 +570,17 @@ TEST(DecodedColumnsStore, TheBudgetBoundsWhatIsHeldOnceReadsFinish) {
     probe.set_decoded_columns_budget(64 * kMiB);
     probe.open_existing();
     read(probe, ob::ColumnSet::all(), "A", kBase, kBase + 50'000 * kSec);
+    read(probe, ob::ColumnSet::all(), "A", kBase, kBase + 50'000 * kSec);   // held from the second
     const size_t one_segment = probe.decoded_columns_stats().held_bytes;
     ASSERT_GT(one_segment, 0u);
 
     ob::ColumnarStore store(dir.str());
     store.set_decoded_columns_budget(one_segment * 2 + one_segment / 2);
     store.open_existing();
-    for (int round = 0; round < 3; ++round) {
+    // The first round reads every segment for the first time and holds nothing (#223).
+    EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 30'000u);
+    EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u);
+    for (int round = 1; round < 4; ++round) {
         EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 30'000u);
         const auto stats = store.decoded_columns_stats();
         EXPECT_LE(stats.held_bytes, stats.limit_bytes) << "round " << round;
@@ -545,6 +610,8 @@ TEST(DecodedColumnsStore, ThreadsReadingTheSameSegmentsUnderEvictionAnswerTheSam
     probe.set_decoded_columns_budget(64 * kMiB);
     probe.open_existing();
     read(probe, ob::ColumnSet::all(), "A", kBase, kBase + 5000 * kSec);
+    read(probe, ob::ColumnSet::all(), "A", kBase, kBase + 5000 * kSec);   // held from the second
+    ASSERT_GT(probe.decoded_columns_stats().held_bytes, 0u);
     store.set_decoded_columns_budget(probe.decoded_columns_stats().held_bytes * 4);
 
     std::atomic<int> wrong{0};
@@ -573,13 +640,14 @@ TEST(DecodedColumnsStore, HoldingOffReadsAsBeforeAndTakesTheSlotsAway) {
     store.open_existing();
     EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
     auto stats = store.decoded_columns_stats();
-    EXPECT_EQ(stats.hits + stats.misses + stats.held_bytes + stats.limit_bytes, 0u)
+    EXPECT_EQ(stats.hits + stats.misses + stats.first_reads + stats.held_bytes + stats.limit_bytes, 0u)
         << "a store not given a budget held columns";
     EXPECT_EQ(store.index().at(0).decoded, nullptr);
 
     store.set_decoded_columns_budget(64 * kMiB);
     EXPECT_NE(store.index().at(0).decoded, nullptr) << "a segment indexed before the budget got no slot";
     EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
+    EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);   // held from the second read (#223)
     EXPECT_GT(store.decoded_columns_stats().held_bytes, 0u);
 
     store.set_decoded_columns_budget(0);

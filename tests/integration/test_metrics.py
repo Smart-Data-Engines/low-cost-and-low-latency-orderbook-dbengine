@@ -135,35 +135,44 @@ def test_segment_count_gauge_tracks_flushed_segments(primary_client: OrderbookEn
 
 def test_a_query_asked_again_reads_its_columns_from_memory(primary_client: OrderbookEngine,
                                                            cluster):
-    """#220: a format-3 segment's decoded columns are held between queries, so the same query
-    asked again reads its columns from memory - and the counters an operator sizes the budget by
-    say so. They are fed after each flush tick, so the test waits for them to move rather than
-    reading them once."""
+    """#220: a format-3 segment's decoded columns are held between queries - from the segment's
+    second read, since #223 - so the same query asked a third time reads its columns from memory,
+    and the counters an operator sizes the budget by say so. They are fed after each flush tick, so
+    the test waits for them to move rather than reading them once."""
     port = cluster.primary().metrics_port
     assert metric_value(scrape(port), "ob_decoded_columns_budget_bytes") == 256 * 2**20, (
         "the default budget is not 256 MiB, or the gauge is not exposed")
+
+    def counter(name: str) -> float:
+        return metric_value(scrape(port), name) or 0.0
+
+    def moves(name: str, before: float) -> bool:
+        deadline = time.monotonic() + 5.0
+        while counter(name) <= before and time.monotonic() < deadline:
+            time.sleep(0.1)
+        return counter(name) > before
 
     book = "METRICS-DECODED"
     primary_client.insert(book, "BINANCE", "bid", [700_000, 700_001, 700_002], [1, 2, 3])
     primary_client.flush()   # a sealed format-3 segment, not rows in memory
     sql = (f"SELECT * FROM '{book}'.'BINANCE' "
            f"WHERE timestamp BETWEEN 0 AND 9999999999999999999")
+    first_reads = counter("ob_decoded_columns_first_reads_total")
     first = primary_client.query(sql)
     assert sorted((r.price, r.quantity) for r in first) == [(700_000, 1), (700_001, 2),
                                                             (700_002, 3)]
+    assert moves("ob_decoded_columns_first_reads_total", first_reads), (
+        "the segment's first read was not counted as one")
 
-    def hits() -> float:
-        return metric_value(scrape(port), "ob_decoded_columns_hits_total") or 0.0
-
-    time.sleep(0.5)   # the first query's misses published by a tick, so they cannot pass for hits
-    before = hits()
-    second = primary_client.query(sql)
-    assert sorted((r.price, r.quantity) for r in second) == sorted(
-        (r.price, r.quantity) for r in first), "the second answer differs from the first"
-    deadline = time.monotonic() + 5.0
-    while hits() <= before and time.monotonic() < deadline:
-        time.sleep(0.1)
-    assert hits() > before, "the same query asked again read no column from memory"
+    second = primary_client.query(sql)   # holds what it decodes
+    time.sleep(0.5)   # its misses published by a tick, so they cannot pass for hits
+    hits = counter("ob_decoded_columns_hits_total")
+    third = primary_client.query(sql)
+    for answer in (second, third):
+        assert sorted((r.price, r.quantity) for r in answer) == sorted(
+            (r.price, r.quantity) for r in first), "an answer asked again differs from the first"
+    assert moves("ob_decoded_columns_hits_total", hits), (
+        "the same query asked a third time read no column from memory")
 
 
 def test_status_reports_no_refused_segment_merges(primary_client: OrderbookEngine):

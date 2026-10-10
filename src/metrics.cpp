@@ -120,6 +120,10 @@ MetricsRegistry::MetricsRegistry() {
                                      "Columns queries read from a segment's file and decoded"));
     counters_.push_back(make_counter("ob_decoded_columns_evictions_total",
                                      "Segments whose held columns were evicted to make room"));
+    // #223: a segment's first read holds nothing, so a hit or a miss is a column of a segment read
+    // before, and this counts the segments queries read for the first time.
+    counters_.push_back(make_counter("ob_decoded_columns_first_reads_total",
+                                     "Segments queries read for the first time, holding none of their columns"));
     counters_.push_back(make_counter("ob_backup_failures_total",
                                      "Backups that failed, and left nothing that looks like one"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out

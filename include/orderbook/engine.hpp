@@ -1394,11 +1394,12 @@ private:
     /// to publish to — `liborderbook_hlc` links nothing, deliberately (#120).
     uint64_t published_drift_excursions_{0};
 
-    /// The decoded columns' hits, misses and evictions already published (#220), by the same shape:
-    /// the store keeps the totals, and a new budget starts them again from zero.
+    /// The decoded columns' hits, misses, evictions and first reads already published (#220, #223),
+    /// by the same shape: the store keeps the totals, and a new budget starts them again from zero.
     uint64_t published_decoded_hits_{0};
     uint64_t published_decoded_misses_{0};
     uint64_t published_decoded_evictions_{0};
+    uint64_t published_decoded_first_reads_{0};
     /// The decoded columns' counters and gauges, from the store's totals; after every flush tick.
     void publish_decoded_columns();
 
