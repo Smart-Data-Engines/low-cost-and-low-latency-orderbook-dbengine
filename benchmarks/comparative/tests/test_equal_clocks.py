@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+import orderbook_engine
 from benchmarks.comparative.systems import clickhouse, kdb, orderbook, timescaledb
 
 ANSWER = [(1_700_000_000_000_000_000, 100_241, 7), (1_700_000_000_001_000_000, 100_242, 9)]
@@ -65,6 +66,15 @@ class FakeSocket:
 
 
 class FakeEngine:
+    """The engine's Python client, answering a query with the reply its server sends, read by the
+    client's own `query_rows()` parse."""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+
+    def query_rows(self, sql: str) -> orderbook_engine.QueryRows:
+        return orderbook_engine._parse_query_rows(self.reply)
+
     def close(self) -> None:
         pass
 
@@ -119,10 +129,9 @@ class FakePsycopg:
 def the_engine(clock, tmp_path, monkeypatch):
     system = orderbook.OrderbookSystem(tmp_path / "ob_tcp_server", 1, tmp_path)
     monkeypatch.setattr(system, "_ensure_running", lambda: None)
-    system._engine = FakeEngine()
-    payload = ("OK\ntimestamp_ns\tprice\tquantity\n" + tsv(ANSWER) + "\n").encode()
-    monkeypatch.setattr(system, "_raw_socket", lambda: FakeSocket(payload))
-    monkeypatch.setattr(orderbook, "int", clock.counting_int, raising=False)
+    system._engine = FakeEngine("OK\ntimestamp_ns\tprice\tquantity\n" + tsv(ANSWER) + "\n")
+    # The client converts the answer, so `int` is counted in its module (#229).
+    monkeypatch.setattr(orderbook_engine, "int", clock.counting_int, raising=False)
     return system
 
 
@@ -213,21 +222,15 @@ def test_the_runner_reports_a_system_without_its_client_instead_of_timing_it():
     assert "continue" in body, "a system whose client is missing is still timed"
 
 
-def test_the_engine_adapter_reads_its_columns_by_name_and_refuses_a_ragged_reply(tmp_path,
-                                                                                 monkeypatch):
-    # The parse splits the whole body at once, so the header is what says which value is which,
-    # and a reply whose values do not make whole rows is refused rather than cut short by `zip`.
+def test_the_engine_adapter_reads_its_columns_by_the_names_the_client_reads(tmp_path):
+    # The client answers the columns in the order the server sent them, and the adapter picks the
+    # three it compares by name - so a header in another order is read right and one without them
+    # is refused rather than read by position. The client's own refusals are its tests' (#229).
     system = orderbook.OrderbookSystem(tmp_path / "ob_tcp_server", 1, tmp_path)
-    reordered = ("OK\nprice\ttimestamp_ns\tquantity\n"
-                 + "".join(f"{p}\t{t}\t{q}\n" for t, p, q in ANSWER) + "\n").encode()
-    monkeypatch.setattr(system, "_reply", lambda query: reordered)
+    system._engine = FakeEngine("OK\nprice\ttimestamp_ns\tquantity\n"
+                                + "".join(f"{p}\t{t}\t{q}\n" for t, p, q in ANSWER) + "\n")
     assert system._raw_rows("SELECT") == ANSWER
-    ragged = b"OK\ntimestamp_ns\tprice\tquantity\n1\t2\t3\n4\t5\n\n"
-    monkeypatch.setattr(system, "_reply", lambda query: ragged)
-    with pytest.raises(RuntimeError, match="do not make rows"):
-        system._raw_rows("SELECT")
-    refused = b"ERR unknown symbol\n\n"
-    monkeypatch.setattr(system, "_reply", lambda query: refused)
-    with pytest.raises(RuntimeError, match="ERR unknown symbol"):
+    system._engine = FakeEngine("OK\ntimestamp_ns\tprice\n" + tsv([row[:2] for row in ANSWER]) + "\n")
+    with pytest.raises(RuntimeError, match="does not name the columns"):
         system._raw_rows("SELECT")
     system.teardown()

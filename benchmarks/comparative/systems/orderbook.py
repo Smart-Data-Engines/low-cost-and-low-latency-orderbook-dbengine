@@ -99,15 +99,14 @@ class OrderbookSystem:
             f"during a bulk load",
             "one MINSERT per update rather than one INSERT per level: a round trip per book change "
             "instead of per price level, which is what the wire protocol is shaped for",
-            "the timed query is read from the socket and parsed into tuples rather than through "
-            "`OrderbookEngine.query()`: measured on 4000 rows, the client's row objects cost p50 "
-            "15.5 ms against 5.3 ms for the same bytes parsed as tuples, and no other adapter here "
-            "pays that - it is a real cost to a Python user and not a property of the engine",
-            "the reply parsed with `split()`, `map(int)` and `zip`: the fastest of three pure-Python "
-            "parses measured on an Amazon EC2 m8a.xlarge with this harness's dataset on 9 October "
-            "2026 - 0.64 ms for 4000 rows, against 0.72 for a loop reading fixed indices and 1.48 "
-            "for the loop this adapter had until #226, when the competitors' clients were chosen "
-            "the same way",
+            "the timed query is read by the client's `query_rows()`, which answers tuples, rather "
+            "than by `query()`, which builds a row object a row and takes `SELECT *` only: measured "
+            "on an Amazon EC2 m8a.xlarge, 4000 rows of `SELECT *` in 1.17 ms against 2.66 (#229)",
+            "`query_rows()` converts the answer with `split()`, `map(int)` and `zip`: the fastest of "
+            "three pure-Python parses measured on that machine with this harness's dataset on "
+            "9 October 2026 - 0.64 ms for 4000 rows, against 0.72 for a loop reading fixed indices "
+            "and 1.48 for the loop this adapter had until #226, when the competitors' clients were "
+            "chosen the same way",
         ] + ([f"{' '.join(self._extra_args)}: set for this measurement"] if self._extra_args else [])
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -132,17 +131,17 @@ class OrderbookSystem:
                 time.sleep(0.3)
         raise RuntimeError(f"{self.name} did not come up on port {self._port}")
 
-    # ── The wire, without the client's row objects ───────────────────────────
+    # ── The wire, read and not parsed ────────────────────────────────────────
     #
-    # Measured, 4000 rows of one symbol on this machine: `OrderbookEngine.query()` p50 **15.5 ms**,
-    # the same rows read from the socket and parsed into tuples p50 **5.3 ms**. Two thirds of what
-    # the first comparative run reported as our query time was the Python client constructing 4000
-    # `OrderbookRow` dataclasses - work no other adapter in this harness pays, because each of them
-    # parses text into tuples. So the table was charging us for our client's convenience and calling
-    # it engine speed: 18.2 ms against ClickHouse's 6.3, where the comparable figure is 5.3.
+    # The timed query goes through the client's `query_rows()` (#229). This socket of its own is for
+    # `reply_seconds()`, which reads the same answer and parses nothing, to say how much of the
+    # query's figure is the engine and the wire and how much the client.
     #
-    # The cost is real for a Python user and it is reported rather than hidden - `tuning_applied()`
-    # carries both numbers, and they are in the published notes column.
+    # It used to carry the query itself. Measured on the workstation this harness was written on,
+    # 4000 rows of one symbol: `OrderbookEngine.query()` p50 **15.5 ms**, the same rows read from a
+    # socket and parsed into tuples p50 **5.3 ms** - two thirds of what the first comparative run
+    # reported as our query time was the client building `OrderbookRow`s. The client has a method
+    # that answers tuples now, and it is the one the query is timed through.
 
     def _raw_socket(self) -> socket.socket:
         if self._raw is None:
@@ -166,38 +165,26 @@ class OrderbookSystem:
         return buf
 
     def _raw_rows(self, query: str) -> list[tuple]:
-        """Send one query, read to the blank line that ends an `OK` response, return tuples.
+        """The query's rows as the engine's own Python client reads them, through `query_rows()`.
 
-        The column indices come from the header the server sends rather than from constants: a
-        protocol that grows a column - as it did in #65, which added `sequence_number` - must make
-        this fail rather than silently read the wrong field.
+        The client reads the header's names and converts the whole answer at once - split, `map(int)`
+        and `zip`, each loop in C (#229). That is the fastest of three pure-Python parses measured on
+        an Amazon EC2 m8a.xlarge, 9 October 2026, over this harness's 4000 rows: 0.64 ms, against
+        0.72 for a loop reading fixed indices and 1.48 for the loop building each tuple from a
+        generator, which is what this adapter did itself until #226 - while the competitors were
+        asked through their slowest clients. The columns compared are picked by the header's names,
+        so a protocol that grows a column fails here rather than being read wrong.
         """
-        status, _, rest = self._reply(query).partition(b"\n")
-        if status != b"OK":
-            raise RuntimeError(f"the server refused the query: "
-                               f"{status.decode(errors='replace') or '(nothing)'}")
-        header, _, body = rest.partition(b"\n")
-        columns = header.decode().split("\t")
+        assert self._engine is not None
+        answer = self._engine.query_rows(query)
         try:
-            want = [columns.index(name) for name in ("timestamp_ns", "price", "quantity")]
+            want = [answer.columns.index(name) for name in ("timestamp_ns", "price", "quantity")]
         except ValueError as exc:
             raise RuntimeError(f"the response header does not name the columns this adapter reads "
-                               f"({columns}): {exc}") from exc
-        # Every column a row can carry is an integer, so the body is integers between whitespace:
-        # split once, convert with `map(int)` and cut into rows with `zip`, each loop in C. The
-        # fastest of three pure-Python parses measured on an Amazon EC2 m8a.xlarge, 9 October 2026,
-        # over this harness's 4000 rows: 0.64 ms, against 0.72 for a loop over the lines reading
-        # fixed indices and 1.48 for the loop building each tuple from a generator, which is what
-        # this was until #226 - while the competitors were asked through their slowest clients.
-        values = list(map(int, body.split()))
-        if len(values) % len(columns):
-            raise RuntimeError(f"the reply's {len(values)} values do not make rows of "
-                               f"{len(columns)} columns")
-        cells = iter(values)
-        rows = list(zip(*[cells] * len(columns)))
-        if want != list(range(len(columns))):
-            rows = [tuple(row[i] for i in want) for row in rows]
-        return rows
+                               f"({list(answer.columns)}): {exc}") from exc
+        if want == list(range(len(answer.columns))):
+            return answer.rows
+        return [tuple(row[i] for i in want) for row in answer.rows]
 
     def server_pid(self) -> int | None:
         """The engine's process while it runs: started here, so its CPU is read by pid rather than
