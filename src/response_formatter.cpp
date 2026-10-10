@@ -261,7 +261,18 @@ void QueryResponseBuilder::start(const QueryResult& first) {
     }
     out_ += '\n';
     all_seven_ = columns == all_query_columns();
-    if (!all_seven_ && !columns.empty()) narrow_row_.resize(max_row_bytes(columns));
+    rows_      = true;
+    used_      = out_.size();
+    row_bytes_ = all_seven_ ? kMaxQueryRowBytes : max_row_bytes(columns);
+    room_for_a_row();
+}
+
+// The rows are written where the reply ends, so the reply has to be longer than its rows ahead of
+// them. Grown by doubling, as an appended string grows: the bytes past `used_` are zeros nobody
+// reads, and finish() cuts them off.
+void QueryResponseBuilder::room_for_a_row() {
+    if (out_.size() - used_ >= row_bytes_) return;
+    out_.resize(std::max(out_.size() * 2, used_ + row_bytes_));
 }
 
 void QueryResponseBuilder::add(const QueryResult& r) {
@@ -272,11 +283,13 @@ void QueryResponseBuilder::add(const QueryResult& r) {
     }
     if (aggregate_) return;   // the one aggregate result is the whole answer
     if (all_seven_) {
-        // The canonical seven unrolled into a fixed local array, as format_query_response() writes
-        // them, and for the reasons given there.
-        char line[kMaxQueryRowBytes];
-        char* p = put_seven(line, line + sizeof(line), r);
-        out_.append(line, static_cast<size_t>(p - line));
+        // The canonical seven unrolled, as format_query_response() writes them and for the reasons
+        // given there - but into the reply itself rather than into a local array appended after.
+        // The append was a call to `memcpy` a row, and answering the comparative benchmark's
+        // time-range query 31% of the server's samples were in it (#227).
+        room_for_a_row();
+        char* const reply = out_.data();
+        used_ = static_cast<size_t>(put_seven(reply + used_, reply + out_.size(), r) - reply);
     } else if (!shape_.columns.empty()) {
         add_narrow(r);
     }
@@ -285,14 +298,16 @@ void QueryResponseBuilder::add(const QueryResult& r) {
 // Out of line for the reason format_narrow_rows() is: inlined beside the seven-column path, it would
 // take `to_chars` out of that path's inlining.
 [[gnu::noinline]] void QueryResponseBuilder::add_narrow(const QueryResult& r) {
+    room_for_a_row();
     const auto& columns = shape_.columns;
-    char* const buf_end = narrow_row_.data() + narrow_row_.size();
-    char* p = narrow_row_.data();
+    char* const reply = out_.data();
+    char* const end   = reply + out_.size();
+    char* p = reply + used_;
     const size_t last = columns.size() - 1;
     for (size_t i = 0; i < columns.size(); ++i) {
-        p = put_column(p, buf_end, r, columns[i], i == last ? '\n' : '\t');
+        p = put_column(p, end, r, columns[i], i == last ? '\n' : '\t');
     }
-    out_.append(narrow_row_.data(), static_cast<size_t>(p - narrow_row_.data()));
+    used_ = static_cast<size_t>(p - reply);
 }
 
 std::string QueryResponseBuilder::finish() {
@@ -300,6 +315,7 @@ std::string QueryResponseBuilder::finish() {
     // A bucket query with no bucket answers its header and nothing else (#44, requirement 2.2).
     if (!started_ && shape_.is_buckets) start_buckets();
     if (!started_) return format_query_response({}, shape_.columns);
+    if (rows_) out_.resize(used_);   // the room ahead of a row nobody wrote
     out_ += '\n';   // empty line terminator
     return std::move(out_);
 }

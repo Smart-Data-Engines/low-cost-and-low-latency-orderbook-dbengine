@@ -104,6 +104,33 @@ TEST(QueryResponseBuilder, EveryFieldAtItsTypesLimit) {
     EXPECT_EQ(built(rows, twice), ob::format_query_response(rows, twice));
 }
 
+// #227 writes the rows into the reply itself, which is sized ahead of them and cut to them at the
+// end. Replies many times the size the reply starts at, of rows as wide as a row can be and as
+// narrow, grow over and over - and must still be format_query_response()'s bytes, with nothing of
+// the room ahead of the rows answered.
+TEST(QueryResponseBuilder, AReplyGrownManyTimesOverIsTheSameBytes) {
+    std::vector<ob::QueryResult> rows;
+    for (uint64_t i = 0; i < 20'000; ++i) {
+        rows.push_back(i % 2 ? a_row(UINT64_MAX - i, INT64_MIN + static_cast<int64_t>(i), UINT64_MAX,
+                                     UINT32_MAX, UINT8_MAX, UINT16_MAX, UINT64_MAX - i)
+                             : a_row(i, static_cast<int64_t>(i), i, 0, 0, 0, i));
+    }
+    for (const auto& columns : std::vector<std::vector<ob::QueryColumn>>{
+             ob::all_query_columns(),
+             {ob::QueryColumn::TimestampNs, ob::QueryColumn::Price, ob::QueryColumn::Quantity},
+             std::vector<ob::QueryColumn>(20, ob::QueryColumn::SequenceNumber)}) {
+        for (size_t n : {size_t{1}, size_t{97}, size_t{2'000}, rows.size()}) {
+            const std::vector<ob::QueryResult> some(rows.begin(),
+                                                    rows.begin() + static_cast<std::ptrdiff_t>(n));
+            const std::string reply = built(some, columns);
+            EXPECT_EQ(reply, ob::format_query_response(some, columns))
+                << n << " rows of " << columns.size() << " columns";
+            EXPECT_EQ(reply.find('\0'), std::string::npos)
+                << "a byte of the room ahead of the rows was answered";
+        }
+    }
+}
+
 // An aggregate query hands over one result with its aggregates set and its row fields zero; the
 // reply is the aggregates', as the server answered when it looked at the first row it collected.
 TEST(QueryResponseBuilder, AFirstResultWithAggregatesIsAnsweredAsAggregates) {

@@ -2674,6 +2674,38 @@ files on the disk first or for the gauge to reach the inputs it expects.
 
 - Effort: S | Impact: a required check failed at random on pull requests that changed nothing it tests
 
+### 227. A row scan's reply was formatted a row at a time into a buffer of its own and copied after it ✅ **P3**
+
+**Found profiling the comparative benchmark's time-range query** after #220
+(`evidence/2026-10-10-comparative-equal-clocks/probe/`, m8a.xlarge): answering SYM0000's 4000 rows of
+three columns, 31% of the server's samples were in `memmove`, on its path for copies of 16 to 64
+bytes. `QueryResponseBuilder` formatted each row into a buffer of its own and appended it to the
+reply, which is a call to `memcpy` a row.
+
+Now a row scan's reply is sized ahead of its rows, each row's digits are written where the reply
+ends, and `finish()` cuts the reply to what was written. The bytes are `format_query_response()`'s,
+which a property test holds it to, and a reply grown many times over, of rows as wide and as narrow
+as a row can be, is tested against it byte for byte.
+
+Measured (`evidence/2026-10-10-rows-in-place/`): master and the branch in Release, the comparative
+benchmark's dataset, the reply read and not parsed, five rounds alternating behind a quiet gate and
+3000 asks a query a round. Medians of the rounds' p50 and of the server's CPU an ask:
+
+| query | m8a.xlarge, wall | its CPU | m9g.xlarge, wall | its CPU |
+|---|---|---|---|---|
+| three columns | 0.183 → 0.171 ms | 147 → 133 µs | 0.385 → 0.386 ms | 190 → 193 µs |
+| `SELECT *` | 0.221 → 0.206 ms | 160 → 147 µs | 0.452 → 0.446 ms | 223 → 217 µs |
+
+On the m8a.xlarge every round was faster, both ways. On the m9g.xlarge `SELECT *` was faster every
+round, and the three columns were 0.4% slower in four rounds of five; its profile was not taken. Both
+hosts answered the same bytes either way.
+
+Mutations, verdicts written before (`plan-mutations.md` there): the reply not cut, room for one byte
+rather than a row, the written length not moved past a narrow row, the room test inverted and the
+reply never marked as rows all died, each to the growth test, the property and four more; growing
+by three rather than two and a byte more room a row survived.
+
+- Effort: S | Impact: the copy took 8 - 10% of the CPU an x86 server spends on a row answer
 ### 225. A filtered read checked every row's conditions one at a time through their optional ends, 96% of a repeated bucket query ✅ **P3**
 
 **Found profiling repeated queries after #220 and #47 step 2**

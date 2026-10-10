@@ -151,16 +151,22 @@ public:
 private:
     void start(const QueryResult& first);
     void start_buckets();
+    void room_for_a_row();
     void add_narrow(const QueryResult& r);
     void add_bucket(const QueryResult& r);
 
     const QueryShape&     shape_;
     std::string           out_;
-    std::vector<char>     narrow_row_;   // a narrowed row's buffer, sized from the columns
     std::vector<AggValue> aggregates_;
+    /// A row scan's reply is written in place (#227): `out_` is sized ahead of the rows and
+    /// `used_` is how much of it the reply is, so a row's digits go straight into the reply rather
+    /// than into a buffer copied after them. finish() cuts `out_` to `used_`.
+    size_t used_      = 0;
+    size_t row_bytes_ = 0;      ///< the widest row this shape can write, its separators included
     bool started_   = false;
     bool aggregate_ = false;
     bool all_seven_ = false;
+    bool rows_      = false;   ///< a row scan's reply, written in place
     bool buckets_   = false;   ///< a GROUP BY answer (#44), told by the shape, not by a row
 };
 
