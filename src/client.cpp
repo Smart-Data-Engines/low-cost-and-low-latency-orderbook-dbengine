@@ -667,7 +667,8 @@ Result<NamedRows> OrderbookClient::parse_named_response(std::string_view resp) {
     if (!resp.starts_with("OK\n")) return Res::err(OB_ERR_PARSE, "unexpected response");
     resp.remove_prefix(3);
     if (resp.size() >= 2 && resp.substr(resp.size() - 2) == "\n\n") resp.remove_suffix(2);
-    if (resp.empty()) return Res::ok(NamedRows{});
+    // A bare `OK` and its blank line leaves one line end, which is no header rather than an empty one.
+    if (resp.empty() || resp == "\n") return Res::ok(NamedRows{});
 
     const size_t header_end = resp.find('\n');
     const std::string_view header = resp.substr(0, header_end);
