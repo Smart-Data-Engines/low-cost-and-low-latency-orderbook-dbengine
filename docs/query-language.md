@@ -77,6 +77,12 @@ SELECT * FROM 'BTC-USD'.'BINANCE'
 the price are, with the same rules (#200): `side = 0 AND level = 0` is the top of the bids, and a
 value past the column's type - `side = 256`, `level = 65536` - does not parse rather than wrap.
 
+The price, side and level conditions narrow what is read, not only what is answered (#47 step 2). A
+segment records the range of its prices and the (side, level) pairs it holds a row of, and a segment
+those prove no row of meets the conditions is not opened. A row that fails them is not built. A
+segment written before these were recorded is read, whatever the conditions say. None of this
+changes an answer.
+
 Before #199 in the roadmap every comparison set one end of the range and nothing else: `=` meant
 `>=`, `>` and `<` kept the value they exclude, and a second condition on a column replaced the
 first instead of narrowing it - all of it answered `OK`. A subscription's conditions are read the
@@ -89,6 +95,9 @@ SELECT * FROM 'BTC-USD'.'BINANCE'
   WHERE timestamp BETWEEN 0 AND 9999999999999999999
   LIMIT 100
 ```
+
+The answer is the first `n` rows the read delivers, and the read ends there: a segment after the
+`n`th row is not opened (#47 step 2). `LIMIT 0` reads nothing.
 
 ### Which columns come back
 

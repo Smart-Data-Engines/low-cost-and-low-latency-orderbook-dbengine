@@ -335,6 +335,11 @@ ob_add_query_test(test_series_of_the_book
     test_series_of_the_book.cpp
 )
 
+# ── #47 step 2: a query's conditions narrow the read - segments left unread, rows unbuilt ─
+ob_add_query_test(test_scan_pushdown
+    test_scan_pushdown.cpp
+)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

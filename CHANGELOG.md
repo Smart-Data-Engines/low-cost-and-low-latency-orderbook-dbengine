@@ -45,6 +45,14 @@ The first release. What it contains, by area:
   them: `OPEN`, `HIGH`, `LOW`, `CLOSE` and the time-weighted `TWAP` of the best bid, the best ask, the
   mid and the spread, every bucket of the range answered (#44, step 2).
 - `BOOK` for the live book over the wire, and `SUBSCRIBE` for rows pushed as they are written.
+- Conditions that narrow the read as well as the answer (#47 step 2):
+  - a segment records the range of its prices in `meta.json`;
+  - a segment whose range or level set proves no row of it meets a query's price, side and level
+    conditions is not opened;
+  - a row that fails them is not built;
+  - `LIMIT n` ends the read at its `n`th row.
+
+  `SELECT`, time buckets and the series of the book read through it.
 - Format 3's decoded columns held between queries, within `--decoded-cache-mb` (256 MiB by
   default; 0 holds none): a query reading a column held reads neither its file nor its checksum and
   decodes nothing. A segment read once is the first to make room, and a merge, retention, a drop or a

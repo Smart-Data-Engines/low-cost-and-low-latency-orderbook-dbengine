@@ -498,6 +498,10 @@ std::string ColumnarStore::meta_json(const SegmentMeta& meta,
         f << ",\"bid_levels\":\"" << LevelSet::to_hex(meta.levels->bid, trimmed) << "\""
           << ",\"ask_levels\":\"" << LevelSet::to_hex(meta.levels->ask, trimmed) << "\"";
     }
+    // #47 step 2's, likewise: absent is unknown, and a scan with a price condition reads it.
+    if (meta.has_price_range) {
+        f << ",\"min_price\":" << meta.min_price << ",\"max_price\":" << meta.max_price;
+    }
     if (inputs != nullptr && !inputs->empty()) {
         f << ",\"compacted_from\":[";
         for (size_t i = 0; i < inputs->size(); ++i) {
@@ -546,6 +550,29 @@ bool ColumnarStore::parse_meta_json(const std::string& path, SegmentMeta& out,
     };
     auto extract_uint64 = [&](const std::string& key) -> uint64_t {
         return find_uint64(key).value_or(0);
+    };
+
+    // A signed one, which a price is: nothing when absent or not a number, so that a key cut short
+    // reads as unknown rather than as zero (#47 step 2).
+    auto find_int64 = [&](const std::string& key) -> std::optional<int64_t> {
+        const std::string search = "\"" + key + "\":";
+        auto pos = content.find(search);
+        if (pos == std::string::npos) return std::nullopt;
+        pos += search.size();
+        const bool negative = pos < content.size() && content[pos] == '-';
+        if (negative) ++pos;
+        uint64_t magnitude = 0;
+        size_t digits = 0;
+        while (pos < content.size() && content[pos] >= '0' && content[pos] <= '9') {
+            const uint64_t d = static_cast<uint64_t>(content[pos] - '0');
+            if (magnitude > (UINT64_MAX - d) / 10) return std::nullopt;
+            magnitude = magnitude * 10 + d;
+            ++pos;
+            ++digits;
+        }
+        const uint64_t limit = negative ? static_cast<uint64_t>(INT64_MAX) + 1 : static_cast<uint64_t>(INT64_MAX);
+        if (digits == 0 || magnitude > limit) return std::nullopt;
+        return negative ? static_cast<int64_t>(0 - magnitude) : static_cast<int64_t>(magnitude);
     };
 
     auto extract_bool = [&](const std::string& key) -> bool {
@@ -611,6 +638,16 @@ bool ColumnarStore::parse_meta_json(const std::string& path, SegmentMeta& out,
         } else {
             out.levels = nullptr;
         }
+    }
+    // Absent before #47 step 2, and then unknown: a scan with a price condition reads the segment.
+    // A range that does not parse, or whose ends are the wrong way round, is unknown too - never a
+    // range that would leave the segment unread.
+    {
+        const auto lo = find_int64("min_price");
+        const auto hi = find_int64("max_price");
+        out.has_price_range = lo.has_value() && hi.has_value() && *lo <= *hi;
+        out.min_price = out.has_price_range ? *lo : 0;
+        out.max_price = out.has_price_range ? *hi : 0;
     }
     if (inputs != nullptr) {
         inputs->clear();
@@ -1360,6 +1397,16 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
                                  "unknown, and the book at an instant reads it always",
                      dir.c_str());
     }
+    // And the range of its prices (#47 step 2), from the same rows: a seal's, a rollover's and a
+    // merge's all come through here.
+    if (!price_buf_.empty()) {
+        const auto [lo, hi] = std::minmax_element(price_buf_.begin(), price_buf_.end());
+        meta.has_price_range = true;
+        meta.min_price = *lo;
+        meta.max_price = *hi;
+        OB_LOG_DEBUG("columnar", "Segment %s holds prices [%lld, %lld]", dir.c_str(),
+                     static_cast<long long>(meta.min_price), static_cast<long long>(meta.max_price));
+    }
     meta.wal_identity    = wal_identity_;
     meta.wal_file_index  = wal_file_index_;
     meta.wal_byte_offset = wal_byte_offset_;
@@ -1825,9 +1872,70 @@ DecodedColumnsBudget::Stats ColumnarStore::decoded_columns_stats() const {
     return decoded_budget_ ? decoded_budget_->stats() : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0};
 }
 
+namespace {
+
+/// The columns one segment's rows are emitted from: spans over the pool's buffers or over held
+/// columns (#220), each the segment's rows long or empty when it was not read - a format-2 price,
+/// quantity or count cut short is padded with zeros, as it always was.
+struct RowColumns {
+    std::span<const uint64_t> ts;
+    std::span<const int64_t>  price;
+    std::span<const uint64_t> qty;
+    std::span<const uint32_t> cnt;
+    std::span<const uint8_t>  side;
+    std::span<const uint16_t> level;
+    std::span<const int64_t>  seq;
+};
+
+/// The rows of one segment within [start_ns, end_ns] that `filter` keeps, built field by field from
+/// what `columns` names and handed to `cb` in the segment's order; false once `cb` has said to stop
+/// (#47 step 2). A row the filter fails is counted into `filtered` and never built. The one loop
+/// both reads emit through, so a pooled read and a held one cannot answer differently.
+bool emit_rows(size_t n, const RowColumns& c, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
+               const RowFilter& filter, const std::function<bool(const SnapshotRow&)>& cb,
+               uint64_t& filtered) {
+    const bool want_price = columns.has(QueryColumn::Price);
+    const bool want_qty   = columns.has(QueryColumn::Quantity);
+    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
+    const bool want_side  = columns.has(QueryColumn::Side);
+    const bool want_level = columns.has(QueryColumn::Level);
+    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
+    const bool check = !filter.empty();
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t ts = (i < c.ts.size()) ? c.ts[i] : 0;
+        if (ts < start_ns || ts > end_ns) continue;
+        if (check) {
+            // The values the row would carry, so a condition sees what a check of the built row
+            // would have seen - a padded price included.
+            const int64_t  price = (i < c.price.size()) ? c.price[i] : 0;
+            const uint8_t  side  = (i < c.side.size()) ? c.side[i] : 0;
+            const uint16_t level = (i < c.level.size()) ? c.level[i] : 0;
+            if (!filter.keeps(price, side, level)) {
+                ++filtered;
+                continue;
+            }
+        }
+        // Value-initialised, so a field whose column was not read is zero rather than whatever
+        // the last row left there.
+        SnapshotRow row{};
+        row.timestamp_ns = ts;
+        if (want_seq)   row.sequence_number = static_cast<uint64_t>(c.seq[i]);
+        if (want_side)  row.side            = c.side[i];
+        if (want_level) row.level_index     = c.level[i];
+        if (want_price) row.price           = (i < c.price.size()) ? c.price[i] : 0;
+        if (want_qty)   row.quantity        = (i < c.qty.size())   ? c.qty[i]   : 0;
+        if (want_cnt)   row.order_count     = (i < c.cnt.size())   ? c.cnt[i]   : 0;
+        if (!cb(row)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
-        const std::function<void(const SnapshotRow&)>& cb, ReadMode mode) const {
+        const RowFilter& filter, const std::function<bool(const SnapshotRow&)>& cb, ReadMode mode,
+        uint64_t* filtered, bool* stopped) const {
     const bool want_price = columns.has(QueryColumn::Price);
     const bool want_qty   = columns.has(QueryColumn::Quantity);
     const bool want_cnt   = columns.has(QueryColumn::OrderCount);
@@ -1850,7 +1958,7 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         return SegmentRead::kUnreadable;
     }
     if (meta.format_version == kColumnarFormatV3 && mode == ReadMode::kQuery && meta.decoded) {
-        return read_held_columns(meta, columns, start_ns, end_ns, cb);
+        return read_held_columns(meta, columns, start_ns, end_ns, filter, cb, filtered, stopped);
     }
 
     // A set of buffers from the pool, holding an earlier read's columns. Every column this read uses
@@ -1973,30 +2081,19 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         }
     }
 
-    // Emit rows within time range
-    size_t n = meta.row_count;
-    for (size_t i = 0; i < n; ++i) {
-        uint64_t ts = (i < timestamps.size()) ? timestamps[i] : 0;
-        if (ts < start_ns || ts > end_ns) continue;
-
-        // Value-initialised, so a field whose column was not read is zero rather than
-        // whatever the last row left there.
-        SnapshotRow row{};
-        row.timestamp_ns = ts;
-        if (want_seq)   row.sequence_number = static_cast<uint64_t>(seqs[i]);
-        if (want_side)  row.side            = sides[i];
-        if (want_level) row.level_index     = levels[i];
-        if (want_price) row.price           = (i < prices.size()) ? prices[i] : 0;
-        if (want_qty)   row.quantity        = (i < qtys.size())   ? qtys[i]   : 0;
-        if (want_cnt)   row.order_count     = (i < counts.size()) ? counts[i] : 0;
-        cb(row);
-    }
+    uint64_t failed = 0;
+    const bool going = emit_rows(static_cast<size_t>(meta.row_count),
+                                 RowColumns{timestamps, prices, qtys, counts, sides, levels, seqs},
+                                 columns, start_ns, end_ns, filter, cb, failed);
+    if (filtered != nullptr) *filtered += failed;
+    if (stopped != nullptr) *stopped = !going;
     return SegmentRead::kRead;
 }
 
 ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
-        const std::function<void(const SnapshotRow&)>& cb) const {
+        const RowFilter& filter, const std::function<bool(const SnapshotRow&)>& cb,
+        uint64_t* filtered, bool* stopped) const {
     DecodedColumns& slot = *meta.decoded;
     const std::string& dir = meta.dir_path;
 
@@ -2035,39 +2132,21 @@ ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
         }
     }
 
-    // The rows within the range, as read_segment_rows() emits them, from the held columns - each
-    // exactly `row_count` long, as a format-3 block decodes or not at all.
+    // The rows within the range, through the loop read_segment_rows() emits through, from the held
+    // columns - each exactly `row_count` long, as a format-3 block decodes or not at all.
     const auto column = [&](size_t c, auto type) {
         using T = decltype(type);
         return held[c] ? held[c]->as<T>() : std::span<const T>{};
     };
-    const std::span<const uint64_t> timestamps = column(0, uint64_t{});
-    const std::span<const int64_t>  prices     = column(1, int64_t{});
-    const std::span<const uint64_t> qtys       = column(2, uint64_t{});
-    const std::span<const uint32_t> counts     = column(3, uint32_t{});
-    const std::span<const uint8_t>  sides      = column(4, uint8_t{});
-    const std::span<const uint16_t> levels     = column(5, uint16_t{});
-    const std::span<const int64_t>  seqs       = column(6, int64_t{});
-    const bool want_price = columns.has(QueryColumn::Price);
-    const bool want_qty   = columns.has(QueryColumn::Quantity);
-    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
-    const bool want_side  = columns.has(QueryColumn::Side);
-    const bool want_level = columns.has(QueryColumn::Level);
-    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
-    const size_t n = meta.row_count;
-    for (size_t i = 0; i < n; ++i) {
-        const uint64_t ts = (i < timestamps.size()) ? timestamps[i] : 0;
-        if (ts < start_ns || ts > end_ns) continue;
-        SnapshotRow row{};
-        row.timestamp_ns = ts;
-        if (want_seq)   row.sequence_number = static_cast<uint64_t>(seqs[i]);
-        if (want_side)  row.side            = sides[i];
-        if (want_level) row.level_index     = levels[i];
-        if (want_price) row.price           = prices[i];
-        if (want_qty)   row.quantity        = qtys[i];
-        if (want_cnt)   row.order_count     = counts[i];
-        cb(row);
-    }
+    uint64_t failed = 0;
+    const bool going = emit_rows(
+        static_cast<size_t>(meta.row_count),
+        RowColumns{column(0, uint64_t{}), column(1, int64_t{}), column(2, uint64_t{}),
+                   column(3, uint32_t{}), column(4, uint8_t{}), column(5, uint16_t{}),
+                   column(6, int64_t{})},
+        columns, start_ns, end_ns, filter, cb, failed);
+    if (filtered != nullptr) *filtered += failed;
+    if (stopped != nullptr) *stopped = !going;
     return SegmentRead::kRead;
 }
 
@@ -2075,18 +2154,65 @@ bool ColumnarStore::read_segment(const SegmentMeta& meta,
                                  const std::function<void(const SnapshotRow&)>& cb) const {
     // Nothing removes a segment a merge is reading - retention and the merge run on one thread -
     // so a missing file here is the corruption it is everywhere else.
-    return read_segment_rows(meta, ColumnSet::all(), 0, UINT64_MAX, cb, ReadMode::kMerge) ==
-           SegmentRead::kRead;
+    return read_segment_rows(meta, ColumnSet::all(), 0, UINT64_MAX, RowFilter{},
+                             [&](const SnapshotRow& row) {
+                                 cb(row);
+                                 return true;
+                             },
+                             ReadMode::kMerge) == SegmentRead::kRead;
 }
 
 ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                                              std::string_view symbol, std::string_view exchange,
                                              ColumnSet columns,
                                              std::function<void(const SnapshotRow&)> cb) const {
+    return scan(start_ns, end_ns, symbol, exchange, columns, RowFilter{},
+                [&cb](const SnapshotRow& row) {
+                    cb(row);
+                    return true;
+                });
+}
+
+bool ColumnarStore::cannot_hold(const SegmentMeta& meta, const RowFilter& filter, bool* by_price) {
+    if (by_price != nullptr) *by_price = false;
+    if (filter.has_price() && meta.has_price_range &&
+        ((filter.price_lo && meta.max_price < *filter.price_lo) ||
+         (filter.price_hi && meta.min_price > *filter.price_hi))) {
+        if (by_price != nullptr) *by_price = true;
+        return true;
+    }
+    if ((filter.has_side() || filter.has_level()) && meta.levels != nullptr) {
+        // A segment has a set only when every row of it is of a side and below `kLevels`
+        // (`LevelSet::from_columns()`), so the rectangle needs no more than that.
+        const unsigned side_lo = filter.side_lo.value_or(SIDE_BID);
+        const unsigned side_hi = std::min<unsigned>(filter.side_hi.value_or(SIDE_ASK), SIDE_ASK);
+        const size_t level_lo = filter.level_lo.value_or(0);
+        const size_t level_hi =
+            std::min<size_t>(filter.level_hi.value_or(LevelSet::kLevels - 1), LevelSet::kLevels - 1);
+        for (unsigned side = side_lo; side <= side_hi; ++side) {
+            for (size_t level = level_lo; level <= level_hi; ++level) {
+                if (meta.levels->has(static_cast<uint8_t>(side), static_cast<uint16_t>(level))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
+                                             std::string_view symbol, std::string_view exchange,
+                                             ColumnSet columns, const RowFilter& filter,
+                                             const std::function<bool(const SnapshotRow&)>& cb) const {
     // Whatever the caller asked to be handed, this filters on the row's timestamp, so it reads
     // that column. Adding it here rather than trusting the caller means a set built by hand
-    // cannot produce a scan that compares every row against a zero it never loaded.
+    // cannot produce a scan that compares every row against a zero it never loaded. The filter's
+    // columns likewise (#47 step 2): it is checked on them before a row is built.
     columns.add(QueryColumn::TimestampNs);
+    if (filter.has_price()) columns.add(QueryColumn::Price);
+    if (filter.has_side()) columns.add(QueryColumn::Side);
+    if (filter.has_level()) columns.add(QueryColumn::Level);
 
     // The segments that can hold a row of this range, copied under the shared lock so the files
     // are read without it. Only this symbol's, and only the window each width tier's sorted starts
@@ -2136,8 +2262,31 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                  static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates,
                  cost.blocks);
 
+    const auto summary = [&]() {
+        OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s: %zu segment(s) read, %zu left unread by price "
+                                 "and %zu by levels, %llu row(s) filtered before they were built%s",
+                     static_cast<int>(symbol.size()), symbol.data(),
+                     static_cast<int>(exchange.size()), exchange.data(), cost.segments_read,
+                     cost.skipped_by_price, cost.skipped_by_levels,
+                     static_cast<unsigned long long>(cost.rows_filtered),
+                     cost.stopped ? "; ended by its reader" : "");
+    };
+    const bool filtering = !filter.empty();
     for (const auto& meta : index_snapshot) {
-        read_segment_rows(meta, columns, start_ns, end_ns, cb, ReadMode::kQuery);
+        bool by_price = false;
+        if (filtering && cannot_hold(meta, filter, &by_price)) {
+            ++(by_price ? cost.skipped_by_price : cost.skipped_by_levels);
+            continue;
+        }
+        ++cost.segments_read;
+        bool stopped = false;
+        read_segment_rows(meta, columns, start_ns, end_ns, filter, cb, ReadMode::kQuery,
+                          &cost.rows_filtered, &stopped);
+        if (stopped) {
+            cost.stopped = true;
+            summary();
+            return cost;
+        }
     }
 
     const bool want_price = columns.has(QueryColumn::Price);
@@ -2154,6 +2303,10 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
     for (const auto& block : block_snapshot) {
         for (const SnapshotRow& r : block->rows) {
             if (r.timestamp_ns < start_ns || r.timestamp_ns > end_ns) continue;
+            if (filtering && !filter.keeps(r.price, r.side, r.level_index)) {
+                ++cost.rows_filtered;
+                continue;
+            }
             SnapshotRow row{};
             row.timestamp_ns = r.timestamp_ns;
             if (want_seq)   row.sequence_number = r.sequence_number;
@@ -2162,9 +2315,14 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
             if (want_price) row.price           = r.price;
             if (want_qty)   row.quantity        = r.quantity;
             if (want_cnt)   row.order_count     = r.order_count;
-            cb(row);
+            if (!cb(row)) {
+                cost.stopped = true;
+                summary();
+                return cost;
+            }
         }
     }
+    summary();
     return cost;
 }
 
@@ -2279,7 +2437,12 @@ ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_v
             }
         };
         if (c.segment != nullptr) {
-            read_segment_rows(*c.segment, ColumnSet::all(), 0, at, consider, ReadMode::kQuery);
+            read_segment_rows(*c.segment, ColumnSet::all(), 0, at, RowFilter{},
+                              [&](const SnapshotRow& r) {
+                                  consider(r);
+                                  return true;
+                              },
+                              ReadMode::kQuery);
             ++out.segments_read;
         } else {
             for (const SnapshotRow& r : c.block->rows) consider(r);
@@ -2313,9 +2476,12 @@ ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_v
 
 ColumnarStore::TimeOrderedCost ColumnarStore::scan_by_time(
         uint64_t start_ns, uint64_t end_ns, std::string_view symbol, std::string_view exchange,
-        ColumnSet columns, const std::function<bool(const SnapshotRow&)>& keep,
+        ColumnSet columns, const RowFilter& filter,
         const std::function<bool(const SnapshotRow&)>& cb) const {
     columns.add(QueryColumn::TimestampNs);
+    if (filter.has_price()) columns.add(QueryColumn::Price);
+    if (filter.has_side()) columns.add(QueryColumn::Side);
+    if (filter.has_level()) columns.add(QueryColumn::Level);
     TimeOrderedCost cost;
     // The candidates scan() would read, in the order it delivers them - that order is each one's
     // rank, which decides a tie on the timestamp - copied under the shared lock, the generation
@@ -2407,13 +2573,20 @@ ColumnarStore::TimeOrderedCost ColumnarStore::scan_by_time(
         return true;
     };
     const auto read_segment_run = [&](size_t i) {
+        // A segment the filter's proof leaves unread holds none of the rows asked for (#47 step 2);
+        // its rank is still its own, so the others' ties are decided as before.
+        if (!filter.empty() && cannot_hold(segments[i], filter)) {
+            ++cost.skipped;
+            return;
+        }
         auto run = std::make_unique<Run>();
         run->rank = i;
-        read_segment_rows(segments[i], columns, start_ns, end_ns,
+        read_segment_rows(segments[i], columns, start_ns, end_ns, filter,
                           [&](const SnapshotRow& row) {
-                              if (keep(row)) run->rows.push_back(row);
+                              run->rows.push_back(row);
+                              return true;
                           },
-                          ReadMode::kQuery);
+                          ReadMode::kQuery, &cost.rows_filtered);
         add_run(std::move(run));
     };
 
@@ -2431,6 +2604,10 @@ ColumnarStore::TimeOrderedCost ColumnarStore::scan_by_time(
         run->rank = segments.size() + b;
         for (const SnapshotRow& r : blocks[b]->rows) {
             if (r.timestamp_ns < start_ns || r.timestamp_ns > end_ns) continue;
+            if (!filter.keeps(r.price, r.side, r.level_index)) {
+                ++cost.rows_filtered;
+                continue;
+            }
             SnapshotRow row{};
             row.timestamp_ns = r.timestamp_ns;
             if (want_seq)   row.sequence_number = r.sequence_number;
@@ -2439,7 +2616,7 @@ ColumnarStore::TimeOrderedCost ColumnarStore::scan_by_time(
             if (want_price) row.price           = r.price;
             if (want_qty)   row.quantity        = r.quantity;
             if (want_cnt)   row.order_count     = r.order_count;
-            if (keep(row)) run->rows.push_back(row);
+            run->rows.push_back(row);
         }
         add_run(std::move(run));
     }
