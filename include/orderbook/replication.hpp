@@ -589,8 +589,14 @@ private:
     /// second account of a removal that has happened either way.
     void continue_catchup(ReplicaInfo& replica);
 
-    /// Hand the replica back to live streaming: the directive, then the records that waited.
-    void finish_catchup(ReplicaInfo& replica);
+    /// How a catch-up ended: at the end it was created with, or short of it - at a WAL file missing
+    /// from the middle of its range. Only the first tells the replica it holds the stream (#215).
+    enum class CatchupEnd { Reached, Stopped };
+
+    /// Hand the replica back to live streaming: `CAUGHT_UP` when the end was reached (#215), the
+    /// compression directive, then the records that waited - in that order, so the replica reads
+    /// `CAUGHT_UP` as plain text after the last record of the catch-up and before any live one.
+    void finish_catchup(ReplicaInfo& replica, CatchupEnd end);
 
     /// Queue a live message: into the send buffer, or behind an unfinished catch-up.
     ///
@@ -856,6 +862,12 @@ private:
     // Compression flag — set when primary sends COMPRESS LZ4 directive.
     bool compress_{false};
 
+    /// The primary of this connection said, in its `STREAM` answer, that it sends `CAUGHT_UP` when a
+    /// catch-up ends (#215). Without it this node cannot tell when it holds the stream, so it never
+    /// records joining and behaves as it did before #215. Set per connection by
+    /// `resolve_stream_identity()`, read on the replication thread only.
+    bool primary_reports_caught_up_{false};
+
     // Client-side buffered reader for efficient line parsing from primary.
     BufferedReader reader_;
 
@@ -918,6 +930,15 @@ private:
 
     /// Handle snapshot bootstrap: send SNAPSHOT_REQUEST, receive files, verify, load.
     void request_and_receive_snapshot();
+
+    /// `CAUGHT_UP <file> <offset>` from the primary (#215): the catch-up ended, so a node that was
+    /// joining holds the stream now and may stand for election again.
+    void note_caught_up(const char* line);
+
+    /// Give up a joining record because this connection's primary never says when a catch-up ends:
+    /// waiting for a `CAUGHT_UP` that will not come would keep this node out of elections for good,
+    /// which is worse than the behaviour before #215 that it falls back to.
+    void drop_joining_for_a_silent_primary();
 
     /// Move staged files into data directory and load columnar index. True when the store was
     /// replaced and the snapshot's WAL position saved.

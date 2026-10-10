@@ -382,6 +382,17 @@ void Engine::open() {
     // failover manager that promotes starts below.
     current_epoch_.store(wal_epoch, std::memory_order_relaxed);
 
+    // A node stopped while it joined is still joining (#215): it holds part of a stream, and
+    // nothing before a primary says the catch-up ended changes that. Said here, before the failover
+    // manager below can ask, because the first thing it may do is stand.
+    if (const auto joining = joining_stream()) {
+        registry_.set_gauge("ob_replica_joining", 1);
+        OB_LOG_INFO("engine",
+                    "this node was joining stream %" PRIu64 " (%s) when it stopped: it does not "
+                    "stand for election until it catches up with a primary (#215) - %s",
+                    joining->stream_id, joining->reason.c_str(), joining->path.c_str());
+    }
+
     // Mutual exclusivity gate: MM mode and Replication mode are mutually exclusive.
     // In MM mode, ONLY MultiMasterManager is created.
     // In non-MM mode, ONLY ReplicationManager/ReplicationClient are created.
@@ -1777,6 +1788,8 @@ Engine::Stats Engine::stats() {
         }
     }
 
+    const auto joining = joining_stream();
+
     std::unique_lock<std::mutex> lock(mtx_);
     Stats s{};
     s.pending_rows      = queued_rows();   // with what a flush tick is syncing (stage 5 of #151)
@@ -1820,6 +1833,16 @@ Engine::Stats Engine::stats() {
         s.bootstrapping          = st.bootstrapping;
         s.snapshot_bytes_received = st.snapshot_bytes_received;
         s.snapshot_bytes_total   = st.snapshot_bytes_total;
+    }
+
+    // Joining (#215): from the record itself, so STATUS says what the failover monitor reads. Read
+    // at the top of this function, before `mtx_`: a file is no work to do under the lock every
+    // writer takes.
+    if (joining) {
+        s.joining           = true;
+        s.joining_stream_id = joining->stream_id;
+        s.joining_since_ns  = joining->since_ns;
+        s.joining_reason    = joining->reason;
     }
 
     // Snapshot transfer active on primary.
@@ -2823,6 +2846,90 @@ std::optional<StreamPosition> Engine::step_down_for_handover() {
                           "stream ends at %u:%u and stays up until a successor is followed",
                 end.file_index, end.offset);
     return StreamPosition{wal_identity(), end.file_index, end.offset};
+}
+
+// ── Joining a stream (#215) ─────────────────────────────────────────────────
+
+std::optional<JoiningStream> Engine::joining_stream() {
+    const std::string path = joining_path();
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) {
+        if (errno == ENOENT) return std::nullopt;
+        // A record that exists and cannot be read is not evidence that this node holds the stream.
+        return JoiningStream{0, 0, "unreadable", path};
+    }
+    JoiningStream joining{};
+    joining.path = path;
+    bool named_stream = false;
+    char line[128];
+    char reason[32] = {};
+    while (std::fgets(line, sizeof(line), f)) {
+        uint64_t value = 0;
+        if (std::sscanf(line, "stream_id=%" SCNu64, &value) == 1) {
+            joining.stream_id = value;
+            named_stream = true;
+        } else if (std::sscanf(line, "since_ns=%" SCNu64, &value) == 1) {
+            joining.since_ns = value;
+        } else if (std::sscanf(line, "reason=%31s", reason) == 1) {
+            joining.reason = reason;
+        }
+    }
+    std::fclose(f);
+    // Half a record is still a record: a node that wrote one was giving up its store.
+    if (!named_stream || joining.reason.empty()) joining.reason = "unreadable";
+    return joining;
+}
+
+void Engine::begin_joining(uint64_t stream_id, const char* reason) {
+    const std::string path = joining_path();
+    char content[160];
+    const int len = std::snprintf(content, sizeof(content),
+                                  "stream_id=%" PRIu64 "\nsince_ns=%" PRIu64 "\nreason=%s\n",
+                                  stream_id, wall_clock_ns(), reason);
+    const int err = (len > 0 && static_cast<size_t>(len) < sizeof(content))
+                        ? write_file_atomically(path, std::string_view(content, static_cast<size_t>(len)))
+                        : EOVERFLOW;
+    if (err != 0) {
+        OB_LOG_ERROR("engine",
+                     "cannot record that this node is joining stream %" PRIu64 " (%s) in %s: %s - "
+                     "the store is kept, and replication will try again (#215)",
+                     stream_id, reason, path.c_str(), std::strerror(err));
+        throw std::runtime_error("cannot record the joining of stream " + std::to_string(stream_id) +
+                                 " in " + path + ": " + std::strerror(err));
+    }
+    registry_.set_gauge("ob_replica_joining", 1);
+    OB_LOG_INFO("engine",
+                "joining stream %" PRIu64 " (%s): this node holds no complete stream until the "
+                "primary says its catch-up has ended, and does not stand for election until then "
+                "(#215) - %s",
+                stream_id, reason, path.c_str());
+}
+
+void Engine::end_joining(uint64_t stream_id, const std::string& how) {
+    const std::string path = joining_path();
+    if (::unlink(path.c_str()) != 0) {
+        const int err = errno;
+        if (err == ENOENT) {
+            registry_.set_gauge("ob_replica_joining", 0);
+            return;
+        }
+        OB_LOG_WARN("engine",
+                    "cannot remove %s (%s): this node stays out of elections until the next end of "
+                    "a catch-up removes it, or an operator does (#215)",
+                    path.c_str(), std::strerror(err));
+        return;
+    }
+    if (const int err = sync_directory(base_dir_); err != 0) {
+        OB_LOG_WARN("engine",
+                    "removed %s but could not sync %s (%s): a power cut may bring the record back, "
+                    "and this node would wait for the next end of a catch-up before standing (#215)",
+                    path.c_str(), base_dir_.c_str(), std::strerror(err));
+    }
+    registry_.set_gauge("ob_replica_joining", 0);
+    OB_LOG_INFO("engine",
+                "no longer joining stream %" PRIu64 ": %s - this node may stand for election again "
+                "(#215)",
+                stream_id, how.c_str());
 }
 
 std::optional<StreamPosition> Engine::replicated_position() {

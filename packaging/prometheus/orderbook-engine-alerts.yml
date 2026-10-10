@@ -114,6 +114,20 @@ groups:
             A new primary was elected and fences the old one by epoch. Check that the old primary is
             a replica now, and why it lost the lease.
 
+      - alert: OrderbookNoPrimaryWhileJoining
+        expr: max by (instance) (ob_failover_abstaining) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: no primary, and this node will not stand while it joins"
+          description: >-
+            The leader key is vacant and this node does not stand for election: its store was
+            replaced to follow a stream and the catch-up has not ended, so it holds part of that
+            stream (#215). Bring back the node that holds it. To accept losing what this node has
+            not received, remove repl_joining.txt from its data directory - docs/operations.md,
+            "A replica that is joining does not stand".
+
   - name: orderbook-engine-mesh
     rules:
       - alert: OrderbookMeshPeerDown

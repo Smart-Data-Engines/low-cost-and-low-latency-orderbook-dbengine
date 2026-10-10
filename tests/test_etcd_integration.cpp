@@ -29,12 +29,14 @@
 #include <rapidcheck.h>
 #include <rapidcheck/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -1230,6 +1232,133 @@ TEST_F(EtcdTestFixture, APrimaryDemotedBeforeAnElectionFollowsTheWinner) {
     fm_b.stop();
     engine_a->close();
     engine_b->close();
+}
+
+/// The engine's role transitions, joining while the test says so (#215). The engine's own record is
+/// a file its replication client removes on `CAUGHT_UP`; a flag is what lets these tests decide when
+/// the node stops joining, independently of any stream.
+struct JoiningOnCue : ob::RoleTransitionHandler {
+    ob::Engine& engine;
+    std::atomic<bool> joining{true};
+    explicit JoiningOnCue(ob::Engine& e) : engine(e) {}
+    void promote_to_primary(const ob::EpochValue& epoch) override { engine.promote_to_primary(epoch); }
+    void demote_to_replica(const std::string& address) override { engine.demote_to_replica(address); }
+    std::pair<uint32_t, size_t> get_wal_position() const override { return engine.get_wal_position(); }
+    ob::EpochValue get_current_epoch() const override { return engine.get_current_epoch(); }
+    void truncate_and_rebootstrap(const ob::EpochValue& epoch, const std::string& address) override {
+        engine.truncate_and_rebootstrap(epoch, address);
+    }
+    std::optional<ob::StreamPosition> step_down_for_handover() override {
+        return engine.step_down_for_handover();
+    }
+    std::optional<ob::StreamPosition> replicated_position() override {
+        return engine.replicated_position();
+    }
+    std::optional<ob::JoiningStream> joining_stream() override {
+        if (!joining.load()) return std::nullopt;
+        return ob::JoiningStream{77, 1, "discard", engine.joining_path()};
+    }
+};
+
+/// The value of an unlabelled-by-us gauge in the registry's exposition, or -1 when absent. The
+/// exposition carries a label set (`name{node_role="..."} 1`), so the name alone finds nothing
+/// (pitfall 66).
+long gauge_value(ob::MetricsRegistry& registry, const std::string& name) {
+    const std::string text = registry.serialize();
+    size_t at = 0;
+    while ((at = text.find(name, at)) != std::string::npos) {
+        const size_t end = at + name.size();
+        if ((at == 0 || text[at - 1] == '\n') && end < text.size() &&
+            (text[end] == '{' || text[end] == ' ')) {
+            const size_t eol = text.find('\n', end);
+            const std::string line = text.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+            return std::strtol(line.substr(line.rfind(' ') + 1).c_str(), nullptr, 10);
+        }
+        at = end;
+    }
+    return -1;
+}
+
+TEST_F(EtcdTestFixture, AReplicaThatIsJoiningDoesNotStandUntilItHoldsTheStream) {
+    // #215, the decision itself: a primary lost while its replica joins leaves the cluster without
+    // one, rather than handing the role to the node that would make the returning one discard its
+    // writes. And when the node holds the stream, it stands as before.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    p.fm_a = std::make_unique<ob::FailoverManager>(make_failover_config("node_A", "127.0.0.1:19401"),
+                                                   *p.engine_a, p.engine_a->registry());
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+
+    JoiningOnCue joining_b(*p.engine_b);
+    // B's manager stops before the handler it calls goes out of scope, on every way out of this test
+    // - an ASSERT included. `HandoverPair` would stop it later, with the handler already gone.
+    struct StopB {
+        HandoverPair& pair;
+        ~StopB() { if (pair.fm_b) { pair.fm_b->stop(); pair.fm_b.reset(); } }
+    } stop_b{p};
+    p.fm_b = std::make_unique<ob::FailoverManager>(make_failover_config("node_B", "127.0.0.1:19402"),
+                                                   joining_b, p.engine_b->registry());
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+    EXPECT_EQ(gauge_value(p.engine_b->registry(), "ob_failover_abstaining"), 0)
+        << "a node with a leader to follow is not abstaining, whatever it holds";
+
+    // The primary goes. Without #215 B promotes once the election wait has passed - a lease TTL
+    // after the key went, about five seconds here (FullFailoverCycle). Watched for more than twice
+    // that, polling, so a promotion that came and went would be seen too.
+    p.fm_a->stop();
+    const auto watch_until = std::chrono::steady_clock::now() + std::chrono::seconds(2 * TEST_LEASE_TTL + 3);
+    bool ever_primary = false;
+    while (std::chrono::steady_clock::now() < watch_until) {
+        if (p.fm_b->role() == ob::NodeRole::PRIMARY) ever_primary = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_FALSE(ever_primary) << "a node joining a stream it does not hold took the primary role";
+    EXPECT_EQ(gauge_value(p.engine_b->registry(), "ob_failover_abstaining"), 1)
+        << "the leader key is vacant and B declines to stand: that is what the gauge is for";
+
+    // B holds the stream now: it stands at the next attempt, a tick away.
+    joining_b.joining.store(false);
+    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(TEST_LEASE_TTL)))
+        << "a node that stopped joining did not stand";
+    EXPECT_EQ(gauge_value(p.engine_b->registry(), "ob_failover_abstaining"), 0);
+
+}
+
+TEST_F(EtcdTestFixture, ANodeWithoutARoleThatIsJoiningDoesNotStandEither) {
+    // The other way in: no leader at all, as after a whole cluster restarts. `start()` and the
+    // STANDALONE branch both try the role, and both go through the same place.
+    HandoverPair p;
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_b->open();
+
+    JoiningOnCue joining_b(*p.engine_b);
+    // B's manager stops before the handler it calls goes out of scope, on every way out of this test
+    // - an ASSERT included. `HandoverPair` would stop it later, with the handler already gone.
+    struct StopB {
+        HandoverPair& pair;
+        ~StopB() { if (pair.fm_b) { pair.fm_b->stop(); pair.fm_b.reset(); } }
+    } stop_b{p};
+    p.fm_b = std::make_unique<ob::FailoverManager>(make_failover_config("node_B", "127.0.0.1:19412"),
+                                                   joining_b, p.engine_b->registry());
+    p.fm_b->start();
+
+    const auto watch_until = std::chrono::steady_clock::now() + std::chrono::seconds(TEST_LEASE_TTL + 2);
+    bool ever_primary = false;
+    while (std::chrono::steady_clock::now() < watch_until) {
+        if (p.fm_b->role() == ob::NodeRole::PRIMARY) ever_primary = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_FALSE(ever_primary) << "a joining node took a role nobody held";
+    EXPECT_EQ(gauge_value(p.engine_b->registry(), "ob_failover_abstaining"), 1);
+
+    joining_b.joining.store(false);
+    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(TEST_LEASE_TTL)));
 }
 
 TEST_F(EtcdTestFixture, SplitBrainRecovery) {

@@ -45,6 +45,13 @@ struct ServerStats {
     uint64_t repl_records_replayed{0};
     bool     repl_connected{false};
 
+    // Joining a stream (#215): the store was replaced to follow it, and the primary has not said
+    // the catch-up ended. Printed as one STATUS line while it lasts.
+    bool        joining{false};
+    uint64_t    joining_stream_id{0};
+    uint64_t    joining_since_ns{0};
+    std::string joining_reason;
+
     // Snapshot bootstrap state
     bool     bootstrapping{false};
     size_t   snapshot_bytes_received{0};

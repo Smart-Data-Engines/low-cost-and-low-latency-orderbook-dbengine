@@ -766,6 +766,10 @@ std::string execute_command(const Command& cmd,
         snap.repl_records_replayed = es.repl_records_replayed;
         snap.repl_connected        = es.repl_connected;
         snap.bootstrapping         = es.bootstrapping;
+        snap.joining               = es.joining;
+        snap.joining_stream_id     = es.joining_stream_id;
+        snap.joining_since_ns      = es.joining_since_ns;
+        snap.joining_reason        = es.joining_reason;
         snap.snapshot_bytes_received = es.snapshot_bytes_received;
         snap.snapshot_bytes_total  = es.snapshot_bytes_total;
         snap.snapshot_active       = es.snapshot_active;

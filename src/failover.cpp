@@ -832,6 +832,17 @@ void FailoverManager::monitor_tick() {
                 }
             }
 
+            // A leader is back, so an abstention while joining is over (#215): whoever it is, the
+            // cluster has a primary again, and this node follows it below.
+            if (leader_present) {
+                if (const uint64_t ticks = close_abstention()) {
+                    OB_LOG_INFO("failover",
+                                "a leader is back (%s) after %llu tick(s) in which this node, "
+                                "joining, did not stand (#215)",
+                                state.leader_node_id.c_str(), static_cast<unsigned long long>(ticks));
+                }
+            }
+
             // The key names us at a term this node handed over at (#204): a handover between its
             // step-down and its revoke, or one whose revoke failed. Its second intent says this
             // node takes no writes at that term, and a successor may stand on that the moment the
@@ -1104,6 +1115,40 @@ void FailoverManager::handle_lease_expiry() {
     attempt_promotion();
 }
 
+// ── abstain_while_joining() ─────────────────────────────────────────────────
+
+void FailoverManager::abstain_while_joining(const JoiningStream& joining) {
+    registry_.set_gauge("ob_failover_abstaining", 1);
+    const uint64_t now = wall_clock_ns();
+    const double joined_for_s =
+        now > joining.since_ns && joining.since_ns != 0
+            ? static_cast<double>(now - joining.since_ns) / 1e9
+            : 0.0;
+    if (joining_abstention_.begin()) {
+        // INFO and once, for the reason #115 gave the coordinator's refusal: an operator looking at
+        // a cluster with no primary asks first whether the engine decided that, and this is the
+        // decision. The way out is in the line, because it is the only thing that ends the episode
+        // when the node that holds the stream is not coming back.
+        OB_LOG_INFO("failover",
+                    "the leader key is vacant and this node is joining stream %llu (%s, for %.1f s): "
+                    "it holds part of that stream, so it does not stand for election (#215). No "
+                    "primary will come from this node until it catches up with one; to accept "
+                    "losing what it has not received, remove %s",
+                    static_cast<unsigned long long>(joining.stream_id), joining.reason.c_str(),
+                    joined_for_s, joining.path.c_str());
+    } else {
+        OB_LOG_DEBUG("failover", "still not standing: joining stream %llu (%llu tick(s))",
+                     static_cast<unsigned long long>(joining.stream_id),
+                     static_cast<unsigned long long>(joining_abstention_.ticks()));
+    }
+}
+
+uint64_t FailoverManager::close_abstention() {
+    const uint64_t ticks = joining_abstention_.end();
+    if (ticks > 0) registry_.set_gauge("ob_failover_abstaining", 0);
+    return ticks;
+}
+
 // ── attempt_promotion() ─────────────────────────────────────────────────────
 
 AbsentKeyAction decide_on_absent_key(NodeRole role_now, bool handing_over) {
@@ -1203,6 +1248,22 @@ bool FailoverManager::should_promote_now() {
 
 void FailoverManager::attempt_promotion(PromotionBasis basis) {
     if (!coordinator_) return;
+
+    // A node joining a stream it does not hold yet does not stand, whichever path asked (#215). The
+    // election, a handover naming this node, a node without a role and `start()` all come through
+    // here, and nothing else takes the leader key: `try_acquire_leadership()` has no other caller.
+    // Asked on every attempt rather than remembered, because the answer is a file an operator may
+    // remove to let this node stand anyway - and this runs at most once a tick, with the key vacant.
+    if (const auto joining = handler_.joining_stream()) {
+        abstain_while_joining(*joining);
+        return;
+    }
+    if (const uint64_t ticks = close_abstention()) {
+        OB_LOG_INFO("failover",
+                    "this node holds the stream again and stands for election, after %llu tick(s) "
+                    "of not standing while it joined (#215)",
+                    static_cast<unsigned long long>(ticks));
+    }
 
     // A node that has just handed the role away must not win the election it
     // announced. Without this, the outgoing primary races the intended successor
