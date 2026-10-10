@@ -1,11 +1,19 @@
-"""TimescaleDB on a native PostgreSQL, driven through one long-lived `psql` session.
+"""TimescaleDB on a native PostgreSQL: loaded through one long-lived `psql` session, asked its
+time-range query through psycopg.
 
 **Why a session rather than `psql -c` per query, measured:** a fresh `psql` costs 40-60 ms on this
 machine, and the queries here are single-digit milliseconds. Per-invocation would have charged
 TimescaleDB roughly ten times the work it was asked to do - the same defect the ClickHouse adapter
 started with, where `clickhouse-client` added 80 ms to a 5 ms query. So one process is started, fed
-statements on stdin, and each answer is terminated by a marker this adapter echoes itself. No
-driver, no dependency: a reader reproduces this with the server and a Python interpreter.
+statements on stdin, and each answer is terminated by a marker this adapter echoes itself.
+
+**Why psycopg for the time-range query, measured (#226):** that session was also how the query was
+asked, with `psql` formatting the rows as text and this adapter parsing them in Python - 2.22 ms to
+rows of Python ints, against **0.64 ms** through psycopg 3 with binary results and 0.81 with text
+ones, on an Amazon EC2 m8a.xlarge with this harness's dataset on 9 October 2026. The clock that
+made `psql` look adequate stopped before the parse (#226); the session stays for the DDL and for
+`\\copy`, which streams the CSV from the client. The price is a dependency: `client_available()`
+names it when it is missing, and TimescaleDB is then not measured rather than measured slower.
 
 **Why port 5433 and not 5432.** The cluster chose it: this workstation publishes the landing page's
 containerised PostgreSQL on 5432, so `pg_createcluster` took the next free port. That is worth
@@ -69,6 +77,7 @@ class TimescaleDbSystem:
         self._ddl = DDL.replace(f"chunk_time_interval => {CHUNK_INTERVAL_NS}",
                                 f"chunk_time_interval => {chunk_interval_ns}")
         self._session: subprocess.Popen | None = None
+        self._conn = None               # psycopg.Connection, for the time-range query
         self._prepared = False
         self._version = ""
 
@@ -149,6 +158,25 @@ class TimescaleDbSystem:
         self._version = f"TimescaleDB {extension[0]} on PostgreSQL {server[0]}"
         return True, ""
 
+    def client_available(self) -> tuple[bool, str]:
+        """The time-range query is asked through psycopg, TimescaleDB's fastest Python client
+        measured here (#226). Imported here and not at the top: the harness's tests run without
+        it."""
+        try:
+            import psycopg  # noqa: F401
+        except ImportError:
+            return False, ("psycopg is not installed, and the time-range query is timed through "
+                           "TimescaleDB's fastest Python client - see "
+                           "benchmarks/install_competitors.md")
+        return True, ""
+
+    def _driver(self):
+        if self._conn is None:
+            import psycopg
+            self._conn = psycopg.connect(f"port={self._port} dbname={self._database}",
+                                         autocommit=True)
+        return self._conn
+
     def version(self) -> str:
         """Both halves, read from the server: the extension's number is the one under test and the
         server's is what it runs on. Neither is a constant in this file."""
@@ -163,9 +191,11 @@ class TimescaleDbSystem:
             "AND name NOT LIKE 'log%' ORDER BY name")
         chunks = self._ask(f"SELECT count(*) FROM timescaledb_information.chunks "
                            f"WHERE hypertable_name = '{TABLE}'")
-        return ("endpoint: 127.0.0.1:%d/%s (one psql session)\n%s\nchunks after load: %s\n"
-                "non-default settings:\n%s" % (
-                    self._port, self._database, self._ddl.strip(),
+        import psycopg
+        return ("endpoint: port %d, database %s, over the Unix socket: one psql session for the "
+                "DDL and the load, psycopg %s with binary results for the time-range query\n%s\n"
+                "chunks after load: %s\nnon-default settings:\n%s" % (
+                    self._port, self._database, psycopg.__version__, self._ddl.strip(),
                     chunks[0] if chunks else "?", "\n".join(settings)))
 
     def tuning_applied(self) -> list[str]:
@@ -182,8 +212,13 @@ class TimescaleDbSystem:
             "and restored afterwards so the query workloads run under the server's own default",
             "timescaledb-tune applied to the cluster: shared_buffers, work_mem, max_worker_processes "
             "and the rest set by Timescale's own tool for this machine's cores and RAM",
-            "one long-lived psql session for every timed statement: measured, a fresh psql costs "
-            "40-60 ms, which is ten times the query it carries",
+            "one connection kept open for every timed statement - a psql session for the load, "
+            "psycopg for the query: measured, a fresh psql costs 40-60 ms, which is ten times the "
+            "query it carries",
+            "the time-range query through psycopg 3 with binary results, to rows of Python ints: "
+            "measured on an Amazon EC2 m8a.xlarge with this harness's dataset on 9 October 2026, "
+            "0.64 ms, against 0.81 with text results and 2.22 through psql with its output parsed "
+            "in Python, which is how this adapter asked it until #226",
         ]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -198,6 +233,9 @@ class TimescaleDbSystem:
 
     def teardown(self) -> None:
         """The table goes, the cluster stays: this adapter did not start the server."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
         try:
             if self._session is not None and self._session.poll() is None:
                 self._ask(f"DROP TABLE IF EXISTS {TABLE}")
@@ -233,10 +271,13 @@ class TimescaleDbSystem:
         self._prepare()
         query = (f"SELECT ts_ns, price_ticks, size_lots FROM {TABLE} "
                  f"WHERE symbol = 'SYM0000' AND ts_ns BETWEEN {start_ns} AND {end_ns}")
+        conn = self._driver()
         started = time.perf_counter()
-        out = self._ask(query)
+        # Rows of Python ints, which is where every adapter's clock stops (#226).
+        with conn.cursor(binary=True) as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
         elapsed = time.perf_counter() - started
-        rows = [tuple(int(cell) for cell in line.split("\t")) for line in out]
         return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:

@@ -67,6 +67,11 @@ class KdbSystem:
                            f"in {self._licence_dir}: q refuses to start without one")
         return True, ""
 
+    def client_available(self) -> tuple[bool, str]:
+        """`q` itself, a process per query, which is all this adapter has until a licence exists to
+        measure anything faster with."""
+        return True, ""
+
     def version(self) -> str:
         """`.z.K` is the version number, read from the running interpreter rather than from a
         constant - the same rule every other adapter here follows."""
@@ -127,9 +132,10 @@ class KdbSystem:
         started = time.perf_counter()
         out = subprocess.run([self._binary, "-q"], input=script, capture_output=True, text=True,
                              timeout=600, check=True)
-        elapsed = time.perf_counter() - started
+        # The clock stops once the answer is rows, where the engine adapter's stops (#226).
         rows = [tuple(int(cell) for cell in line.split("\t"))
                 for line in out.stdout.strip().splitlines() if line]
+        elapsed = time.perf_counter() - started
         return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:

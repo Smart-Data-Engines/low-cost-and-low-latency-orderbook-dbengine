@@ -2566,6 +2566,60 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 226. The comparative benchmark timed the parse of the engine's answer and not the competitors', and asked the competitors through their slowest clients ✅ **P2**
+
+**Found profiling the comparative time-range query after #220.** On the m8a.xlarge the engine's server
+answered SYM0000's 4 000 rows in 0.18 ms of the 1.74 its adapter reported; 1.49 ms was the adapter
+turning the reply into tuples of ints (`evidence/2026-10-10-comparative-equal-clocks/probe/`). The
+note under the published table said every figure included that parse. Four things were unequal:
+- **the clocks**: the engine adapter stopped its clock after the parse, and the ClickHouse,
+  TimescaleDB and kdb+ adapters before it - `elapsed` taken on the line above the parse in all three,
+  since #39 part two;
+- **the competitors' clients**, slowest of those measured, to rows of Python ints on the harness's
+  dataset: TimescaleDB through `psql` with its output parsed in Python, 2.22 ms, against 0.64 through
+  psycopg 3 with binary results; ClickHouse over HTTP with the TSV parsed in Python, 2.59, against
+  1.29 through clickhouse-driver and 1.98 through clickhouse-connect. The measurement that had chosen
+  HTTP for ClickHouse timed HTTP without its parse and the driver with its rows;
+- **the engine's parse**, the slowest of three pure-Python ones measured: 1.48 ms against 0.72 for a
+  loop reading fixed indices and 0.64 for `split()`, `map(int)` and `zip`;
+- **Python's garbage collector**, inside the timed calls: TimescaleDB's query asked every 50 ms for 45 s
+  took 3.0 - 3.6 ms once in about sixteen asks against a p50 of 0.77, at the collector's cadence, and
+  never twice the p50 with it off. The pauses fell on every system's samples and on the floor's
+  control pairs; one preview's floor was 47%.
+
+On one engine build (`782f781`), the harness as it was and with equal clocks alone, minutes apart:
+the engine 1.660 → 1.635 ms, ClickHouse 1.437 → 2.682, TimescaleDB 1.157 → 2.286. Equal clocks turned
+the time-range losses into wins - through clients that were the competitors' slowest, which is why
+the clients were the next correction rather than the result.
+
+Now:
+- every adapter stops its query clock once the answer is rows of Python ints, and a test makes
+  building the rows the only thing that moves a fake clock, for each adapter;
+- TimescaleDB's query goes through psycopg with binary results and ClickHouse's through
+  clickhouse-driver, declared with what was raised in each one's favour; `psql` and HTTP stay for the
+  DDL and the load. A system whose client is missing is NOT MEASURED, with the reason;
+- ClickHouse's query runs with `use_uncompressed_cache = 1`, the counterpart of the engine's decoded
+  columns held between queries (#220) - 2.51 ms with it and 2.58 without, every round faster with it;
+- the engine is asked through its own client's `query_rows()` (#229);
+- the collector is held off for each run of timed calls, collected once before it, as `timeit` does.
+  A collection before every call instead left the next call with cold caches and put ClickHouse's
+  median at 2.26 ms where runs without it measured 1.35 - 1.41;
+- the run times the engine's reply read and not parsed, and states it beside the table.
+
+Mutations, verdicts written before (`evidence/2026-10-10-comparative-equal-clocks/mutations/`): every
+mutation died and every control survived, in five runs as the harness changed.
+
+The published run, at `4b92718` on the m8a.xlarge (README, "How it compares"): at 200,000 rows the
+time-range query is a win against ClickHouse, 0.678 ms against 1.342, and a tie with TimescaleDB,
+0.676, inside a 1.92% floor; ingest is a loss against both. At 1,000,000 rows, with 20,000 rows an
+answer, the query is a loss against ClickHouse, 4.049 ms against 1.908, and a win against
+TimescaleDB, 4.584. The engine's reply takes 0.190 ms of its 0.678 and 0.908 of its 4.049: in Python
+most of what reading its answer costs is the client parsing text, where psycopg and clickhouse-driver
+build their rows from binary in compiled code.
+
+- Effort: S | Impact: the published comparison charged the engine for work it charged no competitor,
+  and charged the competitors for clients nobody would choose
+
 ### 229. The Python client read a row by position: no narrowed answer, and 2.4 ms past the wire for 4000 rows ✅ **P3**
 
 **Found measuring the comparative benchmark's time-range query.** `query()` reads a row's seven

@@ -61,6 +61,11 @@ class OrderbookSystem:
             return False, f"{self._binary} is not built"
         return True, ""
 
+    def client_available(self) -> tuple[bool, str]:
+        """This adapter is the engine's fastest Python client: the socket read and parsed into
+        tuples, which `tuning_applied()` measures against the shipped client's row objects."""
+        return True, ""
+
     def version(self) -> str:
         """Asked of the running node, which is now a question it can answer.
 
@@ -94,10 +99,14 @@ class OrderbookSystem:
             f"during a bulk load",
             "one MINSERT per update rather than one INSERT per level: a round trip per book change "
             "instead of per price level, which is what the wire protocol is shaped for",
-            "the timed query is read from the socket and parsed into tuples rather than through "
-            "`OrderbookEngine.query()`: measured on 4000 rows, the client's row objects cost p50 "
-            "15.5 ms against 5.3 ms for the same bytes parsed as tuples, and no other adapter here "
-            "pays that - it is a real cost to a Python user and not a property of the engine",
+            "the timed query is read by the client's `query_rows()`, which answers tuples, rather "
+            "than by `query()`, which builds a row object a row and takes `SELECT *` only: measured "
+            "on an Amazon EC2 m8a.xlarge, 4000 rows of `SELECT *` in 1.17 ms against 2.66 (#229)",
+            "`query_rows()` converts the answer with `split()`, `map(int)` and `zip`: the fastest of "
+            "three pure-Python parses measured on that machine with this harness's dataset on "
+            "9 October 2026 - 0.64 ms for 4000 rows, against 0.72 for a loop reading fixed indices "
+            "and 1.48 for the loop this adapter had until #226, when the competitors' clients were "
+            "chosen the same way",
         ] + ([f"{' '.join(self._extra_args)}: set for this measurement"] if self._extra_args else [])
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -122,17 +131,17 @@ class OrderbookSystem:
                 time.sleep(0.3)
         raise RuntimeError(f"{self.name} did not come up on port {self._port}")
 
-    # ── The wire, without the client's row objects ───────────────────────────
+    # ── The wire, read and not parsed ────────────────────────────────────────
     #
-    # Measured, 4000 rows of one symbol on this machine: `OrderbookEngine.query()` p50 **15.5 ms**,
-    # the same rows read from the socket and parsed into tuples p50 **5.3 ms**. Two thirds of what
-    # the first comparative run reported as our query time was the Python client constructing 4000
-    # `OrderbookRow` dataclasses - work no other adapter in this harness pays, because each of them
-    # parses text into tuples. So the table was charging us for our client's convenience and calling
-    # it engine speed: 18.2 ms against ClickHouse's 6.3, where the comparable figure is 5.3.
+    # The timed query goes through the client's `query_rows()` (#229). This socket of its own is for
+    # `reply_seconds()`, which reads the same answer and parses nothing, to say how much of the
+    # query's figure is the engine and the wire and how much the client.
     #
-    # The cost is real for a Python user and it is reported rather than hidden - `tuning_applied()`
-    # carries both numbers, and they are in the published notes column.
+    # It used to carry the query itself. Measured on the workstation this harness was written on,
+    # 4000 rows of one symbol: `OrderbookEngine.query()` p50 **15.5 ms**, the same rows read from a
+    # socket and parsed into tuples p50 **5.3 ms** - two thirds of what the first comparative run
+    # reported as our query time was the client building `OrderbookRow`s. The client has a method
+    # that answers tuples now, and it is the one the query is timed through.
 
     def _raw_socket(self) -> socket.socket:
         if self._raw is None:
@@ -143,13 +152,8 @@ class OrderbookSystem:
             self._raw = sock
         return self._raw
 
-    def _raw_rows(self, query: str) -> list[tuple]:
-        """Send one query, read to the blank line that ends an `OK` response, return tuples.
-
-        The column indices come from the header the server sends rather than from constants: a
-        protocol that grows a column - as it did in #65, which added `sequence_number` - must make
-        this fail rather than silently read the wrong field.
-        """
+    def _reply(self, query: str) -> bytes:
+        """Send one query and read to the blank line that ends an `OK` response."""
         sock = self._raw_socket()
         sock.sendall((query + "\n").encode())
         buf = b""
@@ -158,23 +162,29 @@ class OrderbookSystem:
             if not chunk:
                 raise RuntimeError("the server closed the connection mid-response")
             buf += chunk
+        return buf
 
-        lines = buf.decode().split("\n")
-        if not lines or lines[0] != "OK":
-            raise RuntimeError(f"the server refused the query: {lines[0] if lines else '(nothing)'}")
-        columns = lines[1].split("\t")
+    def _raw_rows(self, query: str) -> list[tuple]:
+        """The query's rows as the engine's own Python client reads them, through `query_rows()`.
+
+        The client reads the header's names and converts the whole answer at once - split, `map(int)`
+        and `zip`, each loop in C (#229). That is the fastest of three pure-Python parses measured on
+        an Amazon EC2 m8a.xlarge, 9 October 2026, over this harness's 4000 rows: 0.64 ms, against
+        0.72 for a loop reading fixed indices and 1.48 for the loop building each tuple from a
+        generator, which is what this adapter did itself until #226 - while the competitors were
+        asked through their slowest clients. The columns compared are picked by the header's names,
+        so a protocol that grows a column fails here rather than being read wrong.
+        """
+        assert self._engine is not None
+        answer = self._engine.query_rows(query)
         try:
-            want = [columns.index(name) for name in ("timestamp_ns", "price", "quantity")]
+            want = [answer.columns.index(name) for name in ("timestamp_ns", "price", "quantity")]
         except ValueError as exc:
             raise RuntimeError(f"the response header does not name the columns this adapter reads "
-                               f"({columns}): {exc}") from exc
-        rows = []
-        for line in lines[2:]:
-            if not line:
-                break
-            fields = line.split("\t")
-            rows.append(tuple(int(fields[i]) for i in want))
-        return rows
+                               f"({list(answer.columns)}): {exc}") from exc
+        if want == list(range(len(answer.columns))):
+            return answer.rows
+        return [tuple(row[i] for i in want) for row in answer.rows]
 
     def server_pid(self) -> int | None:
         """The engine's process while it runs: started here, so its CPU is read by pid rather than
@@ -304,13 +314,7 @@ class OrderbookSystem:
         self._ensure_running()
         assert self._engine is not None
         started = time.perf_counter()
-        # Three columns since #139, which is what makes the question the **same** as the others:
-        # TimescaleDB already asks for `ts_ns, price_ticks, size_lots` and we were the only system
-        # receiving seven. Not an optimisation of ours — the removal of an asymmetry that was
-        # costing us.
-        rows = self._raw_rows(
-            f"SELECT timestamp, price, quantity FROM 'SYM0000'.'EX' "
-            f"WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
+        rows = self._raw_rows(self._time_range_query(start_ns, end_ns))
         elapsed = time.perf_counter() - started
         # The first version of this mapped `r.timestamp` and `r.size`, which do not exist -
         # `OrderbookRow` names them `timestamp_ns` and `quantity`. It raised `AttributeError` from
@@ -319,6 +323,25 @@ class OrderbookSystem:
         # touched a row. Two defects in three lines, each hiding the other, and part one's
         # published noise floor was measured through this method.
         return QueryResult(rows=rows, seconds=elapsed)
+
+    @staticmethod
+    def _time_range_query(start_ns: int, end_ns: int) -> str:
+        # Three columns since #139, which is what makes the question the **same** as the others:
+        # TimescaleDB already asks for `ts_ns, price_ticks, size_lots` and we were the only system
+        # receiving seven. Not an optimisation of ours — the removal of an asymmetry that was
+        # costing us.
+        return (f"SELECT timestamp, price, quantity FROM 'SYM0000'.'EX' "
+                f"WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
+
+    def reply_seconds(self, start_ns: int, end_ns: int) -> float:
+        """The time-range query's reply, read and not parsed: the part of the engine's figure that
+        is the engine and the wire rather than its client parsing text in Python (#226). No other
+        adapter can say this of itself - a driver builds its rows as it reads - so it is reported
+        beside the table rather than as a column of it."""
+        self._ensure_running()
+        started = time.perf_counter()
+        self._reply(self._time_range_query(start_ns, end_ns))
+        return time.perf_counter() - started
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:
         """Over the live book, which is a **different question** from the SQL equivalents.

@@ -16,13 +16,15 @@ client costs **80 ms** of `fork`/`exec`/connect on `SELECT 1`, so ~78 ms of that
 charged to ClickHouse — against our own adapter, which holds one socket open. A comparison shaped
 like that measures the harness.
 
-**HTTP rather than the native protocol, and that is measured too.** The worry was that HTTP's text
-framing would disadvantage ClickHouse on a 2000-row result. It does not: with `clickhouse-driver`
-installed for the experiment, native was p50 **5.777 ms** and HTTP p50 **4.980 ms** (mins 4.660 and
-4.439), so HTTP is if anything faster here — the Python driver's row-tuple construction costs more
-than TSV parsing. The transport is therefore chosen for the property that survives: the harness
-needs **no driver dependency at all**, which is what lets a reader reproduce the run with the server
-and a Python interpreter.
+**The native protocol for the query, and that is measured too.** The first version of this adapter
+measured the native protocol through `clickhouse-driver` at p50 **5.777 ms** against HTTP's
+**4.980 ms** on a 2000-row result, and chose HTTP, which needed no driver. The two clocks were not
+the same clock: HTTP's stopped before its TSV was parsed and the driver's after its rows were built
+(#226). With every clock stopped at rows of Python ints, on an Amazon EC2 m8a.xlarge with this
+harness's dataset on 9 October 2026: `clickhouse-driver` **1.29 ms**, `clickhouse-connect` 1.98 and
+HTTP with the TSV parsed in Python 2.59. So the query goes through the fastest, and HTTP stays for
+the load, which streams the CSV in one request. The price is a dependency: `client_available()`
+names it when it is missing, and ClickHouse is then not measured rather than measured slower.
 
 The schema and tuning below are what a ClickHouse user would write for this workload; requirement
 4.2 exists because an untuned competitor produces a flattering number that looks exactly like a fair
@@ -38,12 +40,19 @@ from urllib.parse import quote
 from .base import LoadResult, QueryResult
 
 HTTP_PORT = 8123
+NATIVE_PORT = 9000              # the native protocol, which the time-range query is asked over (#226)
 CONTAINER_PORT = 58123          # the flagship product's test engine; named so it stays named
 DATABASE = "ob_bench"
 TABLE = "book"
 
 # One insert rather than a hundred: the CSV is handed over as a single block.
 MAX_INSERT_BLOCK_SIZE = 1_000_000
+
+# Decompressed blocks kept between queries: the cache ClickHouse documents for short queries asked
+# again, and what the engine has done with its decoded columns since #220. Off by default, so raised
+# here in ClickHouse's favour (#226). Measured on the m8a.xlarge with this harness's dataset and
+# query: 2.51 ms with it and 2.58 ms without, every round of ten faster with it.
+TIMED_QUERY_SETTINGS = {"use_uncompressed_cache": 1}
 
 DDL = f"""
 CREATE DATABASE IF NOT EXISTS {DATABASE};
@@ -66,10 +75,12 @@ ORDER BY (symbol, ts_ns, side, level)
 class ClickHouseSystem:
     name = "clickhouse"
 
-    def __init__(self, host: str = "127.0.0.1", port: int = HTTP_PORT):
+    def __init__(self, host: str = "127.0.0.1", port: int = HTTP_PORT, native_port: int = NATIVE_PORT):
         self._host = host
         self._port = port
+        self._native_port = native_port
         self._conn: http.client.HTTPConnection | None = None
+        self._client = None             # clickhouse_driver.Client, for the time-range query
         self._prepared = False
         self._version = ""
 
@@ -119,6 +130,25 @@ class ClickHouseSystem:
             return False, str(exc)
         return True, ""
 
+    def client_available(self) -> tuple[bool, str]:
+        """The time-range query is asked through clickhouse-driver, ClickHouse's fastest Python
+        client measured here (#226), so a run without it does not time ClickHouse at all rather than
+        time it through a slower one. Imported here and not at the top: the harness's tests run
+        without it."""
+        try:
+            import clickhouse_driver  # noqa: F401
+        except ImportError:
+            return False, ("clickhouse-driver is not installed, and the time-range query is timed "
+                           "through ClickHouse's fastest Python client - see "
+                           "benchmarks/install_competitors.md")
+        return True, ""
+
+    def _native(self):
+        if self._client is None:
+            from clickhouse_driver import Client
+            self._client = Client(host=self._host, port=self._native_port)
+        return self._client
+
     def version(self) -> str:
         """Read from the running server. The number also says *which* server answered: the native
         install on this machine reports 26.8.x and the container on 58123 reports 24.8.x."""
@@ -129,7 +159,11 @@ class ClickHouseSystem:
         table = self._ask(f"SHOW CREATE TABLE {DATABASE}.{TABLE}")
         changed = self._ask(
             "SELECT name || ' = ' || value FROM system.settings WHERE changed ORDER BY name")
-        return (f"endpoint: http://{self._host}:{self._port} (kept-alive, one connection)\n"
+        import clickhouse_driver
+        return (f"endpoint: http://{self._host}:{self._port} (kept-alive, one connection) for the "
+                f"load; the native protocol on {self._host}:{self._native_port} for the time-range "
+                f"query, through clickhouse-driver {clickhouse_driver.__version__} with "
+                f"{TIMED_QUERY_SETTINGS}\n"
                 f"{table}\nchanged settings:\n{changed}")
 
     def tuning_applied(self) -> list[str]:
@@ -141,8 +175,18 @@ class ClickHouseSystem:
             f"max_insert_block_size = {MAX_INSERT_BLOCK_SIZE:,}: the CSV arrives as one block",
             "LowCardinality(String) for symbol, exchange and side: three columns with at most fifty "
             "distinct values between them",
-            "one kept-alive HTTP connection for every timed request: measured, a fresh "
-            "`clickhouse-client` process costs 80 ms, which is 40 times the query it carries",
+            "one connection kept open for every timed request - HTTP for the load, the native "
+            "protocol for the query: measured, a fresh `clickhouse-client` process costs 80 ms, "
+            "which is 40 times the query it carries",
+            "use_uncompressed_cache = 1 for the time-range query: decompressed blocks kept between "
+            "queries, the counterpart of the engine's decoded columns held between queries, and off "
+            "by default. The query cache is not set: it keeps whole answers, and the engine keeps "
+            "none",
+            "the time-range query through clickhouse-driver, over the native protocol, to rows of "
+            "Python ints: the fastest of three Python clients measured on an Amazon EC2 m8a.xlarge "
+            "with this harness's dataset on 9 October 2026 - 1.29 ms, against 1.98 through "
+            "clickhouse-connect and 2.59 over HTTP with the TSV parsed in Python, which is how this "
+            "adapter asked it until #226",
         ]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -166,6 +210,9 @@ class ClickHouseSystem:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        if self._client is not None:
+            self._client.disconnect()
+            self._client = None
 
     # ── Workloads ────────────────────────────────────────────────────────────
 
@@ -193,11 +240,14 @@ class ClickHouseSystem:
         self._prepare()
         query = (f"SELECT ts_ns, price_ticks, size_lots FROM {DATABASE}.{TABLE} "
                  f"WHERE symbol = 'SYM0000' AND ts_ns BETWEEN {start_ns} AND {end_ns}")
+        client = self._native()
         started = time.perf_counter()
-        out = self._ask(query)
+        # Rows of Python ints, which is where every adapter's clock stops (#226). Until then this
+        # one asked over HTTP and stopped before parsing the TSV, so the parse the note under the
+        # table says every figure includes was in the engine's figure alone - and the transport
+        # it was asked over was the slowest of three measured.
+        rows = client.execute(query, settings=TIMED_QUERY_SETTINGS)
         elapsed = time.perf_counter() - started
-        rows = [tuple(int(cell) for cell in line.split("\t"))
-                for line in out.strip().splitlines() if line]
         return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:

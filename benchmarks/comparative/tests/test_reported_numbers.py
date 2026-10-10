@@ -49,8 +49,8 @@ def test_nothing_claims_to_have_been_measured_here_as_a_literal():
 
 def test_the_parsing_constant_cannot_exceed_the_smallest_query_it_is_inside():
     # The contradiction that made this whole change necessary, as a property rather than an
-    # anecdote: the note says the constant is *included* in every query figure, so a run whose
-    # fastest query is 1.47 ms cannot also carry a 4.8 ms constant. Measuring it in the run is what
+    # anecdote: the note says the constant is *included* in the engine's query figure, so a run
+    # whose figure is 1.47 ms cannot also carry a 4.8 ms constant. Measuring it in the run is what
     # keeps the two on the same machine; this asserts the shape of that measurement, not a value.
     wide, narrow = run.parse_cost(rows=4000, samples=3)
     assert wide > 0 and narrow > 0
