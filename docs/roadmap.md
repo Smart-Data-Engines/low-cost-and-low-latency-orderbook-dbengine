@@ -2700,6 +2700,17 @@ What would bring it down, in the order it would be tried:
 - **SIMD unpacking** of Simple8b and narrow blocks (#49);
 - a seal that weighs a block's decoding against its bytes rather than taking the smallest.
 
+**Measured, 10 October 2026: holding a segment's columns from its second read moves the cost rather
+than removing it** (`evidence/2026-10-10-held-from-the-second-read/`, both hosts, three rounds behind
+a quiet gate). A segment's first read decoded into the pool's buffers and held nothing, and its second
+held. On the synthetic set, whose segments are the largest, the first read went from 1.17 to 0.92 of
+format 2's on the m8a.xlarge and from 1.32 to 0.94 on the m9g.xlarge - and the second from 6.46 to
+11.64 ms and from 8.77 to 14.98. On the Binance diff recording the first read did not move, 1.28 to
+1.29 and 1.26 to 1.23, because a read holding nothing costs the same on master, 1.27 and 1.24: there
+what a first read costs over format 2's is decoding, not the allocation. A query asked at least twice
+would pay one more decode a segment, so it is not merged (branch `perf/held-from-the-second-read`).
+What is left on recorded books is the decoders' speed.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 
