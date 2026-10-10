@@ -52,7 +52,8 @@ The first release. What it contains, by area:
   - a row that fails them is not built;
   - `LIMIT n` ends the read at its `n`th row.
 
-  `SELECT`, time buckets and the series of the book read through it.
+  `SELECT`, time buckets and the series of the book read through it, and a filter's columns are
+  checked a chunk at a time, in loops the compiler vectorizes (#225).
 - Format 3's decoded columns held between queries, within `--decoded-cache-mb` (256 MiB by
   default; 0 holds none): a query reading a column held reads neither its file nor its checksum and
   decodes nothing. A segment read once is the first to make room, and a merge, retention, a drop or a
