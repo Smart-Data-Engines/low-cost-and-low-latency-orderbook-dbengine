@@ -3185,19 +3185,71 @@ s6).
 
 - Effort: S | Impact: a moved or corrected peer was dialled at its old address until a restart
 
-### 215. A replica that is still joining stands for election **P1**
+### 215. A replica that is still joining stands for election ✅ **P1**
 
 A node rejoining after a failover discards its data, installs a snapshot of the new primary's store
 and catches up from the snapshot's position; until it has, it knows it does not hold the stream, and
-the election does not ask it. A primary lost in that window hands the role to a node without the
-writes since the snapshot - and the node that comes back after it discards its copy. #214 made the
+the election did not ask it. A primary lost in that window handed the role to a node without the
+writes since the snapshot - and the node that came back after it discarded its copy. #214 made the
 window the join rather than for ever: 0.30 - 0.39 s on the two cluster hosts, from starting as a
 replica to the primary's `catchup complete`, at 25 - 42 segments. It grows with the store and with a
-replay from zero. Not standing for election while joining trades that for a cluster without a primary
-until a node with the data returns, which is a decision about availability rather than a fix.
+replay from zero.
 
-- Effort: M | Impact: an unplanned failover inside a rejoin loses every write the joining node has
-  not received - the whole round, before #214, on two hosts
+**Decided on 10 October 2026: such a replica does not stand.** It trades that loss for a cluster
+without a primary until a node with the data returns, which is a decision about availability rather
+than a fix, and the owner's to make.
+
+What changes:
+
+- **The primary says when a catch-up ends.** `CAUGHT_UP <file> <offset>` goes after the last record of
+  a catch-up that reached its end, as plain text before the `COMPRESS LZ4` directive and the live
+  records that waited; a catch-up that stopped at a WAL file missing from the middle of its range says
+  nothing. The answer to `STREAMID?` announces it: `STREAM <id> caught_up`. An older replica ignores
+  both - it reads the identity with `sscanf` and skips a line it does not know.
+- **The replica records the join.** `<data_dir>/repl_joining.txt` - the stream, since when, and why:
+  `discard` or `snapshot` - is written with `write_file_atomically()` before anything is replaced, and
+  removed when `CAUGHT_UP` arrives. Both replacements remove directories only, so it survives them, and
+  a node restarted in the middle of a join is still joining. A record nobody can read is still a
+  record; one that cannot be written throws, and the store stays.
+- **The election declines.** `FailoverManager::attempt_promotion()` - the only caller of
+  `try_acquire_leadership()`, reached by the election, a handover's target, a node without a role and
+  `start()` - asks the engine first, and while the record exists the node does not stand: INFO once an
+  episode with the way out in it, gauge `ob_failover_abstaining`. Removing the file lets the node stand
+  at the next attempt, without a restart.
+- **A primary from before #215** never says when a catch-up ends, so a replica of it records nothing
+  and gives up a record it had, saying why, and stands as before - a rolling upgrade cannot leave a
+  node out of elections for good.
+- `STATUS` prints `joining: stream=... reason=... since_ns=...`, `ob_replica_joining` is 1 while it
+  lasts, and the alert `OrderbookNoPrimaryWhileJoining` fires when an abstention lasts a minute.
+  `docs/operations.md`, "A replica that is joining does not stand", has the log lines and what removing
+  the record costs.
+
+Out of scope, and said in that section: a replica that resumed its own stream and is catching up
+holds a prefix of it and stands as before - the ordinary loss of asynchronous replication.
+
+Tests:
+- `tests/test_joining_stream.cpp`: the record's contents, its survival of a discard, a snapshot
+  install and a restart, an unreadable record, a write that fails; and a static test that the record
+  is written before the store is replaced, in both places - the one order no test can interrupt.
+- `tests/test_replication.cpp`:
+  - the primary says it after the last record, says it for a catch-up of nothing, and does not say it
+    for a catch-up stopped at a missing file;
+  - against a mock primary, the replica records a discard and a snapshot, ends the join on
+    `CAUGHT_UP`, stays joining across a resumed connection, and records nothing for a primary without
+    the word.
+- `tests/test_replication_compress.cpp`: `CAUGHT_UP` sits after every record of the catch-up and
+  before the directive and the live record that waited.
+- `tests/test_etcd_integration.cpp`, with etcd:
+  - a joining replica does not take the role from a primary that stopped, for twice the lease and
+    three seconds, and takes it the moment it stops joining;
+  - a joining node without a role does not take one nobody holds.
+- `tests/integration/test_joining_replica.py`, two nodes and etcd:
+  - a replica discards and replays 750 000 levels;
+  - its primary is paused at the discard, with the premise checked, and killed;
+  - the replica does not take the role for three times the lease and the election wait;
+  - the primary returns and every row is on both nodes.
+
+  Against master `cf7cf04` the same test fails where the defect is: the replica takes the role.
 
 ### 214. A replica rejoining under writes never took its snapshot, and a node without the round's writes was promoted ✅ **P1**
 
@@ -14283,7 +14335,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #215, #223.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #223.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
