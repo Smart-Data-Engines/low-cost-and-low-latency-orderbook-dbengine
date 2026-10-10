@@ -172,6 +172,29 @@ rows = engine.query(
 )
 ```
 
+`query()` reads a row's seven columns by position, so it takes `SELECT *` and refuses a narrower
+answer by name rather than misreading it. For any select list, use `query_rows()`.
+
+#### engine.query_rows(sql) → QueryRows
+
+A row query's answer read by the names in its header (#229): `columns`, in the order the query named
+them, and `rows`, a tuple of ints each in the same order. A column named twice comes back twice, and
+`side` is the wire's 0 for bid and 1 for ask.
+
+```python
+answer = engine.query_rows(
+    "SELECT timestamp, price FROM 'BTC-USD'.'BINANCE' WHERE side = 0 AND level = 0"
+)
+answer.columns          # ('timestamp_ns', 'price')
+for ts, price in answer.rows:
+    ...
+```
+
+The whole answer is converted at once - split, `map(int)` and `zip`, loops that run in C - rather
+than row by row into objects: on an Amazon EC2 m8a.xlarge, 4000 rows of `SELECT *` in 1.17 ms where
+`query()` took 2.66 (#229). An aggregate or a time-bucket answer is refused with the method that
+reads it. TCP and pool mode only: the local library answers the seven columns of every row.
+
 #### engine.query_all(symbol, exchange, limit=None) → List[OrderbookRow]
 
 Convenience method to query all rows for a symbol/exchange pair.

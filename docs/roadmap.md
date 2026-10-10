@@ -2566,6 +2566,40 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 229. The Python client read a row by position: no narrowed answer, and 2.4 ms past the wire for 4000 rows ✅ **P3**
+
+**Found measuring the comparative benchmark's time-range query.** `query()` reads a row's seven
+columns by position, so it refuses any answer narrower than `SELECT *` - the documented gap that left a
+narrowed query to the raw protocol (`docs/query-language.md`, "Which columns come back"). And over the
+seven it spent 2.4 ms past its transport on 4000 rows, building `OrderbookRow`s, where the reply
+itself arrives in 0.26 ms (`evidence/2026-10-10-comparative-equal-clocks/probe/`).
+
+`query_rows(sql)` reads any row answer by the names in its header and returns `QueryRows`: the columns
+in the order the query named them and a tuple of ints a row. The whole answer is converted at once -
+split, `map(int)` and `zip`, loops that run in C. An aggregate or a time-bucket answer is refused with
+the method that reads it, values that do not make whole rows or are not integers are refused, and
+local mode refuses it as it refuses `query_buckets()`: its library answers seven columns whatever a
+query names.
+
+Measured on the m8a.xlarge, the comparative benchmark's 4000 rows of SYM0000, five rounds alternating
+behind a quiet gate, medians of the rounds' p50 (`evidence/2026-10-10-python-query-rows/`):
+
+| | ms |
+|---|---|
+| `query()`, `SELECT *` | 2.663 |
+| `query_rows()`, `SELECT *` | 1.173 |
+| `query_rows()`, three columns | 0.737 |
+| the transport alone, `SELECT *` | 0.262 |
+
+Both read the same 4000 rows, value for value. Mutations, verdicts written before: the six died - the
+whole-rows check, both refusals, the header's column count, the integer refusal, and `query_rows()`
+reading through `query()` - and the two controls survived.
+
+The integration suite on that host had the client installed from another checkout, so `PYTHONPATH`
+did not choose it: the first run of these tests imported a client without `query_rows()`. They ran
+in a venv without it, and the run says which client it imported.
+
+- Effort: S | Impact: a Python user could not read a narrowed answer, and paid twice what reading it costs
 ### 228. A backup test read the same gauge before the merge had set it, as #224's did ✅ **P3**
 
 **Found in CI** on #47 step 2's pull request, in the coverage job:
@@ -2665,6 +2699,17 @@ What would bring it down, in the order it would be tried:
   allocates nothing fresh;
 - **SIMD unpacking** of Simple8b and narrow blocks (#49);
 - a seal that weighs a block's decoding against its bytes rather than taking the smallest.
+
+**Measured, 10 October 2026: holding a segment's columns from its second read moves the cost rather
+than removing it** (`evidence/2026-10-10-held-from-the-second-read/`, both hosts, three rounds behind
+a quiet gate). A segment's first read decoded into the pool's buffers and held nothing, and its second
+held. On the synthetic set, whose segments are the largest, the first read went from 1.17 to 0.92 of
+format 2's on the m8a.xlarge and from 1.32 to 0.94 on the m9g.xlarge - and the second from 6.46 to
+11.64 ms and from 8.77 to 14.98. On the Binance diff recording the first read did not move, 1.28 to
+1.29 and 1.26 to 1.23, because a read holding nothing costs the same on master, 1.27 and 1.24: there
+what a first read costs over format 2's is decoding, not the allocation. A query asked at least twice
+would pay one more decode a segment, so it is not merged (branch `perf/held-from-the-second-read`).
+What is left on recorded books is the decoders' speed.
 
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's

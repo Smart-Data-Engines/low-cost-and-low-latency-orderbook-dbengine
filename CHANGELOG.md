@@ -108,4 +108,5 @@ The first release. What it contains, by area:
 - A C++ client and a C API. Over TLS the client's calls report a server that has gone as an error;
   they no longer raise the SIGPIPE that ended the application around them (#208).
 - A Python client over TCP, with a pool mode, a sharded mode and LZ4 session compression, and a
-  local mode over the C API library the packages install.
+  local mode over the C API library the packages install. `query_rows()` reads any row answer by
+  the names in its header, as tuples of ints, in under half the time `query()` takes (#229).

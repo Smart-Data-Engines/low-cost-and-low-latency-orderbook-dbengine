@@ -4151,6 +4151,14 @@ Learned the hard way. Check here before debugging.
      empty span wherever a query had not asked for the quantity, and the binary died before any test
      reported: the verdict held and no test could be named. M4c, the same mutation where the
      quantity was read, died in the tests predicted.
+564. **`PYTHONPATH` does not choose the client when a venv has it installed editable from elsewhere.**
+     A new-style editable install puts a finder ahead of the path, so `import orderbook_engine`
+     found the checkout the venv was made from rather than the tree under test, and #229's first
+     integration run failed on a client without `query_rows()`. A run in that venv tests the server
+     it is told to and the client of another checkout, which nothing says while the client has not
+     changed. A run that tests the client prints `orderbook_engine.__file__`, in a venv with no
+     client installed.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
