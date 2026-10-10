@@ -2,7 +2,7 @@
 // Invoked by Python test_cpp_client.py via subprocess.
 //
 // Usage: ob_integration_test --host <host> --port <port> --test <test_name>
-//   test_name: "ping", "insert_query", "minsert"
+//   test_name: "ping", "insert_query", "minsert", "query_agg", "query_buckets", "query_named", ...
 //
 // Exit code 0 = success, 1 = failure.
 // Prints JSON result to stdout: {"test":"...","status":"pass"/"fail","message":"..."}
@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "orderbook/client.hpp"
 
@@ -116,6 +117,50 @@ static int run_insert_query(const std::string& host, uint16_t port) {
 
     print_result("insert_query", "pass",
                  "rows=" + std::to_string(row_count));
+    return 0;
+}
+
+// ── Test: query_named ────────────────────────────────────────────────────────
+
+/// #230: a narrowed answer, in an order of the query's own and with a column twice, read by the
+/// names in its header - the answer query() refuses, which it is checked to go on refusing.
+static int run_query_named(const std::string& host, uint16_t port) {
+    ob::ClientConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+    apply_auth_from_env(cfg);
+
+    ob::OrderbookClient client(cfg);
+    auto conn = client.connect();
+    if (!conn) {
+        print_result("query_named", "fail", "connect failed: " + conn.error_message());
+        return 1;
+    }
+    if (!client.insert("CPP-NAMED", "TEST-EX", ob::Side::ASK, 12345, 77, 1) || !client.flush()) {
+        print_result("query_named", "fail", "insert or flush failed");
+        return 1;
+    }
+    const std::string sql = "SELECT quantity, price, price FROM 'CPP-NAMED'.'TEST-EX' "
+                            "WHERE timestamp BETWEEN 0 AND 9999999999999999999";
+    auto named = client.query_named(sql);
+    if (!named) {
+        print_result("query_named", "fail", "query_named failed: " + named.error_message());
+        return 1;
+    }
+    const auto& got = named.value();
+    if (got.columns != std::vector<std::string>{"quantity", "price", "price"} || got.rows.size() != 1 ||
+        got.rows[0].quantity != 77 || got.rows[0].price != 12345 || got.has("timestamp_ns")) {
+        print_result("query_named", "fail", "the answer was read wrong: " +
+                     std::to_string(got.columns.size()) + " column(s), " +
+                     std::to_string(got.rows.size()) + " row(s)");
+        return 1;
+    }
+    auto positional = client.query(sql);
+    if (positional) {
+        print_result("query_named", "fail", "query() read a narrowed answer by position");
+        return 1;
+    }
+    print_result("query_named", "pass", "quantity=77 price=12345, and query() refused it");
     return 0;
 }
 
@@ -482,6 +527,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "minsert")      return run_minsert(host, port);
     if (test_name == "query_agg")    return run_query_agg(host, port);
     if (test_name == "query_buckets") return run_query_buckets(host, port);
+    if (test_name == "query_named")  return run_query_named(host, port);
     if (test_name == "shard_pool")   return run_shard_pool(coordinator, symbols);
     if (test_name == "shard_writer") return run_shard_writer(coordinator, symbols, until, out);
 

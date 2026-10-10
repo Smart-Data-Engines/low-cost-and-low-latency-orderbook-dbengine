@@ -113,6 +113,19 @@ struct QueryResult {
     std::vector<QueryRow> rows;
 };
 
+/// A row answer read by the names in its header (#230): any select list, where query() reads the
+/// seven of `SELECT *` by position. `columns` are the header's names, in the order the query named
+/// them, and every row carries the fields of those columns; a field of a column the answer did not
+/// carry stays zero, which is why `has()` says which are real. A column named twice is one field.
+struct NamedRows {
+    std::vector<std::string> columns;
+    std::vector<QueryRow>    rows;
+
+    /// Whether the answer carried `column` - "timestamp_ns", "price", "quantity", "order_count",
+    /// "side", "level" or "sequence_number".
+    bool has(std::string_view column) const;
+};
+
 /// One aggregate result, as reported by the server.
 ///
 /// `value` is scaled: the server multiplies VWAP and MID_PRICE by 10^6 and
@@ -225,6 +238,12 @@ public:
     Result<void>        flush();
     Result<QueryResult> query(std::string_view sql);
 
+    /// Run a row query and read its answer by the names in its header (#230): any select list, in
+    /// any order, a column named twice - where query() takes the seven of `SELECT *` by position
+    /// and refuses the rest. An aggregate or a time-bucket answer is refused with the method that
+    /// reads it.
+    Result<NamedRows> query_named(std::string_view sql);
+
     /// Run an aggregate query (SELECT SPREAD(*), MID_PRICE(*) FROM ...).
     ///
     /// Aggregates use their own response shape, so query() cannot return them and
@@ -260,6 +279,7 @@ public:
     // ── Response parsing (public for property-based testing) ─────────
     Result<void>        parse_ok_response(std::string_view resp);
     Result<QueryResult> parse_query_response(std::string_view resp);
+    Result<NamedRows>   parse_named_response(std::string_view resp);
     Result<std::vector<AggEntry>> parse_agg_response(std::string_view resp);
     Result<std::vector<BucketRow>> parse_bucket_response(std::string_view resp);
     RoleInfo            parse_role_response(std::string_view resp);
