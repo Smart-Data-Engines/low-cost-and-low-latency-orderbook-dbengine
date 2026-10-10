@@ -117,8 +117,12 @@ TEST(ReplCompress, ReplCompressHandshake) {
     const char* handshake = "REPLICATE 0 0 0\n";
     ::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL);
 
-    // After catchup (empty WAL), the primary should send COMPRESS LZ4.
+    // After catchup (empty WAL), the primary says the catch-up ended (#215) and then sends
+    // COMPRESS LZ4 - in that order, so the replica reads the first as plain text.
     std::string line = recv_line(fd, 3000);
+    EXPECT_EQ(line.rfind("CAUGHT_UP ", 0), 0u)
+        << "the end of the catch-up goes before the directive, got: " << line;
+    line = recv_line(fd, 3000);
     EXPECT_EQ(line, "COMPRESS LZ4")
         << "Primary with compress=true should send COMPRESS LZ4 after catchup, got: " << line;
 
@@ -222,6 +226,9 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
 
     size_t plain_records = 0;
     bool   seam_seen     = false;
+    // `CAUGHT_UP` (#215): after the last record of the catch-up and before the directive, so a
+    // replica reads it as plain text and holds every record of the catch-up when it does.
+    long   caught_up_after = -1;
     while (!seam_seen) {
         const size_t nl = in.find('\n');
         if (nl == std::string::npos) { if (!pull()) break; continue; }
@@ -232,6 +239,12 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
             break;
         }
         if (line.rfind("HEARTBEAT", 0) == 0) { in.erase(0, nl + 1); continue; }
+        if (line.rfind("CAUGHT_UP ", 0) == 0) {
+            EXPECT_EQ(caught_up_after, -1) << "CAUGHT_UP arrived twice";
+            caught_up_after = static_cast<long>(plain_records);
+            in.erase(0, nl + 1);
+            continue;
+        }
         unsigned file = 0, epoch_lo = 0;
         size_t offset = 0, total_len = 0;
         if (std::sscanf(line.c_str(), "WAL %u %zu %zu %u", &file, &offset, &total_len,
@@ -251,6 +264,9 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
     EXPECT_EQ(plain_records, static_cast<size_t>(kRecords))
         << "the catch-up delivered " << plain_records << " of " << kRecords
         << " records before the seam; a record on the wrong side of it is framed the wrong way";
+    EXPECT_EQ(caught_up_after, static_cast<long>(kRecords))
+        << "CAUGHT_UP must follow every record of the catch-up and precede the directive and the "
+           "live record that waited (-1: it never came before the seam)";
 
     // Exactly one frame after the seam, and it is the live record that waited.
     while (in.size() < 4) { if (!pull()) break; }
@@ -298,11 +314,9 @@ TEST(ReplCompress, ReplNoCompressDefault) {
     const char* handshake = "REPLICATE 0 0\n";
     ::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL);
 
-    // Wait for heartbeat (which comes after ~5s). If we receive a HEARTBEAT
-    // as the first line, it means no COMPRESS LZ4 was sent.
-    // Use a shorter approach: try to recv with a short timeout.
-    // With compress=false, the primary sends nothing until heartbeat or WAL data.
-    // Set a short recv timeout and verify we get nothing (EAGAIN).
+    // With compress=false the primary sends the end of the (empty) catch-up, `CAUGHT_UP` (#215),
+    // and then nothing until a heartbeat or WAL data: no directive. Read for a second and look for
+    // one.
     struct timeval tv{};
     tv.tv_sec  = 1;
     tv.tv_usec = 0;
@@ -310,8 +324,7 @@ TEST(ReplCompress, ReplNoCompressDefault) {
 
     char buf[64];
     ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    // n should be -1 with EAGAIN (no data sent by primary in 1 second)
-    // or n > 0 if the primary sent something (which it shouldn't before heartbeat).
+    // n is the CAUGHT_UP line, or -1 with EAGAIN if it has not arrived within the second.
     if (n > 0) {
         std::string received(buf, static_cast<size_t>(n));
         EXPECT_TRUE(received.find("COMPRESS") == std::string::npos)

@@ -400,6 +400,13 @@ public:
         uint64_t repl_records_replayed{0};
         bool     repl_connected{false};
 
+        // Joining a stream (#215): the store was replaced to follow it, and the primary has not
+        // said the catch-up ended.
+        bool        joining{false};
+        uint64_t    joining_stream_id{0};
+        uint64_t    joining_since_ns{0};
+        std::string joining_reason;
+
         // Snapshot bootstrap state
         bool     bootstrapping{false};
         size_t   snapshot_bytes_received{0};
@@ -622,6 +629,27 @@ public:
     void demote_to_replica(const std::string& new_primary_address) override;
     std::optional<StreamPosition> step_down_for_handover() override;
     std::optional<StreamPosition> replicated_position() override;
+
+    /// Whether this node is joining a stream it does not hold yet (#215): read from
+    /// `joining_path()` on every call, so an operator who removes the file lets the node stand at
+    /// the failover monitor's next attempt. A file that cannot be parsed is joining, with reason
+    /// "unreadable" - not knowing is not a reason to stand.
+    std::optional<JoiningStream> joining_stream() override;
+
+    /// Record, durably, that this node is giving up its store to follow `stream_id` (#215):
+    /// written with `write_file_atomically()` before anything is removed, so a node that has lost
+    /// its data always knows it. Throws when the record cannot be written - the caller then
+    /// replaces nothing, because a node without the record must not be a node without its data.
+    void begin_joining(uint64_t stream_id, const char* reason);
+
+    /// This node is no longer joining `stream_id`, for the reason `how` says - the primary said the
+    /// catch-up ended, or the primary is one that never says so: remove the record durably. A
+    /// removal that fails is a WARN rather than a throw - the record left behind keeps this node
+    /// from standing until the next end of a catch-up, which is the safe direction (#215).
+    void end_joining(uint64_t stream_id, const std::string& how);
+
+    /// Where the joining record lives: `repl_joining.txt` beside `repl_state.txt`.
+    std::string joining_path() const { return base_dir_ + "/repl_joining.txt"; }
 
     /// Throw away everything this node holds, so a stream can be replayed into it from zero.
     ///
