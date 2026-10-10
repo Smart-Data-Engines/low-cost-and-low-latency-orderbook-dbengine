@@ -236,10 +236,10 @@ def test_the_engine_adapter_reads_its_columns_by_the_names_the_client_reads(tmp_
     system.teardown()
 
 
-def test_a_timed_call_runs_with_the_garbage_collector_held_off():
+def test_timed_calls_run_with_the_garbage_collector_held_off():
     # #226: a collection triggered inside a timed call is the harness's pause and not the system's,
-    # and it fell on every system's samples and on the floor's control pairs. Every sample is taken
-    # with the collector off, as `timeit` takes them, and it is on again afterwards.
+    # and it fell on every system's samples and on the floor's control pairs. A run of samples is
+    # taken with the collector off, as `timeit` takes one, and it is on again afterwards.
     import gc
     from benchmarks.comparative import run
     from benchmarks.comparative.systems.base import QueryResult
@@ -254,12 +254,13 @@ def test_a_timed_call_runs_with_the_garbage_collector_held_off():
     run.timed(call, rounds=5)
     assert seen and not any(seen), f"the collector was on during {sum(seen)} of {len(seen)} timed calls"
     assert gc.isenabled(), "the collector was left off"
-    assert run.without_gc(lambda: gc.isenabled()) is False
+    with run.collector_held_off():
+        assert not gc.isenabled()
     assert gc.isenabled()
     # The floor's control samples and the engine's unparsed replies are timed in main(), which needs
-    # servers, so this reads that they go through the same function.
+    # servers, so this reads that they are taken inside the same block.
     source = (Path(__file__).resolve().parents[1] / "run.py").read_text()
-    control = source.split("def control_sample()", 1)[1].split("\n\n", 1)[0]
-    assert "without_gc(" in control, "the floor's control samples are timed with the collector on"
-    assert "without_gc(lambda: reference.reply_seconds(" in source, (
+    assert "with collector_held_off():\n            floor = resolution.measure(" in source, (
+        "the floor's control samples are timed with the collector on")
+    assert "with collector_held_off():\n                replies = sorted(reference.reply_seconds(" in source, (
         "the engine's unparsed replies are timed with the collector on")

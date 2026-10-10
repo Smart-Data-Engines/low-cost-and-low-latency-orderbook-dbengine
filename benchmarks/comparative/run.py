@@ -29,7 +29,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, TypeVar
+from contextlib import contextmanager
+from typing import Callable, Iterator
 
 from . import dataset, equivalence, hardware, report, resolution
 from .systems.base import NoTuningDeclared, QueryResult, require_tuning
@@ -195,11 +196,10 @@ def in_process_sentence(build_dir: Path, wire_levels_per_second: float | None,
             f"be the same mistake as the factor of 111 this sentence replaced.{gap}")
 
 
-T = TypeVar("T")
-
-
-def without_gc(call: Callable[[], T]) -> T:
-    """One call with Python's garbage collector held off, as `timeit` holds it (#226).
+@contextmanager
+def collector_held_off() -> Iterator[None]:
+    """A run of timed calls with Python's garbage collector held off, as `timeit` holds it (#226):
+    collected once before the run, off for the whole of it, on again after.
 
     Every system's answer becomes thousands of Python objects, and a collection triggered inside a
     timed call is the harness's pause, not the system's. Measured on the m8a.xlarge, TimescaleDB's
@@ -207,13 +207,19 @@ def without_gc(call: Callable[[], T]) -> T:
     one ask in about sixteen took 3.0 - 3.6 ms against a p50 of 0.77, at the cadence of the
     collector rather than of the server, and with it off none took twice the p50. The pauses fell
     on every system's samples, and on the control pairs the floor is measured from.
+
+    Once a run rather than once a call: a collection before every call left the next one to start
+    with the collector's walk in its caches, and in a preview run that put ClickHouse's median at
+    2.26 ms where runs without it measured 1.35 - 1.41.
     """
     gc.collect()
+    was_enabled = gc.isenabled()
     gc.disable()
     try:
-        return call()
+        yield
     finally:
-        gc.enable()
+        if was_enabled:
+            gc.enable()
 
 
 def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
@@ -223,8 +229,9 @@ def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
     median - the same reason `resolution.measure()` discards one extreme - and the range is published
     rather than summarised away, because a number without its spread cannot be argued with.
     """
-    without_gc(call)
-    samples = sorted(without_gc(call).seconds for _ in range(rounds))
+    with collector_held_off():
+        call()
+        samples = sorted(call().seconds for _ in range(rounds))
     return {
         "value": samples[len(samples) // 2],
         "unit": "s",
@@ -498,9 +505,10 @@ def main(argv: list[str] | None = None) -> int:
         reference = systems[0]
 
         def control_sample() -> float:
-            return without_gc(lambda: reference.query_time_range(span_start, span_end)).seconds
+            return reference.query_time_range(span_start, span_end).seconds
 
-        floor = resolution.measure(control_sample, rounds=args.rounds)
+        with collector_held_off():
+            floor = resolution.measure(control_sample, rounds=args.rounds)
         print(f"Resolution: {floor.note}")
 
         # The comparison, and this is the first run in which it can happen: `classify()` and
@@ -520,8 +528,9 @@ def main(argv: list[str] | None = None) -> int:
                              if e.get("name") == reference_name and e.get("available")
                              and "value" in e["workloads"].get("time_range", {})), None)
         if engine_query is not None:
-            replies = sorted(without_gc(lambda: reference.reply_seconds(span_start, span_end))
-                             for _ in range(max(args.rounds, 1) * 10))
+            with collector_held_off():
+                replies = sorted(reference.reply_seconds(span_start, span_end)
+                                 for _ in range(max(args.rounds, 1) * 10))
             engine_query["reply_seconds"] = replies[len(replies) // 2]
             print(f"{reference_name}: the time-range reply arrives in "
                   f"{engine_query['reply_seconds'] * 1000:.3f} ms median of {len(replies)}, "
