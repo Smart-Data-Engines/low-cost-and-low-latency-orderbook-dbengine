@@ -19,6 +19,7 @@ pass, which is the lesson the CI skip gate came from.
 from __future__ import annotations
 
 import argparse
+import gc
 import socket
 import sys
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 from . import dataset, equivalence, hardware, report, resolution
 from .systems.base import NoTuningDeclared, QueryResult, require_tuning
@@ -194,6 +195,27 @@ def in_process_sentence(build_dir: Path, wire_levels_per_second: float | None,
             f"be the same mistake as the factor of 111 this sentence replaced.{gap}")
 
 
+T = TypeVar("T")
+
+
+def without_gc(call: Callable[[], T]) -> T:
+    """One call with Python's garbage collector held off, as `timeit` holds it (#226).
+
+    Every system's answer becomes thousands of Python objects, and a collection triggered inside a
+    timed call is the harness's pause, not the system's. Measured on the m8a.xlarge, TimescaleDB's
+    time-range query asked every 50 ms for 45 s after the harness's load: with the collector on,
+    one ask in about sixteen took 3.0 - 3.6 ms against a p50 of 0.77, at the cadence of the
+    collector rather than of the server, and with it off none took twice the p50. The pauses fell
+    on every system's samples, and on the control pairs the floor is measured from.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        return call()
+    finally:
+        gc.enable()
+
+
 def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
     """One warm call, then `rounds` samples, reported as a median with the range beside it.
 
@@ -201,8 +223,8 @@ def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
     median - the same reason `resolution.measure()` discards one extreme - and the range is published
     rather than summarised away, because a number without its spread cannot be argued with.
     """
-    call()
-    samples = sorted(call().seconds for _ in range(rounds))
+    without_gc(call)
+    samples = sorted(without_gc(call).seconds for _ in range(rounds))
     return {
         "value": samples[len(samples) // 2],
         "unit": "s",
@@ -476,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         reference = systems[0]
 
         def control_sample() -> float:
-            return reference.query_time_range(span_start, span_end).seconds
+            return without_gc(lambda: reference.query_time_range(span_start, span_end)).seconds
 
         floor = resolution.measure(control_sample, rounds=args.rounds)
         print(f"Resolution: {floor.note}")
@@ -498,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
                              if e.get("name") == reference_name and e.get("available")
                              and "value" in e["workloads"].get("time_range", {})), None)
         if engine_query is not None:
-            replies = sorted(reference.reply_seconds(span_start, span_end)
+            replies = sorted(without_gc(lambda: reference.reply_seconds(span_start, span_end))
                              for _ in range(max(args.rounds, 1) * 10))
             engine_query["reply_seconds"] = replies[len(replies) // 2]
             print(f"{reference_name}: the time-range reply arrives in "
