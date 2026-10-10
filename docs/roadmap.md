@@ -2566,6 +2566,28 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 230. The C++ client read a row by position, so a narrowed answer went over the raw protocol ✅ **P3**
+
+**Found closing #229.** The C++ client's `query()` reads a row's seven columns by position, so it
+takes `SELECT *` only and refuses a narrower answer - which `docs/query-language.md` sent to the raw
+protocol, and which is the cheaper question: the server decodes only the columns it is asked for
+(#139).
+
+`OrderbookClient::query_named(sql)` reads any row answer by the names in its header and returns
+`NamedRows`: the columns in the order the query named them, and every row as the client's
+`QueryRow`, each field in its own type, the fields of the columns carried filled and the rest zero -
+`has()` says which came. A column named twice is one field read twice. An aggregate or a time-bucket
+answer is refused with the method that reads it; a column the client does not read, a row with fewer
+or more fields than its header, and a value that is not a number of its field's type are refused,
+naming the column and the row.
+
+Tests: `ClientUnit` reads a narrowed answer in its own order with a column twice and values at their
+limits, the seven as `query()` reads them, a header without rows, and ten answers it refuses, each
+saying what. End to end, `test_cpp_client.py` writes a row, reads `quantity, price, price` through
+`query_named()` and checks that `query()` still refuses it.
+
+- Effort: S | Impact: a C++ caller could not ask the narrower, cheaper question without the raw
+  protocol
 ### 226. The comparative benchmark timed the parse of the engine's answer and not the competitors', and asked the competitors through their slowest clients ✅ **P2**
 
 **Found profiling the comparative time-range query after #220.** On the m8a.xlarge the engine's server
@@ -2796,6 +2818,20 @@ format 2's on the m8a.xlarge and from 1.32 to 0.94 on the m9g.xlarge - and the s
 what a first read costs over format 2's is decoding, not the allocation. A query asked at least twice
 would pay one more decode a segment, so it is not merged (branch `perf/held-from-the-second-read`).
 What is left on recorded books is the decoders' speed.
+
+**Nor does a seal that weighs decoding against bytes pay on recorded books** - the third way above,
+estimated from format 3's codec costs (`evidence/2026-10-07-segment-format-v3/codec-round-x86/`,
+every candidate's bytes and decode time a column). The seal's choice decodes the diff recording at
+11.89 ns a row in 3.76 bytes. Taking, for each column, the fastest candidate within a margin of the
+smallest:
+- within 20%: 11.70 ns in 4.16 bytes;
+- within 35%: 8.75 ns in 4.65 bytes;
+- within 50%: 6.90 ns in 5.18 bytes.
+
+The top 20 snapshots: 6.92 ns in 0.53 bytes as chosen, and 3.90 in 0.73 within 50%. So each per
+cent of decoding saved costs about a per cent of bytes, taken out of what the README's storage
+comparison publishes. On the synthetic set a 10% margin decodes in 1.84 ns a row rather than 3.19 at the same 1.77 bytes, but no
+margin under 20% moves the recordings.
 
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's

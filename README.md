@@ -63,8 +63,8 @@ are **not** the same count in the paragraph below about the wire, and that diffe
 published as a ratio.
 
 The ingest column is a limit of the *protocol* rather than of the storage engine: **there is no
-bulk-load path over the wire**, so this harness sends one round trip per book update while the SQL
-systems receive the whole CSV in one request.
+bulk-load path over the wire**, so this harness sends a round trip per 64 book updates (#141) while
+the SQL systems receive the whole CSV in one request.
 
 It used to say the round trip was the whole of the difference — "446,219 updates/s in process
 against 4,012 updates/s through the wire, a factor of 111" — and that was wrong twice. Both numbers
@@ -89,9 +89,9 @@ widens with volume**: at five times the rows (1,000,000, six rounds, floor 0.66%
 what it does at 200,000 and this engine **1.30×**, so 63.2% apart becomes **84.3% apart**.
 
 **At five times the rows this engine is faster than TimescaleDB on ingest** — 624,447 rows/s against
-480,363, **23.1% apart against a 0.66% floor** — where at 200,000 rows it is 5.9% slower. TimescaleDB
-loads **0.94×** what it did, so the crossing is this engine gaining from volume rather than
-TimescaleDB losing. It is a cross-run comparison, which the in-run floor does not govern.
+480,363, **23.1% apart against a 0.66% floor** — where at 200,000 rows it is 5.9% slower. This engine
+loads **1.30×** what it did and TimescaleDB **0.94×**, so the crossing is mostly this engine gaining
+from volume. It is a cross-run comparison, which the in-run floor does not govern.
 
 **And with 20,000 rows an answer the time-range query is ClickHouse's.** In the same run this engine
 answered in 4.049 ms against ClickHouse's 1.908, **52.9% apart**, a loss, and TimescaleDB's 4.584,

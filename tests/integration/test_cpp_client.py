@@ -101,6 +101,13 @@ def test_cpp_time_buckets_with_scales(binary, cluster):
     assert "VWAP=175000000 and NULL" in result["message"], result
 
 
+def test_cpp_reads_a_narrowed_answer_by_name(binary, cluster):
+    """Covers query_named() end to end (#230), and query() going on refusing the same answer."""
+    result = run_cpp_test(binary, cluster.primary().tcp_port, "query_named")
+    assert result["status"] == "pass", result["message"]
+    assert "quantity=77 price=12345" in result["message"], result
+
+
 def test_cpp_client_reports_failure_against_a_dead_port(binary, cluster):
     """A test binary that passes when the server is absent would prove nothing."""
     dead_port = cluster.find_free_port()

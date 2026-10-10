@@ -615,6 +615,123 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
     return Result<QueryResult>::ok(std::move(qr));
 }
 
+bool NamedRows::has(std::string_view column) const {
+    return std::find(columns.begin(), columns.end(), column) != columns.end();
+}
+
+namespace {
+
+/// The columns a row answer can carry, in the order of `SELECT *` (#230).
+enum class RowField : uint8_t { TimestampNs, Price, Quantity, OrderCount, Side, Level, SequenceNumber };
+
+std::optional<RowField> row_field(std::string_view name) {
+    static constexpr std::pair<std::string_view, RowField> kFields[] = {
+        {"timestamp_ns", RowField::TimestampNs}, {"price", RowField::Price},
+        {"quantity", RowField::Quantity},        {"order_count", RowField::OrderCount},
+        {"side", RowField::Side},                {"level", RowField::Level},
+        {"sequence_number", RowField::SequenceNumber},
+    };
+    for (const auto& [n, f] : kFields) {
+        if (n == name) return f;
+    }
+    return std::nullopt;
+}
+
+/// One field of `row` from [p, end), in its own type: `p` moves past its digits, and false means
+/// there were none to read or they do not fit the field.
+bool read_field(const char*& p, const char* end, RowField field, QueryRow& row) {
+    std::from_chars_result r{};
+    switch (field) {
+        case RowField::TimestampNs:    r = std::from_chars(p, end, row.timestamp_ns); break;
+        case RowField::Price:          r = std::from_chars(p, end, row.price); break;
+        case RowField::Quantity:       r = std::from_chars(p, end, row.quantity); break;
+        case RowField::OrderCount:     r = std::from_chars(p, end, row.order_count); break;
+        case RowField::Side:           r = std::from_chars(p, end, row.side); break;
+        case RowField::Level:          r = std::from_chars(p, end, row.level); break;
+        case RowField::SequenceNumber: r = std::from_chars(p, end, row.sequence_number); break;
+    }
+    if (r.ec != std::errc{}) return false;
+    p = r.ptr;
+    return true;
+}
+
+} // namespace
+
+Result<NamedRows> OrderbookClient::parse_named_response(std::string_view resp) {
+    using Res = Result<NamedRows>;
+    if (resp.starts_with("ERR ")) {
+        auto msg = resp.substr(4);
+        if (!msg.empty() && msg.back() == '\n') msg.remove_suffix(1);
+        return Res::err(OB_ERR_INTERNAL, std::string(msg));
+    }
+    if (!resp.starts_with("OK\n")) return Res::err(OB_ERR_PARSE, "unexpected response");
+    resp.remove_prefix(3);
+    if (resp.size() >= 2 && resp.substr(resp.size() - 2) == "\n\n") resp.remove_suffix(2);
+    // A bare `OK` and its blank line leaves one line end, which is no header rather than an empty one.
+    if (resp.empty() || resp == "\n") return Res::ok(NamedRows{});
+
+    const size_t header_end = resp.find('\n');
+    const std::string_view header = resp.substr(0, header_end);
+    if (header == "name\tvalue\tscale")
+        return Res::err(OB_ERR_PARSE, "response holds aggregates, not rows; use query_agg()");
+    if (header.starts_with("bucket_ns"))
+        return Res::err(OB_ERR_PARSE, "response holds time buckets, not rows; use query_buckets()");
+
+    // The header says which field each value is, so a narrower answer, another order or a column
+    // named twice reads as the query asked it.
+    NamedRows out;
+    std::vector<RowField> fields;
+    for (size_t pos = 0;;) {
+        const size_t tab = header.find('\t', pos);
+        const std::string_view name =
+            header.substr(pos, tab == std::string_view::npos ? std::string_view::npos : tab - pos);
+        const auto field = row_field(name);
+        if (!field) {
+            return Res::err(OB_ERR_PARSE, "the answer names a column this client does not read: '" +
+                                              std::string(name) + "'");
+        }
+        out.columns.emplace_back(name);
+        fields.push_back(*field);
+        if (tab == std::string_view::npos) break;
+        pos = tab + 1;
+    }
+    if (header_end == std::string_view::npos) return Res::ok(std::move(out));
+    resp.remove_prefix(header_end + 1);
+
+    size_t row_number = 0;
+    while (!resp.empty()) {
+        const size_t line_end = resp.find('\n');
+        const std::string_view line = resp.substr(0, line_end);
+        if (line_end != std::string_view::npos) resp.remove_prefix(line_end + 1);
+        else resp = {};
+        if (line.empty()) continue;
+        ++row_number;
+        QueryRow row{};
+        const char* p   = line.data();
+        const char* end = p + line.size();
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (!read_field(p, end, fields[i], row)) {
+                return Res::err(OB_ERR_PARSE, "bad " + out.columns[i] + " in row " +
+                                                  std::to_string(row_number));
+            }
+            const bool last = i + 1 == fields.size();
+            if (last && p != end) {
+                return Res::err(OB_ERR_PARSE, "more fields than columns in row " +
+                                                  std::to_string(row_number));
+            }
+            if (!last) {
+                if (p >= end || *p != '\t') {
+                    return Res::err(OB_ERR_PARSE, "fewer fields than columns in row " +
+                                                      std::to_string(row_number));
+                }
+                ++p;
+            }
+        }
+        out.rows.push_back(row);
+    }
+    return Res::ok(std::move(out));
+}
+
 RoleInfo OrderbookClient::parse_role_response(std::string_view resp) {
     // Strip trailing \n
     if (!resp.empty() && resp.back() == '\n')
@@ -1127,6 +1244,23 @@ Result<std::vector<BucketRow>> OrderbookClient::parse_bucket_response(std::strin
         buckets.push_back(std::move(row));
     }
     return Res::ok(std::move(buckets));
+}
+
+Result<NamedRows> OrderbookClient::query_named(std::string_view sql) {
+    using Res = Result<NamedRows>;
+    size_t len = format_query(sql);
+    auto sr = send_all(len);
+    if (!sr) return Res::err(sr.error_code(), sr.error_message());
+    auto rr = recv_response();
+    if (!rr) return Res::err(rr.error_code(), rr.error_message());
+    auto named = parse_named_response(rr.value());
+    if (named) {
+        OB_LOG_DEBUG("client", "query_named: %zu row(s) of %zu column(s)", named.value().rows.size(),
+                     named.value().columns.size());
+    } else {
+        OB_LOG_DEBUG("client", "query_named refused the answer: %s", named.error_message().c_str());
+    }
+    return named;
 }
 
 Result<std::vector<BucketRow>> OrderbookClient::query_buckets(std::string_view sql) {

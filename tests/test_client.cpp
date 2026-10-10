@@ -479,6 +479,90 @@ TEST(ClientUnit, ParseQueryResponseRefusesAGarbageSequenceNumber) {
         << result.error_message();
 }
 
+// #230: query_named() reads an answer by the names in its header, so any select list reads as the
+// query asked it - the answers query() refuses above.
+TEST(ClientUnit, NamedRowsReadANarrowedAnswerInItsOrderWithAColumnTwice) {
+    std::string wire =
+        "OK\n"
+        "quantity\tprice\tprice\n"
+        "50\t-100000\t-100000\n"
+        "7\t9223372036854775807\t9223372036854775807\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_named_response(wire);
+    ASSERT_TRUE(result.has_value()) << result.error_message();
+    const auto& named = result.value();
+    EXPECT_EQ(named.columns, (std::vector<std::string>{"quantity", "price", "price"}));
+    ASSERT_EQ(named.rows.size(), 2u);
+    EXPECT_EQ(named.rows[0].quantity, 50u);
+    EXPECT_EQ(named.rows[0].price, -100000);
+    EXPECT_EQ(named.rows[1].price, INT64_MAX);
+    EXPECT_TRUE(named.has("price") && named.has("quantity"));
+    EXPECT_FALSE(named.has("timestamp_ns")) << "a column the answer did not carry";
+    EXPECT_EQ(named.rows[0].timestamp_ns, 0u) << "a field of a column not carried is not zero";
+}
+
+TEST(ClientUnit, NamedRowsReadTheSevenAsQueryDoes) {
+    std::string wire =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n"
+        "1700000000000000000\t100000\t50\t3\t1\t9\t4242\n"
+        "18446744073709551615\t-1\t0\t4294967295\t0\t65535\t18446744073709551615\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto named = client.parse_named_response(wire);
+    auto rows = client.parse_query_response(wire);
+    ASSERT_TRUE(named.has_value()) << named.error_message();
+    ASSERT_TRUE(rows.has_value()) << rows.error_message();
+    ASSERT_EQ(named.value().rows.size(), rows.value().rows.size());
+    for (size_t i = 0; i < rows.value().rows.size(); ++i) {
+        const auto& a = named.value().rows[i];
+        const auto& b = rows.value().rows[i];
+        EXPECT_EQ(a.timestamp_ns, b.timestamp_ns);
+        EXPECT_EQ(a.price, b.price);
+        EXPECT_EQ(a.quantity, b.quantity);
+        EXPECT_EQ(a.order_count, b.order_count);
+        EXPECT_EQ(a.side, b.side);
+        EXPECT_EQ(a.level, b.level);
+        EXPECT_EQ(a.sequence_number, b.sequence_number);
+    }
+}
+
+TEST(ClientUnit, NamedRowsOfAHeaderWithoutRowsAreItsColumnsAndNoRow) {
+    ob::OrderbookClient client;
+    auto result = client.parse_named_response("OK\nprice\tlevel\n\n");
+    ASSERT_TRUE(result.has_value()) << result.error_message();
+    EXPECT_EQ(result.value().columns, (std::vector<std::string>{"price", "level"}));
+    EXPECT_TRUE(result.value().rows.empty());
+    auto bare = client.parse_named_response("OK\n\n");
+    ASSERT_TRUE(bare.has_value());
+    EXPECT_TRUE(bare.value().columns.empty() && bare.value().rows.empty());
+}
+
+TEST(ClientUnit, NamedRowsRefuseWhatTheyCannotReadAndSayWhat) {
+    ob::OrderbookClient client;
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"OK\nname\tvalue\tscale\nSPREAD(*)\t1000\t1\n\n", "query_agg"},
+        {"OK\nbucket_ns\tCOUNT(*)/1\n1700000000000000000\t3\n\n", "query_buckets"},
+        {"OK\nprice\tvolume\n1\t2\n\n", "'volume'"},
+        {"OK\nprice\tquantity\n1\t2\n3\n\n", "fewer fields than columns in row 2"},
+        {"OK\nprice\tquantity\n1\t2\t3\n\n", "more fields than columns in row 1"},
+        {"OK\nprice\tquantity\n1\tx\n\n", "bad quantity in row 1"},
+        {"OK\nside\n256\n\n", "bad side in row 1"},
+        {"OK\nquantity\n-1\n\n", "bad quantity in row 1"},
+        {"ERR unknown symbol\n", "unknown symbol"},
+        {"PONG\n", "unexpected response"},
+    };
+    for (const auto& [wire, says] : cases) {
+        auto result = client.parse_named_response(wire);
+        ASSERT_FALSE(result.has_value()) << "read: " << wire;
+        EXPECT_NE(result.error_message().find(says), std::string::npos)
+            << "for " << wire << " the refusal says: " << result.error_message();
+    }
+}
+
 TEST(ClientUnit, AggParserRefusesARowResponseByName) {
     std::string wire =
         "OK\n"
