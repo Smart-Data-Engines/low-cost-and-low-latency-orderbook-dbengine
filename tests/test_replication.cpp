@@ -1399,6 +1399,9 @@ TEST_F(ReplicationProtocolTest, HeartbeatSentAfterIdle) {
     const char* handshake = "REPLICATE 0 0\n";
     ::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL);
 
+    // The catch-up of an empty WAL ends at once, and says so (#215).
+    EXPECT_EQ(recv_line(fd, 3000).rfind("CAUGHT_UP ", 0), 0u);
+
     // Wait for heartbeat (sent every 5 seconds). Use a generous timeout.
     // The epoll loop checks every 100ms and sends heartbeat after 5s idle.
     std::string line = recv_line(fd, 7000);
@@ -1470,7 +1473,10 @@ TEST_F(ReplicationProtocolTest, BroadcastToMultipleReplicas) {
     uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
     mgr->broadcast(hdr, payload, 4, wal_->current_position());
 
-    // Both replicas should receive the WAL header line.
+    // Both replicas should receive the WAL header line - after the end of their empty catch-ups,
+    // which each was told (#215).
+    EXPECT_EQ(recv_line(fd1, 3000).rfind("CAUGHT_UP ", 0), 0u);
+    EXPECT_EQ(recv_line(fd2, 3000).rfind("CAUGHT_UP ", 0), 0u);
     std::string line1 = recv_line(fd1, 3000);
     std::string line2 = recv_line(fd2, 3000);
 
@@ -1518,7 +1524,9 @@ TEST_F(ReplicationProtocolTest, BroadcastRemovesDisconnectedReplica) {
     uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
     mgr->broadcast(hdr, payload, 4, wal_->current_position());
 
-    // The surviving replica should receive the WAL message.
+    // The surviving replica should receive the WAL message, after the end of its empty catch-up
+    // (#215).
+    EXPECT_EQ(recv_line(fd2, 3000).rfind("CAUGHT_UP ", 0), 0u);
     std::string line2 = recv_line(fd2, 3000);
     EXPECT_TRUE(line2.rfind("WAL ", 0) == 0)
         << "Surviving replica should receive WAL header, got: " << line2;
@@ -1909,8 +1917,10 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
     // this snapshot on the worker took 7.2 s once, on a loaded machine, so one was queued before the
     // transfer began. Inside the transfer the heartbeat is held back (#99), so between a header line
     // and its bytes it would still be the defect this test is about.
+    // A `CAUGHT_UP` may come first too, and is skipped the same way (#215): it ends the catch-up of
+    // this test's own `REPLICATE`, before the snapshot was asked for - not a record.
     std::string begin = next_line();
-    while (begin.rfind("HEARTBEAT", 0) == 0) begin = next_line();
+    while (begin.rfind("HEARTBEAT", 0) == 0 || begin.rfind("CAUGHT_UP ", 0) == 0) begin = next_line();
     ASSERT_EQ(begin.rfind("SNAPSHOT_BEGIN", 0), 0u) << "got: " << begin;
     size_t total_bytes = 0, file_count = 0;
     unsigned snap_file = 0;
@@ -2068,9 +2078,10 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotGoAheadOfSnapshotBegin) {
     };
 
     // A heartbeat queued before the request reached the manager may come first; the replica skips
-    // it. Anything else before SNAPSHOT_BEGIN is the defect.
+    // it, and the `CAUGHT_UP` that ended this test's own `REPLICATE` (#215). Anything else before
+    // SNAPSHOT_BEGIN - a record - is the defect.
     std::string first = next_line();
-    while (first.rfind("HEARTBEAT", 0) == 0) first = next_line();
+    while (first.rfind("HEARTBEAT", 0) == 0 || first.rfind("CAUGHT_UP ", 0) == 0) first = next_line();
     EXPECT_EQ(first.rfind("SNAPSHOT_BEGIN", 0), 0u)
         << "expected SNAPSHOT_BEGIN, got '" << first << "' - a record broadcast while the snapshot "
            "was being made went ahead of it (#214)";
@@ -2188,12 +2199,17 @@ struct SnapshotBootstrapOutcome {
     /// and the `REPLICATE` line it opened with (#214).
     std::optional<double> resumed_after_ms;
     std::string           resume_line;
+    /// Whether the engine holds a joining record once the install is done (#215).
+    bool joining_after_install{false};
 };
 
 /// What the mock primary does besides the stream it always sends.
 struct BootstrapScript {
     bool splice_a_live_record{false};   ///< a live `WAL` record between the two files (#99)
     bool heartbeat_before_begin{false}; ///< a `HEARTBEAT` before `SNAPSHOT_BEGIN` (#214)
+    /// A primary that reports the end of a catch-up, and a `CAUGHT_UP` before `SNAPSHOT_BEGIN`: the
+    /// end of an earlier catch-up on the connection, which is not the answer either (#215).
+    bool caught_up_before_begin{false};
     bool time_the_resume{false};        ///< wait for the replica to come back, and time it (#214)
 };
 
@@ -2229,7 +2245,11 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     if (peer_fd < 0) { client.stop(); ::close(listen_fd); engine.close(); return out; }
 
-    answer_stream_id(peer_fd, 0x51DULL);
+    if (script.caught_up_before_begin) {
+        answer_stream_id_caught_up(peer_fd, 0x51DULL);
+    } else {
+        answer_stream_id(peer_fd, 0x51DULL);
+    }
     const std::string handshake = recv_line(peer_fd, 3000);
     EXPECT_EQ(handshake.rfind("REPLICATE", 0), 0u) << "got: " << handshake;
 
@@ -2253,6 +2273,10 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
         // `ERR WAL_TRUNCATED` and the request reaching it.
         const char* hb = "HEARTBEAT 0\n";
         EXPECT_GT(::send(peer_fd, hb, std::strlen(hb), MSG_NOSIGNAL), 0);
+    }
+    if (script.caught_up_before_begin) {
+        const char* caught_up = "CAUGHT_UP 0 0\n";
+        EXPECT_GT(::send(peer_fd, caught_up, std::strlen(caught_up), MSG_NOSIGNAL), 0);
     }
 
     // A non-zero WAL position, deliberately: a snapshot taken at 0 0 is indistinguishable from
@@ -2314,6 +2338,7 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
     out.first_file_installed  = std::filesystem::exists(dir + "/SNAPA/EXCH/seg/a.col");
+    out.joining_after_install = engine.joining_stream().has_value();
     out.second_file_installed = std::filesystem::exists(dir + "/SNAPB/EXCH/seg/b.col");
     {
         std::ifstream in(cfg.state_file);
@@ -2359,6 +2384,19 @@ TEST_F(ReplicationClientTest, AHeartbeatBeforeSnapshotBeginIsNotTheAnswer) {
     const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
     EXPECT_TRUE(out.first_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
     EXPECT_TRUE(out.second_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
+}
+
+TEST_F(ReplicationClientTest, ACaughtUpBeforeSnapshotBeginIsNotTheAnswerAndDoesNotEndTheJoin) {
+    // #215, the snapshot side: a `CAUGHT_UP` before `SNAPSHOT_BEGIN` ends a catch-up of an earlier
+    // request on the connection. Read as the answer it would abandon the bootstrap, as a heartbeat
+    // did in #214; read as the end of this join it would let a node stand with a snapshot half in.
+    BootstrapScript script;
+    script.caught_up_before_begin = true;
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
+    EXPECT_TRUE(out.first_file_installed) << "a CAUGHT_UP before SNAPSHOT_BEGIN abandoned the bootstrap";
+    EXPECT_TRUE(out.second_file_installed) << "a CAUGHT_UP before SNAPSHOT_BEGIN abandoned the bootstrap";
+    EXPECT_TRUE(out.joining_after_install)
+        << "the snapshot is in and nothing said the catch-up after it ended: still joining";
 }
 
 TEST_F(ReplicationClientTest, AfterASnapshotTheReplicaAsksForTheStreamAtOnce) {

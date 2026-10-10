@@ -2955,11 +2955,15 @@ void ReplicationClient::request_and_receive_snapshot() {
 
     // Read SNAPSHOT_BEGIN response. A HEARTBEAT may come first and it is not the answer: the
     // primary's timer can fire between its `ERR WAL_TRUNCATED` and this request reaching it, and the
-    // answer was read as `SNAPSHOT_BEGIN` and the bootstrap abandoned (#214).
+    // answer was read as `SNAPSHOT_BEGIN` and the bootstrap abandoned (#214). Nor is a `CAUGHT_UP`
+    // (#215): it ends a catch-up of an earlier request on this connection, and the store it speaks
+    // of is the one this snapshot replaces - so it is skipped, and it does not end the join.
     char line_buf[512];
     ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
-    while (n > 0 && std::strncmp(line_buf, "HEARTBEAT", 9) == 0) {
-        OB_LOG_DEBUG("repl_client", "a HEARTBEAT before SNAPSHOT_BEGIN; still waiting for the answer");
+    while (n > 0 && (std::strncmp(line_buf, "HEARTBEAT", 9) == 0 ||
+                     std::strncmp(line_buf, "CAUGHT_UP ", 10) == 0)) {
+        OB_LOG_DEBUG("repl_client", "%.20s before SNAPSHOT_BEGIN is not the answer; still waiting",
+                     line_buf);
         n = reader_.read_line(line_buf, sizeof(line_buf));
     }
     if (n <= 0) {
