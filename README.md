@@ -14,39 +14,49 @@ Built by [Smart Data Engines](https://smartdataengines.com), who build custom da
 ## How it compares
 
 Measured against natively installed competitors on one machine, by
-`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 1.79%** over
+`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 1.92%** over
 twelve interleaved rounds: this machine does not separate differences smaller than that, so anything
 below it is reported as indistinguishable rather than as a win. That floor was **21.2%** on the
-machine an earlier table was measured on, which is most of why this one exists.
+machine an earlier table was measured on, which is most of why the harness measures its own.
 
-Amazon EC2 m9g.xlarge, aarch64 implementer 0x41 part 0xd84 r0p1, 4 cores, 15.3 GiB, Amazon Elastic Block Store on nvme0n1p1 → nvme0n1, xfs, kernel 6.18.48, gcc14-g++ 14.2.1, Release. Clock: not published by this platform.
+Amazon EC2 m8a.xlarge, AMD EPYC 9R45, 4 cores, 15.3 GiB, Amazon Elastic Block Store on nvme0n1p1 → nvme0n1, ext4, kernel 7.0.0, Ubuntu 26.04, GCC 15.2, Release, at `4b92718`. Clock: what `/proc/cpuinfo` read at the start, a moment's figure rather than a rated one.
 200,000 rows, 50 symbols, 20 levels, seed 7.
 
 | System | Version | Ingest (rows/s) | Time-range query (4000 rows) | Why it is not a like-for-like number |
 |---|---|---|---|---|
-| **orderbook-dbengine** | 0.1.0 | **404,326** | **2.35 ms** (2.32–2.40) | 64 updates per round trip: there is still no bulk-load path over the wire, so this sends rows/64 requests |
-| ClickHouse | 26.8.2.7 | 1,165,162 | 1.51 ms (1.40–1.63) | the whole CSV in one request |
-| TimescaleDB | 2.30.0 / PG 16.15 | 409,924 | 1.84 ms (1.80–1.91) | `\copy` of the whole CSV; `timescaledb-tune` applied |
+| **orderbook-dbengine** | 0.1.0 | **480,898** | **0.678 ms** (0.664–0.744) | 64 updates per round trip: there is still no bulk-load path over the wire, so this sends rows/64 requests. The answer is text, read into rows by the Python client's `query_rows()` |
+| ClickHouse | 26.9.12.8 | 1,307,364 | 1.342 ms (1.267–1.528) | the whole CSV in one request; the query through clickhouse-driver, with the uncompressed cache on |
+| TimescaleDB | 2.30.2 / PG 16.15 | 511,001 | 0.676 ms (0.658–0.881) | `\copy` of the whole CSV; `timescaledb-tune` applied; the query through psycopg, its results in binary |
 | kdb+ | — | NOT MEASURED | NOT MEASURED | needs a vendor registration, and whether its free edition's numbers may be published here is a licence question rather than a technical one |
 
-**Three of the four comparable pairs are losses and the fourth is a tie**, classified by the
+**One of the four comparable pairs is a win, one a tie and two are losses**, classified by the
 harness against its own measured floor rather than by inspection:
 
-- **ingest** against ClickHouse — **65.3% apart** against a 1.79% floor. A loss.
-- **ingest** against TimescaleDB — **1.4% apart, inside the floor**. Indistinguishable, which is
-  the harness's word for it and not a win.
-- **the time-range query** against ClickHouse — **35.6% apart** against a 1.79% floor. A loss.
-- **the time-range query** against TimescaleDB — **21.9% apart** against a 1.79% floor. A loss.
+- **the time-range query** against ClickHouse — **49.5% apart** against a 1.92% floor. A win.
+- **the time-range query** against TimescaleDB — **0.4% apart, inside the floor**. Indistinguishable,
+  which is the harness's word for it and not a win.
+- **ingest** against ClickHouse — **63.2% apart** against a 1.92% floor. A loss.
+- **ingest** against TimescaleDB — **5.9% apart** against a 1.92% floor. A loss.
 
-**What changed since the previous table, and what it is safe to say about it.** The engine went
-from 350,509 rows/s to 404,326 and from 3.02 ms to 2.35 ms, because two limitations of the
-*harness* were removed: the row query now asks for the three columns it uses rather than for all
-seven (#139 — TimescaleDB was already asking for three, so this removed an asymmetry that was
-costing us), and ingest pipelines 64 updates per round trip rather than one (#141). Both
-competitors moved by **1.2% and 1.6% on ingest**, which is the control that says the change is the
-engine's and not the machine's. Read that comparison with the caveat the results file states
-itself: **the floor above governs comparisons inside one run**, and two runs of this table on one
-machine vary by more than it.
+**What the query column measures.** Every figure runs from the request to the answer as rows of
+Python ints, and each system is asked through the fastest Python client measured for it: psycopg
+with binary results for TimescaleDB, clickhouse-driver for ClickHouse, the client's own
+`query_rows()` for this engine (#226, #229). Of the engine's 0.678 ms its reply takes 0.190 ms to
+arrive, read and not parsed; the rest is Python turning its text into ints, where psycopg and
+clickhouse-driver build their rows from binary in compiled code.
+
+**What changed since the previous table, and what it is safe to say about it.** The previous table,
+of 19 September, had this engine losing the time-range query to both, 35.6% and 21.9% apart. That
+comparison was unequal four ways, found together (#226):
+- the competitors' clocks stopped before they parsed their answers, and the engine's after it;
+- the competitors were asked through their slowest Python clients, `psql` and HTTP;
+- the engine's adapter parsed its answer the slowest of three ways measured;
+- Python's garbage collector fell inside timed calls, every system's.
+
+Each is corrected here. The machine changed too - the m9g.xlarge the previous table ran on has since
+been replaced, and this is the host the competitors are installed on - and so did the engine, with segment
+format 3 (#219), decoded columns held between queries (#220) and conditions that narrow the read
+(#47). So no figure here is compared with that table's.
 
 One row of this dataset is one book level, so rows and levels are the same count in this table. They
 are **not** the same count in the paragraph below about the wire, and that difference used to be
@@ -60,7 +70,7 @@ It used to say the round trip was the whole of the difference — "446,219 updat
 against 4,012 updates/s through the wire, a factor of 111" — and that was wrong twice. Both numbers
 said "updates" while one meant a single level and the other twenty, so a factor of twenty of the
 111 was the word. And the remainder is not the round trip. Holding the volume and the client fixed
-and changing only the path, at 20,000,000 levels on this machine:
+and changing only the path, at 20,000,000 levels on the m9g.xlarge an earlier table was measured on:
 
 | | wall ns per level | server CPU ns per level |
 |---|---|---|
@@ -75,21 +85,20 @@ level climbs and then stops. The full series, the caveats and what is still unex
 
 What that does not excuse is the ingest column itself, and against ClickHouse the gap **still
 widens with volume**: at five times the rows (1,000,000, six rounds, floor 0.66%,
-[`…-55fc0e74-2.md`](benchmarks/comparative/results/2026-09-19-55fc0e74-2.md)) ClickHouse loads
-**2.75× faster than it did** and this engine **1.20×**, so 65.3% apart becomes **84.9% apart**.
+[`…-672503ce.md`](benchmarks/comparative/results/2026-10-10-672503ce.md)) ClickHouse loads **3.04×**
+what it does at 200,000 and this engine **1.30×**, so 63.2% apart becomes **84.3% apart**.
 
-The 1.20× is the part that changed, and it is worth being precise about why. The previous table
-measured **1.01× — flat**, and explained it: a round trip per update does not amortise. Since #141
-this harness sends 64 updates per round trip, so some of it does, and the sentence that explained
-the flatness no longer describes the harness. What the engine gains from volume is still far less
-than ClickHouse gains.
+**At five times the rows this engine is faster than TimescaleDB on ingest** — 624,447 rows/s against
+480,363, **23.1% apart against a 0.66% floor** — where at 200,000 rows it is 5.9% slower. TimescaleDB
+loads **0.94×** what it did, so the crossing is this engine gaining from volume rather than
+TimescaleDB losing. It is a cross-run comparison, which the in-run floor does not govern.
 
-**At five times the rows this engine is faster than TimescaleDB on ingest** — 483,400 rows/s
-against 409,505, **15.3% apart against a 0.66% floor** — where at 200,000 rows the two are
-indistinguishable. TimescaleDB loads **1.00×** what it did, so the crossing is this engine gaining
-from volume rather than TimescaleDB losing. That is one workload out of four and it is stated
-next to the three that are still losses; it is also a cross-run comparison, which the in-run floor
-does not govern.
+**And with 20,000 rows an answer the time-range query is ClickHouse's.** In the same run this engine
+answered in 4.049 ms against ClickHouse's 1.908, **52.9% apart**, a loss, and TimescaleDB's 4.584,
+**11.7% apart**, a win. Its reply took 0.908 ms of the 4.049. The rest is the Python client parsing
+20,000 rows of text, where clickhouse-driver decodes ClickHouse's native column blocks in compiled
+code. In Python, then, reading the engine's answer costs more than the engine takes to give it, and
+the more rows, the more.
 
 ### What it costs, which is a different question from who finishes first
 
@@ -160,18 +169,18 @@ queries (`--decoded-cache-mb`, #220). A query asked again on the recordings take
 2's time from the page cache on the m9g.xlarge and the m8a.xlarge (medians of three rounds' p50).
 A segment's first read takes 1.25 - 1.55 times format 2's (#223).
 
-Every figure in the query column also includes Python-side parsing for 4000 rows, identical for all
-three systems, because each adapter turns text into tuples. It is **measured in the run** and stated
-rather than subtracted — an earlier version of this page carried a parsing constant larger than the
-smallest query median in the same table, because the constant had been measured on a different
-machine and written into the report as prose.
+The engine's share of the query column, its reply against its parse, is **measured in each run** and
+stated in its results file rather than subtracted. An earlier version of this page carried a parsing
+constant larger than the smallest query median in the same table, because the constant had been
+measured on a different machine and written into the report as prose. The one after it said the
+parse was in every system's figure, when the clocks put it in the engine's alone (#226).
 
-Full run, with every tuning declaration and every refusal: [`benchmarks/comparative/results/2026-09-19-55fc0e74.md`](benchmarks/comparative/results/2026-09-19-55fc0e74.md). The write-up of
-what this machine found, including the nine defects it exposed and the prediction registered before
-it booted: [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
-To reproduce it, install the competitors natively first —
-[`benchmarks/install_competitors.md`](benchmarks/install_competitors.md); nothing in the harness
-installs anything, and a containerised competitor would measure the container.
+Full run, with every tuning declaration and every refusal: [`benchmarks/comparative/results/2026-10-10-287a4e15.md`](benchmarks/comparative/results/2026-10-10-287a4e15.md). The write-up of
+what the m9g.xlarge the earlier tables ran on found, including the nine defects it exposed and the
+prediction registered before it booted: [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
+To reproduce it, install the competitors natively first, and the two Python clients the harness
+times them through — [`benchmarks/install_competitors.md`](benchmarks/install_competitors.md); nothing
+in the harness installs anything, and a containerised competitor would measure the container.
 ## Features
 
 - **SoA (Struct-of-Arrays) buffer** with seqlock for lock-free concurrent reads
