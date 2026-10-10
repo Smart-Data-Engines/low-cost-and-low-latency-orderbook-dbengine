@@ -1326,10 +1326,55 @@ depends on how it ends:
 
 The node that comes back rejoins the new primary's stream: its data is discarded and replaced by a
 snapshot, and it catches up from the snapshot's position - 0.30 - 0.39 s on those hosts, from
-`starting as REPLICA` to the primary's `catchup complete`. Until it has, it is a replica without the
-stream, and **the election does not know** (#215): a primary lost in that window hands the role to a
-node without the writes since the last failover. Before #214 a rejoin under writes did not finish at
-all, and the next failover lost the whole round.
+`starting as REPLICA` to the primary's `catchup complete`. Before #214 a rejoin under writes did not
+finish at all, and the next failover lost the whole round. Since #215 a node in that window does not
+stand for election: the next section.
+
+### A replica that is joining does not stand
+
+A replica whose store was replaced to follow a stream - discarded because the stream was not its
+own, or replaced by a snapshot - holds part of that stream until its catch-up ends. Elected in that
+window it would hold none of the writes since the snapshot, and the node coming back after it would
+discard its copy of them. So it does not stand (#215): from the moment it gives up its store until
+its primary says the catch-up ended, it declines every election. **A cluster whose primary dies then
+has no primary until a node that holds the stream returns** - that is the trade, made on purpose.
+
+What it looks like:
+
+```
+INFO engine   joining stream 1234 (discard): this node holds no complete stream until the primary
+              says its catch-up has ended, and does not stand for election until then (#215) - <data-dir>/repl_joining.txt
+INFO failover the leader key is vacant and this node is joining stream 1234 (discard, for 0.3 s): it
+              holds part of that stream, so it does not stand for election (#215). ... remove <data-dir>/repl_joining.txt
+INFO engine   no longer joining stream 1234: the primary ... said the catch-up of stream 1234 ended at 3:40960 ...
+```
+
+`STATUS` prints `joining: stream=1234 reason=discard since_ns=...` while it lasts.
+`ob_replica_joining` is 1 while the node joins, and `ob_failover_abstaining` is 1 while it declines
+an election with the leader key vacant. The alert `OrderbookNoPrimaryWhileJoining` fires when that
+lasts a minute.
+
+The record is `repl_joining.txt` in the data directory, beside `repl_state.txt`. It is written
+durably before anything is replaced, so a node restarted in the middle of a join is still joining.
+It is removed when the primary sends `CAUGHT_UP` at the end of the catch-up, which the primary
+announces in its answer to `STREAMID?` (`STREAM <id> caught_up`).
+
+**When the node that holds the stream is not coming back** - its disk is gone - remove
+`repl_joining.txt` from the joining node's data directory. Within a second it stands with what it
+has. Every write it had not received is lost, and a node that returns later discards its copy. The
+engine no longer makes that choice for you; the record and the alert are how it asks.
+
+What this does not cover:
+- **A replica that resumed its own stream** from its saved position and is catching up holds a prefix
+  of that stream. It stands as before, and losing the primary then costs what it had not received:
+  the ordinary loss of asynchronous replication, in the list above.
+- **A primary older than #215** never says when a catch-up ends. A replica of it records nothing,
+  gives up a record it had, says so, and stands as before - so a rolling upgrade cannot leave a node
+  out of elections for good (`docs/upgrading.md`).
+- **Durability of the catch-up itself.** Its records are on the replica's disk as its
+  `--fsync-policy` puts any write there - at once under `every`, within a flush interval under
+  `interval` - and the record goes when `CAUGHT_UP` arrives. Under `interval` a power cut inside that
+  interval can cost the node the tail it had just received, as it can cost any node.
 
 ## When a replica falls behind
 
