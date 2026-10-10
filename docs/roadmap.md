@@ -2819,6 +2819,20 @@ what a first read costs over format 2's is decoding, not the allocation. A query
 would pay one more decode a segment, so it is not merged (branch `perf/held-from-the-second-read`).
 What is left on recorded books is the decoders' speed.
 
+**Nor does a seal that weighs decoding against bytes pay on recorded books** - the third way above,
+estimated from format 3's codec costs (`evidence/2026-10-07-segment-format-v3/codec-round-x86/`,
+every candidate's bytes and decode time a column). The seal's choice decodes the diff recording at
+11.89 ns a row in 3.76 bytes. Taking, for each column, the fastest candidate within a margin of the
+smallest:
+- within 20%: 11.70 ns in 4.16 bytes;
+- within 35%: 8.75 ns in 4.65 bytes;
+- within 50%: 6.90 ns in 5.18 bytes.
+
+The top 20 snapshots: 6.92 ns in 0.53 bytes as chosen, and 3.90 in 0.73 within 50%. So each per
+cent of decoding saved costs about a per cent of bytes, taken out of what the README's storage
+comparison publishes. On the synthetic set a 10% margin decodes in 1.84 ns a row rather than 3.19 at the same 1.77 bytes, but no
+margin under 20% moves the recordings.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 
