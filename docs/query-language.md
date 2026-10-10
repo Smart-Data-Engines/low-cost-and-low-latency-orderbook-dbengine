@@ -109,10 +109,10 @@ header names them, so a client can tell what it was handed — which is the only
 Two consequences worth knowing before writing a query. The server decodes only the columns it
 needs (in format 2, opens only their files), so a narrower question is a cheaper one — including for a column a predicate uses but the
 answer does not carry: `SELECT quantity ... WHERE price BETWEEN ...` reads `price` and does not
-answer it. And the Python client's `query()` and the C++ client read a row **by position**, so they
-accept the seven and refuse anything narrower by name rather than misreading it. The Python client's
-`query_rows()` reads any answer by the names in its header (#229); in C++ a narrowed query goes over
-the raw protocol until that client reads columns by name.
+answer it. And the clients' `query()` reads a row **by position**, in Python and in C++, so it
+accepts the seven and refuses anything narrower by name rather than misreading it. Any answer is read
+by the names in its header by the Python client's `query_rows()` (#229) and the C++ client's
+`query_named()` (#230).
 
 ## Aggregation Queries
 
