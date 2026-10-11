@@ -1544,9 +1544,8 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
     cur.through_offset = through.offset;
     replica.deferred_live.clear();
     replica.deferred_live.shrink_to_fit();
-    // A new range, so a new boundary: until this catch-up ends, the cursor decides what is sent.
-    replica.live_from = WalPosition{};
-    // And a new start to judge it against (#231), taken at its first measurement.
+    // A new start to judge it against (#231), taken at its first measurement. `live_from` is left as
+    // it is: nothing reads it while the cursor runs, and the cursor's end sets it again.
     cur.lag_baseline     = 0;
     cur.lag_baseline_set = false;
     // The directive travels with the cursor rather than with this function, because "after the

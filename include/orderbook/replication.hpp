@@ -425,7 +425,8 @@ struct ReplicaInfo {
     /// catch-up's range, because the range ends at the WAL's position when the request is read. A
     /// catch-up short enough to finish before that broadcast sent the record, and the broadcast then
     /// found no transfer in progress and sent it again - to a store that only appends. Zero, which
-    /// is before every record, until a catch-up ends; reset by each `REPLICATE`.
+    /// is before every record, until a catch-up ends; read only while none is running, and set again
+    /// by the end of each one.
     WalPosition live_from{};
 };
 
