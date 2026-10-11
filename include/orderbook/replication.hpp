@@ -136,10 +136,16 @@ struct SnapshotTransferState {
 struct ReplicaInfo;   // defined below; these two only take a reference to it
 
 /// What to do with something bound for a replica right now.
+///
+/// There is no "hold it until the transfer ends" any more (#231). A catch-up held every live record
+/// past its range in memory, `broadcast()` counted that against the 16 MB ceiling of a replica that
+/// does not drain, and under writes faster than 16 MB for the length of a catch-up every catch-up
+/// ended with the replica disconnected - silently, mid-record, and further behind each time it came
+/// back. The records were in the WAL all along, which the cursor reads.
 enum class LiveRecordAction {
     Send,    ///< Nothing is in progress: straight into the send buffer.
-    Defer,   ///< A transfer is streaming: hold the bytes until it finishes.
-    Drop,    ///< The transfer in progress already covers this record, or covered it.
+    Extend,  ///< A catch-up is walking the WAL: move its end past this record, which it reads there.
+    Drop,    ///< The transfer in progress covers this record, or covered it, or asks for it later.
 };
 
 /// Is a transfer streaming to this replica — a catch-up walking a WAL range, or a snapshot, or one
@@ -314,6 +320,13 @@ struct CatchupCursor {
     /// pass, kept as the reason it is sent from the cursor's end.
     bool     compress_after{false};
 
+    /// How far behind the end of the WAL this catch-up was when it was first measured (#231): the
+    /// ground it is judged against. A catch-up may start any distance behind; what ends it is
+    /// falling further behind than that by more than the limit, which is a replica applying slower
+    /// than this node writes. Set by the first measurement after the cursor is created.
+    uint64_t lag_baseline{0};
+    bool     lag_baseline_set{false};
+
     /// The end of this cursor's range, as a `WalPosition`.
     WalPosition through() const {
         return WalPosition{through_file, static_cast<uint32_t>(through_offset)};
@@ -382,26 +395,38 @@ struct ReplicaInfo {
     // Per-replica catch-up state (active while a requested WAL range is being streamed).
     CatchupCursor catchup;
 
-    /// Bytes waiting for whatever transfer is in progress to finish, framed exactly as they would
-    /// have been queued - compressed too, if this replica asked for that.
+    /// Heartbeats waiting for whatever transfer is in progress to finish, framed exactly as they
+    /// would have been queued - compressed too, if this replica asked for that.
     ///
-    /// It used to live on the catch-up cursor, because a catch-up was the only transfer a live
-    /// record could overtake. A snapshot transfer is the other one, and there the consequence is
-    /// worse than an ordering problem: the receiver reads a `SNAPSHOT_FILE` header with
-    /// `read_line()` and then exactly `file_size` bytes, so a record between two files makes the
-    /// next `read_line()` return `WAL ...` where a header belongs and the bootstrap is abandoned
-    /// with nothing installed (#99, measured). Released in arrival order, which is WAL order,
-    /// because both happen under the engine's write lock.
+    /// The receiver of a snapshot reads a `SNAPSHOT_FILE` header with `read_line()` and then exactly
+    /// `file_size` bytes, so a line between two files is read where a header belongs and the
+    /// bootstrap is abandoned with nothing installed (#99, measured). Live records waited here too
+    /// until #231, and that is what disconnected a catch-up under writes: they are dropped or read
+    /// from the WAL now (`live_record_action()`), so what waits here is a heartbeat or two.
     std::vector<uint8_t> deferred_live;
 
-    /// Has this connection sent `REPLICATE`?
+    /// Has this connection asked for a stream, and is it waiting for one?
     ///
     /// The record joins `replicas_` at `accept()`, which is before this connection has said what
     /// it wants — and `broadcast()` walks every entry. So a live write in that window used to be
     /// queued to a replica that had asked for nothing, and then sent a second time by the catch-up
     /// whose range ends past it (#100). Measured: ten records broadcast in that window, twenty
     /// received.
+    ///
+    /// False again after `ERR WAL_TRUNCATED` (#232): the replica answers that with
+    /// `SNAPSHOT_REQUEST` and reads its next line as `SNAPSHOT_BEGIN`, so a live record in the
+    /// round trip between the two abandoned the bootstrap - every time, under writes, since the
+    /// replica asks for the same position again.
     bool asked_for_stream{false};
+
+    /// Where the last catch-up ended: a live record before this position went out with it (#231).
+    ///
+    /// A `REPLICATE` handled between a record's append and its broadcast takes the record into the
+    /// catch-up's range, because the range ends at the WAL's position when the request is read. A
+    /// catch-up short enough to finish before that broadcast sent the record, and the broadcast then
+    /// found no transfer in progress and sent it again - to a store that only appends. Zero, which
+    /// is before every record, until a catch-up ends; reset by each `REPLICATE`.
+    WalPosition live_from{};
 };
 
 /// A snapshot being created on a worker thread for a replica that asked for one (#79).
@@ -529,6 +554,8 @@ private:
     std::vector<ReplicaInfo>   replicas_;
     /// See `last_broadcast_end()`. Under `mtx_`, written by `broadcast()`.
     WalPosition                last_broadcast_end_{};
+    /// When `end_catchups_too_far_behind_locked()` next measures. Under `mtx_`.
+    std::chrono::steady_clock::time_point next_catchup_lag_check_{};
 
     /// Serialises `stop()`, so that its early return means *stopped* rather than *stopping*.
     ///
@@ -594,8 +621,10 @@ private:
     enum class CatchupEnd { Reached, Stopped };
 
     /// Hand the replica back to live streaming: `CAUGHT_UP` when the end was reached (#215), the
-    /// compression directive, then the records that waited - in that order, so the replica reads
+    /// compression directive, then the heartbeats that waited - in that order, so the replica reads
     /// `CAUGHT_UP` as plain text after the last record of the catch-up and before any live one.
+    /// Records the catch-up read past its first end were read from the WAL, before `CAUGHT_UP`
+    /// (#231), and `live_from` keeps a late broadcast of one of them from going out again.
     void finish_catchup(ReplicaInfo& replica, CatchupEnd end);
 
     /// Queue a live message: into the send buffer, or behind an unfinished catch-up.
@@ -605,7 +634,8 @@ private:
     /// live record in front of the history it belongs after.
     void queue_to_replica(ReplicaInfo& replica, const void* data, size_t len);
 
-    /// Move everything held in `deferred_live` into the send buffer, in arrival order.
+    /// Move everything held in `deferred_live` - heartbeats, since #231 - into the send buffer, in
+    /// arrival order.
     ///
     /// Two callers, one per transfer: `finish_catchup()` and the end of a snapshot transfer. Both
     /// clear their `active` flag first, which is the honest order rather than a guarantee — this
@@ -621,6 +651,19 @@ private:
     /// in hand - polling that would be the busy-spin of pitfall 5 - and EPOLLOUT is what says the
     /// socket drained.
     bool catchup_can_progress_locked() const;
+
+    /// How much ground a catch-up may lose before it is ended (#231): four WAL files,
+    /// `4 x --wal-rotate-bytes`, further behind the end of the WAL than it was when it began. A
+    /// catch-up reads live records from the WAL rather than holding them, so it costs no memory
+    /// however far behind it is - but retention keeps every WAL file back to the slowest connected
+    /// replica, and a replica slower than the writes would hold the primary's disk for ever. Judged
+    /// against its start rather than against zero, because a replica back after an hour starts far
+    /// behind and catches up all the same if it is faster than the writes.
+    uint64_t catchup_lag_limit() const;
+
+    /// End every catch-up that has lost more than `catchup_lag_limit()`, disconnecting its replica.
+    /// Requires `mtx_`. At most every 100 ms: the distance is measured across WAL files.
+    void end_catchups_too_far_behind_locked();
 
     /// Handle a SNAPSHOT_REQUEST from a replica: hand the creation to a worker thread.
     void handle_snapshot_request(ReplicaInfo& replica);

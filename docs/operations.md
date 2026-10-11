@@ -443,7 +443,10 @@ halves, because they differ in a way that matters during an incident:
 | gone (crashed, killed, network down) | the file the newest synced checkpoint vouches for — usually the current one | **freed** — a reconnect from an old position is answered `ERR WAL_TRUNCATED` and needs a snapshot |
 
 A replica that is merely slow therefore costs disk, and a replica that is **absent** costs a
-snapshot when it comes back. Neither is a defect; the failure would be a third case, freeing a file
+snapshot when it comes back. The disk a slow one costs is bounded since #231: a catch-up that falls more than
+`4 x --wal-rotate-bytes` (2 GiB by default) further behind the end of the WAL than it began is ended
+and its replica disconnected, which moves it to the second row (see "A replica that is slow, rather
+than one that is behind" below). Neither is a defect; the failure would be a third case, freeing a file
 a connected replica still needs, which is what `ob_replicas_lag_unknown` counts and what the
 retention test in `tests/integration/test_wal_rotation.py` exists to catch.
 
@@ -452,7 +455,7 @@ not finish. On the primary:
 
 ```
 {"component":"repl_mgr","msg":"catchup: cannot open WAL file .../wal_000000.bin: No such file or directory"}
-{"component":"repl_mgr","msg":"sent ERR WAL_TRUNCATED to replica fd=14"}
+{"component":"repl_mgr","msg":"sent ERR WAL_TRUNCATED to replica fd=14; no live record goes to it until it asks for a snapshot or a stream"}
 {"component":"repl_mgr","msg":"snapshot for replica fd=14 (connection 14) is being created on a worker thread"}
 ```
 
@@ -462,6 +465,15 @@ and on the replica, `snapshot bootstrap` lines ending in an install. **An `ERROR
 asked again every five seconds for ever. If you are running a build from before #125 and a replica
 is stuck in that loop, the way out is to stop it, delete its data directory and start it again: it
 then bootstraps as a new node rather than asking for a position.
+
+**Under writes it did not finish either, until #232.** The replica answers `ERR WAL_TRUNCATED` with a
+snapshot request and reads its next line as `SNAPSHOT_BEGIN`, and a live record broadcast in that
+round trip arrived first. Under writes there always was one, so the replica logged `snapshot
+bootstrap abandoned: expected SNAPSHOT_BEGIN, got 'WAL 4 323634898 136 1'` and asked for the same
+freed position five seconds later, for ever: measured on the cluster hosts. A primary sends a
+refused replica nothing now until it asks again. A replica skips live records before
+`SNAPSHOT_BEGIN`, for a primary from before the fix, and says how many:
+`skipped 3 live record(s) before SNAPSHOT_BEGIN: they are in the snapshot or after it`.
 
 **A rotation the disk refuses** is logged and survived, and neither of its two shapes refuses the
 write that asked for it — that record is already in the file (#153):
@@ -959,13 +971,13 @@ on each receiver for 300 000 writes from one node).
 
 ### A replica that is slow, rather than one that is behind
 
-`replica fd=9 is not draining: queued=16780544 > 16777216 - dropping the connection` means this
-node is holding 16 MB of output for one replica and the socket is not moving it. Read it as a
-statement about the **link or the replica**, not about how far behind that replica was: since #93 a
-catch-up streams in bounded batches and stops at half this ceiling until the socket drains, so the
-size of the range a replica asks for cannot reach the ceiling on its own. Before #93 it could, and
-the same message meant something quite different — a replica more than 16 MB behind was dropped by
-the act of catching it up, reconnected, and was dropped again.
+**A catch-up reads what is written while it runs from the WAL (#231).** A live record past the end
+of its range moves the end, and the cursor reads the record there after everything before it. So a
+catch-up under writes ends where the writes are, as long as the replica applies faster than this node
+writes. Until #231 it held those records in memory instead, against the 16 MB ceiling below. Under a
+writer of about 15 MB of WAL a second every catch-up longer than about a second ended with the
+replica disconnected mid-record, silently on both sides, and further behind each time it came back:
+measured on the cluster hosts, a replica on the slower host never finished its join.
 
 A catch-up that is progressing says so twice: once at the start, with where it is going —
 
@@ -974,19 +986,47 @@ catchup for fd=9: from_file=3, from_offset=1048576, through_file=7, through_offs
 wal_dir=/var/lib/orderbook/wal
 ```
 
-— and once at the end, with where it arrived and how much live traffic it held back:
+— and once at the end, with where it arrived, which is past `through` when writes came while it ran:
 
 ```
-catchup complete for fd=9 at file=7 offset=41904; releasing 24576 bytes of live records
-that arrived while it streamed
+catchup complete for fd=9 at file=9 offset=1290240, CAUGHT_UP sent
 ```
 
-Those held-back bytes are the ordering guarantee, not a queue to worry about: a record written while
-a replica is still receiving history must arrive after that history. If the number is large and the
-completion line is slow to appear, the replica is behind by a lot and the write rate is high — the
-pair to watch is that number growing across successive completions, which says the catch-up is
-losing ground to live traffic. It is bounded by the same 16 MB ceiling as the send queue, and
-reaching it drops the replica as above.
+**A catch-up that does not catch up is ended** once it falls more than `4 x --wal-rotate-bytes`
+(2 GiB by default) further behind the end of the WAL than it was when it began. The node states its
+limit at start: `a catch-up that falls more than ... byte(s) further behind the end of the WAL than it
+began is ended`. Judged against its start, not against zero: a replica back after an hour starts far
+behind, and catches up all the same if it applies faster than this node writes.
+
+```
+catchup for fd=9 (10.0.0.12:51438) is 3221258240 byte(s) behind the end of the WAL at 3:1048576,
+1073741824 when it began - it has lost more than 2147483648 (4 x --wal-rotate-bytes): disconnecting it. ...
+```
+
+That replica applies slower than this node writes. It costs no memory however far behind it is, but
+retention keeps every WAL file back to the slowest connected replica, so without a limit it would
+hold this node's disk. `ob_replica_catchups_abandoned_total` counts these. The replica comes back on
+its backoff, with a catch-up from its position or, once retention has freed that, a snapshot. It
+cannot stay in sync with this write rate whatever is done here, so the cure is on its side: its disk,
+its CPU, or the link.
+
+**A replica that stopped reading what it was keeping up with** is a different line:
+
+```
+replica fd=9 (10.0.0.12:51438) has 16780544 byte(s) queued, over the 16777216 limit: disconnecting
+it; it comes back with a catch-up from its position
+```
+
+This node is holding 16 MB of output for a replica past its catch-up and the socket is not moving it.
+Read it as a statement about the **link or the replica**. Since #93 a catch-up stops at half this
+ceiling until the socket drains, and since #231 it holds nothing for live traffic, so neither the size
+of the range nor the writes during it can reach the ceiling. Before #231 this line did not exist: the
+disconnect was silent.
+
+On the replica, a stream that ends inside a record says where and why, rather than reconnecting
+without a word: `the stream ended or failed inside the record at 0:21570712 (136 byte(s)
+announced), errno=32 (Broken pipe): disconnecting`. A record that fails its CRC32C or its length
+check is an `ERROR` naming the record.
 
 ### A replica that restarted, and which stream it decided it was on
 

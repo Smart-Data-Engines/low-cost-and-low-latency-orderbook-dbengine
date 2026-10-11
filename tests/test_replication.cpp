@@ -20,6 +20,7 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 
 #include "orderbook/wal.hpp"
 #include "orderbook/data_model.hpp"
+#include "orderbook/engine.hpp"
 #include "orderbook/crc32c.hpp"
 
 #include <algorithm>
@@ -487,9 +488,12 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotOvertakeAnUnfinishedCatchup) {
     // cursor is halfway would be queued *now*, in front of the history it comes after, and the
     // replica would replay it before records older than it.
     //
-    // So the cursor's end is fixed when it is created, and live records that arrive while it runs
-    // wait behind it. This test states that in the only form that can fail: the whole arrival
-    // order, not the presence of the record.
+    // So a live record that arrives while the cursor runs is not queued at all: it moves the
+    // cursor's end, and the cursor reads it from the WAL after everything before it (#231; until
+    // then it waited in memory behind the cursor, and that memory is what disconnected a catch-up
+    // under writes). This test states that in the only form that can fail: the whole arrival order,
+    // not the presence of the record - and the count, because a cursor chasing the end while the
+    // live copy is also queued delivers it twice.
     constexpr int      kRecords   = 1000;
     constexpr size_t   kLevels    = 1000;
     constexpr uint64_t kMarkerSeq = 999999;
@@ -820,10 +824,16 @@ TEST_F(ReplicationProtocolTest, ARotatingAppendAnnouncesTheFileTheRecordWentInto
 
 namespace {
 
-/// Append one delta to the WAL and broadcast it, the way the engine does under one lock.
-/// Returns the sequence number it used.
-uint64_t append_and_broadcast(ob::WALWriter& wal, ob::ReplicationManager& mgr, uint64_t seq,
-                              size_t levels) {
+/// A record in the WAL, and what its broadcast will carry.
+struct PendingBroadcast {
+    ob::WALRecord        hdr{};
+    std::vector<uint8_t> payload;
+    ob::WalPosition      pos{};
+};
+
+/// Append one delta to the WAL and return its broadcast without making it: the moment between the
+/// engine's append and its broadcast, held open (#231).
+PendingBroadcast append_without_broadcast(ob::WALWriter& wal, uint64_t seq, size_t levels) {
     std::vector<ob::Level> lv(levels);
     for (size_t l = 0; l < levels; ++l) {
         lv[l].price = static_cast<int64_t>(l) + 1;
@@ -843,15 +853,23 @@ uint64_t append_and_broadcast(ob::WALWriter& wal, ob::ReplicationManager& mgr, u
     std::memcpy(payload.data(), &d, sizeof(d));
     std::memcpy(payload.data() + sizeof(d), lv.data(), levels * sizeof(ob::Level));
 
-    ob::WALRecord hdr{};
-    hdr.sequence_number = seq;
-    hdr.timestamp_ns    = d.timestamp_ns;
-    hdr.payload_len     = static_cast<uint16_t>(payload.size());
-    hdr.checksum        = ob::crc32c(payload.data(), payload.size());
-    hdr.record_type     = ob::WAL_RECORD_DELTA;
+    PendingBroadcast p;
+    p.hdr.sequence_number = seq;
+    p.hdr.timestamp_ns    = d.timestamp_ns;
+    p.hdr.payload_len     = static_cast<uint16_t>(payload.size());
+    p.hdr.checksum        = ob::crc32c(payload.data(), payload.size());
+    p.hdr.record_type     = ob::WAL_RECORD_DELTA;
+    p.payload             = std::move(payload);
+    p.pos                 = wal.append(d, lv.data());
+    return p;
+}
 
-    const ob::WalPosition pos = wal.append(d, lv.data());
-    mgr.broadcast(hdr, payload.data(), payload.size(), pos);
+/// Append one delta to the WAL and broadcast it, the way the engine does under one lock.
+/// Returns the sequence number it used.
+uint64_t append_and_broadcast(ob::WALWriter& wal, ob::ReplicationManager& mgr, uint64_t seq,
+                              size_t levels) {
+    const PendingBroadcast p = append_without_broadcast(wal, seq, levels);
+    mgr.broadcast(p.hdr, p.payload.data(), p.payload.size(), p.pos);
     return seq;
 }
 
@@ -942,6 +960,222 @@ TEST_F(ReplicationProtocolTest, ARecordBroadcastAfterTheHandshakeStillArrives) {
     ASSERT_EQ(live.size(), static_cast<size_t>(kLive))
         << "a live record after the catch-up did not arrive: " << live.size() << " of " << kLive;
     expect_positions_name_their_records(tmp_->str(), live);
+
+    ::close(fd);
+    mgr->stop();
+}
+
+// ── #231: a catch-up under writes, and where it ends ─────────────────────────────────────────────
+
+TEST_F(ReplicationProtocolTest, ACatchupUnderMoreLiveWritesThanTheCeilingKeepsItsReplica) {
+    // #231, measured on the two cluster hosts: a primary taking about 15 MB of WAL a second and a
+    // replica rejoining it. A catch-up held every live record past its end in memory, `broadcast()`
+    // counted that against the 16 MB ceiling of a replica that does not drain, and every catch-up
+    // longer than about a second ended with the replica disconnected - mid-record, logged by
+    // neither side, and further behind each time it came back. The records were in the WAL all
+    // along; the cursor reads them there now.
+    //
+    // A range past half the ceiling, so the cursor fills its share of the queue and waits for a
+    // replica that is not reading yet - the catch-up is in progress when the writes come - and more
+    // live writes than the ceiling while it waits.
+    constexpr int    kRecords = 600;
+    constexpr int    kLive    = 800;
+    constexpr size_t kLevels  = 1000;
+    const size_t range_bytes = fill_wal(*wal_, kRecords, kLevels);
+    ASSERT_GT(range_bytes, 8u << 20) << "the cursor must still be streaming when the writes come";
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    {
+        const auto states = mgr->replica_states();
+        ASSERT_EQ(states.size(), 1u);
+        ASSERT_TRUE(states[0].catchup.active)
+            << "the catch-up ended before the writes, so this test never reached its window";
+    }
+
+    const size_t payload_len = sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
+    for (int i = 0; i < kLive; ++i) {
+        append_and_broadcast(*wal_, *mgr, static_cast<uint64_t>(kRecords + 1 + i), kLevels);
+    }
+    ASSERT_GT(static_cast<size_t>(kLive) * (sizeof(ob::WALRecord) + payload_len), 16u << 20)
+        << "the writes during the catch-up must be past the ceiling for this test to be about it";
+
+    {
+        const auto states = mgr->replica_states();
+        ASSERT_EQ(states.size(), 1u)
+            << "the primary disconnected a replica whose catch-up was making progress, because the "
+               "writes during it were held in memory and counted against its ceiling";
+        EXPECT_GE(states[0].fd, 0);
+    }
+
+    // Every record once, in WAL order: the range, then the writes during it - read from the WAL by
+    // the cursor, so none of them twice.
+    const auto seqs = recv_sequence_numbers(fd, static_cast<size_t>(kRecords + kLive));
+    ASSERT_EQ(seqs.size(), static_cast<size_t>(kRecords + kLive))
+        << "the stream carried " << seqs.size() << " of " << (kRecords + kLive) << " records";
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        ASSERT_EQ(seqs[i], i + 1) << "record " << i << " arrived out of order or twice";
+    }
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ARecordTheCatchupSentIsNotSentAgainByALateBroadcast) {
+    // #231, the other half of a catch-up that runs to a moving end. A `REPLICATE` read between a
+    // record's append and its broadcast takes the record into the range, which ends at the WAL's
+    // position when the request is read. A catch-up that short ended before the broadcast came, and
+    // with nothing in progress the broadcast sent the record again - to a store that only appends.
+    // Held open deterministically: the record is appended, the catch-up runs to its end, and only
+    // then is the record broadcast.
+    fill_wal(*wal_, 3, 4);
+    const PendingBroadcast late = append_without_broadcast(*wal_, 4, 4);
+    ASSERT_TRUE(wal_->flush());
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto caught_up = recv_sequence_numbers(fd, 4);
+    ASSERT_EQ(caught_up, (std::vector<uint64_t>{1, 2, 3, 4}))
+        << "the catch-up did not carry the record appended before the request";
+    bool ended = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto states = mgr->replica_states();
+        if (states.size() == 1 && !states[0].catchup.active) { ended = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(ended) << "the catch-up never ended";
+
+    mgr->broadcast(late.hdr, late.payload.data(), late.payload.size(), late.pos);
+    append_and_broadcast(*wal_, *mgr, 5, 4);
+
+    const auto after = recv_sequence_numbers(fd, 2, 500);
+    ASSERT_FALSE(after.empty()) << "the record written after the catch-up never arrived";
+    EXPECT_EQ(after, (std::vector<uint64_t>{5}))
+        << "the record the catch-up carried arrived a second time with its own late broadcast";
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ACatchupThatLosesGroundIsEnded) {
+    // #231. A catch-up reads what is written during it from the WAL, so it holds no memory however
+    // far behind it falls. What it holds is retention - WAL files are removed only below the slowest
+    // connected replica - and a replica slower than the writes would hold this node's disk for
+    // ever. A catch-up that falls 4 x --wal-rotate-bytes further behind the end of the WAL than it
+    // began is ended, with a count. Against its start rather than zero: a replica back after an hour
+    // starts far behind and catches up all the same if it is faster than the writes. A real engine
+    // with its own manager, because the distance is measured across its files.
+    constexpr size_t kRotate = 64 * 1024;
+    ob::ReplicationConfig rc;
+    rc.port         = port_;
+    rc.max_replicas = 4;
+    ob::Engine engine(tmp_->str() + "/engine", 100'000'000ULL, ob::FsyncPolicy::NONE, rc, {}, {},
+                      {}, {}, kRotate);
+    engine.open();
+
+    std::vector<ob::Level> lv(200);
+    for (size_t l = 0; l < lv.size(); ++l) {
+        lv[l].price = static_cast<int64_t>(l) + 1;
+        lv[l].qty   = 1;
+        lv[l].cnt   = 1;
+        lv[l]._pad  = 0;
+    }
+    uint64_t written = 0;
+    const auto write = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            ob::DeltaUpdate d{};
+            std::strncpy(d.symbol, "LAG", sizeof(d.symbol) - 1);
+            std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+            d.timestamp_ns = 9'000'000'000ULL + written++;
+            d.side         = ob::SIDE_BID;
+            d.n_levels     = static_cast<uint16_t>(lv.size());
+            ASSERT_EQ(engine.apply_delta(d, lv.data()), ob::OB_OK);
+        }
+    };
+    // A history past half the queue's ceiling, so the catch-up is still streaming - stalled on a
+    // replica that reads nothing - when the writes below come.
+    write(2500);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_EQ(engine.registry().counter_value("ob_replica_catchups_abandoned_total"), 0u)
+        << "a catch-up was ended for where it started rather than for losing ground";
+
+    // Every write from here leaves the stalled cursor further behind than it began.
+    uint64_t abandoned = 0;
+    for (int batch = 0; batch < 40 && abandoned == 0; ++batch) {
+        write(500);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        abandoned = engine.registry().counter_value("ob_replica_catchups_abandoned_total");
+    }
+    EXPECT_EQ(abandoned, 1u)
+        << "a catch-up that lost far more than 4 x --wal-rotate-bytes of ground was not ended";
+
+    // And the replica is gone: what it was sent drains, and then the stream ends.
+    struct timeval tv{};
+    tv.tv_sec = 5;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::vector<char> sink(1 << 20);
+    ssize_t n = 0;
+    while ((n = ::recv(fd, sink.data(), sink.size(), 0)) > 0) {}
+    EXPECT_EQ(n, 0) << "the connection of an ended catch-up was not closed";
+
+    ::close(fd);
+    engine.close();
+}
+
+// ── #232: a replica refused for a freed position ─────────────────────────────────────────────────
+
+TEST_F(ReplicationProtocolTest, NoLiveRecordGoesToAReplicaRefusedForAFreedPosition) {
+    // #232, the primary's half. A replica asking from a position retention has freed is answered
+    // `ERR WAL_TRUNCATED`, and answers that with `SNAPSHOT_REQUEST`, reading its next line as
+    // `SNAPSHOT_BEGIN`. The connection had asked for a stream, had no transfer in progress and no
+    // snapshot being prepared yet, so a live record broadcast in that round trip was sent - and
+    // under writes there always was one: measured on the cluster hosts, every five seconds, for ever.
+    const std::string dir = tmp_->str() + "/rotating";
+    std::filesystem::create_directories(dir);
+    wal_ = std::make_unique<ob::WALWriter>(dir, 4096);
+    fill_wal(*wal_, 12, 50);
+    ASSERT_GT(wal_->current_position().file_index, 1u) << "the WAL never rotated";
+    char first[32];
+    std::snprintf(first, sizeof(first), "/wal_%06u.bin", 0u);
+    ASSERT_TRUE(std::filesystem::remove(dir + first)) << "the first WAL file was not there to free";
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+    ASSERT_EQ(recv_line(fd, 3000), "ERR WAL_TRUNCATED");
+
+    // Writes, while the replica's request is on its way.
+    for (int i = 0; i < 5; ++i) append_and_broadcast(*wal_, *mgr, 100 + static_cast<uint64_t>(i), 4);
+
+    struct pollfd pfd{};
+    pfd.fd     = fd;
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 600), 0)
+        << "something reached a replica answered ERR WAL_TRUNCATED before it asked for anything "
+           "else: the line after its snapshot request would not be SNAPSHOT_BEGIN";
+
+    // And the request is answered next. This manager has no engine, so the answer is a refusal -
+    // the point is that it is the next line, not a record.
+    const char* request = "SNAPSHOT_REQUEST\n";
+    ASSERT_GT(::send(fd, request, std::strlen(request), MSG_NOSIGNAL), 0);
+    const std::string answer = recv_line(fd, 3000);
+    EXPECT_EQ(answer.rfind("ERR SNAPSHOT_FAILED", 0), 0u) << "got: " << answer;
 
     ::close(fd);
     mgr->stop();
@@ -2117,27 +2351,31 @@ TEST(LiveRecordDecision, TheAnswerIsAContractRatherThanASideEffect) {
     EXPECT_EQ(ob::live_record_action(r, somewhere), LiveRecordAction::Send);
 
     // A catch-up walking a range. Inside it the cursor will read this record out of the WAL file
-    // itself; at or past its end, the live path is what delivers it - after the cursor's last byte.
+    // itself; at or past its end the range grows to take it, and the cursor reads it there too
+    // (#231) - after every record before it, which is all "after the cursor's last byte" meant.
     r.catchup.active         = true;
     r.catchup.through_file   = 3;
     r.catchup.through_offset = 100;
     EXPECT_TRUE(ob::transfer_in_progress(r));
     EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 99}), LiveRecordAction::Drop);
     EXPECT_EQ(ob::live_record_action(r, WalPosition{2, 999999}), LiveRecordAction::Drop);
-    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 100}), LiveRecordAction::Defer);
-    EXPECT_EQ(ob::live_record_action(r, WalPosition{4, 0}), LiveRecordAction::Defer);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 100}), LiveRecordAction::Extend);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{4, 0}), LiveRecordAction::Extend);
     r.catchup.active = false;
 
     // A snapshot being streamed. The snapshot carries the WAL position it was taken at: earlier
-    // records are inside the files being installed, later ones are what the replica needs next.
+    // records are inside the files being installed, and later ones the replica asks for from that
+    // position on the connection it opens once the snapshot is installed (#214) - so both are
+    // dropped (#231). Held back here, a later one went out on the connection being closed, and
+    // counted against the ceiling of a replica that does not drain while it waited.
     r.snapshot_transfer.active                  = true;
     r.snapshot_transfer.manifest.wal_file_index  = 5;
     r.snapshot_transfer.manifest.wal_byte_offset = 4096;
     EXPECT_TRUE(ob::transfer_in_progress(r));
     EXPECT_EQ(ob::live_record_action(r, WalPosition{5, 4095}), LiveRecordAction::Drop);
     EXPECT_EQ(ob::live_record_action(r, WalPosition{4, 999999}), LiveRecordAction::Drop);
-    EXPECT_EQ(ob::live_record_action(r, WalPosition{5, 4096}), LiveRecordAction::Defer);
-    EXPECT_EQ(ob::live_record_action(r, WalPosition{6, 0}), LiveRecordAction::Defer);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{5, 4096}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{6, 0}), LiveRecordAction::Drop);
 
     // Never `Send` while anything is streaming: a `Send` is what splices bytes into a stream whose
     // receiver is counting them.
@@ -2152,6 +2390,28 @@ TEST(LiveRecordDecision, TheAnswerIsAContractRatherThanASideEffect) {
     // makes decides where its stream starts.
     r.asked_for_stream = false;
     EXPECT_EQ(ob::live_record_action(r, WalPosition{6, 0}), LiveRecordAction::Drop);
+}
+
+TEST(LiveRecordDecision, ARecordTheLastCatchUpSentIsNotSentAgain) {
+    // #231. A `REPLICATE` read between a record's append and its broadcast takes the record into the
+    // catch-up's range, which ends at the WAL's position when the request is read. A catch-up that
+    // short ends before the broadcast arrives - and with nothing in progress the broadcast sent the
+    // record a second time, to a store that only appends. `live_from` is where the cursor ended.
+    using ob::LiveRecordAction;
+    using ob::WalPosition;
+
+    ob::ReplicaInfo r;
+    r.asked_for_stream = true;
+    r.live_from        = WalPosition{3, 100};
+    EXPECT_FALSE(ob::transfer_in_progress(r));
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 99}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{2, 999999}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 100}), LiveRecordAction::Send);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{4, 0}), LiveRecordAction::Send);
+
+    // The default is before every record: a connection no catch-up has ended for sends them all.
+    r.live_from = WalPosition{};
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{0, 0}), LiveRecordAction::Send);
 }
 
 TEST(LiveRecordDecision, NothingGoesAheadOfASnapshotStillBeingMade) {
@@ -2211,6 +2471,9 @@ struct BootstrapScript {
     /// end of an earlier catch-up on the connection, which is not the answer either (#215).
     bool caught_up_before_begin{false};
     bool time_the_resume{false};        ///< wait for the replica to come back, and time it (#214)
+    /// A live `WAL` record before `SNAPSHOT_BEGIN`: what a primary before #232 broadcast in the
+    /// round trip between its `ERR WAL_TRUNCATED` and the request reaching it.
+    bool live_record_before_begin{false};
 };
 
 SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
@@ -2277,6 +2540,21 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     if (script.caught_up_before_begin) {
         const char* caught_up = "CAUGHT_UP 0 0\n";
         EXPECT_GT(::send(peer_fd, caught_up, std::strlen(caught_up), MSG_NOSIGNAL), 0);
+    }
+    if (script.live_record_before_begin) {
+        // Exactly what `broadcast()` puts on the wire, at a position past the snapshot's: the record
+        // a writer appends while the request is in flight.
+        auto [payload, crc] = build_delta_payload("BTCUSD", "BINANCE", 9, 9'000'000, 0, 50000, 100);
+        ob::WALRecord hdr{};
+        hdr.sequence_number = 9;
+        hdr.timestamp_ns    = 9'000'000;
+        hdr.checksum        = crc;
+        hdr.payload_len     = static_cast<uint16_t>(payload.size());
+        hdr.record_type     = ob::WAL_RECORD_DELTA;
+        hdr._pad            = 0;
+        const auto msg = build_wal_message(3, 8192, hdr, payload.data(), payload.size());
+        EXPECT_EQ(::send(peer_fd, msg.data(), msg.size(), MSG_NOSIGNAL),
+                  static_cast<ssize_t>(msg.size()));
     }
 
     // A non-zero WAL position, deliberately: a snapshot taken at 0 0 is indistinguishable from
@@ -2384,6 +2662,20 @@ TEST_F(ReplicationClientTest, AHeartbeatBeforeSnapshotBeginIsNotTheAnswer) {
     const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
     EXPECT_TRUE(out.first_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
     EXPECT_TRUE(out.second_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
+}
+
+TEST_F(ReplicationClientTest, ALiveRecordBeforeSnapshotBeginIsSkippedWithItsBytes) {
+    // #232, the replica's half. A primary before the fix sends live records between its
+    // `ERR WAL_TRUNCATED` and `SNAPSHOT_BEGIN`, and under writes there always was one: the replica
+    // read it as the answer, abandoned the bootstrap and asked for the same freed position again,
+    // every five seconds, for ever. Measured on the cluster hosts. The record is in the snapshot or
+    // after its position, so it is skipped - with exactly the bytes its header announces, or the
+    // next line read would be the middle of its payload.
+    BootstrapScript script;
+    script.live_record_before_begin = true;
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
+    EXPECT_TRUE(out.first_file_installed) << "a live record before SNAPSHOT_BEGIN abandoned the bootstrap";
+    EXPECT_TRUE(out.second_file_installed) << "a live record before SNAPSHOT_BEGIN abandoned the bootstrap";
 }
 
 TEST_F(ReplicationClientTest, ACaughtUpBeforeSnapshotBeginIsNotTheAnswerAndDoesNotEndTheJoin) {
