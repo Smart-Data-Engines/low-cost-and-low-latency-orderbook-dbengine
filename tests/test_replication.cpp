@@ -978,11 +978,12 @@ TEST_F(ReplicationProtocolTest, ACatchupUnderMoreLiveWritesThanTheCeilingKeepsIt
     // A range past half the ceiling, so the cursor fills its share of the queue and waits for a
     // replica that is not reading yet - the catch-up is in progress when the writes come - and more
     // live writes than the ceiling while it waits.
-    constexpr int    kRecords = 600;
+    constexpr int    kRecords = 1000;
     constexpr int    kLive    = 800;
     constexpr size_t kLevels  = 1000;
     const size_t range_bytes = fill_wal(*wal_, kRecords, kLevels);
-    ASSERT_GT(range_bytes, 8u << 20) << "the cursor must still be streaming when the writes come";
+    ASSERT_GT(range_bytes, 20u << 20) << "the cursor must still be streaming when the writes come: "
+                                         "the queue takes 8 MB and the loopback socket several more";
 
     auto mgr = start_manager();
     int fd = connect_to_localhost(port_);
@@ -1101,12 +1102,20 @@ TEST_F(ReplicationProtocolTest, ACatchupThatLosesGroundIsEnded) {
             ASSERT_EQ(engine.apply_delta(d, lv.data()), ob::OB_OK);
         }
     };
-    // A history past half the queue's ceiling, so the catch-up is still streaming - stalled on a
-    // replica that reads nothing - when the writes below come.
-    write(2500);
-
+    // Connected before the history, and silent until after it: retention keeps every WAL file
+    // back to the slowest connected replica, and a connection that has not asked yet counts as one
+    // at the start of the log. Without it the flush ticks of a history this long free the first
+    // files, and the request below is answered `ERR WAL_TRUNCATED` rather than with a catch-up.
     int fd = connect_to_localhost(port_);
     ASSERT_GE(fd, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // A history far past what the queue and the loopback socket together absorb, so the catch-up is
+    // still streaming - stalled on a replica that reads nothing - when the writes below come. 12 MB
+    // was measured leaving the cursor 1.2 - 1.3 MB from its end, too close: about 39 MB leaves a
+    // margin of tens of megabytes.
+    write(8000);
+
     const char* handshake = "REPLICATE 0 0 0\n";
     ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -2093,8 +2102,8 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
                               "window it is about";
 
     // A live write while the snapshot streams. The position is deliberately far past anything the
-    // snapshot could have been taken at, so the decision under test is Defer rather than Drop -
-    // the Drop side is covered by `LiveRecordDecision`.
+    // snapshot could have been taken at: the record the replica needs next, which it asks for from
+    // the snapshot's position once it has installed it. Held back until #231, dropped since.
     constexpr uint64_t kMarkerSeq = 4242;
     ob::Level one{};
     one.price = 1; one.qty = 1; one.cnt = 1;
@@ -2181,24 +2190,24 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
     EXPECT_EQ(end.rfind("SNAPSHOT_END", 0), 0u)
         << "expected SNAPSHOT_END, got '" << end << "'";
 
-    // And the deferred record follows it, rather than having been dropped: the snapshot carries the
-    // position it was taken at, so a record past that position is what the replica needs next.
+    // And the record does not follow it on this connection. The replica installs the snapshot and
+    // connects again at once, asking for the stream from the snapshot's position (#214), where a
+    // catch-up reads the record from the WAL. Held back and released here, as it was until #231,
+    // it went out on a connection the replica was closing - and counted against the ceiling of a
+    // replica that does not drain while it waited, so a snapshot long enough under writes was
+    // ended the way a catch-up was.
     //
-    // Read through the same buffer the walk above used, not with `recv_wire_records()`. That helper
-    // starts from an empty buffer and reads the socket, and by this point the record's bytes are
-    // already in `in` - the "reader with a buffer of its own" mistake, from the other side.
-    const std::string wal_line = next_line();
-    ASSERT_EQ(wal_line.rfind("WAL ", 0), 0u)
-        << "expected the deferred live record after SNAPSHOT_END, got '" << wal_line << "'";
-    unsigned wl_file = 0, wl_epoch = 0;
-    size_t wl_offset = 0, wl_total = 0;
-    ASSERT_GE(std::sscanf(wal_line.c_str(), "WAL %u %zu %zu %u", &wl_file, &wl_offset, &wl_total,
-                          &wl_epoch), 3);
-    while (in.size() < wl_total) { ASSERT_TRUE(pull()) << "the deferred record was truncated"; }
-    uint64_t seq = 0;
-    std::memcpy(&seq, in.data(), sizeof(seq));   // WALRecord::sequence_number is first
-    EXPECT_EQ(seq, kMarkerSeq)
-        << "the record released after the snapshot is not the one that waited for it";
+    // Read through the same buffer the walk above used: by this point anything that followed is
+    // already in `in` or on its way. A heartbeat held back during the transfer may follow, and is
+    // not a record.
+    tv.tv_sec  = 0;
+    tv.tv_usec = 500'000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::string after = next_line();
+    while (after.rfind("HEARTBEAT", 0) == 0) after = next_line();
+    EXPECT_NE(after.rfind("WAL ", 0), 0u)
+        << "a live record went out after SNAPSHOT_END, on the connection the replica closes: '"
+        << after << "'";
 
     ::close(fd);
     mgr->stop();
