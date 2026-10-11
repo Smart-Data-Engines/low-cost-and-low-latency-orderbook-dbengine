@@ -716,7 +716,7 @@ void WALWriter::append_epoch(const EpochValue& epoch) {
     hdr._pad            = 0;
 
     write_record(hdr, payload, sizeof(payload));
-    current_epoch_ = epoch.term;
+    current_epoch_.store(epoch.term, std::memory_order_release);
 }
 
 void WALWriter::rotate() {

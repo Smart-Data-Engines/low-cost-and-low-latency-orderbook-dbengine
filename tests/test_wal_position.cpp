@@ -158,6 +158,58 @@ TEST(WalPosition, WithinOneFileTheOffsetNeverGoesBackwardsForAReaderOnAnotherThr
     std::filesystem::remove_all(dir);
 }
 
+// ── The epoch, across threads ─────────────────────────────────────────────────────────────────────
+
+TEST(WalEpoch, AReaderOnAnotherThreadSeesTheEpochOnlyGrow) {
+    // The replication thread reads the writer's epoch for every heartbeat, for the stream question
+    // and for a replica's handshake. A promotion writes it on the failover thread, through
+    // `set_epoch()` and `append_epoch()` in `Engine::promote_to_primary()`. The field was a plain
+    // `uint64_t` until the TSan battery on PR #241 reported the heartbeat's read against
+    // `append_epoch()`'s write. The PR's integration test was the first to restart a primary that
+    // resumes the role while its replication thread is already running. On the unfixed tree TSan
+    // reports a data race on this read.
+    //
+    // The writes start once the reader has observed at least once, so they overlap its reads rather
+    // than finishing before it is scheduled. What a reader may rely on: the epoch it reads never
+    // goes backwards, and the last one written is the one that stays.
+    const auto dir = make_temp_dir("epoch");
+    ob::WALWriter writer(dir.string());
+
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> observations{0};
+    std::atomic<uint64_t> went_backwards{0};
+
+    std::thread reader([&] {
+        uint64_t last = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            const uint64_t epoch = writer.current_epoch();
+            observations.fetch_add(1, std::memory_order_relaxed);
+            if (epoch < last) {
+                went_backwards.fetch_add(1, std::memory_order_relaxed);
+            }
+            last = epoch;
+        }
+    });
+    while (observations.load(std::memory_order_relaxed) == 0) {
+        std::this_thread::yield();
+    }
+
+    constexpr uint64_t kTerms = 2000;
+    for (uint64_t term = 1; term <= kTerms; ++term) {
+        writer.set_epoch(term);
+        writer.append_epoch(ob::EpochValue{term});
+    }
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+
+    EXPECT_GT(observations.load(), 1u) << "the reader did not run beside the writes";
+    EXPECT_EQ(writer.current_epoch(), kTerms);
+    EXPECT_EQ(went_backwards.load(), 0u)
+        << went_backwards.load() << " of " << observations.load()
+        << " observed epochs were lower than the one observed before them";
+    std::filesystem::remove_all(dir);
+}
+
 // ── The bound that makes a 32-bit offset safe ─────────────────────────────────────────────────────
 
 TEST(WalPosition, ARotateThresholdThatCouldOverflowTheOffsetIsRefused) {

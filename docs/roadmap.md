@@ -3251,6 +3251,16 @@ Tests:
 
   Against master `cf7cf04` the same test fails where the defect is: the replica takes the role.
 
+**Found on the way: the WAL writer's epoch was a data race, on master too.** The TSan battery on this
+PR reported the replication thread's heartbeat reading `WALWriter::current_epoch()` while
+`Engine::promote_to_primary()` wrote it on the failover thread through `append_epoch()`; the field was
+a plain `uint64_t`. `test_joining_replica.py` is the first test to restart a primary that resumes the
+role while its replication thread is already running, and it gave the same report on a local TSan
+build. The field is atomic now, release and acquire like `Engine::current_epoch_`.
+`tests/test_wal_position.cpp`'s `WalEpoch.AReaderOnAnotherThreadSeesTheEpochOnlyGrow` reports the race
+under TSan without the fix and is clean with it, and the integration test against the fixed TSan
+server left no report.
+
 ### 214. A replica rejoining under writes never took its snapshot, and a node without the round's writes was promoted ✅ **P1**
 
 **Found on the two cluster hosts** - an m8a.xlarge with Ubuntu 26.04 and an m9g.xlarge with Amazon

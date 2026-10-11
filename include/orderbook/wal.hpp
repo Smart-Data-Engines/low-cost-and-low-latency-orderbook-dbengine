@@ -429,10 +429,11 @@ public:
     void append_epoch(const EpochValue& epoch);
 
     /// Set the current epoch tracked by this writer.
-    void set_epoch(uint64_t e) { current_epoch_ = e; }
+    void set_epoch(uint64_t e) { current_epoch_.store(e, std::memory_order_release); }
 
-    /// Get the current epoch tracked by this writer.
-    uint64_t current_epoch() const { return current_epoch_; }
+    /// Get the current epoch tracked by this writer. Safe from any thread: the replication thread
+    /// reads it while a promotion writes it on the failover thread.
+    uint64_t current_epoch() const { return current_epoch_.load(std::memory_order_acquire); }
 
     /// Force rotation: write ROTATE record, close current file, open next.
     ///
@@ -689,7 +690,12 @@ private:
     /// and no lock-prefixed instruction on the write path, which `scripts/mnemonic_diff.py`
     /// confirms rather than this comment.
     std::atomic<uint64_t> records_written_{0};
-    uint64_t    current_epoch_{0};
+
+    /// Atomic because the replication thread reads it - for every heartbeat, the stream question
+    /// and a replica's handshake - while `Engine::promote_to_primary()` writes it on the failover
+    /// thread. It was a plain `uint64_t` until the TSan battery on PR #241 reported the heartbeat's
+    /// read against `append_epoch()`'s write. Release and acquire, as `Engine::current_epoch_` is.
+    std::atomic<uint64_t> current_epoch_{0};
     uint16_t    origin_node_id_{0};  // 0 = legacy mode (no multi-master)
 
     // Pre-allocated write buffer to avoid per-record heap allocations.
