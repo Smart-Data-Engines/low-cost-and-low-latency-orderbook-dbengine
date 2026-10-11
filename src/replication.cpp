@@ -4,19 +4,28 @@
 // stream WAL records, handle ACKs, and send heartbeats.
 //
 // Wire protocol (text+binary hybrid, newline-delimited control messages):
-//   Stream ask: STREAMID?\n                      -> STREAM <wal_identity>\n
+//   Stream ask: STREAMID?\n                      -> STREAM <wal_identity> caught_up\n
 //   Handshake:  REPLICATE <file_index> <byte_offset> <epoch>\n
 //   WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
 //   ACK:        ACK <file_index> <byte_offset>\n
 //   Heartbeat:  HEARTBEAT <epoch>\n
 //   Error:      ERR <message>\n
 //   Stale:      ERR STALE_PRIMARY\n
+//   Caught up:  CAUGHT_UP <file_index> <byte_offset>\n   (primary -> replica, #215)
 //
 // `STREAMID?` goes out first and carries no position, which is what makes it compatible in both
 // directions (#101). A primary that does not know it ignores it and sends nothing - so the replica
 // waits one socket timeout, concludes it cannot attribute the position it holds, and starts over -
 // and a replica that never asks is served exactly as before. Answering it changes nothing on the
 // primary: it is stateless and idempotent, and it does not begin streaming.
+//
+// `caught_up` after the identity says this primary sends `CAUGHT_UP` when a replica's catch-up
+// reaches the end it was created with, after the last record of the catch-up and before any live
+// one (#215). A replica whose store was replaced to follow the stream is joining until then and does
+// not stand for election; without the word it never records joining, because nothing would tell it
+// when to stop. Both are additions an older peer ignores: an older replica reads the identity with
+// `sscanf("STREAM %" SCNu64)` and skips a line it does not know, and an older primary answers without
+// the word.
 //
 // Everything before the first `REPLICATE` is the handshake, and nothing unprompted may arrive in
 // it. That is why the heartbeat is gated on this connection having asked for the stream: a
@@ -1284,7 +1293,8 @@ void ReplicationManager::handle_replica_data(int fd) {
                 continue;
             }
             char answer[64];
-            const int alen = std::snprintf(answer, sizeof(answer), "STREAM %" PRIu64 "\n",
+            // `caught_up`: this primary says when a catch-up ends (#215).
+            const int alen = std::snprintf(answer, sizeof(answer), "STREAM %" PRIu64 " caught_up\n",
                                            config_.wal_identity);
             enqueue_and_flush(*replica_ptr, answer, static_cast<size_t>(alen));
             OB_LOG_DEBUG("repl_mgr", "answered STREAMID? for fd=%d with %" PRIu64,
@@ -1531,7 +1541,7 @@ void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
         if (cur.file > cur.through_file ||
             (cur.file == cur.through_file && cur.offset >= cur.through_offset)) {
             if (fd >= 0) { ::close(fd); fd = -1; }
-            finish_catchup(replica);
+            finish_catchup(replica, CatchupEnd::Reached);
             return;
         }
 
@@ -1554,7 +1564,7 @@ void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
                 OB_LOG_WARN("repl_mgr",
                             "catchup for fd=%d: cannot open WAL file %s: %s - stopping at file %u",
                             replica.fd, path.c_str(), std::strerror(errno), cur.file);
-                finish_catchup(replica);
+                finish_catchup(replica, CatchupEnd::Stopped);
                 return;
             }
             open_file = cur.file;
@@ -1598,7 +1608,7 @@ void ReplicationManager::release_deferred_live(ReplicaInfo& replica) {
     replica.deferred_live.shrink_to_fit();
 }
 
-void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
+void ReplicationManager::finish_catchup(ReplicaInfo& replica, CatchupEnd end) {
     CatchupCursor& cur = replica.catchup;
     cur.active = false;
 
@@ -1606,6 +1616,23 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
         replica.deferred_live.clear();
         replica.deferred_live.shrink_to_fit();
         return;
+    }
+
+    // The end of the catch-up, said to the replica (#215): first, so it is plain text, after the
+    // last record of the catch-up and before the directive and every live record. Only an end the
+    // cursor reached - a catch-up that stopped at a missing file went live without the records
+    // after it, and a replica told it holds the stream would then stand for election without them.
+    if (end == CatchupEnd::Reached) {
+        char caught_up[96];
+        const int clen = std::snprintf(caught_up, sizeof(caught_up), "CAUGHT_UP %u %zu\n",
+                                       cur.file, cur.offset);
+        enqueue_send(replica, caught_up, static_cast<size_t>(clen));
+    } else {
+        OB_LOG_INFO("repl_mgr",
+                    "catchup for fd=%d goes live at file=%u offset=%zu without reaching its end, so "
+                    "it is not told CAUGHT_UP: a replica joining the stream keeps out of elections "
+                    "until a catch-up ends (#215)",
+                    replica.fd, cur.file, cur.offset);
     }
 
     // Plain text up to here, LZ4 from here: the directive is the seam, so it goes out after the
@@ -1621,13 +1648,15 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
 
     if (!replica.deferred_live.empty()) {
         OB_LOG_INFO("repl_mgr",
-                    "catchup complete for fd=%d at file=%u offset=%zu; releasing %zu bytes of live "
-                    "records that arrived while it streamed",
-                    replica.fd, cur.file, cur.offset, replica.deferred_live.size());
+                    "catchup complete for fd=%d at file=%u offset=%zu%s; releasing %zu bytes of "
+                    "live records that arrived while it streamed",
+                    replica.fd, cur.file, cur.offset,
+                    end == CatchupEnd::Reached ? ", CAUGHT_UP sent" : "",
+                    replica.deferred_live.size());
         release_deferred_live(replica);
     } else {
-        OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d at file=%u offset=%zu", replica.fd,
-                    cur.file, cur.offset);
+        OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d at file=%u offset=%zu%s", replica.fd,
+                    cur.file, cur.offset, end == CatchupEnd::Reached ? ", CAUGHT_UP sent" : "");
     }
 
     if (!replica.send_buf.empty() && !drain_send_buffer(replica)) {
@@ -2301,6 +2330,9 @@ void ReplicationClient::resolve_stream_identity() {
     // even a second longer starts a second full read and the wait becomes a multiple of the
     // timeout. Measured on the first version, with a six-second deadline: 10.5 seconds.
     uint64_t announced = 0;
+    // Per connection: a primary that said `caught_up` last time may have been replaced since by one
+    // that does not (#215).
+    primary_reports_caught_up_ = false;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(kRecvTimeoutSec);
     char line_buf[128];
@@ -2315,7 +2347,12 @@ void ReplicationClient::resolve_stream_identity() {
         }
         if (n == 0) continue;   // SO_RCVTIMEO expired with nothing to read
         if (std::strncmp(line_buf, "HEARTBEAT", 9) == 0) continue;
-        if (std::sscanf(line_buf, "STREAM %" SCNu64, &announced) == 1) break;
+        char word[16] = {};
+        const int fields = std::sscanf(line_buf, "STREAM %" SCNu64 " %15s", &announced, word);
+        if (fields >= 1) {
+            primary_reports_caught_up_ = fields == 2 && std::strcmp(word, "caught_up") == 0;
+            break;
+        }
 
         // A new primary answers `STREAM`, an old one answers nothing at all. Anything else is a
         // protocol anomaly of unknown meaning, and the safe reading of "unknown" is to retry
@@ -2331,6 +2368,9 @@ void ReplicationClient::resolve_stream_identity() {
                     "resuming from file=%u offset=%zu",
                     announced, confirmed_file_.load(std::memory_order_relaxed),
                     confirmed_offset_.load(std::memory_order_relaxed));
+        // A node that was joining this stream when it stopped still is, and its catch-up ends with a
+        // `CAUGHT_UP` like any other (#215) - unless this primary never sends one.
+        if (!primary_reports_caught_up_) drop_joining_for_a_silent_primary();
         return;
     }
 
@@ -2355,6 +2395,15 @@ void ReplicationClient::resolve_stream_identity() {
                     announced, saved);
     }
 
+    // Recorded before anything is removed (#215): a node that has given up its store knows it,
+    // across a crash and a power cut, until its primary says the catch-up ended. A record that
+    // cannot be written throws from here, the store stays, and `run_loop()` connects again. A
+    // primary that never says when a catch-up ends gets the behaviour from before #215 instead.
+    if (primary_reports_caught_up_) {
+        engine_.begin_joining(announced, "discard");
+    } else {
+        drop_joining_for_a_silent_primary();
+    }
     engine_.discard_local_data_for_resync();
     set_stream(announced, 0, 0);
     // Written before the position is asked for, so a crash between the two leaves a file naming an
@@ -2559,6 +2608,13 @@ void ReplicationClient::receive_and_replay() {
                 continue;
             }
 
+            // The end of the catch-up (#215). Sent before `COMPRESS LZ4`, so it arrives in the
+            // plain loop below; read here as well, because a line this loop skipped is lost.
+            if (line.rfind("CAUGHT_UP ", 0) == 0) {
+                note_caught_up(line.c_str());
+                continue;
+            }
+
             // Handle HEARTBEAT.
             if (line.rfind("HEARTBEAT", 0) == 0) {
                 uint64_t hb_epoch = 0;
@@ -2678,6 +2734,12 @@ void ReplicationClient::receive_and_replay() {
             continue;
         }
 
+        // The end of the catch-up (#215): this node holds the stream from here.
+        if (std::strncmp(line_buf, "CAUGHT_UP ", 10) == 0) {
+            note_caught_up(line_buf);
+            continue;
+        }
+
         // Handle HEARTBEAT <epoch>: respond with current ACK (Requirement 4.5, 3.3, 3.5).
         if (std::strncmp(line_buf, "HEARTBEAT", 9) == 0) {
             // Parse epoch from HEARTBEAT message.
@@ -2710,6 +2772,46 @@ void ReplicationClient::receive_and_replay() {
 
         // Unknown message — ignore.
     }
+}
+
+void ReplicationClient::note_caught_up(const char* line) {
+    uint32_t file = 0;
+    uint64_t offset = 0;
+    if (std::sscanf(line, "CAUGHT_UP %u %" SCNu64, &file, &offset) != 2) {
+        OB_LOG_WARN("repl_client", "a CAUGHT_UP this node cannot read, ignored: '%s'",
+                    sanitise_for_log(line, 48).c_str());
+        return;
+    }
+    const auto joining = engine_.joining_stream();
+    if (!joining) {
+        OB_LOG_DEBUG("repl_client", "CAUGHT_UP at %u:%" PRIu64 "; this node was not joining",
+                     file, offset);
+        return;
+    }
+    // The records before this line have been applied - it arrives after them on this connection -
+    // so they are as durable as the fsync policy makes any write: at once under `every`, within a
+    // flush interval under `interval`. The record goes now; it promises no more than that.
+    char how[256];
+    std::snprintf(how, sizeof(how),
+                  "the primary %s:%u said the catch-up of stream %" PRIu64 " ended at %u:%" PRIu64
+                  ", and this node holds it to %u:%zu",
+                  config_.primary_host.c_str(), config_.primary_port,
+                  stream_id_.load(std::memory_order_relaxed), file, offset,
+                  confirmed_file_.load(std::memory_order_relaxed),
+                  confirmed_offset_.load(std::memory_order_relaxed));
+    engine_.end_joining(joining->stream_id, how);
+}
+
+void ReplicationClient::drop_joining_for_a_silent_primary() {
+    const auto joining = engine_.joining_stream();
+    if (!joining) return;
+    char how[256];
+    std::snprintf(how, sizeof(how),
+                  "the primary %s:%u does not say when a catch-up ends (it predates #215), so this "
+                  "node cannot tell when it holds the stream and stands for election as it did "
+                  "before",
+                  config_.primary_host.c_str(), config_.primary_port);
+    engine_.end_joining(joining->stream_id, how);
 }
 
 void ReplicationClient::send_ack() {
@@ -2823,6 +2925,11 @@ void ReplicationClient::load_state() {
 // ── Snapshot bootstrap (replica side) ─────────────────────────────────────────
 
 void ReplicationClient::request_and_receive_snapshot() {
+    // The store is about to be replaced (#215). First, so that a record which cannot be written
+    // throws with nothing begun - not even `bootstrapping_`, which nothing below would clear.
+    if (primary_reports_caught_up_) {
+        engine_.begin_joining(stream_id_.load(std::memory_order_relaxed), "snapshot");
+    }
     bootstrapping_.store(true, std::memory_order_release);
     snapshot_bytes_received_.store(0, std::memory_order_relaxed);
     snapshot_bytes_total_.store(0, std::memory_order_relaxed);
@@ -2848,11 +2955,15 @@ void ReplicationClient::request_and_receive_snapshot() {
 
     // Read SNAPSHOT_BEGIN response. A HEARTBEAT may come first and it is not the answer: the
     // primary's timer can fire between its `ERR WAL_TRUNCATED` and this request reaching it, and the
-    // answer was read as `SNAPSHOT_BEGIN` and the bootstrap abandoned (#214).
+    // answer was read as `SNAPSHOT_BEGIN` and the bootstrap abandoned (#214). Nor is a `CAUGHT_UP`
+    // (#215): it ends a catch-up of an earlier request on this connection, and the store it speaks
+    // of is the one this snapshot replaces - so it is skipped, and it does not end the join.
     char line_buf[512];
     ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
-    while (n > 0 && std::strncmp(line_buf, "HEARTBEAT", 9) == 0) {
-        OB_LOG_DEBUG("repl_client", "a HEARTBEAT before SNAPSHOT_BEGIN; still waiting for the answer");
+    while (n > 0 && (std::strncmp(line_buf, "HEARTBEAT", 9) == 0 ||
+                     std::strncmp(line_buf, "CAUGHT_UP ", 10) == 0)) {
+        OB_LOG_DEBUG("repl_client", "%.20s before SNAPSHOT_BEGIN is not the answer; still waiting",
+                     line_buf);
         n = reader_.read_line(line_buf, sizeof(line_buf));
     }
     if (n <= 0) {

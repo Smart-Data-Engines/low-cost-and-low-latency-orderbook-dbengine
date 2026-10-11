@@ -247,6 +247,16 @@ MetricsRegistry::MetricsRegistry() {
                                  "Segments refused as already indexed (a flush race; should stay 0)"));
     gauges_.push_back(make_gauge("ob_symbol_count",    "Number of tracked symbols"));
     gauges_.push_back(make_gauge("ob_current_epoch",   "Current failover epoch"));
+    // #215: a replica whose store was replaced to follow a stream holds part of it until its
+    // primary says the catch-up ended, and does not stand for election meanwhile.
+    gauges_.push_back(make_gauge("ob_replica_joining",
+                                 "1 while this node is joining a stream it does not hold yet - its "
+                                 "store was replaced to follow it and the primary has not said the "
+                                 "catch-up ended - so it does not stand for election (#215)"));
+    gauges_.push_back(make_gauge("ob_failover_abstaining",
+                                 "1 while the leader key is vacant and this node does not stand "
+                                 "for election because it is joining (#215): no primary will come "
+                                 "from it until it catches up with one"));
     // TLS on the node links (#30 part three, series D). Registered in the same change that writes
     // them: `set_gauge()` on an unregistered name is dropped in silence, which is how five gauges
     // served a flat zero while the engine worked (#77), and `scripts/check_metrics.py` fails CI for

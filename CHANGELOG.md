@@ -66,7 +66,16 @@ The first release. What it contains, by area:
   under writes takes its snapshot and reaches the stream - 0.30 - 0.39 s on two hosts - where before
   every attempt was abandoned and the next failover lost the whole round (#214). Replication is
   asynchronous: what an unplanned failover can lose is in `docs/operations.md`, "What a failover
-  keeps", and a replica still joining can be elected (#215).
+  keeps".
+- A replica that is joining does not stand for election (#215). From giving up its store to follow a
+  stream - a discard or a snapshot - until its primary says the catch-up ended (`CAUGHT_UP`,
+  announced as `STREAM <id> caught_up`), it holds part of the stream, and electing it made the node
+  returning after it discard the writes it had not received. The record is `repl_joining.txt` in the
+  data directory, written before anything is replaced; a primary lost in that window leaves the
+  cluster without one until a node that holds the stream returns, and removing the record lets the
+  joining node stand anyway. `STATUS` says `joining:`, `ob_replica_joining` and
+  `ob_failover_abstaining` say it to Prometheus, and the alert `OrderbookNoPrimaryWhileJoining`
+  fires when an abstention lasts a minute.
 - Automatic failover through etcd with epoch fencing, and graceful handover to a named replica;
   a primary that gives the role up replicates from whoever takes it (#201). A handover loses no
   acknowledged write and takes a monitor tick rather than a lease TTL: the outgoing primary closes

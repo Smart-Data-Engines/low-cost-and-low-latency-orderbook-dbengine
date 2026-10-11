@@ -84,6 +84,19 @@ struct FailoverConfig {
     int64_t election_lease_wait_ms{0};
 };
 
+// ── Joining a stream (#215) ─────────────────────────────────────────────────
+
+/// A replica whose store was replaced so that it could follow a stream - discarded for a stream
+/// that was not its own, or replaced by a snapshot - from that decision until its primary says the
+/// catch-up ended. It holds part of that stream, so it does not stand for election: the writes it
+/// has not received would be lost when the node that has them returns and discards its copy.
+struct JoiningStream {
+    uint64_t    stream_id{0};
+    uint64_t    since_ns{0};   ///< wall clock, when the store was given up
+    std::string reason;        ///< "discard", "snapshot", or "unreadable" for a record nobody can parse
+    std::string path;          ///< the record: what an operator removes to let this node stand anyway
+};
+
 // ── Callback interface for Engine to implement role transitions ──────────────
 
 /// The Engine implements this interface so that FailoverManager can trigger
@@ -117,6 +130,11 @@ struct RoleTransitionHandler {
     /// it follows none. What a handover's successor compares with the announced end.
     /// Not const: the engine answers it under the lock that replaces its replication client.
     virtual std::optional<StreamPosition> replicated_position() { return std::nullopt; }
+
+    /// Whether this node is joining a stream it does not hold yet (#215); nullopt when it is not,
+    /// which is the default for a handler without a replication client. Not const: the engine
+    /// answers it from a file, which is what lets an operator override it without a restart.
+    virtual std::optional<JoiningStream> joining_stream() { return std::nullopt; }
 
     /// Called to get current WAL position for election comparison.
     virtual std::pair<uint32_t, size_t> get_wal_position() const = 0;
@@ -418,6 +436,15 @@ private:
 
     /// The REPLICA branch with the leader key vacant: wait, defer, or stand (#82, #204).
     void act_on_vacant_leader();
+
+    /// The leader key vacant and this node joining (#215), once per episode: the episode is the
+    /// abstention, ended when a leader is back or this node holds the stream again. Touched only
+    /// by the monitor thread - and by `start()`, before that thread exists.
+    LogEpisode joining_abstention_{};
+    /// Decline to stand because this node is joining: the gauge, and the line once an episode.
+    void abstain_while_joining(const JoiningStream& joining);
+    /// End an abstention episode and clear the gauge. Returns its ticks; 0 when none was open.
+    uint64_t close_abstention();
     void reconcile_epoch(const ClusterState& state);
 };
 

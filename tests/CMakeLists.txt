@@ -609,6 +609,16 @@ target_compile_definitions(test_replication
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# A replica whose store was replaced to follow a stream is joining until its primary says the
+# catch-up ended, and does not stand for election meanwhile (#215). The static test in it reads
+# src/replication.cpp: the record before the replacement is an order no test can interrupt.
+ob_add_engine_test(test_joining_stream
+    test_joining_stream.cpp
+)
+target_compile_definitions(test_joining_stream
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # A node that steps down closes writes first and keeps serving its stream until it follows
 # somebody (#204).
 ob_add_engine_test(test_handover_stream

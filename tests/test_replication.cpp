@@ -271,10 +271,12 @@ std::vector<WireRecord> recv_wire_records(int fd, size_t want, int quiet_ms = 40
             continue;
         }
         const std::string header = in.substr(0, nl);
-        // A heartbeat or a COMPRESS directive is a line of this protocol too, and skipping them
-        // rather than failing is what keeps this reader from being a clock: the heartbeat is on a
-        // five-second timer that no test should have to finish inside.
-        if (header.rfind("HEARTBEAT", 0) == 0 || header.rfind("COMPRESS", 0) == 0) {
+        // A heartbeat, a COMPRESS directive or the end of a catch-up (#215) is a line of this
+        // protocol too, and skipping them rather than failing is what keeps this reader from being
+        // a clock: the heartbeat is on a five-second timer that no test should have to finish
+        // inside.
+        if (header.rfind("HEARTBEAT", 0) == 0 || header.rfind("COMPRESS", 0) == 0 ||
+            header.rfind("CAUGHT_UP", 0) == 0) {
             in.erase(0, nl + 1);
             continue;
         }
@@ -1397,6 +1399,9 @@ TEST_F(ReplicationProtocolTest, HeartbeatSentAfterIdle) {
     const char* handshake = "REPLICATE 0 0\n";
     ::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL);
 
+    // The catch-up of an empty WAL ends at once, and says so (#215).
+    EXPECT_EQ(recv_line(fd, 3000).rfind("CAUGHT_UP ", 0), 0u);
+
     // Wait for heartbeat (sent every 5 seconds). Use a generous timeout.
     // The epoll loop checks every 100ms and sends heartbeat after 5s idle.
     std::string line = recv_line(fd, 7000);
@@ -1468,7 +1473,10 @@ TEST_F(ReplicationProtocolTest, BroadcastToMultipleReplicas) {
     uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
     mgr->broadcast(hdr, payload, 4, wal_->current_position());
 
-    // Both replicas should receive the WAL header line.
+    // Both replicas should receive the WAL header line - after the end of their empty catch-ups,
+    // which each was told (#215).
+    EXPECT_EQ(recv_line(fd1, 3000).rfind("CAUGHT_UP ", 0), 0u);
+    EXPECT_EQ(recv_line(fd2, 3000).rfind("CAUGHT_UP ", 0), 0u);
     std::string line1 = recv_line(fd1, 3000);
     std::string line2 = recv_line(fd2, 3000);
 
@@ -1516,7 +1524,9 @@ TEST_F(ReplicationProtocolTest, BroadcastRemovesDisconnectedReplica) {
     uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
     mgr->broadcast(hdr, payload, 4, wal_->current_position());
 
-    // The surviving replica should receive the WAL message.
+    // The surviving replica should receive the WAL message, after the end of its empty catch-up
+    // (#215).
+    EXPECT_EQ(recv_line(fd2, 3000).rfind("CAUGHT_UP ", 0), 0u);
     std::string line2 = recv_line(fd2, 3000);
     EXPECT_TRUE(line2.rfind("WAL ", 0) == 0)
         << "Surviving replica should receive WAL header, got: " << line2;
@@ -1641,6 +1651,17 @@ static void answer_stream_id(int fd, uint64_t identity, int timeout_ms = 3000) {
     ASSERT_EQ(question.rfind("STREAMID?", 0), 0u)
         << "the client asks which stream this is before sending its position, got: " << question;
     const std::string answer = "STREAM " + std::to_string(identity) + "\n";
+    ASSERT_EQ(::send(fd, answer.data(), answer.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(answer.size()));
+}
+
+// Answer `STREAMID?` the way a #215 primary does: the identity, and `caught_up` - the word that
+// says this primary sends `CAUGHT_UP` when a catch-up ends, without which a replica never records
+// joining.
+static void answer_stream_id_caught_up(int fd, uint64_t identity, int timeout_ms = 3000) {
+    const std::string question = recv_line(fd, timeout_ms);
+    ASSERT_EQ(question.rfind("STREAMID?", 0), 0u) << "got: " << question;
+    const std::string answer = "STREAM " + std::to_string(identity) + " caught_up\n";
     ASSERT_EQ(::send(fd, answer.data(), answer.size(), MSG_NOSIGNAL),
               static_cast<ssize_t>(answer.size()));
 }
@@ -1896,8 +1917,10 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
     // this snapshot on the worker took 7.2 s once, on a loaded machine, so one was queued before the
     // transfer began. Inside the transfer the heartbeat is held back (#99), so between a header line
     // and its bytes it would still be the defect this test is about.
+    // A `CAUGHT_UP` may come first too, and is skipped the same way (#215): it ends the catch-up of
+    // this test's own `REPLICATE`, before the snapshot was asked for - not a record.
     std::string begin = next_line();
-    while (begin.rfind("HEARTBEAT", 0) == 0) begin = next_line();
+    while (begin.rfind("HEARTBEAT", 0) == 0 || begin.rfind("CAUGHT_UP ", 0) == 0) begin = next_line();
     ASSERT_EQ(begin.rfind("SNAPSHOT_BEGIN", 0), 0u) << "got: " << begin;
     size_t total_bytes = 0, file_count = 0;
     unsigned snap_file = 0;
@@ -2055,9 +2078,10 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotGoAheadOfSnapshotBegin) {
     };
 
     // A heartbeat queued before the request reached the manager may come first; the replica skips
-    // it. Anything else before SNAPSHOT_BEGIN is the defect.
+    // it, and the `CAUGHT_UP` that ended this test's own `REPLICATE` (#215). Anything else before
+    // SNAPSHOT_BEGIN - a record - is the defect.
     std::string first = next_line();
-    while (first.rfind("HEARTBEAT", 0) == 0) first = next_line();
+    while (first.rfind("HEARTBEAT", 0) == 0 || first.rfind("CAUGHT_UP ", 0) == 0) first = next_line();
     EXPECT_EQ(first.rfind("SNAPSHOT_BEGIN", 0), 0u)
         << "expected SNAPSHOT_BEGIN, got '" << first << "' - a record broadcast while the snapshot "
            "was being made went ahead of it (#214)";
@@ -2175,12 +2199,17 @@ struct SnapshotBootstrapOutcome {
     /// and the `REPLICATE` line it opened with (#214).
     std::optional<double> resumed_after_ms;
     std::string           resume_line;
+    /// Whether the engine holds a joining record once the install is done (#215).
+    bool joining_after_install{false};
 };
 
 /// What the mock primary does besides the stream it always sends.
 struct BootstrapScript {
     bool splice_a_live_record{false};   ///< a live `WAL` record between the two files (#99)
     bool heartbeat_before_begin{false}; ///< a `HEARTBEAT` before `SNAPSHOT_BEGIN` (#214)
+    /// A primary that reports the end of a catch-up, and a `CAUGHT_UP` before `SNAPSHOT_BEGIN`: the
+    /// end of an earlier catch-up on the connection, which is not the answer either (#215).
+    bool caught_up_before_begin{false};
     bool time_the_resume{false};        ///< wait for the replica to come back, and time it (#214)
 };
 
@@ -2216,7 +2245,11 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     if (peer_fd < 0) { client.stop(); ::close(listen_fd); engine.close(); return out; }
 
-    answer_stream_id(peer_fd, 0x51DULL);
+    if (script.caught_up_before_begin) {
+        answer_stream_id_caught_up(peer_fd, 0x51DULL);
+    } else {
+        answer_stream_id(peer_fd, 0x51DULL);
+    }
     const std::string handshake = recv_line(peer_fd, 3000);
     EXPECT_EQ(handshake.rfind("REPLICATE", 0), 0u) << "got: " << handshake;
 
@@ -2240,6 +2273,10 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
         // `ERR WAL_TRUNCATED` and the request reaching it.
         const char* hb = "HEARTBEAT 0\n";
         EXPECT_GT(::send(peer_fd, hb, std::strlen(hb), MSG_NOSIGNAL), 0);
+    }
+    if (script.caught_up_before_begin) {
+        const char* caught_up = "CAUGHT_UP 0 0\n";
+        EXPECT_GT(::send(peer_fd, caught_up, std::strlen(caught_up), MSG_NOSIGNAL), 0);
     }
 
     // A non-zero WAL position, deliberately: a snapshot taken at 0 0 is indistinguishable from
@@ -2301,6 +2338,7 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
     out.first_file_installed  = std::filesystem::exists(dir + "/SNAPA/EXCH/seg/a.col");
+    out.joining_after_install = engine.joining_stream().has_value();
     out.second_file_installed = std::filesystem::exists(dir + "/SNAPB/EXCH/seg/b.col");
     {
         std::ifstream in(cfg.state_file);
@@ -2346,6 +2384,19 @@ TEST_F(ReplicationClientTest, AHeartbeatBeforeSnapshotBeginIsNotTheAnswer) {
     const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
     EXPECT_TRUE(out.first_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
     EXPECT_TRUE(out.second_file_installed) << "a heartbeat before SNAPSHOT_BEGIN abandoned the bootstrap";
+}
+
+TEST_F(ReplicationClientTest, ACaughtUpBeforeSnapshotBeginIsNotTheAnswerAndDoesNotEndTheJoin) {
+    // #215, the snapshot side: a `CAUGHT_UP` before `SNAPSHOT_BEGIN` ends a catch-up of an earlier
+    // request on the connection. Read as the answer it would abandon the bootstrap, as a heartbeat
+    // did in #214; read as the end of this join it would let a node stand with a snapshot half in.
+    BootstrapScript script;
+    script.caught_up_before_begin = true;
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, script);
+    EXPECT_TRUE(out.first_file_installed) << "a CAUGHT_UP before SNAPSHOT_BEGIN abandoned the bootstrap";
+    EXPECT_TRUE(out.second_file_installed) << "a CAUGHT_UP before SNAPSHOT_BEGIN abandoned the bootstrap";
+    EXPECT_TRUE(out.joining_after_install)
+        << "the snapshot is in and nothing said the catch-up after it ended: still joining";
 }
 
 TEST_F(ReplicationClientTest, AfterASnapshotTheReplicaAsksForTheStreamAtOnce) {
@@ -3991,6 +4042,174 @@ TEST_F(ReplicationClientTest, APrimaryThatNamesNoStreamMakesTheReplicaStartOver)
     engine.close();
 }
 
+/// Poll until `engine` holds no joining record, or `timeout_ms` passes. The record goes when the
+/// client reads `CAUGHT_UP`, on its own thread.
+static bool joining_ends(ob::Engine& engine, int timeout_ms = 3000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!engine.joining_stream().has_value()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return !engine.joining_stream().has_value();
+}
+
+TEST_F(ReplicationClientTest, AReplicaThatGivesUpItsStoreIsJoiningUntilThePrimarySaysTheCatchUpEnded) {
+    // #215, the replica's half: the store discarded for a stream that is not its own is recorded as
+    // joining before the discard, and the record goes when the primary says the catch-up ended.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "STALE", 5);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id_caught_up(client_fd, 778);
+
+    EXPECT_EQ(recv_line(client_fd, 3000), "REPLICATE 0 0 0");
+    EXPECT_EQ(count_rows(engine, "STALE"), 0u) << "the store of the other stream was kept";
+    const auto joining = engine.joining_stream();
+    ASSERT_TRUE(joining.has_value()) << "a node that gave up its store does not know it";
+    EXPECT_EQ(joining->stream_id, 778u);
+    EXPECT_EQ(joining->reason, "discard");
+
+    const char* caught_up = "CAUGHT_UP 0 0\n";
+    ASSERT_GT(::send(client_fd, caught_up, std::strlen(caught_up), MSG_NOSIGNAL), 0);
+    EXPECT_TRUE(joining_ends(engine)) << "the end of the catch-up left the node joining";
+    EXPECT_FALSE(std::filesystem::exists(tmp_->str() + "/repl_joining.txt"));
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, APrimaryThatNeverSaysWhenACatchUpEndsLeavesNoJoiningRecord) {
+    // Requirement 4.2: a primary from before #215 answers `STREAM <id>` alone, and a `CAUGHT_UP` will
+    // never come. A record kept against it would keep this node out of elections for good, so the
+    // node behaves as it did before #215 - and gives up a record it had, saying why.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "STALE", 5);
+    engine.begin_joining(5, "discard");   // left from a join that a restart interrupted
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 778);
+
+    EXPECT_EQ(recv_line(client_fd, 3000), "REPLICATE 0 0 0");
+    EXPECT_EQ(count_rows(engine, "STALE"), 0u) << "the discard itself is unchanged";
+    EXPECT_FALSE(engine.joining_stream().has_value())
+        << "a node waiting for a CAUGHT_UP this primary never sends would never stand again";
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, ANodeStoppedWhileJoiningIsStillJoiningWhenItResumes) {
+    // Requirement 2.2: a restart in the middle of a join resumes the stream from where the join had
+    // got to - and it is still a join: the store holds part of the stream until the catch-up ends.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    engine.begin_joining(777, "snapshot");
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id_caught_up(client_fd, 777);
+
+    EXPECT_EQ(recv_line(client_fd, 3000), "REPLICATE 2 1024 0") << "the join's own progress was lost";
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ASSERT_TRUE(engine.joining_stream().has_value())
+        << "resuming the stream it was joining is not the end of the join";
+
+    const char* caught_up = "CAUGHT_UP 2 4096\n";
+    ASSERT_GT(::send(client_fd, caught_up, std::strlen(caught_up), MSG_NOSIGNAL), 0);
+    EXPECT_TRUE(joining_ends(engine));
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, ASnapshotBootstrapRecordsJoiningBeforeItAsksForTheSnapshot) {
+    // The other replacement: a position retention has passed, `ERR WAL_TRUNCATED`, a snapshot. The
+    // record is on the disk by the time the snapshot is asked for.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id_caught_up(client_fd, 777);
+    EXPECT_EQ(recv_line(client_fd, 3000), "REPLICATE 2 1024 0");
+    EXPECT_FALSE(engine.joining_stream().has_value()) << "resuming its own stream is not joining";
+
+    const char* truncated = "ERR WAL_TRUNCATED\n";
+    ASSERT_GT(::send(client_fd, truncated, std::strlen(truncated), MSG_NOSIGNAL), 0);
+    EXPECT_EQ(recv_line(client_fd, 3000), "SNAPSHOT_REQUEST");
+    const auto joining = engine.joining_stream();
+    ASSERT_TRUE(joining.has_value()) << "the snapshot was asked for with no record of the join";
+    EXPECT_EQ(joining->stream_id, 777u);
+    EXPECT_EQ(joining->reason, "snapshot");
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
 TEST_F(ReplicationProtocolTest, ThePrimaryAnswersTheStreamQuestionAndStreamsNothing) {
     // The primary's whole half of this: it answers and it decides nothing. Stateless, so asking
     // twice on one connection gives the same answer twice; and it must not start streaming, or the
@@ -4003,10 +4222,11 @@ TEST_F(ReplicationProtocolTest, ThePrimaryAnswersTheStreamQuestionAndStreamsNoth
 
     const char* q = "STREAMID?\n";
     ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
-    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430");
+    // `caught_up`: this primary says when a catch-up ends (#215).
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430 caught_up");
 
     ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
-    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430")
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430 caught_up")
         << "the second answer differs from the first, so the question changed something";
 
     // Nothing else, and not just "no records": a `HEARTBEAT` here would be read by the replica
@@ -4016,6 +4236,123 @@ TEST_F(ReplicationProtocolTest, ThePrimaryAnswersTheStreamQuestionAndStreamsNoth
     EXPECT_TRUE(quiet.empty())
         << "the primary sent something to a connection that has only asked which stream this is: "
         << quiet;
+
+    ::close(fd);
+    mgr->stop();
+}
+
+/// The stream as a list of what arrived, in order: "WAL <file> <offset>" for a record and every
+/// other line as it came. Where `CAUGHT_UP` sits among the records is the claim (#215), so the
+/// order is the measurement. Read until the socket is quiet, for the reason recv_wire_records()
+/// gives; heartbeats are skipped, being a clock.
+static std::vector<std::string> recv_stream_items(int fd, int quiet_ms = 400, int total_cap_s = 20) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(total_cap_s);
+    struct timeval tv{};
+    tv.tv_sec  = quiet_ms / 1000;
+    tv.tv_usec = (quiet_ms % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    std::vector<std::string> items;
+    std::string in;
+    char buf[65536];
+    const auto pull = [&]() {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) return false;
+        in.append(buf, static_cast<size_t>(n));
+        return true;
+    };
+    while (std::chrono::steady_clock::now() < deadline) {
+        const size_t nl = in.find('\n');
+        if (nl == std::string::npos) { if (!pull()) break; continue; }
+        const std::string line = in.substr(0, nl);
+        if (line.rfind("HEARTBEAT", 0) == 0) { in.erase(0, nl + 1); continue; }
+        unsigned file = 0, epoch_lo = 0;
+        size_t offset = 0, total_len = 0;
+        if (std::sscanf(line.c_str(), "WAL %u %zu %zu %u", &file, &offset, &total_len, &epoch_lo) >= 3) {
+            if (in.size() < nl + 1 + total_len) { if (!pull()) break; continue; }
+            items.push_back("WAL " + std::to_string(file) + " " + std::to_string(offset));
+            in.erase(0, nl + 1 + total_len);
+            continue;
+        }
+        items.push_back(line);
+        in.erase(0, nl + 1);
+    }
+    return items;
+}
+
+TEST_F(ReplicationProtocolTest, APrimarySaysTheCatchUpEndedAfterItsLastRecord) {
+    // #215, the primary's half: after the last record of a catch-up, once, with the position the
+    // cursor reached - the end of this WAL, since nothing was written meanwhile.
+    fill_wal(*wal_, 5, 2);
+    const ob::WalPosition end = wal_->current_position();
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto items = recv_stream_items(fd);
+    ASSERT_EQ(items.size(), 6u) << "five records and the end of the catch-up, nothing else";
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(items[i].rfind("WAL ", 0), 0u) << "item " << i << ": " << items[i];
+    }
+    EXPECT_EQ(items[5], "CAUGHT_UP " + std::to_string(end.file_index) + " " +
+                            std::to_string(end.offset))
+        << "the catch-up's end, said after its last record";
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ACatchUpWithNothingToSendStillSaysItEnded) {
+    // A replica that asks from the end - a join that got that far before a restart - holds the
+    // stream once its catch-up of nothing ends, and has to be told.
+    fill_wal(*wal_, 3, 2);
+    const ob::WalPosition end = wal_->current_position();
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const std::string handshake = "REPLICATE " + std::to_string(end.file_index) + " " +
+                                  std::to_string(end.offset) + " 0\n";
+    ASSERT_GT(::send(fd, handshake.data(), handshake.size(), MSG_NOSIGNAL), 0);
+
+    const auto items = recv_stream_items(fd);
+    ASSERT_EQ(items.size(), 1u);
+    EXPECT_EQ(items[0], "CAUGHT_UP " + std::to_string(end.file_index) + " " +
+                            std::to_string(end.offset));
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ACatchUpThatStopsAtAMissingFileDoesNotSayItEnded) {
+    // Requirement 3.1: a catch-up that goes live at a WAL file missing from the middle of its range
+    // left records out, and a replica told it holds the stream would stand for election without
+    // them. Several files, a middle one removed.
+    constexpr size_t kLevels = 2;
+    const size_t record_bytes =
+        sizeof(ob::WALRecord) + sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
+    wal_ = std::make_unique<ob::WALWriter>(tmp_->str(), record_bytes * 2);
+    fill_wal(*wal_, 8, kLevels);
+    const std::string middle = tmp_->str() + "/wal_000001.bin";
+    ASSERT_TRUE(std::filesystem::exists(middle)) << "the WAL did not rotate into a second file";
+    ASSERT_TRUE(std::filesystem::exists(tmp_->str() + "/wal_000002.bin"));
+    std::filesystem::remove(middle);
+
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto items = recv_stream_items(fd);
+    ASSERT_FALSE(items.empty()) << "the first file's records should still come";
+    for (const auto& item : items) {
+        EXPECT_NE(item.rfind("CAUGHT_UP", 0), 0u)
+            << "a catch-up that stopped short of its end said it ended";
+    }
 
     ::close(fd);
     mgr->stop();
@@ -4146,7 +4483,7 @@ TEST_F(ReplicationClientTest, ARealPrimaryAnnouncesTheIdentityOfTheWalItWrites) 
     const char* q = "STREAMID?\n";
     ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
 
-    EXPECT_EQ(recv_line(fd, 3000), "STREAM " + std::to_string(engine.wal_identity()));
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM " + std::to_string(engine.wal_identity()) + " caught_up");
 
     ::close(fd);
     engine.close();

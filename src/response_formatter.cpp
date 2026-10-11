@@ -476,6 +476,17 @@ std::string format_status(const ServerStats& stats, std::string_view identity) {
         out += '\n';
     }
 
+    // Joining a stream (#215): this node does not stand for election while the line is here.
+    if (stats.joining) {
+        out += "joining: stream=";
+        out += std::to_string(stats.joining_stream_id);
+        out += " reason=";
+        out += stats.joining_reason;
+        out += " since_ns=";
+        out += std::to_string(stats.joining_since_ns);
+        out += '\n';
+    }
+
     // Snapshot bootstrap progress (replica)
     if (stats.bootstrapping) {
         out += "snapshot: bootstrapping bytes_received=";

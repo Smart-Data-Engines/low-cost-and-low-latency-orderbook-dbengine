@@ -259,6 +259,12 @@ def _replicate(primary_binary: str, replica_binary: str, symbol: str) -> None:
             assert prices(p.port, symbol) == want
             assert eventually(lambda: prices(r.port, symbol) == want), (
                 f"the replica holds {len(prices(r.port, symbol) or [])} of {len(want)} rows")
+            # Caught up and holding no joining record (#215): a primary of the previous version
+            # never says when a catch-up ends, so a replica of this one must not wait for it - it
+            # would keep out of elections for good - and one of the previous version has no record
+            # to keep.
+            assert not os.path.exists(os.path.join(r.data_dir, "repl_joining.txt")), (
+                "the replica holds a joining record after its catch-up")
         finally:
             r.stop()
             p.stop()
