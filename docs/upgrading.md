@@ -16,21 +16,23 @@ read as a pass. The file moves to the previous release's revision at each releas
 
 ## The matrix
 
-The previous version here is `c610b72` (master on 28 September 2026, before #34, #197 and #190's
-step 4), against this tree.
+The previous version here is **v0.1.0** (`555ad74`, the first release, 12 October 2026), against
+this tree. Until that release it was `c610b72`, master on 28 September 2026: that matrix, with the
+rows that measured a previous version without format 3, `CAUGHT_UP` and backups, is in this file's
+history.
 
 | Scenario | Result | Test |
 |---|---|---|
 | A data directory the previous version wrote - segments, and rows only in the WAL after a kill - opened by this one | every row once; writes go on, numbered after them | `test_an_upgrade_in_place_keeps_every_row_once` |
 | A data directory this version wrote in segment format 2 (`segment-format = 2`), opened by the previous one | every row once (the other permitted answer is a refusal to start; a start with part of the rows is the failure) | `test_a_downgrade_keeps_every_row_once_or_refuses_to_start` |
-| A data directory this version wrote in segment format 3, the default, opened by the previous one | it starts without the rows of format-3 segments, which it cannot decode, saying `Skipping segment ...: unsupported format_version=3 (this build reads 2)` at `ERROR` for each one a query reaches; it removes none, and this version started again holds every row once. A start with part of the rows, which this matrix calls the failure - the row changed with segment format 3, and "Going back" below says what an operator does | `test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing` |
-| A primary of the previous version, a replica of this one | the replica holds every row, and no joining record: that primary never says when a catch-up ends (`CAUGHT_UP`, #215), so the replica stands for election as it did before rather than wait for it | `test_a_primary_of_the_previous_version_replicates_to_this_one` |
-| A primary of this version, a replica of the previous one | the replica holds every row; it ignores the word `caught_up` and the line `CAUGHT_UP` (#215) | `test_a_primary_of_this_version_replicates_to_the_previous_one` |
-| A failover from a previous-version primary to this version's replica, under etcd | no acknowledged write lost; writes go on at the new primary - the replica, which holds no joining record against that primary, stands (#215) | `test_a_failover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
-| A planned `FAILOVER` from a previous-version primary to this version's replica | it completes: no acknowledged write lost, writes go on at the new primary, the outgoing node is a replica. The previous version's intent says nothing that would let the target stand before the election delay (#204) | `test_a_handover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
+| A data directory this version wrote in segment format 3, the default, opened by the previous one | every row once, and every row once again when this version starts on it after: v0.1.0 reads format 3 | `test_a_downgrade_after_format_3_keeps_every_row_once` |
+| A primary of the previous version, a replica of this one | the replica holds every row, and no joining record once its catch-up has ended: v0.1.0 says when a catch-up ends (`CAUGHT_UP`, #215) | `test_a_primary_of_the_previous_version_replicates_to_this_one` |
+| A primary of this version, a replica of the previous one | the replica holds every row, and no joining record once its catch-up has ended | `test_a_primary_of_this_version_replicates_to_the_previous_one` |
+| A failover from a previous-version primary to this version's replica, under etcd | no acknowledged write lost; writes go on at the new primary - the replica, its catch-up ended, holds no joining record and stands (#215) | `test_a_failover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
+| A planned `FAILOVER` from a previous-version primary to this version's replica | it completes: no acknowledged write lost, writes go on at the new primary, the outgoing node is a replica | `test_a_handover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
 | A planned `FAILOVER` from this version's primary to a previous-version replica | it completes: no acknowledged write lost, writes go on at the new primary, the outgoing node is a replica - the previous version reads this one's intent | `test_a_handover_from_this_versions_primary_to_the_previous_replica_loses_no_write` |
 | A two-node mesh, one node of each version | both hold every row either wrote | `test_a_mesh_of_both_versions_converges` |
-| This version's Python client and `ob_backup` against the previous server | writes and queries work; `capabilities:` has no `backup`, and `ob_backup` refuses with status 2 | `test_this_versions_clients_work_against_the_previous_server` |
+| This version's Python client and `ob_backup` against the previous server | writes and queries work; `capabilities:` has `backup`, and this version's `ob_backup` takes a backup from it | `test_this_versions_clients_work_against_the_previous_server` |
 
 What the matrix does not say: anything about a version older than the previous one, and anything
 this module does not run - a sharded cluster, TLS, authentication. Those are upgraded by the same
