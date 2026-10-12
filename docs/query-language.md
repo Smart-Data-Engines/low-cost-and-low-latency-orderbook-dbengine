@@ -262,7 +262,8 @@ GROUP BY TIME_BUCKET(1m)
 ```
 
 - **The series** are read from level 0 of each side of the book at each instant - the book
-  `WHERE AT` answers. `bid` and `ask` are their prices, `mid` is (bid + ask) / 2 at `MID_PRICE`'s
+  `WHERE AT` answers, so the first level of each update that wrote the side (#233: the live book
+  agrees when updates are a side's levels best first, `docs/python.md`). `bid` and `ask` are their prices, `mid` is (bid + ask) / 2 at `MID_PRICE`'s
   scale of 10^6, `spread` is ask - bid. A series changes only at an instant holding a row of level 0,
   once every row of that instant is applied, so a row that loses a tie on the time is in force at no
   instant. `mid` and `spread` have a value once both sides have a row.
@@ -329,7 +330,9 @@ SELECT * FROM 'BTC-USD'.'BINANCE' WHERE AT 1700000000000000000
 ```
 
 For each side and level, the answer is the row with the **latest event time at or before** the
-one asked for; two rows of one level at one instant resolve to the one written later. Levels come
+one asked for - the level is the row's position in the update that wrote it, which is the book's
+level for a writer that sends a side's levels best first (`docs/python.md`, "How a side is written";
+#233); two rows of one level at one instant resolve to the one written later. Levels come
 bids first, then asks, each by level — the order `BOOK` answers in — so `LIMIT n` keeps the first
 `n` of them. It answers the columns it names, like any row query (`SELECT price, quantity … WHERE
 AT …`), and reads the columnar store, so a row the flush tick has not yet written is not in it.
