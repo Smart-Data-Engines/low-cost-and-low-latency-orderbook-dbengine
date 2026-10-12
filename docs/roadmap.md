@@ -14727,9 +14727,9 @@ The capability items are in the table below.
 
 Things a reviewer will notice, listed here so they do not look like oversights:
 
-- **Fuzzing covers three parsers, not the server.** #38 drives `parse_command`/`parse_minsert`, the
-  multi-master frame codec and WAL replay, with a committed corpus and a bounded run on every pull
-  request. Nothing in it opens a socket, starts etcd or binds a port, so a framing bug that needs
+- **Fuzzing covers four parsers, not the server.** #38 drives `parse_command`/`parse_minsert`, the
+  multi-master frame codec and WAL replay, and format 3's column blocks since #219 (`fuzz/`), with a
+  committed corpus and a bounded run on every pull request. Nothing in it opens a socket, starts etcd or binds a port, so a framing bug that needs
   two live nodes belongs to the integration battery instead. There is no OSS-Fuzz submission, and
   that was never a condition of the item: it would mean sending builds of a public repository to a
   third-party service, the same class of decision as the coverage badge in #37.
@@ -14752,12 +14752,15 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   TTL uses stored event time, so old backfills can expire at the next retention sweep, while a
   future-dated row keeps its entire segment alive. LWW conflict resolution still uses the node's
   HLC, not the client's chosen event time.
-- **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
-  anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
-  `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also
-  covers `SIGTERM` deliberately, because the difference between the two is the defect it was written
-  for. What none of them do is fail a disk, drop a packet or stall a thread — fault injection more
-  broadly is still #54.
+- **Process death and faults are exercised, by the modules written for them.** Until #62 no module
+  killed anything, and that hid total loss of acknowledged writes on crash. Today 24 modules SIGKILL
+  a node, directly or through the cluster manager's `kill_node()`, and #54 added the faults the
+  others cannot make: a storage call that fails (`test_storage_faults.py` and the failover and mesh
+  modules beside it), a mesh link broken by a proxy between two nodes (`test_mesh_link_faults.py`),
+  and a power cut (`test_power_cut.py`, opt-in locally and on in CI). What a module of its own does not cover, a
+  fault does not reach: the rest of the battery runs on healthy disks and links.
+  *(This bullet said three modules and "fault injection is still #54" until 13 October 2026, long
+  after both stopped being true.)*
 - **Anti-entropy reconciles, but only what a peer still retains** (#57). Gap detection and repair are
   real; what neither covers is a gap whose records have left every peer's WAL. That needs a snapshot,
   and the reconciler has no path to one: `AntiEntropyManager` is a scheduler around a pluggable
@@ -14772,10 +14775,11 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   The third item that used to be on this list — creation running on the io thread — closed with #79:
   the loop now pays 0.060-0.146 ms to hand the work to a worker, and that figure does not grow with
   the store, where creation does. One request at a time, so a second peer arriving mid-creation is
-  told `busy` rather than queued. And **nothing in the integration battery bootstraps a replica by
-  snapshot over the replication protocol** — the coverage is unit-level on both halves now (#99
-  added the sending side), which is why a live record and a heartbeat could both be spliced into
-  that stream for as long as they were.
+  told `busy` rather than queued. The battery bootstraps replicas by snapshot over the replication
+  protocol in two modules: `test_wal_rotation.py`, after retention freed the replica's position
+  (#125), and `test_replica_lineage.py`, where the replica that bootstrapped is promoted and serves a
+  new one. *(This bullet said nothing in the battery did so - true when #99 added the unit test of
+  the sending side, and not since #125.)*
 - **Benchmark baselines were recorded on one developer machine** with no hardware description. The
   table below fixes that going forward. Any published number needs its hardware next to it.
 - **A subscriber that stops reading is disconnected, not throttled** (#45). Each subscription has an
