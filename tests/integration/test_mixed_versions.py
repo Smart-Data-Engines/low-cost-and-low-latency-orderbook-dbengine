@@ -214,22 +214,21 @@ def test_a_downgrade_keeps_every_row_once_or_refuses_to_start():
             n.stop()
 
 
-def test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing():
+def test_a_downgrade_after_format_3_keeps_every_row_once():
     """A data directory this version wrote in segment format 3, the default, opened by the previous
-    one: a start with part of the rows, which this matrix calls a failure, and why it is the answer
-    since format 3 - the previous version cannot decode those segments. It says so for each and
-    removes none, and this version started again holds every row once (docs/upgrading.md)."""
+    one. The previous version is v0.1.0, which reads format 3, so every row is there once - on the
+    previous version and on this one started again. Against `c610b72`, the previous version until
+    v0.1.0, the answer was a start without the rows of format-3 segments, said for each: the row
+    `docs/upgrading.md` had for it is in git history."""
     with tempfile.TemporaryDirectory(prefix="ob_mixed_down3_") as tmp:
         want = written_then_killed(CURRENT, f"{tmp}/data", "DW3")
         previous = Node(PREVIOUS, f"{tmp}/data")
         previous.start()
         try:
-            # What only the WAL held, the previous version replays into segments of its own; what
-            # this version sealed is format 3.
-            assert prices(previous.port, "DW3") == expected(20, 10), (
-                "the previous version read rows of a format-3 segment, or lost a replayed one")
-            assert "unsupported format_version=3" in previous.log(), (
-                "the previous version left format-3 segments out without saying so")
+            assert prices(previous.port, "DW3") == want, (
+                "the previous version lost rows of a format-3 segment, or holds some twice")
+            assert "unsupported format_version" not in previous.log(), (
+                "the previous version left format-3 segments out")
         finally:
             previous.stop()
         again = Node(CURRENT, f"{tmp}/data")
@@ -367,7 +366,9 @@ def test_a_mesh_of_both_versions_converges():
 
 def test_this_versions_clients_work_against_the_previous_server():
     with tempfile.TemporaryDirectory(prefix="ob_mixed_client_") as tmp:
-        n = Node(PREVIOUS, f"{tmp}/data")
+        # The previous version is v0.1.0, which takes backups (#34): until it, this asserted the
+        # opposite - no `backup` capability, and `ob_backup` refusing with status 2.
+        n = Node(PREVIOUS, f"{tmp}/data", ["--backup-dir", f"{tmp}/backups"])
         n.start()
         try:
             import sys
@@ -379,12 +380,14 @@ def test_this_versions_clients_work_against_the_previous_server():
                 engine.flush()
                 assert [r.price for r in engine.query("SELECT * FROM 'CLI'.'EX'")] == [100, 101]
                 caps = engine.server_capabilities()
-                assert "backup" not in caps, caps   # the previous version takes no backups
+                assert "backup" in caps, caps
             finally:
                 engine.close()
-            refused = subprocess.run([BACKUP_TOOL, "--host", "127.0.0.1", "--port", str(n.port)],
-                                     capture_output=True, text=True, timeout=patience(30))
-            assert refused.returncode == 2 and "does not take backups" in refused.stderr, refused
+            run = subprocess.run([BACKUP_TOOL, "--host", "127.0.0.1", "--port", str(n.port)],
+                                 capture_output=True, text=True, timeout=patience(120))
+            assert run.returncode == 0, run.stderr
+            name = re.match(r"backup (\S+) done", run.stdout).group(1)
+            assert (Path(tmp) / "backups" / name / "backup.json").is_file()
         finally:
             n.stop()
 
