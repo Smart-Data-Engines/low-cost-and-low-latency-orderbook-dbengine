@@ -67,6 +67,18 @@ The first release. What it contains, by area:
   every attempt was abandoned and the next failover lost the whole round (#214). Replication is
   asynchronous: what an unplanned failover can lose is in `docs/operations.md`, "What a failover
   keeps".
+- A catch-up under writes reads what is written while it runs from the WAL, and ends where the writes
+  are (#231). It held those records in memory, against the 16 MB ceiling of a replica that does not
+  drain, so under about 15 MB of WAL a second every catch-up longer than a second ended in a silent
+  disconnect mid-record, and the replica came back further behind each time: measured on two hosts,
+  it never finished. A catch-up that falls `4 x --wal-rotate-bytes` further behind the end of the WAL
+  than it began is ended, so a replica slower than the writes cannot hold the primary's disk (counted
+  by `ob_replica_catchups_abandoned_total`). Every disconnect is a log line on both sides, and a replica
+  no longer logs two INFO lines for every record it applies.
+- A replica whose position the primary has freed takes its snapshot under writes (#232). Live records
+  reached it between `ERR WAL_TRUNCATED` and `SNAPSHOT_BEGIN`, and it abandoned every attempt and asked
+  again five seconds later, for ever. A primary sends a refused replica nothing until it asks again,
+  and a replica skips a live record before `SNAPSHOT_BEGIN`, for a primary from before the fix.
 - A replica that is joining does not stand for election (#215). From giving up its store to follow a
   stream - a discard or a snapshot - until its primary says the catch-up ended (`CAUGHT_UP`,
   announced as `STREAM <id> caught_up`), it holds part of the stream, and electing it made the node

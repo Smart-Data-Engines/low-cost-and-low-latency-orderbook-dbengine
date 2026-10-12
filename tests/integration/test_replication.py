@@ -11,7 +11,7 @@ import socket
 import time
 
 import pytest
-from conftest import patience
+from conftest import node_log_since, node_log_size, patience
 
 from orderbook_engine import OrderbookEngine
 
@@ -241,3 +241,40 @@ def test_the_replica_persists_the_position_of_what_it_received(cluster,
     assert saved_offset() > first_saved, (
         f"the persisted position stayed at {first_saved} while another {rows} records arrived - "
         f"what a restart reads is not tracking what the replica received")
+
+
+def test_the_replicas_log_does_not_grow_with_the_records_it_applies(cluster,
+                                                                   primary_client: OrderbookEngine):
+    """#231. A replica logged two INFO lines for every WAL record it received - `about to call
+    read_line` and `received line: WAL ...` - at the server's default level. Measured on the
+    cluster hosts: 62 MB of log for one join, and in the steady state two lines for every write the
+    primary acknowledged, about 6 MB of log a second at 25 000 writes a second, on every replica.
+
+    The allowance is a constant and the records are many, so a line per record cannot fit under it
+    whatever its wording - a new one, anywhere on the replica's apply path, included."""
+    replica = cluster.replica()
+    records = 2000
+    symbol, exchange = "REPL-LOGVOL", "BINANCE"
+    offset = node_log_size(replica)
+
+    for i in range(records):
+        primary_client.insert(symbol, exchange, "bid", [400_000 + i], [1])
+
+    reader = OrderbookEngine(host="127.0.0.1", port=replica.tcp_port)
+    try:
+        deadline = time.monotonic() + patience(60)
+        held = 0
+        while time.monotonic() < deadline:
+            held = len(reader.query_all(symbol, exchange))
+            if held >= records:
+                break
+            time.sleep(0.5)
+    finally:
+        reader.close()
+    assert held == records, f"the replica holds {held} of the {records} records written"
+
+    info = [ln for ln in node_log_since(replica, offset).splitlines() if '"level":"INFO"' in ln]
+    assert len(info) < 100, (
+        f"{len(info)} INFO lines on the replica for {records} records - a line per record is "
+        f"back on its apply path. The first of them: {info[:3]}")
+

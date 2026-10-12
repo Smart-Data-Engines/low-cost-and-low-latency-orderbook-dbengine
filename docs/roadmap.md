@@ -2566,6 +2566,99 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 232. A replica whose position the primary had freed never took its snapshot while the primary took writes ✅ **P1**
+
+**Found measuring #215 on the two cluster hosts** (`evidence/2026-10-11-joining-replica-hosts/`). A
+replica asking from a position retention has freed is answered `ERR WAL_TRUNCATED`, answers that with
+`SNAPSHOT_REQUEST`, and reads its next line as `SNAPSHOT_BEGIN`. Between the two, the connection had
+asked for a stream, had no transfer in progress and no snapshot being prepared yet, so
+`live_record_action()` said `Send` - and under writes a live record was always there to send. The
+replica logged `snapshot bootstrap abandoned: expected SNAPSHOT_BEGIN, got 'WAL 4 323634898 136 1'`,
+asked for the same freed position five seconds later, and did so for as long as anyone watched. #214
+closed the same window for a heartbeat and for a snapshot being made; this was the round trip before
+either.
+
+Fixed on both sides:
+- the primary sets `asked_for_stream = false` after `ERR WAL_TRUNCATED`, so neither a live record
+  nor a heartbeat reaches the connection until it asks for a snapshot or a stream;
+- the replica skips a `WAL` line before `SNAPSHOT_BEGIN` with exactly the bytes its header announces,
+  bounded as in the receive loop, so a primary from before the fix cannot hold it in the loop either.
+
+Tests: `NoLiveRecordGoesToAReplicaRefusedForAFreedPosition` (the primary: nothing arrives after the
+refusal, and the snapshot request is answered next) and
+`ALiveRecordBeforeSnapshotBeginIsSkippedWithItsBytes` (the replica, against a scripted primary from
+before the fix).
+
+- Effort: S | Impact: a replica that had been away long enough for retention to free its position
+  never came back while the primary took writes, and the cluster ran on one copy for as long as that
+  lasted
+
+### 231. A catch-up under writes held the writes in memory, and the ceiling on that memory disconnected it every time ✅ **P1**
+
+**Found measuring #215 on the two cluster hosts.** Primary on x86 with an unthrottled writer beside
+it, about 15 MB of WAL a second; replica on ARM, restarted without a position, so it discards and
+replays. Its join never ended:
+- the stream broke every 0.6 s, mid-record. The replica said nothing; a build with the silent
+  returns logged showed `the stream ended or failed inside the record at 0:21570712 (136 byte(s)
+  announced), errno=32 (Broken pipe)`;
+- the replica came back five seconds later, on its backoff, from where it had got to: 21.3, 21.6,
+  21.1, 21.0 and 21.0 MB per connection, against 81 MB of new WAL between connections;
+- once rotation and retention freed the file it asked for, it fell into #232.
+
+In the other direction, primary on ARM and replica on x86, the same join took 0.26 - 0.29 s.
+
+**The cause** is in the primary:
+- a catch-up's range ended where the WAL stood when `REPLICATE` was read, and every live record past
+  that end waited in `deferred_live` until the catch-up finished;
+- `broadcast()` counted those bytes with the send buffer against `MAX_SEND_BUF_SIZE`, 16 MB, and
+  removed the replica past it, with no log line;
+- under writes faster than 16 MB for the length of a catch-up, every catch-up longer than about a
+  second ended that way, and each one left the next longer.
+
+The records were in the WAL all along.
+
+**Fixed:**
+- **A catch-up chases the end of the WAL.** A live record past its range moves the range's end
+  (`LiveRecordAction::Extend`), and the cursor reads the record from the WAL after everything before
+  it. Broadcasts happen in WAL order under the engine's write lock, and the record is in the file
+  before its broadcast, so the end never moves past a record still to come.
+- **`live_from`** closes the race that a moving end makes reachable more often. A `REPLICATE` read
+  between a record's append and its broadcast takes the record into the range, and a catch-up that
+  ended first used to let the late broadcast send it again.
+- **A snapshot transfer drops live records past its position** rather than holding them. The replica
+  asks for exactly those from the snapshot's position once it has installed it (#214), and the ones
+  held went out on the connection it was closing.
+- **A catch-up that does not catch up is ended** once it falls `4 x --wal-rotate-bytes` further
+  behind the end of the WAL than it began, with a `WARN` and `ob_replica_catchups_abandoned_total`. It
+  costs no memory now, but retention keeps every WAL file back to the slowest connected replica.
+  Judged against its start, because a replica back after an hour starts far behind and catches up all
+  the same if it is faster than the writes.
+- **Every disconnect is a log line on both sides:**
+  - the primary's removals for a full queue;
+  - the replica's broken stream, out-of-range length, length mismatch and CRC32C mismatch.
+- **The replica no longer logs two INFO lines for every record it applies.** That was 62 MB for the
+  750 000-level join above, and about 6 MB a second at 25 000 writes a second, on every replica.
+
+Tests:
+- `ACatchupUnderMoreLiveWritesThanTheCeilingKeepsItsReplica`: 19 MB of writes into a catch-up stalled
+  on a replica that is not reading; the replica stays, and every record arrives once, in order;
+- `ARecordTheCatchupSentIsNotSentAgainByALateBroadcast`;
+- `ACatchupThatLosesGroundIsEnded`: a real engine, `--wal-rotate-bytes` 64 KiB, a catch-up stalled
+  behind a history and then losing ground to writes - not ended for where it started, ended for what
+  it lost;
+- `LiveRecordDecision`: the table as a pure function;
+- `test_the_replicas_log_does_not_grow_with_the_records_it_applies` in `test_replication.py`: fewer
+  than 100 INFO lines for 2000 records.
+
+**Measured after the fix on the same hosts:**
+- the join from the faster host, which had not ended in 180 s on master nor on PR #241's branch, took
+  1.31 - 1.32 s on the primary's side and 1.45 - 1.46 s on the replica's;
+- the other way it took 0.23 - 0.30 s and 0.30 - 0.38 s;
+- the replica's log for one round fell from 55.9 - 59.6 MB to about 17 KB.
+
+- Effort: M | Impact: a replica rejoining a primary that writes faster than the replica's catch-up
+  could queue 16 MB never rejoined, and nothing in either log said why
+
 ### 230. The C++ client read a row by position, so a narrowed answer went over the raw protocol ✅ **P3**
 
 **Found closing #229.** The C++ client's `query()` reads a row's seven columns by position, so it
@@ -3260,6 +3353,28 @@ build. The field is atomic now, release and acquire like `Engine::current_epoch_
 `tests/test_wal_position.cpp`'s `WalEpoch.AReaderOnAnotherThreadSeesTheEpochOnlyGrow` reports the race
 under TSan without the fix and is clean with it, and the integration test against the fixed TSan
 server left no report.
+
+**Measured on the two cluster hosts on 11 October** (`evidence/2026-10-11-joining-replica-hosts/`):
+ARM m9g.xlarge and x86 m8a.xlarge, one subnet, Release builds, etcd on the x86 host, lease TTL 5 s.
+- The primary alternates between the hosts, and a writer beside it acknowledges one-level updates
+  without a limit.
+- The replica restarts without a position and asks for a replay from zero.
+- A watcher beside the primary stops it at that request - the replica then joining - and 0.5 s
+  later, with the premise read from both logs, it is killed.
+
+Four rounds a variant, two in each direction. The branch is #215 with #231's fix, without which the
+join from the faster host did not end at all:
+
+| variant | first to hold the role | acknowledged | missing on the final primary |
+|---|---|---|---|
+| fixed, the primary back after 30 s | the old primary, after 35.3 - 35.9 s | 98 649 - 215 105 | **0** |
+| fixed, back after 1 s | the old primary, after 1.21 s | 103 535 - 212 427 | **0** |
+| master `cf7cf04`, back after 30 s | the joining replica, after 8.6 - 9.4 s | 96 038 - 216 172 | **all of them** |
+| master `cf7cf04`, back after 1 s | the old primary after 1.21 s, then the joining replica | 98 393 - 257 554 | **all of them** |
+
+The join itself is no longer: the primary's catch-up, from the request to its end, took 0.23 - 0.30 s
+with the ARM host primary against 0.25 - 0.26 s on master, so the end is said when it happens
+(requirement 6.2).
 
 ### 214. A replica rejoining under writes never took its snapshot, and a node without the round's writes was promoted ✅ **P1**
 

@@ -204,8 +204,10 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
     hdr.checksum        = ob::crc32c(payload.data(), payload.size());
     hdr.record_type     = ob::WAL_RECORD_DELTA;
     // Appended as well as broadcast, which is what the engine does under one lock - and since #98
-    // the position announced on the wire is the one that append returns. The append does not widen
-    // the catch-up: the cursor's end was fixed when it was created.
+    // the position announced on the wire is the one that append returns. The broadcast widens the
+    // catch-up (#231): the cursor's end moves past the record, and the cursor reads it from the WAL
+    // as the last plain record. It used to wait in memory and go out after the directive, and that
+    // memory is what disconnected a catch-up under writes.
     const ob::WalPosition marker_pos = wal.append(marker, &one);
     ASSERT_TRUE(wal.flush());
     mgr.broadcast(hdr, payload.data(), payload.size(), marker_pos);
@@ -224,8 +226,9 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
         return true;
     };
 
-    size_t plain_records = 0;
-    bool   seam_seen     = false;
+    size_t   plain_records  = 0;
+    uint64_t last_plain_seq = 0;
+    bool     seam_seen      = false;
     // `CAUGHT_UP` (#215): after the last record of the catch-up and before the directive, so a
     // replica reads it as plain text and holds every record of the catch-up when it does.
     long   caught_up_after = -1;
@@ -255,20 +258,33 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
             break;
         }
         if (in.size() < nl + 1 + total_len) { if (!pull()) break; continue; }
+        if (total_len >= sizeof(uint64_t)) std::memcpy(&last_plain_seq, in.data() + nl + 1, sizeof(uint64_t));
         in.erase(0, nl + 1 + total_len);
         ++plain_records;
     }
 
     EXPECT_TRUE(seam_seen) << "the directive never arrived, so the replica would read the live "
                               "records that follow it as plain text";
-    EXPECT_EQ(plain_records, static_cast<size_t>(kRecords))
-        << "the catch-up delivered " << plain_records << " of " << kRecords
-        << " records before the seam; a record on the wrong side of it is framed the wrong way";
-    EXPECT_EQ(caught_up_after, static_cast<long>(kRecords))
-        << "CAUGHT_UP must follow every record of the catch-up and precede the directive and the "
-           "live record that waited (-1: it never came before the seam)";
+    EXPECT_EQ(plain_records, static_cast<size_t>(kRecords) + 1)
+        << "the catch-up delivered " << plain_records << " of " << (kRecords + 1)
+        << " records before the seam - its range and the record written while it ran; a record on "
+           "the wrong side of it is framed the wrong way";
+    EXPECT_EQ(last_plain_seq, kMarkerSeq)
+        << "the record written during the catch-up is not its last plain record";
+    EXPECT_EQ(caught_up_after, static_cast<long>(kRecords) + 1)
+        << "CAUGHT_UP must follow every record of the catch-up, the one written while it ran "
+           "included, and precede the directive (-1: it never came before the seam)";
 
-    // Exactly one frame after the seam, and it is the live record that waited.
+    // A record written after the catch-up ended is live, and the first frame after the seam.
+    {
+        marker.sequence_number = kMarkerSeq + 1;
+        std::memcpy(payload.data(), &marker, sizeof(marker));
+        hdr.sequence_number = kMarkerSeq + 1;
+        hdr.checksum        = ob::crc32c(payload.data(), payload.size());
+        const ob::WalPosition live_pos = wal.append(marker, &one);
+        ASSERT_TRUE(wal.flush());
+        mgr.broadcast(hdr, payload.data(), payload.size(), live_pos);
+    }
     while (in.size() < 4) { if (!pull()) break; }
     ASSERT_GE(in.size(), 4u) << "nothing followed the directive";
     const uint32_t frame_len = (static_cast<uint32_t>(static_cast<uint8_t>(in[0])) << 24) |
@@ -285,7 +301,7 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
     uint64_t seq = 0;
     ASSERT_GE(plain.size(), nl + 1 + sizeof(uint64_t));
     std::memcpy(&seq, plain.data() + nl + 1, sizeof(seq));
-    EXPECT_EQ(seq, kMarkerSeq) << "the first frame after the seam is not the record that waited";
+    EXPECT_EQ(seq, kMarkerSeq + 1) << "the first frame after the seam is not the live record";
 
     ::close(fd);
     mgr.stop();

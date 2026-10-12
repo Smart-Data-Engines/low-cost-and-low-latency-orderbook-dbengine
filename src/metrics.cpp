@@ -177,6 +177,14 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_repl_io_errors_total",
                                      "Replication io loop events or passes abandoned because "
                                      "they threw"));
+    // Catch-ups ended because the replica fell more than 4 x --wal-rotate-bytes further behind the
+    // end of the WAL than it began (#231). Since a catch-up reads what is written during it from the
+    // WAL rather than holding it, that distance - the retention it pins on this node's disk - is its
+    // only bound.
+    counters_.push_back(make_counter("ob_replica_catchups_abandoned_total",
+                                     "Catch-ups ended, their replica disconnected, for falling "
+                                     "more than 4 x --wal-rotate-bytes further behind the end of "
+                                     "the WAL than they began"));
     // Lease refreshes that threw (#112). A ratchet like the one above and for the same reason -
     // `CoordinatorClient` contains no `throw` and `refresh_lease()` answers failure with `false`
     // - but the thing behind it is the least recoverable of the four loops: the lease this thread

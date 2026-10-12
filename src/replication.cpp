@@ -258,6 +258,11 @@ static constexpr size_t kCatchupDrainThreshold = 256 * 1024;
 /// about a millisecond, and the loop comes straight back for the next one.
 static constexpr size_t kCatchupBatchBytes = 1024 * 1024;
 
+/// The largest `WAL` record a replica reads: what a header may announce, in the receive loop and in
+/// the wait for `SNAPSHOT_BEGIN` (#232). One name for the two, so that they cannot disagree about
+/// which records a stream may carry.
+static constexpr size_t kMaxStreamedRecordBytes = 1024 * 1024;
+
 /// Everything queued for a replica: what is on its way out, plus what is waiting behind an
 /// unfinished catch-up.
 ///
@@ -458,6 +463,10 @@ void ReplicationManager::start() {
     OB_LOG_INFO("replication", "replication port %u listens on %s",
                 static_cast<unsigned>(config_.port),
                 config_.bind_address.empty() ? "every interface" : config_.bind_address.c_str());
+    OB_LOG_INFO("replication",
+                "a catch-up that falls more than %llu byte(s) further behind the end of the WAL "
+                "than it began is ended and its replica disconnected (4 x --wal-rotate-bytes, %zu)",
+                static_cast<unsigned long long>(catchup_lag_limit()), wal_.rotate_threshold());
 
     if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::close(listen_fd_);
@@ -571,17 +580,37 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
     last_broadcast_end_ = WalPosition{record_pos.file_index,
                                       static_cast<uint32_t>(record_pos.offset + total_len)};
     for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-        if (live_record_action(*it, record_pos) == LiveRecordAction::Drop) {
+        const LiveRecordAction action = live_record_action(*it, record_pos);
+        if (action == LiveRecordAction::Extend) {
+            // The catch-up reads this record from the WAL, after everything before it (#231). It is
+            // there already: `WALWriter::write_record()` has written it before the append that gave
+            // this position returned, and the engine broadcasts under the lock it appends under, so
+            // no record before this one is still to come. Monotonic, because so are broadcasts.
+            const WalPosition end = last_broadcast_end_;
+            if (wal_position_before(it->catchup.through(), end)) {
+                it->catchup.through_file   = end.file_index;
+                it->catchup.through_offset = end.offset;
+            }
+            OB_LOG_DEBUG("repl_mgr",
+                         "catchup for fd=%d now runs to %u:%u: a live record past its end is read "
+                         "from the WAL", it->fd, it->catchup.through_file,
+                         static_cast<unsigned>(it->catchup.through_offset));
+            ++it;
+            continue;
+        }
+        if (action == LiveRecordAction::Drop) {
             OB_LOG_DEBUG("repl_mgr",
                          "not broadcasting seq=%lu at file=%u offset=%u to fd=%d: "
                          "asked_for_stream=%d catchup_active=%d through=%u/%u snapshot_preparing=%d "
-                         "snapshot_active=%d - the transfer in progress covers this record",
+                         "snapshot_active=%d live_from=%u/%u - covered by a transfer, or asked for "
+                         "from a snapshot's position later",
                          static_cast<unsigned long>(hdr.sequence_number),
                          record_pos.file_index, record_pos.offset, it->fd,
                          it->asked_for_stream ? 1 : 0, it->catchup.active ? 1 : 0,
                          it->catchup.through_file,
                          static_cast<unsigned>(it->catchup.through_offset),
-                         it->snapshot_preparing ? 1 : 0, it->snapshot_transfer.active ? 1 : 0);
+                         it->snapshot_preparing ? 1 : 0, it->snapshot_transfer.active ? 1 : 0,
+                         it->live_from.file_index, it->live_from.offset);
             ++it;
             continue;
         }
@@ -601,8 +630,14 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
             queue_to_replica(*it, msg.data(), msg.size());
         }
 
-        // If the send buffer is too large, the replica is too slow — disconnect it.
+        // If the send buffer is too large, the replica is too slow — disconnect it. Live, past any
+        // catch-up: a catch-up no longer queues live records (#231), so this is a replica that has
+        // stopped reading the stream it was keeping up with.
         if (queued_bytes(*it) > MAX_SEND_BUF_SIZE) {
+            OB_LOG_WARN("repl_mgr",
+                        "replica fd=%d (%s) has %zu byte(s) queued, over the %zu limit: "
+                        "disconnecting it; it comes back with a catch-up from its position",
+                        it->fd, it->address.c_str(), queued_bytes(*it), MAX_SEND_BUF_SIZE);
             remove_replica_locked(it->fd);
             it = replicas_.erase(it);
         } else {
@@ -909,6 +944,7 @@ void ReplicationManager::run_loop() {
             {
                 std::lock_guard<std::mutex> lock(mtx_);
                 publish_replica_gauges();
+                end_catchups_too_far_behind_locked();
             }
 
             for (int i = 0; i < nfds; ++i) {
@@ -1023,6 +1059,11 @@ void ReplicationManager::run_loop() {
                         queue_to_replica(*it, hb, static_cast<size_t>(hb_len));
                     }
                     if (queued_bytes(*it) > MAX_SEND_BUF_SIZE) {
+                        OB_LOG_WARN("repl_mgr",
+                                    "replica fd=%d (%s) has %zu byte(s) queued at a heartbeat, over "
+                                    "the %zu limit: disconnecting it; it comes back with a catch-up "
+                                    "from its position", it->fd, it->address.c_str(),
+                                    queued_bytes(*it), MAX_SEND_BUF_SIZE);
                         remove_replica_locked(it->fd);
                         it = replicas_.erase(it);
                     } else {
@@ -1477,7 +1518,15 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
                         std::strerror(errno));
             const char* err = "ERR WAL_TRUNCATED\n";
             enqueue_and_flush(replica, err, std::strlen(err));
-            OB_LOG_INFO("repl_mgr", "sent ERR WAL_TRUNCATED to replica fd=%d", replica.fd);
+            // The replica answers with `SNAPSHOT_REQUEST` and reads its next line as
+            // `SNAPSHOT_BEGIN`. A live record in that round trip abandoned the bootstrap, and under
+            // writes there always was one (#232). Nothing here is owed to it: a record before the
+            // snapshot's position is inside the snapshot, one after it is in the WAL it asks for
+            // once it has installed the snapshot.
+            replica.asked_for_stream = false;
+            OB_LOG_INFO("repl_mgr",
+                        "sent ERR WAL_TRUNCATED to replica fd=%d; no live record goes to it until it "
+                        "asks for a snapshot or a stream", replica.fd);
             return;
         }
         ::close(probe);
@@ -1495,6 +1544,10 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
     cur.through_offset = through.offset;
     replica.deferred_live.clear();
     replica.deferred_live.shrink_to_fit();
+    // A new start to judge it against (#231), taken at its first measurement. `live_from` is left as
+    // it is: nothing reads it while the cursor runs, and the cursor's end sets it again.
+    cur.lag_baseline     = 0;
+    cur.lag_baseline_set = false;
     // The directive travels with the cursor rather than with this function, because "after the
     // last plain byte of the catch-up" is now a moment the cursor decides.
     cur.compress_after = replica.compress;
@@ -1611,6 +1664,10 @@ void ReplicationManager::release_deferred_live(ReplicaInfo& replica) {
 void ReplicationManager::finish_catchup(ReplicaInfo& replica, CatchupEnd end) {
     CatchupCursor& cur = replica.catchup;
     cur.active = false;
+    // Everything before this went out with the catch-up, and a broadcast of it that arrives late -
+    // a `REPLICATE` read between a record's append and its broadcast takes the record into the
+    // range - must not send it again (#231).
+    replica.live_from = cur.position();
 
     if (replica.fd < 0) {
         replica.deferred_live.clear();
@@ -1648,8 +1705,8 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica, CatchupEnd end) {
 
     if (!replica.deferred_live.empty()) {
         OB_LOG_INFO("repl_mgr",
-                    "catchup complete for fd=%d at file=%u offset=%zu%s; releasing %zu bytes of "
-                    "live records that arrived while it streamed",
+                    "catchup complete for fd=%d at file=%u offset=%zu%s; releasing %zu byte(s) "
+                    "of heartbeats held back while it streamed",
                     replica.fd, cur.file, cur.offset,
                     end == CatchupEnd::Reached ? ", CAUGHT_UP sent" : "",
                     replica.deferred_live.size());
@@ -1678,14 +1735,18 @@ LiveRecordAction live_record_action(const ReplicaInfo& replica, WalPosition reco
     // Either way the live copy is a second one (#100).
     if (!replica.asked_for_stream) return LiveRecordAction::Drop;
 
-    // A cursor still walking its range reads this record out of the WAL file itself. Only what
-    // lies at or past the end of that range needs the live path. The window where the Drop matters
-    // is one mutex hand-off wide - the handshake processed between an append and its broadcast -
-    // so it is narrow rather than absent, and the comparison costs nothing.
+    // A cursor still walking its range reads this record out of the WAL file itself. The window
+    // where the Drop matters is one mutex hand-off wide - the handshake processed between an append
+    // and its broadcast - so it is narrow rather than absent, and the comparison costs nothing.
+    //
+    // A record at or past the end of the range is read there too: the range grows to take it
+    // (#231). It used to wait in memory for the catch-up to finish, and that memory counted against
+    // the ceiling of a replica that does not drain - so under writes every catch-up long enough
+    // was ended by a disconnect, mid-record, with the replica further behind when it came back.
     if (replica.catchup.active) {
         return wal_position_before(record_pos, replica.catchup.through())
                    ? LiveRecordAction::Drop
-                   : LiveRecordAction::Defer;
+                   : LiveRecordAction::Extend;
     }
 
     // A snapshot still being created on the worker. The replica reads its next line as
@@ -1696,15 +1757,16 @@ LiveRecordAction live_record_action(const ReplicaInfo& replica, WalPosition reco
     if (replica.snapshot_preparing) return LiveRecordAction::Drop;
 
     // A snapshot being streamed. The snapshot carries the WAL position it was taken at, so a
-    // record before that position is already inside the files this replica is installing, and a
-    // record at or past it is exactly what the replica needs next - after the last snapshot byte,
-    // never inside it (#99).
-    if (replica.snapshot_transfer.active) {
-        const auto& m = replica.snapshot_transfer.manifest;
-        const WalPosition taken_at{m.wal_file_index, static_cast<uint32_t>(m.wal_byte_offset)};
-        return wal_position_before(record_pos, taken_at) ? LiveRecordAction::Drop
-                                                         : LiveRecordAction::Defer;
-    }
+    // record before that position is already inside the files this replica is installing. A record
+    // at or past it is what the replica needs next, and it asks for exactly that: once the snapshot
+    // is installed it connects again at once and sends `REPLICATE` from the snapshot's position
+    // (#214). Held here until the last snapshot byte, as it was (#99), it went out on the
+    // connection the replica was about to close - and counted against its ceiling while it waited,
+    // so a snapshot long enough under writes was ended the way a catch-up was (#231).
+    if (replica.snapshot_transfer.active) return LiveRecordAction::Drop;
+
+    // Live. A record before the position the last catch-up ended at went out with it.
+    if (wal_position_before(record_pos, replica.live_from)) return LiveRecordAction::Drop;
 
     return LiveRecordAction::Send;
 }
@@ -1731,6 +1793,53 @@ bool ReplicationManager::catchup_can_progress_locked() const {
         if (r.send_buf.size() < MAX_SEND_BUF_SIZE / 2) return true;
     }
     return false;
+}
+
+uint64_t ReplicationManager::catchup_lag_limit() const {
+    return 4ULL * static_cast<uint64_t>(wal_.rotate_threshold());
+}
+
+void ReplicationManager::end_catchups_too_far_behind_locked() {
+    // The distance is measured across WAL files, by the engine, so a manager without one - which
+    // exists in tests only - has nothing to measure with.
+    if (engine_ == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_catchup_lag_check_) return;
+    next_catchup_lag_check_ = now + std::chrono::milliseconds(100);
+
+    const uint64_t limit = catchup_lag_limit();
+    for (auto it = replicas_.begin(); it != replicas_.end(); ) {
+        if (it->fd < 0 || !it->catchup.active) { ++it; continue; }
+        // Unknown - a file of the range is gone - is not "too far": the cursor stops there by
+        // itself and says why.
+        const std::optional<uint64_t> behind = engine_->wal_bytes_since(it->catchup.position());
+        if (!behind.has_value()) { ++it; continue; }
+        // A catch-up may start any distance behind - a replica back after an hour asks from where it
+        // stopped, and one faster than the writes closes that distance. Judged against its own
+        // start, then, not against zero: what ends it is losing ground by more than the limit.
+        CatchupCursor& cur = it->catchup;
+        if (!cur.lag_baseline_set) {
+            cur.lag_baseline     = *behind;
+            cur.lag_baseline_set = true;
+            OB_LOG_DEBUG("repl_mgr", "catchup for fd=%d starts %llu byte(s) behind the end of the WAL",
+                         it->fd, static_cast<unsigned long long>(*behind));
+            ++it;
+            continue;
+        }
+        if (*behind <= cur.lag_baseline + limit) { ++it; continue; }
+        OB_LOG_WARN("repl_mgr",
+                    "catchup for fd=%d (%s) is %llu byte(s) behind the end of the WAL at %u:%zu, "
+                    "%llu when it began - it has lost more than %llu (4 x --wal-rotate-bytes): "
+                    "disconnecting it. It is not keeping up with the writes; retention stops holding "
+                    "the WAL back for it, and it comes back with a catch-up from its position or, "
+                    "once that is freed, a snapshot",
+                    it->fd, it->address.c_str(), static_cast<unsigned long long>(*behind),
+                    cur.file, cur.offset, static_cast<unsigned long long>(cur.lag_baseline),
+                    static_cast<unsigned long long>(limit));
+        engine_->registry().increment_counter("ob_replica_catchups_abandoned_total");
+        remove_replica_locked(it->fd);
+        it = replicas_.erase(it);
+    }
 }
 
 void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
@@ -1978,13 +2087,13 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
     st.active = false;
     st.pin.reset();
 
-    // Anything that arrived while the snapshot streamed goes out now, after its last byte. The
-    // snapshot carries the WAL position it was taken at, so what waited is what this replica needs
-    // next - and putting it here rather than inside the stream is the whole of #99.
+    // A heartbeat that came due while the snapshot streamed goes out now, after its last byte,
+    // rather than inside the stream (#99). Live records do not wait here since #231: the replica
+    // asks for what follows the snapshot from its position, on the connection it opens next.
     if (!replica.deferred_live.empty()) {
         OB_LOG_INFO("repl_mgr",
                     "snapshot transfer complete for fd=%d at wal file=%u offset=%zu; releasing %zu "
-                    "bytes of live records that arrived while it streamed",
+                    "byte(s) of heartbeats held back while it streamed",
                     replica.fd, st.manifest.wal_file_index, st.manifest.wal_byte_offset,
                     replica.deferred_live.size());
         release_deferred_live(replica);
@@ -2512,7 +2621,7 @@ void ReplicationClient::receive_and_replay() {
                 return;
             }
 
-            OB_LOG_INFO("repl_client", "reading compressed frame: %u bytes", comp_len);
+            OB_LOG_DEBUG("repl_client", "reading compressed frame: %u bytes", comp_len);
 
             // Read the compressed frame.
             std::vector<uint8_t> compressed(comp_len);
@@ -2639,9 +2748,10 @@ void ReplicationClient::receive_and_replay() {
         }
 
         // Uncompressed path (original logic).
-        // Read a text header line using the buffered reader.
-        OB_LOG_INFO("repl_client", "about to call read_line, running=%d",
-                    running_.load(std::memory_order_acquire));
+        // Read a text header line using the buffered reader. Nothing is logged per line at INFO
+        // (#231): this loop is the replica's apply path, and two INFO lines for every record - one
+        // here, one after the read - were 62 MB of log for one join on the cluster hosts, and at
+        // 25 000 writes a second about 6 MB a second on every replica.
         ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
         if (n < 0) {
             // Disconnect or error.
@@ -2654,7 +2764,7 @@ void ReplicationClient::receive_and_replay() {
             continue;
         }
 
-        OB_LOG_INFO("repl_client", "received line: %.*s", static_cast<int>(n), line_buf);
+        OB_LOG_DEBUG("repl_client", "received line: %.*s", static_cast<int>(n), line_buf);
 
         // Parse WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>
         if (std::strncmp(line_buf, "WAL ", 4) == 0) {
@@ -2671,15 +2781,23 @@ void ReplicationClient::receive_and_replay() {
             // Stale-epoch check (Requirement 2.1, 2.2, 3.5), and epoch advancement (2.4).
             if (parsed == 4 && !accept_announced_epoch(msg_epoch, "record")) return;
 
-            if (total_len < sizeof(WALRecord) || total_len > 1024 * 1024) {
+            if (total_len < sizeof(WALRecord) || total_len > kMaxStreamedRecordBytes) {
                 // Sanity check: total_len must be at least WALRecord header size
                 // and not absurdly large.
+                OB_LOG_WARN("repl_client",
+                            "the record at %u:%zu announces %zu byte(s), outside %zu - %zu: "
+                            "disconnecting", file_index, byte_offset, total_len,
+                            sizeof(WALRecord), kMaxStreamedRecordBytes);
                 return; // Protocol error — disconnect.
             }
 
             // Read exactly total_len binary bytes: WALRecord header + payload.
             std::vector<uint8_t> buf(total_len);
             if (!reader_.read_exact(buf.data(), total_len)) {
+                OB_LOG_WARN("repl_client",
+                            "the stream ended or failed inside the record at %u:%zu (%zu byte(s) "
+                            "announced), errno=%d (%s): disconnecting", file_index, byte_offset,
+                            total_len, errno, std::strerror(errno));
                 return; // Disconnect.
             }
 
@@ -2692,13 +2810,22 @@ void ReplicationClient::receive_and_replay() {
 
             // Verify CRC32C of payload (Requirement 2.2).
             if (payload_len != hdr.payload_len) {
-                // Length mismatch — protocol error.
+                OB_LOG_ERROR("repl_client",
+                             "the record at %u:%zu carries %zu payload byte(s) and says it has "
+                             "%u: disconnecting", file_index, byte_offset, payload_len,
+                             static_cast<unsigned>(hdr.payload_len));
                 return;
             }
 
             const uint32_t computed_crc = ob::crc32c(payload, payload_len);
             if (computed_crc != hdr.checksum) {
                 // CRC32C mismatch — disconnect and log error (Requirement 2.3).
+                OB_LOG_ERROR("repl_client",
+                             "the record at %u:%zu fails its CRC32C (computed %08x, the record "
+                             "says %08x; type %u, %zu payload byte(s)): disconnecting",
+                             file_index, byte_offset, computed_crc,
+                             static_cast<unsigned>(hdr.checksum),
+                             static_cast<unsigned>(hdr.record_type), payload_len);
                 return;
             }
 
@@ -2958,13 +3085,53 @@ void ReplicationClient::request_and_receive_snapshot() {
     // answer was read as `SNAPSHOT_BEGIN` and the bootstrap abandoned (#214). Nor is a `CAUGHT_UP`
     // (#215): it ends a catch-up of an earlier request on this connection, and the store it speaks
     // of is the one this snapshot replaces - so it is skipped, and it does not end the join.
+    //
+    // Nor is a live record (#232). A primary from before that fix sends records in the same round
+    // trip, and under writes there always was one: the bootstrap was abandoned and asked for again
+    // from the same freed position, every five seconds, for ever. Each is inside the snapshot or
+    // after its position, which is where this node asks from once the snapshot is installed, so it
+    // is skipped - with its bytes, by the length its header announces, which is bounded as in the
+    // receive loop.
     char line_buf[512];
+    size_t skipped_live = 0;
     ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
-    while (n > 0 && (std::strncmp(line_buf, "HEARTBEAT", 9) == 0 ||
-                     std::strncmp(line_buf, "CAUGHT_UP ", 10) == 0)) {
-        OB_LOG_DEBUG("repl_client", "%.20s before SNAPSHOT_BEGIN is not the answer; still waiting",
-                     line_buf);
+    while (n > 0) {
+        if (std::strncmp(line_buf, "HEARTBEAT", 9) == 0 ||
+            std::strncmp(line_buf, "CAUGHT_UP ", 10) == 0) {
+            OB_LOG_DEBUG("repl_client",
+                         "%.20s before SNAPSHOT_BEGIN is not the answer; still waiting", line_buf);
+        } else if (std::strncmp(line_buf, "WAL ", 4) == 0) {
+            unsigned file = 0;
+            size_t   offset = 0;
+            size_t   total_len = 0;
+            if (std::sscanf(line_buf, "WAL %u %zu %zu", &file, &offset, &total_len) != 3 ||
+                total_len < sizeof(WALRecord) || total_len > kMaxStreamedRecordBytes) {
+                OB_LOG_WARN("repl_client",
+                            "snapshot bootstrap abandoned: a WAL line before SNAPSHOT_BEGIN that "
+                            "cannot be skipped: '%s'", sanitise_for_log(line_buf, 200).c_str());
+                bootstrapping_.store(false, std::memory_order_release);
+                return;
+            }
+            std::vector<uint8_t> skipped(total_len);
+            if (!reader_.read_exact(skipped.data(), total_len)) {
+                OB_LOG_WARN("repl_client",
+                            "snapshot bootstrap abandoned: the stream ended inside the live record "
+                            "at %u:%zu before SNAPSHOT_BEGIN", file, offset);
+                bootstrapping_.store(false, std::memory_order_release);
+                return;
+            }
+            ++skipped_live;
+            OB_LOG_DEBUG("repl_client", "skipped the live record at %u:%zu before SNAPSHOT_BEGIN",
+                         file, offset);
+        } else {
+            break;
+        }
         n = reader_.read_line(line_buf, sizeof(line_buf));
+    }
+    if (skipped_live > 0) {
+        OB_LOG_INFO("repl_client",
+                    "skipped %zu live record(s) before SNAPSHOT_BEGIN: they are in the snapshot or "
+                    "after it", skipped_live);
     }
     if (n <= 0) {
         OB_LOG_WARN("repl_client",

@@ -4158,6 +4158,25 @@ Learned the hard way. Check here before debugging.
      it is told to and the client of another checkout, which nothing says while the client has not
      changed. A run that tests the client prints `orderbook_engine.__file__`, in a venv with no
      client installed.
+565. **Memory held for a transfer, under a ceiling meant for a replica that does not read,
+     disconnects a replica that does.** #231: a catch-up deferred every live record past its range
+     in memory, and `broadcast()` counted those bytes with the send buffer against the 16 MB ceiling
+     of a stalled replica. Under writes faster than 16 MB for the length of a catch-up, every
+     catch-up of a replica that was making progress ended in a removal mid-record. The records were
+     in the WAL, which the cursor reads: a bound on memory protects nothing when what it holds is
+     already on disk. And a removal without a line is a defect of its own - neither side logged it,
+     and it took a diagnostic build to see who closed the stream.
+566. **A measurement on two hosts runs in both directions.** #231 showed only with the faster host
+     as the primary: the x86 writer outran the ARM replica's catch-up, and the other way round the
+     same join took 0.26 s. Three of the first four rounds passed. A series that alternates the
+     primary between the hosts is the cheapest way not to measure only the direction that works.
+567. **A test that needs a catch-up in progress needs retention held for it.** A history long
+     enough to keep the cursor streaming past what the queue and the loopback socket absorb (about
+     10 MB here) is long enough for the flush ticks to free the first WAL files before the replica
+     asks, and the request is then answered `ERR WAL_TRUNCATED`. A connection that has not sent
+     `REPLICATE` counts for retention as a replica at the start of the log, so: connect, write the
+     history, then ask. Found when `ACatchupThatLosesGroundIsEnded` passed alone and failed after
+     another test in the same process.
 
 ## Current state and open problems
 
