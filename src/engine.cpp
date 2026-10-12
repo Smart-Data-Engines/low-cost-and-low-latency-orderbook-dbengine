@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -45,6 +46,56 @@ namespace {
 /// rather than begin an empty one. Not a directory, so no sweep of the data directory removes it,
 /// and not a segment's file (is_segment_file()), so no snapshot carries it.
 constexpr const char* kWalLocationFile = "wal_location";
+
+/// #233, variant B (prototype, branch proto/history-from-the-live-book): the rows an update leaves
+/// in history are the live book's top positions it changed, not the levels it carried. The first
+/// `k` levels of the side as they stood before the update, compared with the side after it: a
+/// position whose price, quantity or count differs is a row at that position, and a position the
+/// side no longer reaches is a row of quantity 0 at the price it had. `k` is OB_HISTORY_DEPTH
+/// (default 20, at most MAX_LEVELS) for the measurement; a merge would make it configuration.
+uint32_t history_depth() {
+    static const uint32_t k = [] {
+        const char* env = std::getenv("OB_HISTORY_DEPTH");
+        long v = env != nullptr ? std::strtol(env, nullptr, 10) : 20;
+        if (v < 1) v = 1;
+        if (v > static_cast<long>(MAX_LEVELS)) v = static_cast<long>(MAX_LEVELS);
+        OB_LOG_INFO("engine", "history keeps the live book's top %ld position(s) of each side (#233, variant B prototype)", v);
+        return static_cast<uint32_t>(v);
+    }();
+    return k;
+}
+
+/// A side's first levels, copied: the side itself changes in place. Trivially constructible, so a
+/// declaration touches nothing - the 76% regression of a default-constructed array of rows on this
+/// path (apply_in_memory()) is the reason it must stay so.
+struct SideTop {
+    uint32_t depth;
+    int64_t  prices[MAX_LEVELS];
+    uint64_t quantities[MAX_LEVELS];
+    uint32_t counts[MAX_LEVELS];
+};
+
+void capture_top(const SoASide& side, uint32_t k, SideTop& out) {
+    out.depth = std::min(side.depth, k);
+    std::memcpy(out.prices, side.prices, out.depth * sizeof(int64_t));
+    std::memcpy(out.quantities, side.quantities, out.depth * sizeof(uint64_t));
+    std::memcpy(out.counts, side.order_counts, out.depth * sizeof(uint32_t));
+}
+
+template <class Emit>
+void emit_position_changes(const SideTop& before, const SoASide& after, uint32_t k, Emit&& emit) {
+    const uint32_t now = std::min(after.depth, k);
+    const uint32_t n   = std::max(before.depth, now);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (i >= now) {
+            emit(i, before.prices[i], uint64_t{0}, uint32_t{0});
+        } else if (i >= before.depth || before.prices[i] != after.prices[i] ||
+                   before.quantities[i] != after.quantities[i] ||
+                   before.counts[i] != after.order_counts[i]) {
+            emit(i, after.prices[i], after.quantities[i], after.order_counts[i]);
+        }
+    }
+}
 
 /// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
 bool holds_wal(const std::filesystem::path& dir) {
@@ -1483,6 +1534,10 @@ ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& d
                                     const Level* levels) {
     // Apply to SoA buffer using seqlock writer protocol.
     SoABuffer& buf = get_or_create_buffer(key, delta.symbol, delta.exchange);
+    const SoASide& side = delta.side == SIDE_BID ? buf.bid : buf.ask;
+    const uint32_t k = history_depth();
+    thread_local SideTop before;
+    capture_top(side, k, before);
     bool gap_detected = false;   // unused: gaps are decided per origin in observe_sequence()
     const ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
 
@@ -1497,18 +1552,17 @@ ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& d
     // no lock is taken. It may read high for a moment and never low, so a row is never dropped.
     const size_t rows_before = pending_rows_.size();
 
-    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+    emit_position_changes(before, side, k, [&](uint32_t i, int64_t price, uint64_t qty, uint32_t cnt) {
         SnapshotRow row{};
         row.timestamp_ns    = delta.timestamp_ns;
         row.sequence_number = delta.sequence_number;
         row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
+        row.level_index     = static_cast<uint16_t>(i);
+        row.price           = price;
+        row.quantity        = qty;
+        row.order_count     = cnt;
         pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/true});
-    }
+    });
 
     // Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
     //
@@ -1666,6 +1720,10 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
     // 4. Apply winning levels to SoA buffer.
     if (!winning_levels.empty()) {
         SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
+        const SoASide& side = delta.side == SIDE_BID ? buf.bid : buf.ask;
+        const uint32_t k = history_depth();
+        thread_local SideTop before;
+        capture_top(side, k, before);
 
         // Build a filtered DeltaUpdate + Level array for winning levels only.
         if (winning_levels.size() == static_cast<size_t>(delta.n_levels)) {
@@ -1700,18 +1758,18 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
         // unsynchronised subscription list a live race rather than a latent one.
         const size_t rows_before = pending_rows_.size();
 
-        for (uint16_t idx : winning_levels) {
+        emit_position_changes(before, side, k,
+                              [&](uint32_t i, int64_t price, uint64_t qty, uint32_t cnt) {
             SnapshotRow row{};
             row.timestamp_ns    = delta.timestamp_ns;
             row.sequence_number = delta.sequence_number;
             row.side            = delta.side;
-            row.level_index     = idx;
-            row.price           = levels[idx].price;
-            row.quantity        = levels[idx].qty;
-            row.order_count     = levels[idx].cnt;
-
+            row.level_index     = static_cast<uint16_t>(i);
+            row.price           = price;
+            row.quantity        = qty;
+            row.order_count     = cnt;
             pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/false});
-        }
+        });
 
         if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
             std::vector<SnapshotRow> batch;
@@ -4500,21 +4558,24 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels,
     const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
 
     SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
+    const SoASide& side = delta.side == SIDE_BID ? buf.bid : buf.ask;
+    const uint32_t k = history_depth();
+    thread_local SideTop before;
+    capture_top(side, k, before);
     bool gap_detected = false;
     (void)ob::apply_delta(buf, delta, levels, gap_detected);
 
-    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+    emit_position_changes(before, side, k, [&](uint32_t i, int64_t price, uint64_t qty, uint32_t cnt) {
         SnapshotRow row{};
         row.timestamp_ns    = delta.timestamp_ns;
         row.sequence_number = delta.sequence_number;
         row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
+        row.level_index     = static_cast<uint16_t>(i);
+        row.price           = price;
+        row.quantity        = qty;
+        row.order_count     = cnt;
         pending_rows_.push_back({delta.symbol, delta.exchange, row, own});
-    }
+    });
 }
 
 uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last) {
