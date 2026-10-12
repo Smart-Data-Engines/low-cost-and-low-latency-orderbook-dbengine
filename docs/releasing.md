@@ -40,9 +40,11 @@ sha256sum -c SHA256SUMS
    (`git rev-parse vX.Y.Z^{commit}`) and the matrix in `docs/upgrading.md` with it: from then on
    `tests/integration/test_mixed_versions.py` measures every tree against the build users run.
 
-A first attempt can fail on something only a tag exercises. PyPI never gives a version back once a
-file is uploaded, so a failure after the upload means the next release is X.Y.Z+1; a GitHub release
-can be deleted and the tag pushed again.
+A first attempt can fail on something only a tag exercises. A failed job is run again from its
+workflow run, on the same tag. The tag itself cannot be deleted or moved -
+`.github/rulesets/tags.json` refuses both, with nobody exempt - so a fix that needs a commit is the
+next version, X.Y.Z+1. So is a failure after the PyPI upload, since PyPI never gives a version back
+once a file is uploaded.
 
 ## What runs, and when
 
