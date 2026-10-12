@@ -93,6 +93,22 @@ Two things follow, and both are refusals rather than surprises:
   that is the server, which assigns one per symbol. The argument used to be accepted and discarded;
   it is now refused. In embedded mode you still choose it.
 
+**How a side is written, so that the live book and history name the same book** (#233). The engine
+reads one update two ways:
+- the live book - `book()`, and every aggregate without `GROUP BY` - applies it level by level **by
+  price**: a price it holds takes the new quantity, a new one is inserted in order, a quantity of 0
+  removes it;
+- history - `WHERE AT` and the series of `OPEN`, `HIGH`, `LOW`, `CLOSE`, `TWAP` - keys each row by
+  its **position in the update**, level 0 its first.
+
+They agree for an update that is a side's levels **best first**, followed by every price that has
+left the side since it was last written, with a quantity of 0. Bids `[100, 99]` and then `[98, 97]`
+alone leave the live book's best bid at 100 and history's at 98; `[98, 97, 100, 99]` with quantities
+`[q, q, 0, 0]` leaves both at 98. An update of changed levels only, as an exchange's diff stream
+sends them, keeps the live book right and history wrong. Turn it into the side's levels first:
+`examples/binance-live/market.py` does it for Binance's depth20. #233 is open on what an update
+should mean; until it closes, this is the encoding both views are tested on.
+
 #### engine.insert_batch(updates) → List[BatchOutcome]
 
 Several updates in one round trip, with a word about each of them.
