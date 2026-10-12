@@ -2566,6 +2566,37 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 234. Between releases everything built from master called itself the last release ✅ **P3**
+
+**Found after #42's first release.** After v0.1.0 `CMakeLists.txt` still said 0.1.0, which is the only
+kind of version it could say: CMake's `project(VERSION)` takes numbers. So everything built from master
+after the tag said 0.1.0, which only `555ad74` is:
+- `ob_tcp_server --version`, the banner, `STATUS` and `ob_build_info`;
+- the wheel `pip install .` builds, which pip would have taken for the release beside PyPI's;
+- the packages of CI's `package` jobs, which apt and dnf would have taken for it too.
+
+The SDK learnt this before its first release and keeps its `main` on development versions.
+
+**Fixed.** The version is one string, `set(OB_VERSION "...")`: X.Y.Z in a release, and between releases
+the next one as a development version, X.Y.Z.devN.
+- That is PEP 440's spelling, which the binaries, `STATUS` and the wheel carry as it is, and
+  `project(VERSION)` takes its numbers.
+- The packages carry X.Y.Z~devN, which dpkg and rpm sort before X.Y.Z. X.Y.Z.devN would sort after it:
+  `dpkg --compare-versions 0.1.1.dev0 lt 0.1.1` is false, and rpm's `vercmp` says the same.
+- `release.py gate` refuses to tag a development version and says why.
+- `release.py check` lets the README's banner show, between releases, a version `CHANGELOG.md` has
+  released and that comes before the one under development - what a reader installs.
+- `release.py self-test` holds both rules to eleven cases of their own in CI. Of five mutations of the
+  rules, the first run of the cases killed four; the one that survived, a development version let
+  through to the equality check, was refused there all the same, under the wrong reason. The case
+  now asks for the reason, and kills it. A change to a message's words survives, as it must.
+- `docs/releasing.md`'s step after a release sets the next development version.
+
+Master is 0.1.1.dev0.
+
+- Effort: S | Impact: a build of master could be taken for the release it followed, by an operator
+  and by a package manager
+
 ### 232. A replica whose position the primary had freed never took its snapshot while the primary took writes ✅ **P1**
 
 **Found measuring #215 on the two cluster hosts** (`evidence/2026-10-11-joining-replica-hosts/`). A
