@@ -1190,7 +1190,8 @@ until v0.1.0 is on PyPI.
   scikit-build-core is already in place), signed tags
 - Effort: S | Impact: `pip install orderbook-dbengine` is the shortest path to a first user
 
-**The pipeline is in; no release has been cut** (spec `smart-data-engine-workspace/specs/engine-release/`,
+**The pipeline is in, and v0.1.0 went out through it on 12 October 2026** (spec
+`smart-data-engine-workspace/specs/engine-release/`,
 `docs/releasing.md`). A tag `vX.Y.Z` is the whole trigger: `release.yml` checks that it names
 `CMakeLists.txt`'s version - the only place the version is written now; `pyproject.toml` reads it and
 the Python client asks its own metadata, where it had said "0.2.0" by hand while the project was
@@ -1207,8 +1208,20 @@ platform wheel would have carried its own OpenSSL and curl. Local mode loads the
 packages install under `/usr/lib/orderbook-dbengine/`. And the RPM said its licence was MIT; it is
 Apache-2.0.
 
-What is left is the owner's: a pending trusted publisher on PyPI for `orderbook-dbengine` (the name is
-free), the `pypi` environment with a reviewer, a key to sign tags - and then the tag.
+**v0.1.0** is the tag on `555ad74`, annotated and unsigned: no key to sign tags exists yet. Its run
+built and attested both architectures' packages, the wheel and the sdist, and published them with
+`SHA256SUMS` as the GitHub release. PYPI_FACTS Checked from what it published rather than from the
+run's log (`evidence/2026-10-12-release-0.1.0/`):
+- every file against `SHA256SUMS` and its attestation, which names `release.yml` at the tag, the
+  commit and a GitHub-hosted runner; a changed copy has none, and the right file is refused under
+  another tag;
+- the RPM installed by `dnf` on Amazon Linux 2023 (aarch64) and the `.deb` by `apt` on Ubuntu 26.04
+  (x86-64), each on a host made to look as if the engine had never been there. The unit started as
+  `orderbook` on 9090, took writes and gave them back;
+- #215's two-host series on the installed server: a replica joined in 0.48 - 1.03 s, and with the
+  primary killed in the join, none of 101 725 and 197 545 acknowledged writes was missing.
+
+What is left of this item is signed tags: the key, and `required_signatures` with it.
 
 ### 43. Worked example: live market data ingestion ✅
 - A runnable Binance (or Coinbase) websocket ingestor writing into the engine, with a Grafana
@@ -15491,7 +15504,7 @@ The capability items are in the table below.
 | **P1** | The live book comes back with the node (#235) | M | After a stop the book is gone, and after a crash it is the WAL's tail: every live aggregate answers a book the market never had |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
-| **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
+| **P3** | Signed release tags (#42, what is left of it) | S | v0.1.0 went out unsigned; a signed tag lets a user check it is ours without trusting the host it came from |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
 | **P3** | The WAL's budget keeps the device busy with fewer syncs (#242) | M | On a device slower than the writes, at 7 - 10 MB/s, its syncs' journal costs 1 - 2% of the levels a second |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
