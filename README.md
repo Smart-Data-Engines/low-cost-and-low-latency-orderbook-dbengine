@@ -317,6 +317,13 @@ for row in rows:
 engine.close()
 ```
 
+### Watch it on a live market
+
+[`examples/binance-live/`](examples/binance-live/) writes the order books of ten Binance pairs into a
+node as they arrive. It reads them back as minute bars and as the top of each book, and draws the
+market as the node holds it next to the node's own metrics, in Grafana. Everything runs natively,
+and the example's README has what an hour of it measured.
+
 ### Run a Multi-Master Cluster
 
 Start three nodes that all accept writes with automatic replication:

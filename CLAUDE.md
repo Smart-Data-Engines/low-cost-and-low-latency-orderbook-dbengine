@@ -4178,6 +4178,17 @@ Learned the hard way. Check here before debugging.
      history, then ask. Found when `ACatchupThatLosesGroundIsEnded` passed alone and failed after
      another test in the same process.
 
+568. **A book written one way can be read two ways.** The live book (`BOOK`, every aggregate without
+     `GROUP BY`) applies an update by price, and history (`WHERE AT`, the series) keys a row by its
+     position in the update (#233). A test that writes a book and reads only one of them proves one
+     model. Read the live book and `WHERE AT` the same instant, level by level, as
+     `test_example_binance_live.py` does; the writer it holds sends a side's levels best first, then
+     the prices that left it with a quantity of 0.
+569. **What survives a restart is history, not the live book.** A start replays the WAL's tail into
+     the live book and rebuilds nothing from the segments (#235): after a clean stop `BOOK` refuses
+     the symbol, after SIGKILL it holds the tail. A test of the live book that restarts a node is
+     testing that, not recovery.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -1,0 +1,2 @@
+orderbook-dbengine>=0.1.0
+websockets>=12

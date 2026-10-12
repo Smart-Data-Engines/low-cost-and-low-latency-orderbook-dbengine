@@ -105,3 +105,43 @@ def test_a_symbol_the_node_has_never_seen_is_refused_by_name(primary_client):
     with pytest.raises(OrderbookError) as absent:
         primary_client.book("BOOK-NOSUCH", "EX")
     assert "BOOK-NOSUCH" in str(absent.value), absent.value
+
+
+# #233: one write, read two ways. The live book applies an update by price - a price it does not get
+# again stays - and history keys a row by its position in the update, so the two answer different best
+# bids for the same writes. Both kinds of writer, each a strict xfail until the item decides what an
+# update means; the one encoding on which the two agree is examples/binance-live's, held by
+# test_example_binance_live.py.
+REASON_233 = "#233: the live book applies an update by price, history keys it by position"
+T233 = 1_791_900_000_000_000_000
+
+
+def _best_bids(engine: OrderbookEngine, symbol: str, at: int) -> tuple[int, int]:
+    """The best bid of the live book now, and of history at `at`."""
+    engine.flush()
+    live = [r.price for r in engine.book(symbol, "EX", depth=1) if r.side == "bid"][0]
+    then = engine.query_rows(f"SELECT price FROM '{symbol}'.'EX' WHERE AT {at} AND side = 0 "
+                             f"AND level = 0").rows[0][0]
+    return live, then
+
+
+@pytest.mark.xfail(strict=True, reason=REASON_233)
+def test_a_writer_of_top_levels_gets_one_best_bid_from_the_book_and_history(primary_client):
+    # Each update is the side's best two levels, as a depth stream sends them.
+    primary_client.insert("BOOK-233-TOP", "EX", "bid", [100, 99], [1, 1], timestamp_ns=T233)
+    primary_client.insert("BOOK-233-TOP", "EX", "ask", [101, 102], [1, 1], timestamp_ns=T233)
+    primary_client.insert("BOOK-233-TOP", "EX", "bid", [98, 97], [2, 2],
+                          timestamp_ns=T233 + 1_000_000_000)
+    live, then = _best_bids(primary_client, "BOOK-233-TOP", T233 + 1_000_000_000)
+    assert live == then, f"the live book's best bid is {live}, history's {then}"
+
+
+@pytest.mark.xfail(strict=True, reason=REASON_233)
+def test_a_writer_of_changed_levels_gets_one_best_bid_from_the_book_and_history(primary_client):
+    # The first update is the book; the second changes one level behind the best, as a diff does.
+    primary_client.insert("BOOK-233-DIFF", "EX", "bid", [1000, 990], [1, 1], timestamp_ns=T233)
+    primary_client.insert("BOOK-233-DIFF", "EX", "ask", [1010], [1], timestamp_ns=T233)
+    primary_client.insert("BOOK-233-DIFF", "EX", "bid", [995], [5],
+                          timestamp_ns=T233 + 1_000_000_000)
+    live, then = _best_bids(primary_client, "BOOK-233-DIFF", T233 + 1_000_000_000)
+    assert live == then, f"the live book's best bid is {live}, history's {then}"

@@ -9,12 +9,30 @@ here as `#N`.
 
 ## [Unreleased]
 
+### Added
+
+- `examples/binance-live/`: the order books of ten Binance pairs written into a node as they arrive,
+  read back as minute bars and as the top of each book, and drawn by a Grafana dashboard of the
+  market as the node holds it and of the node itself - every process native (#43).
+  `scripts/check_dashboards.py` holds an example's dashboard to the engine's metrics and to the ones
+  its exporter writes.
+
 ### Changed
 
 - Between releases the version is the next one as a development version: `0.1.1.dev0` now, in
   `ob_tcp_server --version`, `STATUS` and the wheel, and `0.1.1~dev0` in the packages, which pip,
   dpkg and rpm all order after 0.1.0 and before 0.1.1. Everything built from `master` after v0.1.0
   had called itself 0.1.0 (#234).
+
+### Known issues
+
+- The live book applies a write by price, and history keys it by its position in the update, so
+  the two can name different best prices for the same writes (#233). The example writes the one
+  encoding on which they agree: a side's levels best first, then the prices that left it with a
+  quantity of 0.
+- The live book does not come back with the node: after a clean stop `BOOK` refuses the symbol,
+  and after a crash it holds only what was written after the last checkpoint, while history holds
+  every row (#235).
 
 ## [0.1.0] - 2026-10-12
 
