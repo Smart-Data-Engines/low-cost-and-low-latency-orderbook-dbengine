@@ -1,0 +1,18 @@
+# Prometheus for examples/binance-live: the node's own metrics and the market exporter.py reads from
+# it, every 5 s. Started from Prometheus's tarball with this file and its own listen address, :9091,
+# since the node takes :9090:
+#   ./prometheus --config.file=<this example>/prometheus.yml --web.listen-address=127.0.0.1:9091 \
+#       --storage.tsdb.path=<a directory of its own>
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # The node, with metrics-port = 9100 in its configuration (--metrics-port 9100).
+  - job_name: orderbook
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+  # exporter.py, --listen 127.0.0.1:9101.
+  - job_name: market
+    static_configs:
+      - targets: ["127.0.0.1:9101"]

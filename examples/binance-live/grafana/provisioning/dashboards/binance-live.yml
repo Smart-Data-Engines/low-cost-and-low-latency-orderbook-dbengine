@@ -1,0 +1,10 @@
+# The example's dashboard. Grafana expands environment variables in provisioning files, so the path
+# follows wherever the repository is: EXAMPLE_DIR=<this example>, set when Grafana is started.
+apiVersion: 1
+providers:
+  - name: binance-live
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: $EXAMPLE_DIR/grafana/dashboards

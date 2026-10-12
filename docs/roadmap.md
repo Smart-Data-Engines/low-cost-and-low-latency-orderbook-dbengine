@@ -1188,10 +1188,37 @@ Apache-2.0.
 What is left is the owner's: a pending trusted publisher on PyPI for `orderbook-dbengine` (the name is
 free), the `pypi` environment with a reviewer, a key to sign tags - and then the tag.
 
-### 43. Worked example: live market data ingestion
+### 43. Worked example: live market data ingestion ✅
 - A runnable Binance (or Coinbase) websocket ingestor writing into the engine, with a Grafana
   dashboard showing it live. `scripts/binance_*.py` is the seed for this
 - Effort: S | Impact: Turns an abstract engine into a visible demo
+
+**Done** (spec `smart-data-engine-workspace/specs/live-market-data-example/`, `examples/binance-live/`).
+- `ingest.py` writes ten Binance pairs' `<symbol>@depth20@100ms` into a node with the released
+  client. Prices and quantities are counts of each pair's steps from `exchangeInfo`, through `Decimal`.
+- `bars.py` reads minute bars and the top of each book back from the node.
+- A Grafana dashboard draws the market as the node holds it, from an exporter that reads `BOOK`,
+  beside the node's own metrics.
+- Prometheus and Grafana run from their tarballs, nothing in a container.
+
+Writing it found #233 and #235. The example writes a side's levels best first, then the prices that
+left it with a quantity of 0: that is the one encoding on which the live book and history agree.
+
+`test_example_binance_live.py` runs it without the network, on messages made from a seed:
+- the bars from the engine equal the bars computed from the messages, to the last digit of the
+  engine's scale;
+- `WHERE AT` the messages' instants and the live book equal the messages, level by level;
+- the exporter's scrape has the last message's best prices;
+- a value off a pair's step is refused before anything is written.
+
+Eight mutations of the shared code are all killed and two controls survive. `scripts/check_dashboards.py`
+holds an example's dashboard to the engine's registry and to the metrics its exporter writes.
+
+An hour on an m8a.xlarge (`evidence/2026-10-12-binance-live-example/`):
+- 204 824 messages and 4.1 M levels, nothing refused;
+- `insert_batch` at p50 0.056 ms and p99 0.16 ms;
+- 0.23% of one core for the node;
+- 3.4 MB of history in segments (0.8 bytes a level), beside 124 MB of WAL.
 
 ## Phase 9 — Query and Analytics Depth
 
@@ -2566,6 +2593,26 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 235. The live book does not come back with the node: a start rebuilds it from the WAL's tail alone **P1**
+
+**Found with #233, writing #43's example.** Measured on v0.1.0, on one node:
+- bids `[100, 99]` and asks `[101]`, a `FLUSH`, then bid `[98]`, which only the WAL's tail holds;
+- after a clean stop and a start, `BOOK` refuses the symbol: `OB_ERR_NOT_FOUND ... not found in live
+  buffers`. The stop's flush left no tail to replay;
+- after SIGKILL and a start, `BOOK` holds the tail's bid 98 alone. The best bid reads 98 where the
+  writes made it 100, and the ask side is empty, so `SPREAD(*)` and `MID_PRICE(*)` answer `NULL`.
+
+History holds all four rows either way. A start replays the WAL's tail into the live book and
+rebuilds nothing from the segments, so the book an application reads after a restart, a crash or -
+not measured yet - a failover or a snapshot bootstrap is whatever was written since.
+
+What a start rebuilds the book from depends on what an update means, which is #233's question. The
+spec `smart-data-engine-workspace/specs/one-book-live-and-in-history/` holds both items. Two strict
+xfails in `test_crash_recovery.py`, one after a clean stop and one after SIGKILL, name this item.
+
+- Effort: M | Impact: after any restart the live book, and every aggregate read from it, answers a
+  book the market never had until each level is written again
+
 ### 234. Between releases everything built from master called itself the last release ✅ **P3**
 
 **Found after #42's first release.** After v0.1.0 `CMakeLists.txt` still said 0.1.0, which is the only
@@ -2596,6 +2643,39 @@ Master is 0.1.1.dev0.
 
 - Effort: S | Impact: a build of master could be taken for the release it followed, by an operator
   and by a package manager
+### 233. The live book and the stored history disagree about which level a write is **P1**
+
+**Found writing #43's example.** A write is read two ways, and the two disagree about which level each
+of its prices is:
+- the live book - `BOOK`, and the aggregates without `GROUP BY` (`SPREAD(*)`, `MID_PRICE(*)` and the
+  rest) - applies an update level by level **by price**: a price it holds takes the new quantity, a
+  new one is inserted in order, and a quantity of 0 removes it (`insert_level()`);
+- a stored row keeps the level as its **position in the update** (`level_index = i` in
+  `Engine::insert()`), and history reads it so: `WHERE AT` answers the latest row of each side and
+  level, and `OPEN`, `HIGH`, `LOW`, `CLOSE` and `TWAP` read the rows of level 0.
+
+Measured on v0.1.0: bids `[100, 99]` and then `[98, 97]`, a writer sending its top two levels each time,
+leave all four prices in the live book and its best bid at 100, while `WHERE AT` and `CLOSE(bid)` say
+98. A writer sending only the levels that changed, as an exchange's diff stream does, gets the
+opposite: the live book is right, and history takes whichever price came first in an update for the
+best. No error, and nothing in the API or the docs says which kind of writer the engine expects.
+
+A writer can make the two agree today by sending a side's current levels, best first, and after them
+every price that has left the side, with a quantity of 0: the live book drops those prices, and
+history finds them past the levels it reads. That is what `examples/binance-live/` writes, and
+`test_example_binance_live.py` holds both views to its messages.
+
+A fix decides what an update means, and the other view follows:
+- **a side's top levels**: the live book replaces them. History already reads updates this way, and a
+  writer of deltas would have to send the side whole;
+- **a set of price levels**: history replays the rows by price. `WHERE AT` and the series then read
+  every level's rows rather than level 0's, which #47's narrowing does not cover;
+- **either, said per update**: neither the wire nor the WAL record carries that today.
+
+`test_live_book.py` has both writers as strict xfails naming this item.
+
+- Effort: M-L | Impact: an application reading the live book and one reading history disagree about
+  the best price, silently, for any writer that does not use the encoding above
 
 ### 232. A replica whose position the primary had freed never took its snapshot while the primary took writes ✅ **P1**
 
@@ -14491,7 +14571,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #223.** Every other item above #58 is marked closed, and
+**Open: #169, #190, #193, #194, #223, #233, #235.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -14630,9 +14710,10 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
+| **P1** | The live book and history agree about which level a write is (#233) | M–L | One write answers two best prices - the live book's and history's - for any writer that does not send removals after its levels |
+| **P1** | The live book comes back with the node (#235) | M | After a stop the book is gone, and after a crash it is the WAL's tail: every live aggregate answers a book the market never had |
 | **P2** | A flush tick's WAL sync at the ceiling does not keep writers waiting seconds for room (#190) | M | On a device the segments keep busy the tick's WAL sync took 1.2 - 3.0 s at the pipelined ceiling, and writers waited up to 3.4 s for room in the pending queue - 1.6 s from the refusal |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
-| **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |

@@ -1,0 +1,12 @@
+# The example's Prometheus, as Grafana's default data source. Grafana reads this directory as its
+# provisioning path: GF_PATHS_PROVISIONING=<this example>/grafana/provisioning.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: binance-live-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9091
+    isDefault: true
+    jsonData:
+      timeInterval: 5s

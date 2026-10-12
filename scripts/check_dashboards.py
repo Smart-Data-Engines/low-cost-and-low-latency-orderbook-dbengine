@@ -16,10 +16,16 @@ a dashboard at all - registered under one name, written under another, zero for 
   `promtool check rules` as recording rules, the dashboard's variables replaced by a match-all.
   scripts/check_alert_rules.py tests the alerts themselves.
 
+An example's dashboard (`examples/*/grafana/dashboards/*.json`, #43) is held to the same rules, and
+it may also draw what the example's own `exporter.py` writes: a name with one of the prefixes of that
+exporter's `METRICS` has to be a key of it - read from the file, not imported - and, every one of them
+a gauge, is never taken a rate of.
+
 Exit status 0 if clean, 1 otherwise. Needs PyYAML for the rules.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -55,7 +61,9 @@ def exported_as(name: str, kinds: dict[str, str]) -> tuple[str | None, str | Non
     return None, None
 
 
-def check_expr(where: str, expr: str, kinds: dict[str, str], errors: list[str]) -> None:
+def check_expr(where: str, expr: str, kinds: dict[str, str], errors: list[str],
+               own: frozenset[str] = frozenset()) -> None:
+    """`own`: the gauges an example's exporter writes, which its dashboard may draw too."""
     for name in NAME.findall(expr):
         base, _ = exported_as(name, kinds)
         if base is None:
@@ -64,6 +72,25 @@ def check_expr(where: str, expr: str, kinds: dict[str, str], errors: list[str]) 
         base, kind = exported_as(name, kinds)
         if base is not None and kind == "gauge":
             errors.append(f"{where}: rate()/increase() of the gauge {name}")
+    for prefix in sorted({name.split("_", 1)[0] + "_" for name in own}):
+        for name in re.findall(rf"\b{re.escape(prefix)}[a-z0-9_]+\b", expr):
+            if name not in own:
+                errors.append(f"{where}: {name} is not a metric the example's exporter writes")
+        for name in re.findall(rf"\b(?:rate|increase|irate)\(\s*({re.escape(prefix)}[a-z0-9_]+)", expr):
+            errors.append(f"{where}: rate()/increase() of the gauge {name}")
+
+
+def exporter_metrics(example: Path) -> frozenset[str]:
+    """The keys of `METRICS` in an example's exporter.py, read as a literal; none without one."""
+    path = example / "exporter.py"
+    if not path.exists():
+        return frozenset()
+    for node in ast.walk(ast.parse(path.read_text())):
+        target = node.target if isinstance(node, ast.AnnAssign) else (
+            node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else None)
+        if isinstance(target, ast.Name) and target.id == "METRICS" and isinstance(node.value, ast.Dict):
+            return frozenset(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+    return frozenset()
 
 
 def exprs_of(node, path=""):
@@ -85,19 +112,22 @@ def main() -> int:
     rules = sorted((REPO / "packaging" / "prometheus").glob("*.yml"))
     if not dashboards or not rules:
         errors.append("no dashboard or no rules under packaging/ - nothing checked")
+    examples = sorted((REPO / "examples").glob("*/grafana/dashboards/*.json"))
+    own = {path: exporter_metrics(path.parents[2]) for path in examples}
     n_exprs = 0
-    for path in dashboards:
+    for path in dashboards + examples:
         doc = json.loads(path.read_text())
+        name = str(path.relative_to(REPO)) if path in own else path.name
         for panel in doc.get("panels", []):
             if panel.get("type") == "row":
                 continue
             if not panel.get("title"):
-                errors.append(f"{path.name}: a panel with no title")
+                errors.append(f"{name}: a panel with no title")
             if not [t for t in panel.get("targets", []) if t.get("expr")]:
-                errors.append(f"{path.name}: panel '{panel.get('title')}' has no query")
+                errors.append(f"{name}: panel '{panel.get('title')}' has no query")
         for where, expr in exprs_of(doc):
             n_exprs += 1
-            check_expr(f"{path.name}{where}", expr, kinds, errors)
+            check_expr(f"{name}{where}", expr, kinds, errors, own.get(path, frozenset()))
     n_alerts = 0
     for path in rules:
         doc = yaml.safe_load(path.read_text())
@@ -114,9 +144,11 @@ def main() -> int:
     parsed = ""
     promtool = os.environ.get("PROMTOOL") or shutil.which("promtool")
     if promtool:
-        queries = [e for path in dashboards for _, e in exprs_of(json.loads(path.read_text()))]
+        queries = [e for path in dashboards + examples
+                   for _, e in exprs_of(json.loads(path.read_text()))]
         recording = {"groups": [{"name": "dashboard-queries", "rules": [
-            {"record": f"dashboard:query{i}", "expr": q.replace("$job", ".*").replace("$instance", ".*")}
+            {"record": f"dashboard:query{i}",
+             "expr": q.replace("$job", ".*").replace("$instance", ".*").replace("$symbol", ".*")}
             for i, q in enumerate(queries)]}]}
         with tempfile.TemporaryDirectory() as tmp:
             rules_file = Path(tmp) / "dashboard-queries.yml"
@@ -133,9 +165,9 @@ def main() -> int:
         print(e)
     if errors:
         return 1
-    print(f"{len(dashboards)} dashboard(s) with {n_exprs} queries and {len(rules)} rule file(s) with "
-          f"{n_alerts} alerts: every metric is one the engine exports, no gauge is taken a rate of"
-          f"{parsed}")
+    print(f"{len(dashboards)} dashboard(s) and {len(examples)} example dashboard(s) with {n_exprs} "
+          f"queries, and {len(rules)} rule file(s) with {n_alerts} alerts: every metric is one the "
+          f"engine or the example's exporter writes, no gauge is taken a rate of{parsed}")
     return 0
 
 
