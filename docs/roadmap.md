@@ -4655,7 +4655,7 @@ so that one query answers both sides and the spread (`SELECT VWAP(bid), VWAP(ask
 `DEPTH` and `DEPTH_RANGE` are by price and read both sides, or the one their argument names. The
 spellings that meant the bids - `SUM(quantity)`, `VWAP(*)`, `CUMULATIVE_VOLUME(n)` and the rest -
 are refused with `AGG_NEEDS_SIDE`, which names the spelling to use, rather than answered with a
-number whose meaning changed; the engine has no release yet (#42). A first design took the side
+number whose meaning changed; the engine had no release yet (#42). A first design took the side
 from `WHERE side = …` and was dropped: both sides' VWAP would have taken two queries. `side` and
 `level` are `WHERE` conditions now, with #199's rules, for row scans, a snapshot's levels and a
 subscription's pushes, through one predicate where three copies of the time and price checks were;
