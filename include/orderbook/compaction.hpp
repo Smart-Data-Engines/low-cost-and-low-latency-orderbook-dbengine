@@ -12,7 +12,7 @@
 // words that decode from the first - so a one-second query in a segment of 65 536 rows took 0.79 ms
 // on the m9g.xlarge, 3.2-3.5 ms at 262 144 and 14.3-14.5 at a million, while a merge costs about
 // 50 ns a row whatever its size (benchmarks/segment_size_cost). The design is in
-// kiro-workspace/specs/segment-growth/design.md §2.5.
+// smart-data-engine-workspace/specs/segment-growth/design.md §2.5.
 
 #include <chrono>
 #include <cstddef>

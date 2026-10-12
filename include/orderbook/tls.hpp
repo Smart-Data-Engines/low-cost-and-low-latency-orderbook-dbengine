@@ -18,7 +18,7 @@ namespace ob {
 //
 // In-process OpenSSL, TLS 1.3 minimum, no kernel TLS. Every one of those three was decided from a
 // measurement rather than from taste - `benchmarks/tls/` and
-// `kiro-workspace/specs/wire-tls/requirements.md` §1. The short version: a sidecar pays the same
+// `smart-data-engine-workspace/specs/wire-tls/requirements.md` §1. The short version: a sidecar pays the same
 // record-layer cost plus a loopback hop, kTLS measured 1.08x and 1.15x *slower* on this path, and
 // TLS 1.2 is the only version this OpenSSL gives a full kernel data path - which a public database
 // engine should not be capped at in 2026.

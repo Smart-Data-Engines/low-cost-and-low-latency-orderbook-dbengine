@@ -29,7 +29,7 @@ namespace ob {
 /// and sequence_number on read, which lost the order side of every row that made
 /// it past a flush. Version 2 stores all seven columns.
 ///
-/// Version 3 (kiro-workspace/specs/segment-format-v3/) stores them in one file, `columns.v3`, each
+/// Version 3 (smart-data-engine-workspace/specs/segment-format-v3/) stores them in one file, `columns.v3`, each
 /// column in the smallest of its candidate encodings (column_codec.hpp) and checksummed: version 2
 /// wrote four of them raw, 25 bytes a row on the comparative dataset where version 3 writes under 2.
 inline constexpr uint32_t kColumnarFormatV2 = 2;

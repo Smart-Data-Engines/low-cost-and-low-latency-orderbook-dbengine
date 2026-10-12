@@ -1,4 +1,4 @@
-// Configuration file support (#32). Spec: kiro-workspace/specs/config-file/.
+// Configuration file support (#32). Spec: smart-data-engine-workspace/specs/config-file/.
 //
 // The file is rewritten into synthetic argv and handed to the existing flag parser, so a config key
 // *is* a flag name by construction, type validation and its message stay in one place, and

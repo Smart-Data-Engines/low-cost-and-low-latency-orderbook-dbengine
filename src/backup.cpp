@@ -1,5 +1,5 @@
 // A node's backup: taken by the server, checked and restored offline (#34). See backup.hpp for the
-// layout on the disk and kiro-workspace/specs/backup-restore/ for the design.
+// layout on the disk and smart-data-engine-workspace/specs/backup-restore/ for the design.
 
 #include "orderbook/backup.hpp"
 

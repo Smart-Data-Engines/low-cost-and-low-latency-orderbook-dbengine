@@ -637,7 +637,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_index_sorted_invariant, ()) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Side, level_index and sequence_number survive a flush
 //
-// Spec: kiro-workspace/specs/columnar-side-level-seq. Format version 1 stored
+// Spec: smart-data-engine-workspace/specs/columnar-side-level-seq. Format version 1 stored
 // only ts/price/qty/cnt and zeroed the other three fields on read, so every row
 // that passed a flush came back as a bid at level 0 with sequence 0. The whole
 // suite missed it because make_row() pinned side to SIDE_BID.

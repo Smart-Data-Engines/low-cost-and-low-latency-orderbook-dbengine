@@ -61,7 +61,7 @@ less the column's minimum or less the value before it, divided by what the value
 Simple8b, as runs of equal values, in fixed-width blocks of 128, or each value in the bytes it
 needs; and under LZ4 at a seal, or ZSTD at a merge where that saves 10% over LZ4. The layout,
 byte by byte, is in `include/orderbook/column_codec.hpp` and in the spec,
-`kiro-workspace/specs/segment-format-v3/design.md`.
+`smart-data-engine-workspace/specs/segment-format-v3/design.md`.
 
 Format 2, which a node writes with `segment-format = 2` and every node reads:
 

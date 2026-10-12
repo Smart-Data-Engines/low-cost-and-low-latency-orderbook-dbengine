@@ -1,5 +1,5 @@
 // SubscriptionHub: bounded queues, one wake-up per batch, and the epoll loop as the only thread
-// that touches a Session. Task group 3 of kiro-workspace/specs/streaming-subscriptions/.
+// that touches a Session. Task group 3 of smart-data-engine-workspace/specs/streaming-subscriptions/.
 
 #include "orderbook/subscription_hub.hpp"
 
