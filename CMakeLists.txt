@@ -1,15 +1,27 @@
 cmake_minimum_required(VERSION 3.20)
-project(orderbook-dbengine VERSION 0.1.0 LANGUAGES CXX)
 
 # ── Version ───────────────────────────────────────────────────────────────────
 #
-# `project(... VERSION)` above is the source, and it reaches the binary as a compile definition
-# rather than being retyped. It was retyped: a literal `v0.1.0` in `tools/ob_tcp_server.cpp` was the
-# startup line's version, and nothing checked it against this line or against `pyproject.toml`
-# (#90). #90 took that one out and missed two more, the welcome banner every client reads and the
-# interactive CLI's greeting, because the test it wrote could not see a version inside a longer
-# literal (#148).
-set(OB_VERSION "${PROJECT_VERSION}")
+# This string is the version, and nowhere else: it reaches the binaries as a compile definition,
+# pyproject.toml reads it from this line, and the packages take it below. It was retyped: a literal
+# `v0.1.0` in `tools/ob_tcp_server.cpp` was the startup line's version, and nothing checked it
+# against the build or against `pyproject.toml` (#90). #90 took that one out and missed two more,
+# the welcome banner every client reads and the interactive CLI's greeting, because the test it
+# wrote could not see a version inside a longer literal (#148).
+#
+# A release is X.Y.Z. Between releases it is the next one as a development version, X.Y.Z.devN -
+# PEP 440's spelling, which the wheel takes as it is - and a release's pull request drops `.devN`
+# (#234). Until then everything built from master after v0.1.0 called itself 0.1.0: the binary, the
+# wheel pip took for the release, the packages apt and dnf would have.
+set(OB_VERSION "0.1.1.dev0")
+set(OB_VERSION_FORM "^([0-9]+\\.[0-9]+\\.[0-9]+)(\\.dev([0-9]+))?$")
+string(REGEX MATCH "${OB_VERSION_FORM}" OB_VERSION_MATCHED "${OB_VERSION}")
+if(NOT OB_VERSION_MATCHED)
+    message(FATAL_ERROR "OB_VERSION \"${OB_VERSION}\" is neither X.Y.Z nor X.Y.Z.devN")
+endif()
+set(OB_VERSION_NUMBERS "${CMAKE_MATCH_1}")
+set(OB_VERSION_DEV "${CMAKE_MATCH_3}")   # empty in a release
+project(orderbook-dbengine VERSION ${OB_VERSION_NUMBERS} LANGUAGES CXX)
 
 # ── Language standard ──────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
@@ -679,6 +691,14 @@ install(FILES README.md SECURITY.md LICENSE docs/cli.md
 
 # ── CPack ─────────────────────────────────────────────────────────────────────
 set(CPACK_PACKAGE_NAME "orderbook-dbengine")
+# A development build's packages sort before the release they lead to (#234): dpkg and rpm both sort
+# `~` before anything, so 0.1.1~dev0 < 0.1.1, where 0.1.1.dev0 would sort after it. A release's is
+# X.Y.Z.
+if(OB_VERSION_DEV STREQUAL "")
+    set(CPACK_PACKAGE_VERSION "${OB_VERSION_NUMBERS}")
+else()
+    set(CPACK_PACKAGE_VERSION "${OB_VERSION_NUMBERS}~dev${OB_VERSION_DEV}")
+endif()
 set(CPACK_PACKAGE_VENDOR "Smart Data Engines")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Level 2 orderbook database engine for HFT environments")

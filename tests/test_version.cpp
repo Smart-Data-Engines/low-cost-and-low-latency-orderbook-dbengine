@@ -67,27 +67,30 @@ TEST(VersionStatic, TheBinaryReportsTheBuildSystemsVersion) {
     const std::string cmake = read_source("CMakeLists.txt");
     ASSERT_FALSE(cmake.empty()) << "cannot read CMakeLists.txt";
 
+    // `set(OB_VERSION "...")` is the version since #234: X.Y.Z in a release, X.Y.Z.devN between.
     const std::string declared =
-        first_match(cmake, std::regex(R"(project\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+))"));
-    ASSERT_FALSE(declared.empty()) << "no VERSION in project(); the regex or the file has changed";
+        first_match(cmake, std::regex(R"re(set\(OB_VERSION "([^"]+)"\))re"));
+    ASSERT_FALSE(declared.empty())
+        << "no set(OB_VERSION ...) in CMakeLists.txt; the regex or the file has changed";
 
     EXPECT_EQ(std::string(ob::version()), declared)
-        << "the compiled version and `project(... VERSION)` disagree, which means the compile "
+        << "the compiled version and CMakeLists.txt's OB_VERSION disagree, which means the compile "
            "definition is not reaching this translation unit";
 }
 
 TEST(VersionStatic, ThePythonPackageReadsTheBuildSystemsVersion) {
     // Since #42 pyproject.toml has no version of its own: scikit-build-core reads CMakeLists.txt's
     // through the regular expression pyproject.toml names. What can drift now is that expression -
-    // a project() line reformatted until it no longer matches, which fails the wheel's build, or
-    // matches something else - so this applies it to CMakeLists.txt, as the build will.
+    // the `set(OB_VERSION ...)` line reformatted until it no longer matches, which fails the
+    // wheel's build, or matches something else - so this applies it to CMakeLists.txt, as the
+    // build will.
     const std::string cmake = read_source("CMakeLists.txt");
     const std::string pyproject = read_source("pyproject.toml");
     ASSERT_FALSE(pyproject.empty()) << "cannot read pyproject.toml";
 
     const std::string declared =
-        first_match(cmake, std::regex(R"(project\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+))"));
-    ASSERT_FALSE(declared.empty()) << "no project(... VERSION) in CMakeLists.txt";
+        first_match(cmake, std::regex(R"re(set\(OB_VERSION "([^"]+)"\))re"));
+    ASSERT_FALSE(declared.empty()) << "no set(OB_VERSION ...) in CMakeLists.txt";
 
     EXPECT_NE(pyproject.find(R"(dynamic = ["version"])"), std::string::npos)
         << "pyproject.toml does not take its version from the build";

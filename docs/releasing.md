@@ -27,8 +27,8 @@ sha256sum -c SHA256SUMS
 
 ## Cutting one
 
-1. A pull request that sets the version in `CMakeLists.txt` -
-   `project(orderbook-dbengine VERSION X.Y.Z ...)`, the only place it is written - and renames
+1. A pull request that sets the version in `CMakeLists.txt` - `set(OB_VERSION "X.Y.Z")`, the only
+   place it is written, from the `X.Y.Z.devN` it says between releases - and renames
    `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD`, with a new empty
    `## [Unreleased]` above it. CI checks it with `scripts/release.py check` and builds and accepts
    the packages and the wheel on both architectures, as on every pull request.
@@ -39,6 +39,14 @@ sha256sum -c SHA256SUMS
 5. Once it is out, a pull request that moves `scripts/previous_version.txt` to the tagged commit
    (`git rev-parse vX.Y.Z^{commit}`) and the matrix in `docs/upgrading.md` with it: from then on
    `tests/integration/test_mixed_versions.py` measures every tree against the build users run.
+   The same pull request sets `OB_VERSION` to the next version's first development version,
+   `X.Y.(Z+1).dev0` (#234). Between releases everything built from `master` says so: `--version`,
+   the wheel (`X.Y.(Z+1).dev0`, which pip orders after the release and before the next), and the
+   packages (`X.Y.(Z+1)~dev0`, which dpkg and rpm order the same way). Before this, master built
+   after v0.1.0 called itself 0.1.0, and a wheel or a package of it would have been taken for the
+   release. The README's banner stays the release's: `release.py check` accepts, between releases,
+   a version `CHANGELOG.md` has released, and `release.py gate` refuses to tag a development
+   version.
 
 A first attempt can fail on something only a tag exercises. A failed job is run again from its
 workflow run, on the same tag. The tag itself cannot be deleted or moved -

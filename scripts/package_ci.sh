@@ -30,11 +30,15 @@ case "${3:-}" in
     --no-install) INSTALL=no ;;
     *)            echo "usage: $0 [build dir] [dist dir] [--no-install]" >&2; exit 2 ;;
 esac
-VERSION=$(python3 scripts/release.py version | cut -d= -f2)
+# The version, and the packages' spelling of it: X.Y.Z in a release, X.Y.Z.devN and X.Y.Z~devN
+# between releases (#234) - the wheel and `--version` carry the first, the .deb, .rpm and tarball
+# the second.
+VERSION=$(python3 scripts/release.py version | sed -n 's/^version=//p')
+PKG_VERSION=$(python3 scripts/release.py version | sed -n 's/^package_version=//p')
 GLIBC_FLOOR=${OB_GLIBC_FLOOR:-2.34}
 step() { echo; echo "── $*"; }
 
-step "build, natively ($(uname -m)), version $VERSION"
+step "build, natively ($(uname -m)), version $VERSION (packages: $PKG_VERSION)"
 cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF -DOB_STATIC_LIBSTDCXX=ON
 cmake --build "$BUILD" -j"$(nproc)" --target ob_tcp_server ob_restore ob_backup orderbook_shared
 reported=$("$BUILD/ob_tcp_server" --version)
@@ -118,13 +122,13 @@ echo "  ok: scikit-build-core $FLOOR, the oldest pyproject.toml allows, builds i
 
 if [ "$INSTALL" = yes ]; then
     step "installed as a user would, and accepted from the artefacts"
-    sudo apt-get install -y -qq "$PWD/$BUILD/orderbook-dbengine_${VERSION}_$(dpkg --print-architecture).deb"
+    sudo apt-get install -y -qq "$PWD/$BUILD/orderbook-dbengine_${PKG_VERSION}_$(dpkg --print-architecture).deb"
     python3 scripts/release_acceptance.py "$DIST" "$VERSION"
 else
     step "accepted from the artefacts, the tarball extracted rather than the .deb installed"
     rm -rf "${BUILD:?}/extracted"
     mkdir -p "$BUILD/extracted"
-    tar xzf "$BUILD/orderbook-dbengine-$VERSION-Linux-$(uname -m).tar.gz" -C "$BUILD/extracted" \
+    tar xzf "$BUILD/orderbook-dbengine-$PKG_VERSION-Linux-$(uname -m).tar.gz" -C "$BUILD/extracted" \
         --strip-components=1
     python3 scripts/release_acceptance.py "$DIST" "$VERSION" --root "$BUILD/extracted"
 fi

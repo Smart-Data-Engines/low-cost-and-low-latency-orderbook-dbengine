@@ -29,8 +29,12 @@ jobs:
 
       - name: One version, and a release workflow PyPI can trust
         # The version only in CMakeLists.txt, a changelog section for it or for what is unreleased,
-        # and release.yml under its name, triggered by tags alone, its actions pinned (#42).
-        run: python3 scripts/release.py check
+        # and release.yml under its name, triggered by tags alone, its actions pinned (#42). The
+        # rules on cases of their own first: a development version between releases is not
+        # tagged, and the README shows a version a reader can install (#234).
+        run: |
+          python3 scripts/release.py self-test
+          python3 scripts/release.py check
 
       - name: Check every metric written by name is registered
         run: python3 scripts/check_metrics.py

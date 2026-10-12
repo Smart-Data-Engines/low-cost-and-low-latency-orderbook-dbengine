@@ -9,6 +9,13 @@ here as `#N`.
 
 ## [Unreleased]
 
+### Changed
+
+- Between releases the version is the next one as a development version: `0.1.1.dev0` now, in
+  `ob_tcp_server --version`, `STATUS` and the wheel, and `0.1.1~dev0` in the packages, which pip,
+  dpkg and rpm all order after 0.1.0 and before 0.1.1. Everything built from `master` after v0.1.0
+  had called itself 0.1.0 (#234).
+
 ## [0.1.0] - 2026-10-12
 
 The first release. What it contains, by area:
