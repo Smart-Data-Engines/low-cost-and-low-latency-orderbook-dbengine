@@ -2650,6 +2650,12 @@ Tests:
 - `test_the_replicas_log_does_not_grow_with_the_records_it_applies` in `test_replication.py`: fewer
   than 100 INFO lines for 2000 records.
 
+**Measured after the fix on the same hosts:**
+- the join from the faster host, which had not ended in 180 s on master nor on PR #241's branch, took
+  1.31 - 1.32 s on the primary's side and 1.45 - 1.46 s on the replica's;
+- the other way it took 0.23 - 0.30 s and 0.30 - 0.38 s;
+- the replica's log for one round fell from 55.9 - 59.6 MB to about 17 KB.
+
 - Effort: M | Impact: a replica rejoining a primary that writes faster than the replica's catch-up
   could queue 16 MB never rejoined, and nothing in either log said why
 
@@ -3347,6 +3353,28 @@ build. The field is atomic now, release and acquire like `Engine::current_epoch_
 `tests/test_wal_position.cpp`'s `WalEpoch.AReaderOnAnotherThreadSeesTheEpochOnlyGrow` reports the race
 under TSan without the fix and is clean with it, and the integration test against the fixed TSan
 server left no report.
+
+**Measured on the two cluster hosts on 11 October** (`evidence/2026-10-11-joining-replica-hosts/`):
+ARM m9g.xlarge and x86 m8a.xlarge, one subnet, Release builds, etcd on the x86 host, lease TTL 5 s.
+- The primary alternates between the hosts, and a writer beside it acknowledges one-level updates
+  without a limit.
+- The replica restarts without a position and asks for a replay from zero.
+- A watcher beside the primary stops it at that request - the replica then joining - and 0.5 s
+  later, with the premise read from both logs, it is killed.
+
+Four rounds a variant, two in each direction. The branch is #215 with #231's fix, without which the
+join from the faster host did not end at all:
+
+| variant | first to hold the role | acknowledged | missing on the final primary |
+|---|---|---|---|
+| fixed, the primary back after 30 s | the old primary, after 35.3 - 35.9 s | 98 649 - 215 105 | **0** |
+| fixed, back after 1 s | the old primary, after 1.21 s | 103 535 - 212 427 | **0** |
+| master `cf7cf04`, back after 30 s | the joining replica, after 8.6 - 9.4 s | 96 038 - 216 172 | **all of them** |
+| master `cf7cf04`, back after 1 s | the old primary after 1.21 s, then the joining replica | 98 393 - 257 554 | **all of them** |
+
+The join itself is no longer: the primary's catch-up, from the request to its end, took 0.23 - 0.30 s
+with the ARM host primary against 0.25 - 0.26 s on master, so the end is said when it happens
+(requirement 6.2).
 
 ### 214. A replica rejoining under writes never took its snapshot, and a node without the round's writes was promoted ✅ **P1**
 
