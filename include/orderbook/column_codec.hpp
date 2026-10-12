@@ -4,7 +4,7 @@
 //
 // Format 2 wrote four of a segment's seven columns raw and a fifth as one zigzag delta a word:
 // 25 bytes a row on the comparative dataset, where ClickHouse as installed takes 4.2. Which
-// encoding replaces them was measured, not chosen (kiro-workspace/specs/segment-format-v3/,
+// encoding replaces them was measured, not chosen (smart-data-engine-workspace/specs/segment-format-v3/,
 // `benchmarks/segment_encoding_probe`): no single encoding wins on every dataset - fixed-width
 // blocks on random quantities, ZSTD on a book's snapshots, whose levels repeat from one to the
 // next - so every column of every segment is written in the smallest of the candidates below that

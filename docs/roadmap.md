@@ -145,7 +145,7 @@ extension, with a test that fails if a column on disk is absent from the manifes
 
 Verified: 540 tests passing, mutation-verified per field, and benchmarks measured before and after in
 the same conditions show no regression (p50 10576ns vs 10736ns at cv ~1.3%). Spec:
-`kiro-workspace/specs/columnar-side-level-seq/`
+`smart-data-engine-workspace/specs/columnar-side-level-seq/`
 
 ### 26. Concurrent flush registered the same segment twice ✅
 
@@ -189,7 +189,7 @@ which fails within one round without the lock.
 Verified: four tests written red first, then green; each of the four fixes mutation-verified
 separately; 544 tests passing; the integration suite six consecutive clean runs where it previously
 failed 1 in 6; `BM_UpdateLatency` p50 unchanged within noise (the lock is taken once per flush, not
-per row). Spec: `kiro-workspace/specs/flush-race-duplicate-segments/`
+per row). Spec: `smart-data-engine-workspace/specs/flush-race-duplicate-segments/`
 
 ### 27. Aggregations are unreachable over the wire protocol ✅
 
@@ -257,7 +257,7 @@ CPU, with the loop stream detector disabled, that front-end difference is worth 
 level observed. Control benchmarks the change cannot touch confirm the two build environments are
 equivalent: ingestion −1.3%, `BM_UpdateLatency` +0.1%. Treat as no regression.
 
-Spec: `kiro-workspace/specs/aggregations-over-wire/`
+Spec: `smart-data-engine-workspace/specs/aggregations-over-wire/`
 
 ### 28. Restore the integration test suite ✅
 - The framework survived (`tests/integration/conftest.py`, 691 lines), the tests did not
@@ -312,14 +312,14 @@ Six integration tests against a real etcd, including a ten-iteration handover lo
 case. Mutation-verified: disabling the deferral turns the three-node test red, disabling the cooldown
 turns the fallback test red. Worth recording that the two-node test catches *neither* on its own,
 because the two mechanisms overlap there — which is why the three-node test exists. Spec:
-`kiro-workspace/specs/graceful-failover-fix/`
+`smart-data-engine-workspace/specs/graceful-failover-fix/`
 
 ### 30. Authentication and TLS on the wire protocol ✅
 
 **All three parts are done.** Client sessions authenticate and so do the node links (parts one and
-two, spec in `kiro-workspace/specs/wire-authentication/`), the client port encrypts with both
+two, spec in `smart-data-engine-workspace/specs/wire-authentication/`), the client port encrypts with both
 shipped clients verifying the name, and the replication link and the mesh encrypt and verify each
-other (part three, spec in `kiro-workspace/specs/wire-tls/`).
+other (part three, spec in `smart-data-engine-workspace/specs/wire-tls/`).
 
 The item bundled two independent things with different risk profiles, so it was built in that order.
 Authentication is a protocol concern: one place per surface, once per connection, off the hot path,
@@ -391,7 +391,7 @@ of an unknown peer.
 
 **Part three — TLS on all three surfaces ✅**
 
-Spec: `kiro-workspace/specs/wire-tls/`. Series C did the client port
+Spec: `smart-data-engine-workspace/specs/wire-tls/`. Series C did the client port
 (`--tls-client --tls-cert-file --tls-key-file`, TLS 1.3 minimum, both shipped clients verifying by
 default); series D did the replication link and the mesh (`--tls-replication`,
 `--tls-multi-master`, `--tls-ca-file`, `--tls-peer-names`), where TLS is **mutual** and mTLS is what
@@ -546,7 +546,7 @@ gives channel binding.
 - Cost published with named hardware, a percentile, and the floor of the range.
 - Six things easy to miss because they are not about cryptography — starting with the TLS output
   buffer being a *second* place the 64 MB send cap has to hold — are in
-  `kiro-workspace/specs/wire-tls/requirements.md` §3.
+  `smart-data-engine-workspace/specs/wire-tls/requirements.md` §3.
 
 - Effort: L | Impact: **Unblocks production adoption**
 
@@ -583,7 +583,7 @@ gives channel binding.
 
 **Both halves are done and merged (PR #66).** Packages, unit and operations documentation, plus
 `scripts/bootstrap-cluster.sh` for a single host; the multi-host procedure is written rather than
-scripted, for the reason given below. Spec: `kiro-workspace/specs/native-packaging/`.
+scripted, for the reason given below. Spec: `smart-data-engine-workspace/specs/native-packaging/`.
 
 - `.deb` and a static tarball with **byte-identical relative layouts**, holding the binary, headers,
   `/etc/orderbook/ob.conf`, the systemd unit, a man page and the docs. Dependencies resolved by
@@ -652,7 +652,7 @@ node that is merely listening can accept a write and have nobody to send it to.
 - `ob_backup` / `ob_restore` tooling on top of existing snapshots plus WAL
 - Documented recovery procedure with RPO/RTO numbers
 - Effort: M | Impact: Nobody runs a database they cannot restore
-- **Backup and restore shipped** (28 September 2026; spec `kiro-workspace/specs/backup-restore/`,
+- **Backup and restore shipped** (28 September 2026; spec `smart-data-engine-workspace/specs/backup-restore/`,
   procedure in `docs/operations.md`, "Backing up and restoring a node"). `BACKUP` on a server
   started with `--backup-dir` takes a cut from the snapshot path - the pin, everything waiting
   sealed, the WAL position and the sequence state in one critical section - without its checksums,
@@ -1027,7 +1027,7 @@ anybody careless: every change added a context and no change recounted the sente
 **Both parts are done.** Part one (PR #70) built the harness, the dataset, the resolution
 measurement and our own adapter. Part two installed ClickHouse and TimescaleDB natively, wrote the
 three competitor adapters, ran the multi-system checkpoint and published the table — and it found
-more in our own code than in theirs. Spec: `kiro-workspace/specs/reproducible-benchmarks/`.
+more in our own code than in theirs. Spec: `smart-data-engine-workspace/specs/reproducible-benchmarks/`.
 
 **The first published answer was that this engine loses all four comparable workloads**, and the
 reasons were worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds, control
@@ -1168,7 +1168,7 @@ flag rather than a file.
   scikit-build-core is already in place), signed tags
 - Effort: S | Impact: `pip install orderbook-dbengine` is the shortest path to a first user
 
-**The pipeline is in; no release has been cut** (spec `kiro-workspace/specs/engine-release/`,
+**The pipeline is in; no release has been cut** (spec `smart-data-engine-workspace/specs/engine-release/`,
 `docs/releasing.md`). A tag `vX.Y.Z` is the whole trigger: `release.yml` checks that it names
 `CMakeLists.txt`'s version - the only place the version is written now; `pyproject.toml` reads it and
 the Python client asks its own metadata, where it had said "0.2.0" by hand while the project was
@@ -1200,7 +1200,7 @@ and getting data into their existing Python stack without a copy.
 
 ### 44. Time-bucketed aggregation in the query language
 - `GROUP BY time_bucket(interval)`, OHLCV bar generation, time-weighted mid price, rolling windows
-- **Step 1 done: aggregates over the rows of each bucket** (spec `kiro-workspace/specs/time-buckets/`).
+- **Step 1 done: aggregates over the rows of each bucket** (spec `smart-data-engine-workspace/specs/time-buckets/`).
   `SELECT <aggregates> FROM ... [WHERE ...] GROUP BY TIME_BUCKET(<n><unit>) [LIMIT n]`, the unit one
   of `ns us ms s m h d`, at most 366 d; buckets on the Unix epoch in UTC, only those holding a row,
   in time order, `LIMIT` on buckets. `COUNT(*)`, `FIRST`, `LAST`, `MIN`, `MAX` of `price` or
@@ -1268,7 +1268,7 @@ and getting data into their existing Python stack without a copy.
   What does not exist: any way to ask for it over TCP. `CommandType` has no `SUBSCRIBE`, and
   `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
   client polls. The README now says exactly that.
-- **Done.** Spec: `kiro-workspace/specs/streaming-subscriptions/`.
+- **Done.** Spec: `smart-data-engine-workspace/specs/streaming-subscriptions/`.
   `SUBSCRIBE 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
   as `PUSH <id>` with the same seven columns as a query row. Bounded queue per subscriber
   (`--max-subscriber-queue-bytes`, 8 MB ≈ 140 000 rows), overflow closes the session, per-session
@@ -1348,7 +1348,7 @@ before. Conditions on price, a segment's minimum and maximum, are a later step o
 the series of the book, reads through this.
 
 **Step 2: a query's conditions narrow the read, not only the answer** (spec
-`kiro-workspace/specs/conditions-narrow-the-read/`). The price, side and level conditions of a
+`smart-data-engine-workspace/specs/conditions-narrow-the-read/`). The price, side and level conditions of a
 `SELECT` (#199, #200) were checked on rows the scan had already built and handed over. Every segment
 of the time range was opened, every column decoded, every row built and passed through a
 `std::function`, and then dropped. `LIMIT` ended the answer, not the read. Now:
@@ -1664,7 +1664,7 @@ runners, the fix is a measured timeout, not deletion.
 ### 56. Rolling upgrade support ✅
 - Protocol version negotiation matrix, mixed-version cluster tests, documented upgrade path
 - Effort: M | Impact: Required before anyone runs this longer than one release
-- **Shipped** (28 September 2026; spec `kiro-workspace/specs/rolling-upgrades/`): the matrix is
+- **Shipped** (28 September 2026; spec `smart-data-engine-workspace/specs/rolling-upgrades/`): the matrix is
   measured rather than negotiated. `tests/integration/test_mixed_versions.py` runs the server of the
   revision `scripts/previous_version.txt` names beside this tree's - a data directory written by
   one and opened by the other, each way; a primary of one with a replica of the other, each way; a
@@ -1731,7 +1731,7 @@ three mutations red — closure counted on dispatch, a silent peer read as holdi
 missing reconciler reported as a clean pass. The fourth mutation, disabling the pass, is green against
 the partition scenario for the reason above; that gap closes with #69.
 
-- Spec: `kiro-workspace/specs/mm-version-vector-catchup/` (section 6a)
+- Spec: `smart-data-engine-workspace/specs/mm-version-vector-catchup/` (section 6a)
 
 ### 58. Distributed tracing
 - OpenTelemetry spans across client, primary, replica and peers; trace a write end to end
@@ -1775,7 +1775,7 @@ is the only condition under which either defect appears.
 Verified: 8 integration tests (including a deliberately slow reader that fills the buffer every run,
 and a client vanishing mid-response with `SO_LINGER 0`) plus 6 unit tests on `Session`; four mutations
 confirmed red separately — EAGAIN as failure, no `EPOLLOUT` arming, no cap, no `MSG_NOSIGNAL`.
-Spec: `kiro-workspace/specs/large-response-write-path/`
+Spec: `smart-data-engine-workspace/specs/large-response-write-path/`
 
 ### 60. Graceful failover could not work outside its own tests, and two more links were missing ✅
 
@@ -2360,7 +2360,7 @@ pitfall 37 twice in one afternoon.
 `test_a_restarted_node_catches_up_on_what_it_missed` lost its `xfail(strict=True)` marker: it went
 XPASS the moment the fix landed, which is what strict was for.
 
-- Spec: `kiro-workspace/specs/mm-version-vector-catchup/`
+- Spec: `smart-data-engine-workspace/specs/mm-version-vector-catchup/`
 
 ### 68. STATUS killed every multi-master node (P0) ✅
 
@@ -2416,7 +2416,7 @@ alive, `/metrics` leaves the node alive, and the scheduler records a run within 
 one-second interval. Mutation red: drop the pointer check in `stats()` and the process dumps core
 again.
 
-- Spec: `kiro-workspace/specs/mm-status-crash/`
+- Spec: `smart-data-engine-workspace/specs/mm-status-crash/`
 
 ### 69. Queued output for a peer had no ceiling, and discarding it corrupted the stream ✅
 
@@ -2469,7 +2469,7 @@ scenario and reports what it observed, including "the ceiling never tripped, so 
 when it did not — a diagnostic, not a verdict. What the code guarantees is the bound; what the harness
 can show is that the bound is reachable.
 
-- Spec: `kiro-workspace/specs/mm-send-buffer-cap/`
+- Spec: `smart-data-engine-workspace/specs/mm-send-buffer-cap/`
 
 ### 80. The integration suite had never been run under a sanitizer, and it reported a deadlock ✅
 
@@ -3021,7 +3021,7 @@ were given buffers of their own and the two builds alternated on the m9g.xlarge,
 Format 3 was 3 - 11% slower on the diff stream with them, format 2's control within 2% - slower, not
 faster, so the buffer stays shared.
 
-The spec's budget (`kiro-workspace/specs/segment-format-v3/`, design §7: no query more than 10%
+The spec's budget (`smart-data-engine-workspace/specs/segment-format-v3/`, design §7: no query more than 10%
 slower) does not hold on the recordings, and no choice of encodings makes it hold at a size worth
 having. By `benchmarks/column_codec_cost` on the m9g.xlarge, decoding a seal's blocks costs 3.3, 11.6
 and 6.9 ns a row on the comparative set and the two recordings, against format 2's 3.0, 3.7 and 3.4;
@@ -3038,7 +3038,7 @@ What would close it, in the order it would be tried:
 - a seal that weighs a block's decoding against its bytes rather than taking the smallest.
 
 **Closed by holding the decoded columns between queries**, the first of the three ways above (spec
-`kiro-workspace/specs/decoded-segment-cache/`).
+`smart-data-engine-workspace/specs/decoded-segment-cache/`).
 - **Where they live.** A query's decoded columns stay with the segment's entry in the index. The
   slot is given at the only door into it, `insert_locked()`, so a merge, retention, a drop, a
   snapshot installed under the same paths or a rebuild takes the columns with it, and a path that
@@ -3092,7 +3092,7 @@ TimescaleDB after compression 14.05. Segment format 2 wrote the timestamp, the o
 and the level raw, and the price as one zigzagged delta in a 64-bit word - 23 of the 25 bytes. The
 comment beside `seq.col` described the same mistake, fixed for the sequence numbers alone.
 
-**Segment format 3** (spec `kiro-workspace/specs/segment-format-v3/`) holds a segment's seven columns
+**Segment format 3** (spec `smart-data-engine-workspace/specs/segment-format-v3/`) holds a segment's seven columns
 in one file, `columns.v3`, each column in whichever of its candidate encodings is smallest for it:
 
 - less the column's minimum, or less the value before it and zigzagged, and divided by what the
@@ -3680,7 +3680,7 @@ primary revoked its lease and only then demoted, so for a moment the key was gon
 took writes, and every candidate - the named target included - waits a lease TTL after the key goes
 for exactly that reason.
 
-**Fixed by closing that moment at its source** (spec `kiro-workspace/specs/handover-without-the-lease-wait/`):
+**Fixed by closing that moment at its source** (spec `smart-data-engine-workspace/specs/handover-without-the-lease-wait/`):
 
 - **Every demotion closes writes first**, in the engine, under the lock a write holds from its WAL
   append to its broadcast (`writes_closed_`, `OB_ERR_READ_ONLY`, answered `ERR read-only replica`
@@ -3959,7 +3959,7 @@ A fix moves a symbol's segments and the WAL records after them to the target, sw
 assignment by a compare-and-swap once the target holds them, and only then refuses writes at the
 source; its test is a symbol written, moved and read back whole from the target.
 
-**Fixed** (spec `kiro-workspace/specs/symbol-migration/`), in two parts. `MIGRATE <symbol.exchange>
+**Fixed** (spec `smart-data-engine-workspace/specs/symbol-migration/`), in two parts. `MIGRATE <symbol.exchange>
 <shard>` on the shard that owns the symbol - by the map's assignment or by the ring, as a write is
 owned - moves it there with its rows while it is written, answers `OK` once the move has begun, and
 `SHARD_INFO` says how it goes (`docs/operations.md`, "Moving a symbol to another shard").
@@ -4169,7 +4169,7 @@ that is slow now and then is absorbed by the unsealed budget (4 M rows) instead 
 (1 M). Its measure is this run's waits and refusals, on a device slower than the ingest.
 
 **Three prototypes measured, 28 September, none merged** (spec
-`kiro-workspace/specs/drain-beside-the-seal/`, `evidence/2026-09-28-write-ceiling-2/`, the same run
+`smart-data-engine-workspace/specs/drain-beside-the-seal/`, `evidence/2026-09-28-write-ceiling-2/`, the same run
 ABAB against `bed1212`). The seal's sync handed to a thread of its own, the checkpoint appended by the
 next tick with the claim frozen when it asked (branch `perf/drain-beside-the-seal`): writers waited in
 7 rounds of 8 with it and without, because the slow ticks became the WAL's sync instead - 7.6 s, 3.5
@@ -4218,7 +4218,7 @@ prototypes against `bed1212`:
   3.8 M: at that rate the pending queue passes half between two ticks with nothing behind.
 
 **Step 5: writes admitted at the rate the device takes** (spec
-`kiro-workspace/specs/admission-at-the-device-rate/`). The signal is the device, not the queue: a
+`smart-data-engine-workspace/specs/admission-at-the-device-rate/`). The signal is the device, not the queue: a
 flush tick that took twice its interval or longer says how many rows the device took in how long, and
 from then on every batch of writes waits, after it is written and outside the engine's lock, for its
 rows' time at that rate - a token bucket shared by the writers, with a tick's worth of credit so a
@@ -4244,7 +4244,7 @@ from it - and, at 30 MB/s, a tick whose seals took 4.5 s, during which even the 
 fills the queue, because the next drain waits for the tick to end. The second is what the seal's
 sync in the background shortens: a step 6 for this item, measured the same way.
 
-**Step 6: the seal's sync in the background** (spec `kiro-workspace/specs/drain-beside-the-seal/`,
+**Step 6: the seal's sync in the background** (spec `smart-data-engine-workspace/specs/drain-beside-the-seal/`,
 requirements 1 and 2). A tick no longer waits for the `syncfs()` of what it sealed before it drains the
 queue again: it hands the sync to a thread of its own with the checkpoint's claim frozen when it asks -
 the drain's position, the seal epoch, and whether rows wait in blocks - and the next tick appends that
@@ -4353,7 +4353,7 @@ export 6.8 - 7.7 ms, the serialisation 0.5 ms, the records 1.7 ms - and in the e
 tracker's `fingerprint()`, 1.3 - 1.4 ms at every checkpoint whether anything moved or not, and a walk of
 every frontier for the held set.
 
-**Fixed** (spec `kiro-workspace/specs/vector-changes/`). The engine's copy of the vector (#180) lists
+**Fixed** (spec `smart-data-engine-workspace/specs/vector-changes/`). The engine's copy of the vector (#180) lists
 what moved since the last vector written down, from the same list it is updated from, and a checkpoint
 writes those entries - parts of a record type of their own, `WAL_RECORD_VERSION_VECTOR_CHANGES` (10),
 serialised from the copy - where it wrote the whole vector. A restart takes the last whole vector and
@@ -4421,7 +4421,7 @@ A fix asks one peer, and the next only if that one refuses or fails; refuses a `
 for, or once it holds data; and tells a peer when its snapshot is no longer wanted. Its test is a
 joiner of three peers that installs one snapshot.
 
-**Fixed** (spec `kiro-workspace/specs/mesh-joiner-one-snapshot/`). A joiner asks the first peer whose
+**Fixed** (spec `smart-data-engine-workspace/specs/mesh-joiner-one-snapshot/`). A joiner asks the first peer whose
 vector says it holds something, and nobody else until that one answers; a refusal, the connection
 dropping or `MM_SNAPSHOT_ASK_DEADLINE_MS` (ten minutes) of silence asks the next such peer at once,
 as does a bootstrap abandoned part-way - a second peer's BEGIN used to be the retry. A `BEGIN` is
@@ -4494,7 +4494,7 @@ a segment from before #184 from its highest number - every origin's - so a node 
 stated `LH01.LEG origin 3 from 1`, #185 for data from before #184, and the catch-ups ran at every
 reconciliation.
 
-**Fixed** (spec `kiro-workspace/specs/mesh-legacy-numbering/`). A mesh node whose store holds
+**Fixed** (spec `smart-data-engine-workspace/specs/mesh-legacy-numbering/`). A mesh node whose store holds
 segments from before #184 closes their numbering once, at its first start, after the tail replay:
 every origin of every symbol it knows is declared up to `kClosedNumberingBase - 1` (2^48 - 1), its
 own numbers of them go on from the base, the vector goes into the WAL and onto the device, and only
@@ -4551,7 +4551,7 @@ at every seal of a 4 008-entry vector. What decides it is the tick's locked sect
 writer (WARN above 20 ms), and the same run against a standalone node and a mesh node of 40 symbols.
 The evidence of #179 holds the runs and the writer's log of each.
 
-**Measured, then fixed** (spec `kiro-workspace/specs/wal-dir/`,
+**Measured, then fixed** (spec `smart-data-engine-workspace/specs/wal-dir/`,
 `evidence/2026-09-27-write-stalls/`). The instrumentation this adds - a write that waited for the
 engine lock or held it 20 ms or more says where the time went, and so does each section of the flush
 tick that holds the lock - put all of it in **the WAL append**: `A batch of 1 write(s) waited 0.0 ms
@@ -5085,7 +5085,7 @@ A fix carries a vector of any size - in parts, on the wire and in the WAL - and 
 vectors without a loop inside a loop, which `compare_vectors()` has for the direction this node
 lacks. Its test is this module's two strict xfails.
 
-**Fixed** (spec `kiro-workspace/specs/mesh-vector-parts/`). A vector that fits one record goes as
+**Fixed** (spec `smart-data-engine-workspace/specs/mesh-vector-parts/`). A vector that fits one record goes as
 before, one record of type 7. Past 1 560 entries it goes as parts, `WAL_RECORD_VERSION_VECTOR_PART`
 (9) - a generation, the part's number, the number of parts and up to 1 560 entries each - on the
 wire, where the receiver takes it when the last part of one generation arrives in sequence and until
@@ -5172,7 +5172,7 @@ xfail is #176's alone. A second limit sits just past the first: the
 metadata blob is capped at 8 MiB, and the manifest is about 800 bytes of JSON a segment, so a 32-bit
 index alone would move the refusal from 8 192 segments to about 10 000.
 
-**Fixed** (spec `kiro-workspace/specs/mesh-snapshot-many-files/`). A joiner says in its request - whose
+**Fixed** (spec `smart-data-engine-workspace/specs/mesh-snapshot-many-files/`). A joiner says in its request - whose
 payload was empty - that it takes `SNAPSHOT_CHUNK_WIDE` (`record_type` 207: a 32-bit file index, the
 metadata at `0xFFFFFFFF`) and up to 1 GiB of metadata (`MM_SNAPSHOT_MAX_META_BYTES_LARGE`, about
 1.3 million segments of manifest), and a sender answers such a request in wide chunks whatever the
@@ -5247,7 +5247,7 @@ together do not overwrite each other (a compare-and-swap on the key's revision),
 leaves does to it (its lease), how a shard's failover keys are its own, and how both clients read
 the map.
 
-**Fixed** (spec `kiro-workspace/specs/shard-control-plane/`). A node started with `--shard-id` writes
+**Fixed** (spec `smart-data-engine-workspace/specs/shard-control-plane/`). A node started with `--shard-id` writes
 its node under its lease (`<prefix>shards/<id>`), reads `<prefix>shard_map`, puts itself in it and
 writes it back only on the revision it read - a compare-and-swap, `/v3/kv/txn` on the key's
 `mod_revision`, tried again on a conflict - so two shards starting together both end up in it; and it
@@ -5312,7 +5312,7 @@ epoch, and each pass cost about 4 us a record - a `lseek()` and three `read()`s,
 payload, for every record: 4.6 - 5.3 s a pass. Filed at P2 from the m9g's 0.3 and 0.9 s; what it
 measures is how long a node that crashed stays out.
 
-**Fixed** (spec `kiro-workspace/specs/start-reads-wal-once/`). The replayer reads a file a block at a
+**Fixed** (spec `smart-data-engine-workspace/specs/start-reads-wal-once/`). The replayer reads a file a block at a
 time - 1 MiB, and never less than the largest record whatever is asked for - and hands records out of
 the block, and what it decides about a record is what it decided: one cut short, a torn file that is
 not the last, a `ROTATE`, an epoch. The pass that finds the last checkpoint hands every record on, and
@@ -5813,7 +5813,7 @@ row and after the last, and the sources restored byte for byte.
 **The documents.** The four that said otherwise say since when it is true: #105's item, pitfall 208,
 `docs/operations.md` — which also has a section on what the first start after the upgrade does and
 what its log line means — and the `--ttl-hours` row of `docs/cli.md`. Spec:
-`kiro-workspace/specs/segment-time-range/`.
+`smart-data-engine-workspace/specs/segment-time-range/`.
 
 - Effort: M | Impact: a time-range `SELECT` could answer `OK` without rows the node held, and
   `--ttl-hours` could delete rows younger than the retention, whenever one symbol's rows reached a
@@ -7165,7 +7165,7 @@ one of its own.
 on the m9g.xlarge and one on the development laptop, each a set of placements (the server's cores
 and the probe's under `taskset`, a CPU limit through `systemd-run --user --scope -p CPUQuota=`)
 against configurations against workloads, written down in full in
-`kiro-workspace/specs/uses-the-whole-machine/design.md`:
+`smart-data-engine-workspace/specs/uses-the-whole-machine/design.md`:
 
 - **Loops = usable CPUs, no fewer and no more.** Twelve connections — which one to four loops divide
   evenly — on the server's own cores: two cores read 28.7 million levels a second with two loops and
@@ -7978,7 +7978,7 @@ the component was a failure mode, and there was no measurement on the other side
 **What would bring it back** is a measurement, not a preference: an io_uring loop that shares
 `Session`'s output buffer and the engine's construction with the epoll loop rather than copying
 them, and that beats `boost` on the table above. The spec it was built from is still in
-`kiro-workspace/specs/io-uring-transport/`, with a note at its head naming this item.
+`smart-data-engine-workspace/specs/io-uring-transport/`, with a note at its head naming this item.
 
 **What removing it took, and the order it had to happen in.** Four files deleted (the transport,
 its header, its property tests, and #117's test reading its source), its build block, its metrics
@@ -8005,7 +8005,7 @@ and go out with **one** `send()` after the read's last command, and the read is 
 
 **Found by measuring what the next piece of work would parallelise, before parallelising it.** The
 first step of making the engine use every core it is given
-(`kiro-workspace/specs/uses-the-whole-machine/`) was a baseline, and it said two things. The rate
+(`smart-data-engine-workspace/specs/uses-the-whole-machine/`) was a baseline, and it said two things. The rate
 did not move with the number of writers — about 3.14 million levels a second at one connection and
 at four — and one thread, the epoll loop, sat at 0.88 of wall time throughout. Flat in connections
 with one thread saturated means that thread is the ceiling. A profile of it then said the thing
@@ -14124,7 +14124,7 @@ pitfall 35 again, one layer up.
 Verified: 7 unit tests, 5 integration tests that actually `SIGKILL` a server (including two crashes in a
 row, and writes made after a recovery surviving the next crash), three mutations red — empty replay,
 checkpoint before the flush, timestamp guard removed.
-Spec: `kiro-workspace/specs/wal-replay-recovery/`
+Spec: `smart-data-engine-workspace/specs/wal-replay-recovery/`
 
 - Also added: `--flush-interval-ms` on `ob_tcp_server`. The recovery tests need rows to stay in the WAL,
   and hardcoding 100 ms made the test race the server instead of measuring it.
@@ -14255,7 +14255,7 @@ two key builds per write: `apply_delta()` built it once for the migrated-symbol 
 `stamp_sequence()`, and now builds it once and passes it down.
 
 - Status: **DONE**
-- Spec: `kiro-workspace/specs/wal-sequence-numbers/`
+- Spec: `smart-data-engine-workspace/specs/wal-sequence-numbers/`
 
 ### 66. The write path built the same key string four times ✅
 

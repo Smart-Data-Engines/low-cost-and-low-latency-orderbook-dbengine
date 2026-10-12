@@ -16,7 +16,7 @@
 // A crash anywhere leaves the inputs, the merged segment naming them, or both, and a start keeps
 // each row once: it removes a working directory, and an input it finds beside the merged segment
 // that names it (`ColumnarStore::rebuild_index_locked()`). The design and the measurement that sized
-// it are in kiro-workspace/specs/segment-growth/design.md §2.5.
+// it are in smart-data-engine-workspace/specs/segment-growth/design.md §2.5.
 
 #include "orderbook/compaction.hpp"
 #include "orderbook/engine.hpp"

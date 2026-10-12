@@ -848,7 +848,7 @@ private:
     // A seal - what queries read most - writes LZ4 or nothing, reusing its store's last choice and
     // searching every sixteenth segment; a merge searches always and takes ZSTD where it saves 10%
     // over LZ4, since what it writes is what stays (segment format v3, design §3). Measured
-    // choices, not guesses: kiro-workspace/specs/segment-format-v3/.
+    // choices, not guesses: smart-data-engine-workspace/specs/segment-format-v3/.
     ColumnarStore::SegmentFormat seal_format_{ColumnarStore::SegmentFormat::seal()};
     ColumnarStore::SegmentFormat merge_format_{ColumnarStore::SegmentFormat::merge()};
 

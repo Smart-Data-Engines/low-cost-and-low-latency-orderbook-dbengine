@@ -5,7 +5,7 @@ Commands to read before pasting. **The harness installs nothing** — a benchmar
 decided to change about the machine.
 
 Everything here is native. Requirement 1.2 of
-`kiro-workspace/specs/reproducible-benchmarks/requirements.md` is not a preference: this engine has
+`smart-data-engine-workspace/specs/reproducible-benchmarks/requirements.md` is not a preference: this engine has
 no containerised deployment path *by design*, so measuring it against containerised competitors
 would compare an engine tuned for the hardware against databases separated from that hardware by a
 network namespace and an overlay filesystem. The container layer would be the largest difference in

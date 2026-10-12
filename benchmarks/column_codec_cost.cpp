@@ -1,5 +1,5 @@
 // What segment format 3's column blocks cost to write and to read, against what format 2's columns
-// cost to read (kiro-workspace/specs/segment-format-v3/, task 3).
+// cost to read (smart-data-engine-workspace/specs/segment-format-v3/, task 3).
 //
 // Every segment of a data directory is read as format 2 writes it, each column decoded to its
 // values, and then, per column:

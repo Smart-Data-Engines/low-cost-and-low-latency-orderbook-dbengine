@@ -1,6 +1,6 @@
 // The WAL position is read from four threads and has to be a coherent pair (#85).
 //
-// Spec: kiro-workspace/specs/wal-position-coherence/.
+// Spec: smart-data-engine-workspace/specs/wal-position-coherence/.
 //
 // TSan reported the read of `current_offset()` from `FailoverManager::publish_position_if_due()`
 // against the write from the flush thread. The atomicity is the smaller half. The real defect is

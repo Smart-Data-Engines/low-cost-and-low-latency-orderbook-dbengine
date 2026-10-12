@@ -2,7 +2,7 @@
 
 Two standalone programs, run once to decide the shape of #30 part three. They are here because a
 number that cannot be re-measured is an anecdote, and this one governs a design decision:
-`kiro-workspace/specs/wire-tls/requirements.md` §1.
+`smart-data-engine-workspace/specs/wire-tls/requirements.md` §1.
 
 Standalone, and not part of `bench_engine`: neither of them touches the engine. They measure what
 OpenSSL and this kernel do with a socket, which is the question that had to be answered *before*

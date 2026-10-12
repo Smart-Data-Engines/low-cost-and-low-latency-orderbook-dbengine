@@ -1,4 +1,4 @@
-// Column blocks of segment format 3 (kiro-workspace/specs/segment-format-v3/, design §2 and §3).
+// Column blocks of segment format 3 (smart-data-engine-workspace/specs/segment-format-v3/, design §2 and §3).
 //
 // Every encoding has to give back exactly the values it was given - for every value, not for the
 // range prices happen to occupy - and a block that is not what the encoder writes has to be

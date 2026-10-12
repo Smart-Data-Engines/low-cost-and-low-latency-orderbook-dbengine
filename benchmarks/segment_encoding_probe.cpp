@@ -1,5 +1,5 @@
 // What each column of a store's segments takes, and what it would take under each candidate
-// encoding (segment format v3, kiro-workspace/specs/segment-format-v3/).
+// encoding (segment format v3, smart-data-engine-workspace/specs/segment-format-v3/).
 //
 // Format 2 writes the timestamp, the order count, the side and the level raw, and the price as one
 // zigzag delta a word: fifteen and eight of a row's twenty-five bytes on the comparative dataset.

@@ -13,7 +13,7 @@ one JSON line a query: the variant, the cold time, p50 and min of the ten in ms,
 over the ten (utime + stime from /proc), and the answer's lines, which every variant must give the
 same.
 
-The queries, requirement 8 of kiro-workspace/specs/conditions-narrow-the-read/:
+The queries, requirement 8 of smart-data-engine-workspace/specs/conditions-narrow-the-read/:
 - `level0`: SELECT * of level 0 - 2 rows an instant of 200;
 - `band`: SELECT * in a band of prices the mid passes through once, around 30% of the history;
 - `limit`: SELECT * ... LIMIT 100 over the whole symbol;
