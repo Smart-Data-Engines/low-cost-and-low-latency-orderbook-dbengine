@@ -270,8 +270,9 @@ public:
             if (n > 0) continue;
             if (std::chrono::steady_clock::now() > deadline) return false;
             if (commands_.prepare_to_wait_for_room()) {
+                // Long enough that a bell the node never rang shows as a failure, not as a pause.
                 pollfd p{client_bell_, POLLIN, 0};
-                ::poll(&p, 1, 50);
+                if (::poll(&p, 1, 2000) == 0) return false;
                 ob::ring::drain_bell(client_bell_);
                 commands_.done_waiting_for_room();
             }
@@ -305,8 +306,13 @@ public:
                 return "(timed out with " + std::to_string(buf_.size()) + " bytes)";
             }
             if (answers_.prepare_to_sleep()) {
+                // Two seconds asleep with the node's answer due is a bell it never rang: said as
+                // such, rather than covered by a poll that wakes anyway.
                 pollfd p{client_bell_, POLLIN, 0};
-                ::poll(&p, 1, 50);
+                if (::poll(&p, 1, 2000) == 0) {
+                    return "(no bell within 2 s, " + std::to_string(answers_.available()) +
+                           " bytes in the ring)";
+                }
                 ob::ring::drain_bell(client_bell_);
                 answers_.woke();
             }
@@ -693,7 +699,11 @@ void the_protocol_goes_through_rings(uint16_t port, bool polling) {
     EXPECT_EQ(r.answer(), "PONG\n");
     EXPECT_EQ(r.answer(), book);
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    // A loop that went to sleep is woken by the command, not by its own 100 ms timeout.
+    const auto t0 = std::chrono::steady_clock::now();
     EXPECT_EQ(r.ask("PING"), "PONG\n");
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(50))
+        << "the PING waited for the loop's timeout rather than waking it";
 
     // The socket the session is kept under carries nothing more, and the session is still there.
     EXPECT_FALSE(r.socket_closed_within(50));
@@ -849,5 +859,32 @@ TEST(RingsServer, ACounterTheClientCouldNotHaveLeftEndsTheSession) {
     ob::ring::ring_bell(r.server_bell());
     EXPECT_TRUE(r.socket_closed_within(5000)) << "the session went on after its ring was broken";
     w.reset();
+    server.stop();
+}
+
+TEST(RingsServer, ClosingTheSocketEndsTheSessionInRings) {
+    // One session a node: the place the session in rings held is given back when its socket closes.
+    Dir dir;
+    auto config         = ring_config(dir, port_at(170), false);
+    config.max_sessions = 1;
+    Running server(config);
+    {
+        auto w = through(config.unix_socket);
+        ASSERT_TRUE(w);
+        ASSERT_TRUE(greeted(w->greeting()));
+        RingWire r(*w);
+        ASSERT_TRUE(r.ok()) << r.error();
+        EXPECT_EQ(r.ask("PING"), "PONG\n");
+    }   // the socket closes here, and the rings with the session
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::string greeting;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto again = through(config.unix_socket);
+        ASSERT_TRUE(again);
+        greeting = again->greeting();
+        if (greeted(greeting)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(greeted(greeting)) << "the session in rings outlived its socket: " << greeting;
     server.stop();
 }

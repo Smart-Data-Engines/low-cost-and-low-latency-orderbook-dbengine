@@ -2488,6 +2488,44 @@ For the C++ client it is `ClientConfig::unix_socket`, and for backups from cron
 `ob_backup --unix-socket /run/orderbook/ob.sock`. A client asked for TLS through the socket is refused
 before it connects, and a pool or the shard router dials every node at its address.
 
+### Rings in shared memory
+
+A session through the socket can move its bytes to a pair of rings in shared memory (`RINGS`, #52
+step 2): commands into one ring, answers and pushed rows out of the other, and no system call a round
+trip while both ends poll. The protocol is the same byte for byte; how the move works is on the
+[wire protocol](protocol.md#rings-in-shared-memory) page.
+
+```cpp
+ob::ClientConfig cc;
+cc.unix_socket   = "/run/orderbook/ob.sock";
+cc.rings.enabled = true;   // after AUTH, where the node asks for it
+```
+
+What a command cost through each, pinned, in the default profile (`boost`, whose loops poll for a
+moment after each event) and with a client that polls for its answer, the median of seven rounds of
+50 000 (the roadmap, #52, has the series):
+
+| p50 | EPYC 9R45, TCP | socket | rings | Graviton, TCP | socket | rings |
+|---|---|---|---|---|---|---|
+| `PING` | 2.96 us | 1.59 us | **0.51 us** | 4.66 us | 2.83 us | **0.92 us** |
+| `BOOK`, ten levels | 3.99 us | 2.67 us | 1.51 us | 6.36 us | 4.53 us | 2.33 us |
+| `MINSERT`, twenty levels | 5.78 us | 3.98 us | 2.84 us | 8.17 us | 5.82 us | 3.75 us |
+
+- **The client polls before it sleeps.** A node answers a `PING` through rings in well under a
+  microsecond, so a client that sleeps on its bell at once is caught going to sleep and pays the
+  whole wake-up: 3.50 us a `PING` on the EPYC, more than the socket's 2.00, against 0.51 for one
+  that polled 5 us first. `ClientConfig::rings.spin_us` is 20 by default; 0 sleeps at once.
+- **The node polls in `boost`.** In `eco` its loop sleeps between events, every command rings its
+  bell, and the rings keep less: 2.19 us a `PING` on the EPYC with a polling client.
+- **Memory:** `--ring-bytes` (1 MiB by default) a direction, so 2 MiB a session plus a page.
+  `ob_ring_bytes` is what the sessions in rings hold, `ob_ring_sessions_total` counts the moves, and
+  `ob_ring_bells_total` the answers that had to wake a sleeping client.
+- **Who may:** a session through the socket, after `AUTH` where it is required. TCP, TLS and
+  compressed sessions are refused, and `--rings off` refuses every one. The memory is shared with
+  the process at the other end of the socket alone, through descriptors passed on it, and sealed
+  against shrinking; a client that leaves a ring in a state the node never wrote has its session
+  closed.
+
 ### The metrics endpoint
 
 No authentication, deliberately — a Prometheus scraper cannot perform a challenge-response, and a

@@ -275,6 +275,31 @@ and replay it.
 A failed attempt closes the connection, which is also the rate limit: one attempt per connection,
 and connections are bounded by `--max-sessions`.
 
+### RINGS
+
+Only through the node's Unix socket (`--unix-socket`), after `AUTH` where it is required, and only
+with `--rings on` (the default). Moves the session to a pair of rings in shared memory (#52):
+
+```
+C: RINGS [bytes]
+S: OK RINGS 1048576          (with three descriptors: the memory and two bells)
+S:
+```
+
+`bytes` is each direction's size, a power of two up to `--ring-bytes`; without it the node's. The
+socket carries nothing afterwards and closing it ends the session. The memory layout and the rule
+for waking are in [the wire protocol](protocol.md#rings-in-shared-memory); the C++ client does all
+of it with `ClientConfig::rings`.
+
+| Response | Means |
+|----------|-------|
+| `OK RINGS <bytes>` | the session is in rings; the answer arrived with their descriptors |
+| `ERR rings: only a session through the node's Unix socket can move to rings` | a TCP session |
+| `ERR rings: switched off on this node (--rings off)` | the node refuses every move |
+| `ERR rings: <n> bytes a direction; ...` | a size the node does not take |
+| `ERR rings: nothing may follow RINGS before its answer` | bytes after `RINGS` on the socket; the session is closed |
+| `ERR rings: earlier answers are still being sent; ...` | ask again once they are read |
+
 ## Large responses and slow clients
 
 A response is queued per session and written as the socket accepts it, so a result set larger than the

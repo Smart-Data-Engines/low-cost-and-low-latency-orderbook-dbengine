@@ -220,7 +220,9 @@ in the harness installs anything, and a containerised competitor would measure t
 - **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse, and on the node's
   own host through a Unix socket beside the port (`--unix-socket`, #52): the same protocol without
   TCP, 1.4-1.7 µs off a command on an EPYC 9R45 and 1.9-2.4 µs on a Graviton, measured with a client
-  that polls
+  that polls. From the socket a session can move to **rings in shared memory** (`RINGS`, the C++
+  client's `ClientConfig::rings`): a `PING` in 0.51 µs on the EPYC and 0.92 µs on the Graviton,
+  pinned, against 2.96 and 4.66 through TCP
 - **Backup and restore** — `BACKUP` takes a cut at one moment into the server's `--backup-dir`
   (hard links on the data directory's filesystem, a checksummed copy on another), `ob_backup` asks
   for one from cron, and `ob_restore` checks a backup whole before it writes anything and restores
