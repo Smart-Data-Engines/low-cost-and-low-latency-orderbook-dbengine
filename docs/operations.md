@@ -2241,9 +2241,11 @@ with an identity is the only thing that stops that, which is what mTLS is.
 Each node needs a certificate of its own and the CA that signed the others. One CA for the cluster:
 
 ```bash
-# The cluster CA. Keep this key off the nodes.
+# The cluster CA. Keep this key off the nodes. keyUsage, so a client that verifies strictly takes
+# a certificate it signed: Python's ssl does since 3.13, and refuses a CA without the extension.
 openssl req -x509 -newkey rsa:4096 -days 3650 -nodes \
-        -keyout cluster-ca-key.pem -out cluster-ca.pem -subj "/CN=orderbook cluster CA"
+        -keyout cluster-ca-key.pem -out cluster-ca.pem -subj "/CN=orderbook cluster CA" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign"
 
 # One per node. The SAN is what the *dialling* end verifies, so it has to be the address or name
 # the other nodes use to reach this one.

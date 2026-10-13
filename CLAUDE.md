@@ -4224,6 +4224,20 @@ Learned the hard way. Check here before debugging.
      `OB_ERR_NOT_FOUND` it got ended the test where the next poll would have found the rows. It
      passed alone every time and failed once in a battery under load. A helper that waits counts
      what is not there yet as none.
+577. **A signal the process lives through has to be blocked in every thread but one.** The kernel
+     runs a process-directed signal's handler on any thread that does not block it, and the call that
+     thread was in - `epoll_wait`, a `recv` on a socket with `SO_RCVTIMEO` - fails with EINTR whatever
+     `SA_RESTART` says. The replica's stream reader counts that as a disconnect. SIGINT and SIGTERM
+     never showed it because the node stops anyway; SIGHUP (#238) is blocked in `run_server()` before
+     the server makes a thread and unblocked in `ob-signals` alone, and `test_tls_reload.py` reads
+     every thread's `SigBlk` in `/proc` to hold it.
+578. **Python's default TLS context verifies strictly since 3.13.** `ssl.create_default_context()`
+     sets `VERIFY_X509_STRICT`, which refuses a CA certificate without `keyUsage` (`CA cert does not
+     include key usage extension`) - and `openssl req -x509` adds none. Our Python client builds its
+     context that way, so a test CA, or an operator's, needs `-addext
+     "keyUsage=critical,keyCertSign,cRLSign"`. An older OpenSSL's `x509 -req` also adds no authority
+     key identifier, which strict verification wants too; `authorityKeyIdentifier=keyid` in the
+     extension file covers both.
 
 ## Current state and open problems
 
@@ -4566,7 +4580,8 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What is still true: **an unconfigured node is plaintext and unauthenticated on all three
   surfaces**, and the startup log WARNs for each disabled surface rather than leaving "default open"
   in a document.
-  Certificate rotation needs a restart. Three things to know before touching authentication: the
+  A certificate is replaced with `SIGHUP` (#238); `--tls-peer-names` and the `--tls-*` flags are
+  read at the start only. Three things to know before touching authentication: the
   client gate sits *before* `execute_command`'s switch and its classifier has no `default:` (pitfall
   109); the surface label is inside the HMAC input because replication and multi-master share one
   secret; and the two secret files must differ, which the start enforces, because a client holding
