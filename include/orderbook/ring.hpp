@@ -105,7 +105,7 @@ public:
     size_t write(const char* p, size_t n);
 
     /// Makes what was written visible, and answers whether the consumer sleeps - the caller rings
-    /// its bell then. Both sequentially consistent, so a consumer about to sleep either sees the
+    /// its bell then. A seq_cst fence between the two, so a consumer about to sleep either sees the
     /// bytes or is seen asleep (pitfall 582: two relaxed stores and loads pass in a store buffer).
     bool publish();
 
@@ -146,7 +146,7 @@ public:
     size_t read(char* p, size_t n);
 
     /// After a read: whether the producer waits for room - the caller rings its bell then. The
-    /// same pairing as `Writer::publish()`, the other way round.
+    /// same fence as `Writer::publish()`, the other way round.
     bool producer_waiting();
 
     /// About to sleep on an empty ring: says so, then looks again. True: still empty, sleep.
