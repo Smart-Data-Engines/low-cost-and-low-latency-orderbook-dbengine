@@ -11,6 +11,10 @@ here as `#N`.
 
 ### Added
 
+- IPv6, on every listener and every connection (#236). A listener with no bind flag takes both
+  families; `--bind`, `--replication-bind`, `--mm-bind` and `--metrics-bind` take an IPv6 address;
+  a replica, a mesh peer and both clients dial a name, an IPv4 or an IPv6 address, every address of
+  a name in turn; an IPv6 host is written in brackets wherever a port follows it.
 - `examples/binance-live/`: the order books of ten Binance pairs written into a node as they arrive,
   read back as minute bars and as the top of each book, and drawn by a Grafana dashboard of the
   market as the node holds it and of the node itself - every process native (#43).
@@ -19,6 +23,12 @@ here as `#N`.
 
 ### Changed
 
+- A port with no bind flag listens on IPv6 as well: `::`, both families on one socket, where it was
+  `0.0.0.0` (#236). On a host whose firewall covers IPv4 alone, such a port is now reachable over
+  IPv6. `--bind 0.0.0.0`, and the same in `--replication-bind`, `--mm-bind` and `--metrics-bind`,
+  keeps a port on IPv4 as it was ("Listeners after v0.1.0" in `docs/upgrading.md`).
+- A replica's connection to its primary gives up an address after 5 s, where a blocking `connect()`
+  waited out the kernel's SYN retries - minutes - before the replica's own retry could begin (#236).
 - Between releases the version is the next one as a development version: `0.1.1.dev0` now, in
   `ob_tcp_server --version`, `STATUS` and the wheel, and `0.1.1~dev0` in the packages, which pip,
   dpkg and rpm all order after 0.1.0 and before 0.1.1. Everything built from `master` after v0.1.0

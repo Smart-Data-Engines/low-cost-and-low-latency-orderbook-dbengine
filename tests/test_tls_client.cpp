@@ -8,6 +8,7 @@
 // certificate good for every other node, and the verification reads as done.
 
 #include "orderbook/client.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/shard_router.hpp"
 #include "orderbook/tls.hpp"
 
@@ -69,20 +70,18 @@ class TinyTlsServer {
 public:
     /// `reset_on_command`: after its banner, the first command the client sends is answered by a
     /// reset - the connection closed with SO_LINGER 0 - rather than a reply (#208).
-    TinyTlsServer(const KeyPair& kp, bool speak_tls, bool reset_on_command = false)
-        : speak_tls_(speak_tls), reset_on_command_(reset_on_command) {
-        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        int one = 1;
-        ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port        = 0;
-        if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return;
+    /// `loopback`: the address it listens on, `::1` for the IPv6 tests.
+    TinyTlsServer(const KeyPair& kp, bool speak_tls, bool reset_on_command = false,
+                  std::string loopback = "127.0.0.1")
+        : speak_tls_(speak_tls), reset_on_command_(reset_on_command), loopback_(std::move(loopback)) {
+        std::string error;
+        listen_fd_ = ob::net::listen_on(loopback_, 0, 4, 0, error);
+        if (listen_fd_ < 0) return;
+        sockaddr_storage addr{};
         socklen_t len = sizeof(addr);
         ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
-        port_ = ntohs(addr.sin_port);
-        ::listen(listen_fd_, 4);
+        port_ = addr.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&addr)->sin6_port)
+                                           : ntohs(reinterpret_cast<sockaddr_in*>(&addr)->sin_port);
 
         thread_ = std::thread([this, kp] { run(kp); });
     }
@@ -91,14 +90,10 @@ public:
         stop_.store(true);
         // Wake the accept by connecting to it, rather than closing the descriptor the thread is
         // sitting in - pitfall 49, and it is wrong every time it is written.
-        int poke = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port        = htons(port_);
-        ::connect(poke, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        std::string why;
+        const int poke = port_ != 0 ? ob::net::dial(loopback_, port_, 5000, false, why, "test") : -1;
         if (thread_.joinable()) thread_.join();
-        ::close(poke);
+        if (poke >= 0) ::close(poke);
         if (listen_fd_ != -1) ::close(listen_fd_);
     }
 
@@ -150,6 +145,7 @@ private:
 
     bool             speak_tls_;
     bool             reset_on_command_{false};
+    std::string      loopback_;
     int              listen_fd_{-1};
     uint16_t         port_{0};
     std::thread      thread_;
@@ -163,6 +159,17 @@ ob::ClientConfig client_for(uint16_t port) {
     cc.connect_timeout_sec = 5.0;
     cc.read_timeout_sec    = 5.0;
     return cc;
+}
+
+bool has_ipv6_loopback() {
+    const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in6 a{};
+    a.sin6_family = AF_INET6;
+    a.sin6_addr   = in6addr_loopback;
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+    ::close(fd);
+    return ok;
 }
 
 std::string read_file(const std::string& path) {
@@ -219,6 +226,54 @@ TEST(TlsClient, RefusesACertificateIssuedForAnotherAddress) {
     EXPECT_NE(conn.error_message().find("handshake"), std::string::npos)
         << "failed for some other reason: " << conn.error_message();
     EXPECT_FALSE(client.connected());
+}
+
+// ── An IPv6 address, bare or in brackets (#236) ───────────────────────────────
+
+TEST(TlsClient, AnIPv6AddressInBracketsIsCheckedAsTheAddress) {
+    // `[::1]` is how an address with a port writes an IPv6 host, and the client takes its host in
+    // that form too. The brackets went to the name check as they were: `set1_ip_asc` refused them,
+    // and the name branch then required a DNS entry spelled `[::1]` - a correct certificate refused.
+    if (!has_ipv6_loopback()) GTEST_SKIP() << "this host has no ::1";
+    const auto kp = generate("server6", "subjectAltName=IP:::1");
+    ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
+    TinyTlsServer server(kp, /*speak_tls=*/true, /*reset_on_command=*/false, "::1");
+    ASSERT_NE(server.port(), 0);
+
+    for (const char* host : {"::1", "[::1]"}) {
+        auto cc = client_for(server.port());
+        cc.host        = host;
+        cc.tls         = true;
+        cc.tls_ca_file = kp.cert;
+        ob::OrderbookClient client(std::move(cc));
+        auto conn = client.connect();
+        ASSERT_TRUE(conn) << host << ": " << conn.error_message();
+        auto pong = client.ping();
+        ASSERT_TRUE(pong) << host << ": " << pong.error_message();
+        client.disconnect();
+    }
+}
+
+TEST(TlsClient, AnIPv6AddressInBracketsIsStillChecked) {
+    // The other half: taking the brackets off must not take the check off with them. A certificate
+    // this client trusts, issued for another IPv6 address, is refused in both spellings.
+    if (!has_ipv6_loopback()) GTEST_SKIP() << "this host has no ::1";
+    const auto kp = generate("elsewhere6", "subjectAltName=IP:fd00::2");
+    ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
+    TinyTlsServer server(kp, /*speak_tls=*/true, /*reset_on_command=*/false, "::1");
+    ASSERT_NE(server.port(), 0);
+
+    for (const char* host : {"::1", "[::1]"}) {
+        auto cc = client_for(server.port());
+        cc.host        = host;
+        cc.tls         = true;
+        cc.tls_ca_file = kp.cert;
+        ob::OrderbookClient client(std::move(cc));
+        auto conn = client.connect();
+        ASSERT_FALSE(conn) << host << ": a certificate for fd00::2 was accepted for ::1";
+        EXPECT_NE(conn.error_message().find("handshake"), std::string::npos)
+            << host << " failed for some other reason: " << conn.error_message();
+    }
 }
 
 TEST(TlsClient, RefusesACertificateItsCaDidNotSign) {

@@ -1,4 +1,5 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/net.hpp"
 
 #include "orderbook/backup.hpp"
 #include "orderbook/socket_options.hpp"
@@ -260,24 +261,10 @@ bool allowed_before_authentication(CommandType t) {
 
 namespace {
 
-/// The peer's address, for a log line. "unknown" when the socket will not say.
+/// The peer's address, for a log line. "unknown" when the socket will not say - or is not an IP
+/// socket: getpeername succeeds on an AF_UNIX socket too, which is what the unit tests use.
 std::string peer_address(int fd) {
-    sockaddr_in addr{};
-    socklen_t len = sizeof(addr);
-    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-        return "unknown";
-    }
-    // Checked rather than assumed: getpeername succeeds on an AF_UNIX socket too - which is what
-    // the unit tests use - and reading a sockaddr_un through a sockaddr_in would put whatever bytes
-    // followed the path into a log line as an address.
-    if (addr.sin_family != AF_INET) {
-        return "unknown";
-    }
-    char host[INET_ADDRSTRLEN] = {0};
-    if (::inet_ntop(AF_INET, &addr.sin_addr, host, sizeof(host)) == nullptr) {
-        return "unknown";
-    }
-    return std::string(host) + ":" + std::to_string(ntohs(addr.sin_port));
+    return net::peer_address(fd);
 }
 
 /// Handle AUTH. Five outcomes, and the only one that continues the session is the last.
@@ -1600,9 +1587,9 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             // refusal to start, said with the flag that carried it - not a listener on every
             // interface, the opposite of what was asked, and not a failure deep in a manager's start.
             const std::string val{cursor.value()};
-            in_addr parsed{};
-            if (::inet_pton(AF_INET, val.c_str(), &parsed) != 1) {
-                std::fprintf(stderr, "Error: %s expects an IPv4 address such as 127.0.0.1, got '%s'\n",
+            if (val.empty() || !net::valid_bind(val)) {
+                std::fprintf(stderr,
+                             "Error: %s expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, got '%s'\n",
                              std::string(arg).c_str(), val.c_str());
                 std::exit(1);
             }
@@ -2141,7 +2128,7 @@ TcpServer::TcpServer(ServerConfig config)
         // What a replica dials once this node is primary: the host it is reached by, which was
         // 127.0.0.1 whatever that was - a replica on another host dialled itself (#195).
         failover_config.replication_address =
-            config_.advertise_host + ":" + std::to_string(config_.replication_port);
+            net::join_host_port(config_.advertise_host, config_.replication_port);
         if (const std::string remote = remote_coordinator_for_loopback_advertise(config_);
             !remote.empty()) {
             OB_LOG_WARN("tcp_server",
@@ -2697,7 +2684,7 @@ void Reactor::run_loop() {
 
                     // Accept new connection(s).
                     while (true) {
-                        struct sockaddr_in client_addr{};
+                        sockaddr_storage client_addr{};
                         socklen_t client_len = sizeof(client_addr);
                         int client_fd = ::accept4(listen_fd_,
                                                   reinterpret_cast<struct sockaddr*>(&client_addr),
@@ -3146,7 +3133,7 @@ void TcpServer::run() {
         sc_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
         sc_config.coordinator.node_id = config_.node_id;
         sc_config.coordinator.cluster_prefix = "/ob/";
-        sc_config.advertise_address = config_.advertise_host + ":" + std::to_string(config_.port);
+        sc_config.advertise_address = net::join_host_port(config_.advertise_host, config_.port);
         // How this shard reaches another's client port to move a symbol there (#196): TLS when its
         // own client port has it - one cluster, one configuration - and the identity it was given.
         sc_config.migration_access.tls         = config_.tls_client;
@@ -3169,36 +3156,16 @@ void TcpServer::run() {
         backups = std::make_unique<BackupRunner>(*engine_, config_.backup_dir, engine_->registry());
     }
 
-    // 1. Create non-blocking TCP socket.
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (listen_fd_ < 0) {
-        throw std::runtime_error(std::string("socket() failed: ") + std::strerror(errno));
-    }
-
-    // 2. Set SO_REUSEADDR.
-    int opt = 1;
-    if (::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        throw std::runtime_error(std::string("setsockopt() failed: ") + std::strerror(errno));
-    }
-
-    // 3. Bind to the client port, on every interface unless --bind names one (#203). The address
-    //    parsed when the flag was read; a config built without the parser is checked here.
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(config_.port);
-    if (!config_.bind.empty() && ::inet_pton(AF_INET, config_.bind.c_str(), &addr.sin_addr) != 1) {
+    // 1-4. The client port's listener: every interface of both families unless --bind names one
+    //      (#203), non-blocking, backlog 128. The address parsed when the flag was read; a config
+    //      built without the parser is checked here.
+    if (!net::valid_bind(config_.bind)) {
         throw std::runtime_error("invalid --bind address '" + config_.bind + "'");
     }
-
-    if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        throw std::runtime_error(std::string("bind() failed on port ")
-                                 + std::to_string(config_.port) + ": " + std::strerror(errno));
-    }
-
-    // 4. Listen with backlog 128.
-    if (::listen(listen_fd_, 128) < 0) {
-        throw std::runtime_error(std::string("listen() failed: ") + std::strerror(errno));
+    std::string listen_error;
+    listen_fd_ = net::listen_on(config_.bind, config_.port, 128, SOCK_NONBLOCK, listen_error);
+    if (listen_fd_ < 0) {
+        throw std::runtime_error(listen_error);
     }
 
     // The line that says the server is up, logged *after* the bind and the listen have succeeded,

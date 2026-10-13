@@ -40,8 +40,10 @@ namespace ob {
 /// *dialled* — both mesh directions, the C++ client library — and on no socket it *accepted*.
 /// `tests/test_socket_options.cpp` derives the connection-holding sites from the source and
 /// counts them against the calls each file makes, because the sixth of them is the one that will
-/// be added without it — and counting per file rather than per socket would have let
-/// `src/replication.cpp`, which holds two, lose one of them silently.
+/// be added without it — and counting per file rather than per socket would let
+/// `src/tcp_server.cpp`, which holds two (the client it serves, and one it refuses while
+/// draining), lose one of them silently. Every socket the engine dials gets it in
+/// `ob::net::dial()`, the one place any of them is dialled.
 ///
 /// A failure is logged and not fatal: the connection works, it is just slower, and refusing to
 /// serve a client over a socket option would be the worse trade.

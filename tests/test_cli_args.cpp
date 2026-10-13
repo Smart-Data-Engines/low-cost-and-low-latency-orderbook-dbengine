@@ -280,10 +280,20 @@ TEST(CliArgs, WithoutTheFlagsEveryListenerTakesEveryInterface) {
 TEST(CliArgsDeath, AnAddressThatDoesNotParseIsARefusalNotEveryInterface) {
     // Listening on 0.0.0.0 because a typed address did not parse is the opposite of what was asked.
     EXPECT_EXIT(parse({"--bind", "127.0.0.256"}), ::testing::ExitedWithCode(1),
-                "--bind expects an IPv4 address such as 127.0.0.1, got '127.0.0.256'");
+                "--bind expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, got '127.0.0.256'");
     EXPECT_EXIT(parse({"--replication-bind", "localhost"}), ::testing::ExitedWithCode(1),
-                "--replication-bind expects an IPv4 address");
-    EXPECT_EXIT(parse({"--mm-bind", ""}), ::testing::ExitedWithCode(1), "--mm-bind expects an IPv4 address");
+                "--replication-bind expects an IPv4 or IPv6 address");
+    EXPECT_EXIT(parse({"--mm-bind", ""}), ::testing::ExitedWithCode(1),
+                "--mm-bind expects an IPv4 or IPv6 address");
+    EXPECT_EXIT(parse({"--bind", "::1:"}), ::testing::ExitedWithCode(1),
+                "--bind expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, got '::1:'");
+}
+
+TEST(CliArgs, AnIPv6AddressIsABindAddress) {
+    // Both spellings: bare, as `ip` prints it, and in the brackets an address with a port carries.
+    EXPECT_EQ(parse({"--bind", "::1"}).bind, "::1");
+    EXPECT_EQ(parse({"--replication-bind", "[::1]"}).replication_bind, "[::1]");
+    EXPECT_EQ(parse({"--mm-bind", "fd00::7"}).mm_bind, "fd00::7");
 }
 
 // ── #220: what the decoded columns may hold between queries ──────────────────────────────

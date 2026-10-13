@@ -42,8 +42,8 @@ def make_cluster_certs(tmp: Path, node_count: int) -> NodeTls:
 
     Each certificate carries **two** SAN entries and both are load-bearing:
 
-    * `IP:127.0.0.1`, because the *dialling* end verifies the address it dialled and the
-      replication client dials an address and never a name — it resolves nothing;
+    * `IP:127.0.0.1`, because the *dialling* end verifies the host it was given, and these nodes
+      reach each other at 127.0.0.1;
     * `DNS:node-<i>`, so `--tls-peer-names` has a per-node identity to match on the accepting end.
 
     Getting that split wrong is the mistake this whole area is about: verification matches the SAN,

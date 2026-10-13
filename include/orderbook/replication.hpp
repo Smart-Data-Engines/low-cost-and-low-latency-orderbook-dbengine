@@ -74,9 +74,10 @@ struct ReplicationClientConfig {
 
     /// TLS for the connection to the primary (#30 part three, series D). Null = plaintext.
     ///
-    /// A `node_client` context. The name this side requires is `primary_host`, pinned through
-    /// `tls_expect_host()` - and since `connect_to_primary()` resolves nothing (`inet_pton` only),
-    /// that name is always an address, so the primary's certificate needs an `IP:` SAN.
+    /// A `node_client` context. The name this side requires is `primary_host` as given, pinned
+    /// through `tls_expect_host()`: an address needs an `IP:` SAN in the primary's certificate and a
+    /// name a `DNS:` one. `connect_to_primary()` resolves a name since #236, and the check stays on
+    /// the name rather than on the address it resolved to.
     std::shared_ptr<TlsContext> tls_client;
 
     // Snapshot bootstrap configuration

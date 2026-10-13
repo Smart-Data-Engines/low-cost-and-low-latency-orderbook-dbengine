@@ -131,6 +131,13 @@ ob_add_test(test_version
     test_version.cpp
 )
 
+# Sockets and addresses of both families: binds loopback ports, so it is a test that touches the
+# network, like the replication and mesh ones (ctest -j1).
+ob_add_test(test_net
+    test_net.cpp
+)
+target_link_libraries(test_net PRIVATE orderbook_net)
+
 # The drift guards read `CMakeLists.txt` and `pyproject.toml`, so the tree has to be findable at
 # test time — same reason `test_wal_position` and `test_cli_config` get this.
 target_compile_definitions(test_version

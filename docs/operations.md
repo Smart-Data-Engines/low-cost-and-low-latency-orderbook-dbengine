@@ -145,6 +145,41 @@ x86 host, against 11.9 - 12.6 million from a client beside it, and 14.0 - 15.2 m
 node, against 16.1 - 17.8 million (`benchmarks/command_latency` and `benchmarks/pipelined_ingest`
 with `OB_HOST`, three rounds each way).
 
+### IPv6
+
+Every port listens on both families unless a flag says otherwise. With no `bind`, `replication-bind`,
+`mm-bind` or `metrics-bind`, a listener is `::` with `IPV6_V6ONLY` off. That takes IPv4 clients too,
+as mapped addresses, which the log and `STATUS` show as the IPv4 address they are. A host without
+IPv6 - compiled out, or `disable_ipv6` - gets IPv4 listeners, and its log says so once a port.
+
+An address in a bind flag listens on its own family alone, written bare or in brackets (`::1`,
+`[::1]`). So `0.0.0.0` is every IPv4 interface and nothing else, and `::` every IPv6 one - whatever
+the host's `net.ipv6.bindv6only` says.
+
+**A firewall that covers IPv4 alone does not cover a port with no bind flag.** v0.1.0 listened on
+`0.0.0.0` there. Put `0.0.0.0` in the flag to keep a port on IPv4, or extend the rules to IPv6
+("Listeners after v0.1.0" in `docs/upgrading.md`).
+
+An address with a port carries an IPv6 host in brackets:
+- `--advertise-host fd00::11` is published as `[fd00::11]:21591`;
+- the Python client takes `hosts=["[fd00::11]:5555"]`.
+
+A replica's `--primary-host`, a mesh peer and the hosts of both clients take a name, an IPv4 or an
+IPv6 address. Every address of a name is tried in the resolver's order, each within the connect
+timeout. With TLS the certificate has to cover the host as given: an IPv6 address is an `IP:` entry
+(`IP:fd00::11`), and a host given in brackets is checked as the address.
+
+The coordinator's endpoints are URLs and go to libcurl as they are, with an IPv6 host in brackets
+(`http://[fd00::10]:2379`).
+
+`tests/integration/test_ipv6.py` holds this on `::1`:
+- a node bound to it, with the Python client given `::1` and `[::1]`;
+- a node bound to nothing, answering both families;
+- the C++ client, given `::1` and `[::1]`;
+- a replica following its primary, and the primary's `STATUS` naming it `[::1]:<port>`;
+- an IPv4 replica of a port with no bind, named by its IPv4 address;
+- a mesh pair that finds each other through an etcd on `[::1]`.
+
 ## Sharding by symbol
 
 Each shard is a node - or a failover group of them - started with the same `--shard-id`, and every
@@ -2163,10 +2198,14 @@ for host in 10.0.0.1 10.0.0.2 10.0.0.3; do
 done
 ```
 
-`IP:` and not `DNS:`, unless you are sure. **The replication client dials an address and never a
-name** — it resolves nothing — so a replica's certificate for `db1.internal` presented at
-`10.0.0.1` is refused, correctly, and the message names the certificate. The mesh does resolve
-names, so `DNS:` works there; a certificate carrying both entries works everywhere.
+**The dialling end checks the certificate against the host it was given, not against what that
+host resolved to.** A replica started with `--primary-host 10.0.0.1` needs `IP:10.0.0.1` in its
+primary's certificate, and one started with `--primary-host db1.internal` needs
+`DNS:db1.internal`; a certificate for `db1.internal` presented at `10.0.0.1` is refused, correctly,
+and the message names the certificate. After a failover the host is the one the new primary
+publishes (`--advertise-host`), and a mesh peer's is the one it publishes, so that is the entry its
+certificate needs. A certificate carrying both entries works everywhere. An IPv6 address is an
+`IP:` entry like any other (`IP:fd00::11`).
 
 Then on every node:
 

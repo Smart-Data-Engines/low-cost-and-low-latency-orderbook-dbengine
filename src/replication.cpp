@@ -47,6 +47,7 @@
 // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
 
 #include "orderbook/replication.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/socket_options.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/compression.hpp"
@@ -437,26 +438,9 @@ void ReplicationManager::start() {
     if (config_.port == 0) return;
     if (running_.load(std::memory_order_relaxed)) return;
 
-    // 1. Create non-blocking TCP socket for replication port.
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (listen_fd_ < 0) {
-        throw std::runtime_error(std::string("ReplicationManager: socket() failed: ") +
-                                 std::strerror(errno));
-    }
-
-    int opt = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    // 2. Bind to the replication port, on every interface unless --replication-bind names one
-    //    (#203).
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(config_.port);
-    if (!config_.bind_address.empty() &&
-        ::inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+    // 1-2. The replication port's listener: every interface of both families unless
+    //      --replication-bind names one (#203), non-blocking, backlog 16.
+    if (!net::valid_bind(config_.bind_address)) {
         throw std::runtime_error("ReplicationManager: invalid bind address '" +
                                  config_.bind_address + "'");
     }
@@ -467,19 +451,10 @@ void ReplicationManager::start() {
                 "a catch-up that falls more than %llu byte(s) further behind the end of the WAL "
                 "than it began is ended and its replica disconnected (4 x --wal-rotate-bytes, %zu)",
                 static_cast<unsigned long long>(catchup_lag_limit()), wal_.rotate_threshold());
-
-    if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-        throw std::runtime_error(std::string("ReplicationManager: bind() failed on port ") +
-                                 std::to_string(config_.port) + ": " + std::strerror(errno));
-    }
-
-    if (::listen(listen_fd_, 16) < 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-        throw std::runtime_error(std::string("ReplicationManager: listen() failed: ") +
-                                 std::strerror(errno));
+    std::string listen_error;
+    listen_fd_ = net::listen_on(config_.bind_address, config_.port, 16, SOCK_NONBLOCK, listen_error);
+    if (listen_fd_ < 0) {
+        throw std::runtime_error("ReplicationManager: " + listen_error);
     }
 
     // 3. Create epoll instance.
@@ -1103,7 +1078,7 @@ void ReplicationManager::run_loop() {
 
 void ReplicationManager::accept_replica() {
     while (true) {
-        struct sockaddr_in client_addr{};
+        sockaddr_storage client_addr{};
         socklen_t client_len = sizeof(client_addr);
         int client_fd = ::accept4(listen_fd_,
                                    reinterpret_cast<struct sockaddr*>(&client_addr),
@@ -1118,11 +1093,8 @@ void ReplicationManager::accept_replica() {
         // A live record and the `ACK` answering it are the two-small-writes shape exactly (#140).
         set_tcp_nodelay(client_fd, "repl_mgr");
 
-        // Build address string for logging.
-        char addr_str[64];
-        ::inet_ntop(AF_INET, &client_addr.sin_addr, addr_str, sizeof(addr_str));
-        std::string address = std::string(addr_str) + ":" +
-                              std::to_string(ntohs(client_addr.sin_port));
+        // Its address, for logging: "1.2.3.4:5", or "[::1]:5" for IPv6.
+        const std::string address = net::address_of(client_addr, client_len);
 
         OB_LOG_INFO("repl_mgr", "new replica connection from %s, fd=%d", address.c_str(), client_fd);
 
@@ -2107,6 +2079,10 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
 /// that nothing came. One constant rather than a literal per call site, because
 /// `resolve_stream_identity()` derives its deadline from it (#101).
 static constexpr int kRecvTimeoutSec = 5;
+/// How long the replica waits for the primary to answer a connect, per address of its host. The
+/// connect was blocking until the move to ob::net, and a SYN to an address that drops it waited out
+/// the kernel's retries - two minutes - in a loop that retries on its own anyway.
+static constexpr uint32_t kConnectTimeoutMs = 5000;
 
 ReplicationClient::ReplicationClient(ReplicationClientConfig config, Engine& engine)
     : config_(std::move(config))
@@ -2290,32 +2266,21 @@ void ReplicationClient::run_loop() {
 }
 
 void ReplicationClient::connect_to_primary() {
-    // Create a blocking TCP socket (Requirement 4.1).
-    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    // A blocking TCP socket to the primary (Requirement 4.1), of whichever family its address is:
+    // an IPv4 or IPv6 literal, or a name, every address of it tried in turn. Bounded, where the
+    // blocking connect() it replaced was not: a SYN to nowhere waited out the kernel's retries.
+    //
+    // ob::net::dial() turns Nagle off on it: this socket carries an `ACK` per record, and the
+    // primary holds the next record behind Nagle until one arrives (#140).
+    std::string why;
+    fd_ = net::dial(config_.primary_host, config_.primary_port, kConnectTimeoutMs,
+                    /*leave_nonblocking=*/false, why, "repl_client");
     if (fd_ < 0) {
-        throw std::runtime_error(std::string("ReplicationClient: socket() failed: ") +
-                                 std::strerror(errno));
+        fd_ = -1;
+        throw std::runtime_error("ReplicationClient: connect() to " +
+                                 net::join_host_port(config_.primary_host, config_.primary_port) +
+                                 " failed: " + why);
     }
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(config_.primary_port);
-
-    if (::inet_pton(AF_INET, config_.primary_host.c_str(), &addr.sin_addr) <= 0) {
-        close_socket();
-        throw std::runtime_error("ReplicationClient: invalid primary_host: " +
-                                 config_.primary_host);
-    }
-
-    if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close_socket();
-        throw std::runtime_error(std::string("ReplicationClient: connect() failed: ") +
-                                 std::strerror(errno));
-    }
-
-    // The other end of the pair above: this socket carries an `ACK` per record, and the primary
-    // holds the next record behind Nagle until one arrives (#140).
-    set_tcp_nodelay(fd_, "repl_client");
 
     // Set a receive timeout so we can periodically check running_ flag.
     struct timeval tv{};

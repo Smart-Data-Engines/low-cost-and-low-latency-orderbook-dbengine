@@ -123,7 +123,8 @@ private:
 /// code. RFC 6066 §3 forbids a literal address in `server_name`, so no SNI is sent for one; and the
 /// chain check matches an address against the certificate's `iPAddress` SAN, not its `dNSName`, so
 /// `SSL_set1_host("127.0.0.1")` hunts for a DNS entry spelled that way and fails against a correct
-/// certificate.
+/// certificate. An IPv6 literal may come in the brackets of an address (`[::1]`, as a client's host
+/// and `--primary-host` accept it), and the brackets are not part of what the certificate covers.
 ///
 /// Inert under `TlsContext::client(ca, verify=false)`: OpenSSL still computes the verification
 /// result and nothing acts on it. Callers that do not verify should not call this, so the absence of

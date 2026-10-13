@@ -1,4 +1,5 @@
 #include "orderbook/metrics_server.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
@@ -19,45 +20,18 @@ MetricsServer::MetricsServer(uint16_t port, MetricsRegistry& registry, std::stri
 MetricsServer::~MetricsServer() { stop(); }
 
 void MetricsServer::start() {
-    // Create listen socket
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    // Refused rather than silently falling back to every interface. An operator who typed a bind
+    // address and got a listener on every interface has the opposite of what they asked for, and
+    // this endpoint is the one that has no authentication in front of it.
+    if (!net::valid_bind(bind_address_)) {
+        OB_LOG_ERROR("metrics", "invalid --metrics-bind address '%s'; metrics endpoint not started",
+                     bind_address_.c_str());
+        return;
+    }
+    std::string error;
+    listen_fd_ = net::listen_on(bind_address_, port_, 8, SOCK_NONBLOCK | SOCK_CLOEXEC, error);
     if (listen_fd_ < 0) {
-        OB_LOG_ERROR("metrics", "socket() failed: %s", std::strerror(errno));
-        return;
-    }
-
-    int opt = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port_);
-
-    if (!bind_address_.empty()) {
-        // Refused rather than silently falling back to every interface. An operator who typed a
-        // bind address and got a listener on 0.0.0.0 has the opposite of what they asked for, and
-        // this endpoint is the one that has no authentication in front of it.
-        if (::inet_pton(AF_INET, bind_address_.c_str(), &addr.sin_addr) != 1) {
-            OB_LOG_ERROR("metrics", "invalid --metrics-bind address '%s'; metrics endpoint not started",
-                         bind_address_.c_str());
-            ::close(listen_fd_);
-            listen_fd_ = -1;
-            return;
-        }
-    }
-
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        OB_LOG_ERROR("metrics", "bind() failed on port %u: %s", port_, std::strerror(errno));
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-        return;
-    }
-
-    if (::listen(listen_fd_, 8) < 0) {
-        OB_LOG_ERROR("metrics", "listen() failed: %s", std::strerror(errno));
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+        OB_LOG_ERROR("metrics", "%s", error.c_str());
         return;
     }
 

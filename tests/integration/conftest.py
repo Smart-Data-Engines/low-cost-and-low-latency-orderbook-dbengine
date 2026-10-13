@@ -125,6 +125,21 @@ def free_port() -> int:
         "process — something is leaking ports or the ephemeral range is exhausted")
 
 
+def has_ipv6_loopback() -> bool:
+    """Whether this host has `::1`, asked the only way that answers it: a socket binds it.
+
+    The port is the kernel's choice and the socket closes at once - no port number leaves this
+    function, which is what `test_no_module_allocates_its_own_port` guards. One copy here rather
+    than one per module that needs to know, for the reason `free_port()` is here.
+    """
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
 def patience(seconds: float) -> float:
     """A timeout, tripled where a sanitizer is instrumenting the server.
 

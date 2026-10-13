@@ -563,7 +563,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 
 | Flag | Argument | Meaning |
 |------|----------|---------|
-| `--advertise-host` | `<HOST>` | The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1) |
+| `--advertise-host` | `<HOST>` | The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1). A name, an IPv4 or an IPv6 address; an IPv6 one is published in brackets, `[::1]:21591` |
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
 | `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
 | `--backup-dir` | `<DIR>` | Where `BACKUP` writes this node's backups, one directory each: hard links on the data directory's filesystem, a checked copy on another. Not the data or the WAL directory, inside either or holding either - the start is refused. Without it `BACKUP` is refused (#34; `docs/operations.md`, "Backing up and restoring a node") |
@@ -592,25 +592,25 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--max-sessions` | `<N>` | Maximum concurrent client sessions (default: 64) |
 | `--max-subscriber-queue-bytes` | `<N>` | Per-subscriber queue ceiling; past it the session closes |
 | `--max-subscriptions-per-session` | `<N>` | Subscription limit per session (default: 16) |
-| `--metrics-bind` | `<ADDR>` | Address the metrics listener binds to (default: every interface) |
+| `--metrics-bind` | `<ADDR>` | IPv4 or IPv6 address the metrics listener binds to (default: every interface, both families) |
 | `--metrics-port` | `<PORT>` | Prometheus metrics port; 0 disables the endpoint |
 | `--migration-identity` | `<IDENTITY>` | The identity from `--auth-secret-file` a shard authenticates as on another shard's client port when it moves a symbol there (`MIGRATE`, #196); every shard's file must have it, and one its own file lacks refuses to start |
 | `--mm-max-catchup-bytes` | `<N>` | WAL bytes one catch-up round reads for a peer before the io loop turns to its other work (default: 8 MiB); a longer catch-up is more rounds |
 | `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |
 | `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |
 | `--mm-replication-port` | `<PORT>` | Multi-master peer port |
-| `--mm-bind` | `<ADDR>` | IPv4 address the multi-master port listens on (default: every interface), as `--replication-bind` is for the replication port (#203) |
+| `--mm-bind` | `<ADDR>` | IPv4 or IPv6 address the multi-master port listens on (default: every interface, both families), as `--replication-bind` is for the replication port (#203) |
 | `--multi-master` | — (boolean) | Run as a multi-master node instead of primary/replica |
 | `--node-id` | `<ID>` | This node's name, as it appears to the coordinator |
 | `--port` | `<PORT>` | TCP port to listen on (default: 9090) |
-| `--bind` | `<ADDR>` | IPv4 address the client port listens on (default: every interface). `127.0.0.1` keeps it to the machine without a firewall rule, with or without TLS and authentication on it; an address that does not parse is a refusal to start, not a listener on every interface (#203) |
-| `--primary-host` | `<HOST>` | Primary to replicate from, when starting as a replica |
+| `--bind` | `<ADDR>` | IPv4 or IPv6 address the client port listens on (default: every interface, both families: `::` taking IPv4 too). `127.0.0.1` keeps it to the machine without a firewall rule, with or without TLS and authentication on it; an address that does not parse is a refusal to start, not a listener on every interface (#203) |
+| `--primary-host` | `<HOST>` | Primary to replicate from, when starting as a replica: a name, an IPv4 or an IPv6 address, every address of a name tried in turn |
 | `--primary-port` | `<PORT>` | Primary's replication port |
 | `--print-config` | — (boolean) | Print every setting with its origin and exit; opens no port |
 | `--read-only` | — (boolean) | Refuse writes regardless of role |
 | `--replication-compress` | — (boolean) | Compress the replication stream with LZ4 |
 | `--replication-port` | `<PORT>` | Port replicas connect to on this node |
-| `--replication-bind` | `<ADDR>` | IPv4 address the replication port listens on (default: every interface) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
+| `--replication-bind` | `<ADDR>` | IPv4 or IPv6 address the replication port listens on (default: every interface, both families) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
 | `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |

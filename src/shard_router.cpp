@@ -1,6 +1,7 @@
 // ── ShardRouter — client-side shard routing implementation ───────────────────
 
 #include "orderbook/shard_router.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
@@ -154,16 +155,8 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
         cc.compress            = config_.compress;
         copy_client_access(config_, cc);
 
-        auto colon = node.address.rfind(':');
-        if (colon != std::string::npos) {
-            cc.host = node.address.substr(0, colon);
-            try {
-                cc.port = static_cast<uint16_t>(
-                    std::stoi(node.address.substr(colon + 1)));
-            } catch (...) {
-                cc.port = 9090;
-            }
-        } else {
+        // "host:port", an IPv6 host in brackets; a host alone is on 9090.
+        if (!net::split_host_port(node.address, cc.host, cc.port)) {
             cc.host = node.address;
             cc.port = 9090;
         }
@@ -209,16 +202,8 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
             cc.compress            = config_.compress;
         copy_client_access(config_, cc);
 
-            auto colon = mm.address.rfind(':');
-            if (colon != std::string::npos) {
-                cc.host = mm.address.substr(0, colon);
-                try {
-                    cc.port = static_cast<uint16_t>(
-                        std::stoi(mm.address.substr(colon + 1)));
-                } catch (...) {
-                    cc.port = 9090;
-                }
-            } else {
+            // "host:port", an IPv6 host in brackets; a host alone is on 9090.
+            if (!net::split_host_port(mm.address, cc.host, cc.port)) {
                 cc.host = mm.address;
                 cc.port = 9090;
             }
