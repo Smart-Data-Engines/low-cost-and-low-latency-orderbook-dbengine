@@ -392,6 +392,13 @@ def _build_tls_context(tls: bool, tls_ca_file: Optional[str],
     return ctx
 
 
+def _join_host_port(host: str, port: int) -> str:
+    """The other direction: an IPv6 host in brackets ("[::1]:5555"), any other host as it is - the
+    form a node publishes its address in, and the one a shard map names it by."""
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    return f"[{bare}]:{port}" if ":" in bare else f"{bare}:{port}"
+
+
 def _split_host_port(address: str, default_port: int) -> Tuple[str, int]:
     """"host:port" into its halves, an IPv6 host in brackets ("[::1]:5555"). A host alone is on
     `default_port`, and so is an IPv6 literal alone, with or without its brackets."""
@@ -479,8 +486,8 @@ class _TcpBackend:
                     self._abandon("", quietly=True)
                     if isinstance(e, (OrderbookError, OSError)):
                         raise OrderbookError(
-                            -1, f"the connection to {self._host}:{self._port} was closed while "
-                                f"this call was in flight") from e
+                            -1, f"the connection to {_join_host_port(self._host, self._port)} was "
+                                f"closed while this call was in flight") from e
                     raise
                 self._abandon(f"an exchange ({label}) did not finish: {str(e) or type(e).__name__}",
                               quietly=opening)
@@ -489,7 +496,7 @@ class _TcpBackend:
     def _check_open(self) -> None:
         if self._sock is not None:
             return
-        where = f"{self._host}:{self._port}"
+        where = _join_host_port(self._host, self._port)
         if self._closed_because is None:
             raise OrderbookError(-1, f"the connection to {where} is closed")
         raise OrderbookError(
@@ -544,7 +551,7 @@ class _TcpBackend:
                 # "wrong version number" here almost always means the port is not running with
                 # --tls-client: the plaintext banner arrives where a ServerHello was expected.
                 raise OrderbookTlsError(
-                    f"TLS handshake with {self._host}:{self._port} failed: {e}") from e
+                    f"TLS handshake with {_join_host_port(self._host, self._port)} failed: {e}") from e
             except OSError:
                 sock.close()
                 raise
@@ -1322,7 +1329,7 @@ class _ClientPool:
         self._health_thread.start()
 
     def _node_key(self, node: _NodeState) -> str:
-        return f"{node.host}:{node.port}"
+        return _join_host_port(node.host, node.port)
 
     def _connect_all(self):
         """Connect to all nodes that aren't already connected."""
@@ -1603,7 +1610,9 @@ class _ClientPool:
             connections = {}
             for sid, backend in self._routing.connections.items():
                 info = shards.get(sid)
-                where = f"{backend._host}:{backend._port}"
+                # As the node publishes it, an IPv6 host in brackets: written without them the
+                # comparison never held for one, and every refresh replaced the connection.
+                where = _join_host_port(backend._host, backend._port)
                 if info is None or self._shard_connection_closed(backend) or \
                         info.get("address", "") not in (where, backend._host):
                     retired.append(backend)

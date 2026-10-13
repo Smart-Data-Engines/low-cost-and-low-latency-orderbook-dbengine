@@ -12,6 +12,7 @@ integration job's skip gate refuses a skip it does not know, so in CI this runs.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ import urllib.request
 import pytest
 
 from conftest import cpp_client_binary_path, free_port, has_ipv6_loopback, patience, server_binary_path
+import orderbook_engine as ob
 from orderbook_engine import OrderbookEngine
 
 pytestmark = pytest.mark.smoke
@@ -321,6 +323,35 @@ def test_a_replica_given_its_primary_in_brackets_checks_the_certificate_against_
             primary.stop()
 
 
+def _start_etcd_on_ipv6(root: str) -> tuple[subprocess.Popen, str]:
+    """A native etcd on [::1], and its client URL. Its log is `etcd.log` in `root`."""
+    client_port, peer_port = free_port(), free_port()
+    url = f"http://[::1]:{client_port}"
+    with open(os.path.join(root, "etcd.log"), "ab") as log:
+        proc = subprocess.Popen(
+            [ETCD, "--name", "ipv6", "--data-dir", os.path.join(root, "etcd"),
+             "--advertise-client-urls", url, "--listen-client-urls", url,
+             "--listen-peer-urls", f"http://[::1]:{peer_port}",
+             "--initial-advertise-peer-urls", f"http://[::1]:{peer_port}",
+             "--initial-cluster", f"ipv6=http://[::1]:{peer_port}"],
+            stdout=log, stderr=subprocess.STDOUT)
+    try:
+        _wait_for_etcd(url)
+    except BaseException:
+        _stop(proc)
+        raise
+    return proc, url
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
 def _wait_for_etcd(url: str) -> None:
     deadline = time.time() + patience(30)
     last: Exception | None = None
@@ -340,19 +371,9 @@ def test_a_mesh_pair_meets_over_ipv6_through_an_etcd_on_ipv6():
     """Two multi-master nodes on ::1, finding each other through an etcd on ::1: each publishes
     `[::1]:<port>`, the other reads it back, splits it and dials it."""
     with tempfile.TemporaryDirectory(prefix="ob_ipv6_mesh_") as root:
-        client_port, peer_port = free_port(), free_port()
-        etcd_url = f"http://[::1]:{client_port}"
-        with open(os.path.join(root, "etcd.log"), "ab") as etcd_log:
-            etcd = subprocess.Popen(
-                [ETCD, "--name", "ipv6", "--data-dir", os.path.join(root, "etcd"),
-                 "--advertise-client-urls", etcd_url, "--listen-client-urls", etcd_url,
-                 "--listen-peer-urls", f"http://[::1]:{peer_port}",
-                 "--initial-advertise-peer-urls", f"http://[::1]:{peer_port}",
-                 "--initial-cluster", f"ipv6=http://[::1]:{peer_port}"],
-                stdout=etcd_log, stderr=subprocess.STDOUT)
+        etcd, etcd_url = _start_etcd_on_ipv6(root)
         nodes: list[Node] = []
         try:
-            _wait_for_etcd(etcd_url)
             for i in (1, 2):
                 d = os.path.join(root, f"node-{i}")
                 os.makedirs(d)
@@ -389,9 +410,51 @@ def test_a_mesh_pair_meets_over_ipv6_through_an_etcd_on_ipv6():
         finally:
             for node in reversed(nodes):
                 node.stop()
-            etcd.terminate()
+            _stop(etcd)
+
+
+def test_a_pool_keeps_its_connection_to_a_shard_at_an_ipv6_address():
+    """A shard map names a shard by the address its node publishes: `[::1]:<port>` for IPv6. The
+    pool compared that with its connection's host and port written without brackets, so the
+    comparison never held, and every refresh of the map replaced the connection to that shard."""
+    with tempfile.TemporaryDirectory(prefix="ob_ipv6_shards_") as root:
+        etcd, etcd_url = _start_etcd_on_ipv6(root)
+        node: Node | None = None
+        eng: OrderbookEngine | None = None
+        try:
+            d = os.path.join(root, "s0")
+            os.makedirs(d)
+            node = Node(d, "::1", ["--bind", "::1"])
+            node.start()
+            address = ob._join_host_port("::1", node.port)
+            shard_map = {"active_migrations": [], "assignments": {"V6SHARD.EX": "s0"},
+                         "pinned_symbols": [], "version": 1,
+                         "shards": {"s0": {"address": address, "mm_nodes": [], "shard_id": "s0",
+                                           "status": "active", "vnodes": 150}}}
+            body = json.dumps({"key": base64.b64encode(b"/ob/shard_map").decode(),
+                               "value": base64.b64encode(json.dumps(shard_map).encode()).decode()})
+            req = urllib.request.Request(f"{etcd_url}/v3/kv/put", data=body.encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                assert resp.status == 200
+
+            eng = OrderbookEngine(hosts=[address], coordinator_endpoints=[etcd_url],
+                                  health_check_interval=3600)
+            first = eng._pool._routing.connections.get("s0")
+            assert first is not None, "the pool opened no connection to the shard the map names"
+            eng._pool._refresh_routing(eng._pool._routing.shard_map)
+            assert eng._pool._routing.connections.get("s0") is first, (
+                f"a refresh of the same map replaced the connection to {address}")
+            eng.insert("V6SHARD", "EX", "bid", [100], [1], [1])
+            reader = node.client()
             try:
-                etcd.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                etcd.kill()
-                etcd.wait(timeout=10)
+                reader.flush()
+                assert [r.price for r in reader.query_all("V6SHARD", "EX")] == [100]
+            finally:
+                reader.close()
+        finally:
+            if eng is not None:
+                eng.close()
+            if node is not None:
+                node.stop()
+            _stop(etcd)

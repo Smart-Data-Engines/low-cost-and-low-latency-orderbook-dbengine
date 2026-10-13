@@ -2617,7 +2617,10 @@ every listener and every connection, and splits and joins every address:
 - an IPv6 host is in brackets wherever a port follows it (`[::1]:9090`), and an IPv4 client of a
   dual-stack port is logged, and shown in `STATUS`, as itself.
 
-The Python client dials with `socket.create_connection()` and reads brackets in `hosts=[...]`.
+The Python client dials with `socket.create_connection()`, reads brackets in `hosts=[...]` and
+writes them wherever a port follows a host. That includes the address it matches against a shard
+map's, and written without them a refresh of the map would have replaced the connection to an IPv6
+shard every time.
 
 **The default changed with it.** A port with no bind flag listened on `0.0.0.0`, and now listens on
 IPv6 too. A host whose firewall covers IPv4 alone exposes it on IPv6 after the upgrade, so the
@@ -2639,7 +2642,8 @@ both ways. `test_ipv6.py` holds a node on `::1`:
 - a node with no bind answering both families;
 - a replica following its primary, which `STATUS` names `[::1]:<port>`;
 - an IPv4 replica of a dual-stack port, named by its IPv4 address;
-- a mesh pair that finds each other through an etcd on `[::1]`.
+- a mesh pair that finds each other through an etcd on `[::1]`;
+- a pool that keeps its connection to a shard at `[::1]:<port>` across a refresh of the map.
 
 Against a server and clients built before this item, five of those six fail. The sixth, the IPv4
 replica, passes on both: it is the control.

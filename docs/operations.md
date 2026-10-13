@@ -178,7 +178,8 @@ The coordinator's endpoints are URLs and go to libcurl as they are, with an IPv6
 - the C++ client, given `::1` and `[::1]`;
 - a replica following its primary, and the primary's `STATUS` naming it `[::1]:<port>`;
 - an IPv4 replica of a port with no bind, named by its IPv4 address;
-- a mesh pair that finds each other through an etcd on `[::1]`.
+- a mesh pair that finds each other through an etcd on `[::1]`;
+- a pool that keeps its connection to a shard at `[::1]:<port>` across a refresh of the shard map.
 
 ## Sharding by symbol
 
