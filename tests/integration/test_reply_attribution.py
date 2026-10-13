@@ -528,6 +528,25 @@ def test_an_answer_no_reader_can_parse_is_refused_at_once_rather_than_waited_out
         server.close()
 
 
+def test_a_pushed_row_names_its_side_as_every_other_row_does() -> None:
+    """#239. A client resuming a subscription from a book applies pushed rows to the rows `book()`
+    returned, and the two named a side differently: "bid" and "ask" in a book, the wire's 0 and 1 in
+    a push, whatever `OrderbookRow` says its `side` is. A side that is neither is a malformed push,
+    dropped like one whose number does not parse."""
+    pushes = (b"PUSH 7\t1700000000000000000\t100\t5\t1\t0\t0\t42\n"
+              b"PUSH 7\t1700000000000000001\t101\t6\t1\t1\t0\t43\n"
+              b"PUSH 7\t1700000000000000002\t102\t7\t1\t2\t0\t44\n")
+    server = ScriptedServer([pushes + b"OK\n\n"])
+    client = OrderbookEngine(host="127.0.0.1", port=server.port, timeout=5.0)
+    try:
+        assert client._tcp.execute("FLUSH") == "OK\n\n"
+        got = [(row.sequence_number, row.side) for _, row in client._tcp.take_pushes()]
+        assert got == [(42, "bid"), (43, "ask")], got
+    finally:
+        client.close()
+        server.close()
+
+
 def test_an_answer_and_a_pushed_row_that_arrive_in_pieces_are_read_whole() -> None:
     """The other side of refusing at once: bytes that may still become an answer, or a pushed row,
     are waited for - `P` could be `PONG` or `PUSH `, and `O` could be `OK`."""
