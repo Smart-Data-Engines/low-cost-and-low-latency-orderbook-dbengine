@@ -4251,6 +4251,20 @@ Learned the hard way. Check here before debugging.
      207-230 faults and 0.51-0.54 after 313-318, or 0.64-0.75 ms after 37-50 faults - a 2 MiB page to
      zero - and 0.46-0.51 after 81-98. Print the faults beside the time, and when the ranges are wide,
      run more rounds before reading the ratio (#223).
+581. **A label read after a seqlock snapshot can be newer than the snapshot.** `read_book()` read the
+     buffer's sequence number after `read_snapshot()` had copied the sides, so a write between a
+     side's copy and that load labelled a book with an update it did not hold: 22 to 33 books of a
+     run of about a second, under a writer, in a Debug build (#239). Read before the copies, under
+     every seqlock a write to it goes through, a label is a lower bound instead. Which end of a read
+     a label is taken at decides what it promises, and a client resuming from it needs the lower
+     bound.
+582. **A relaxed flag the write path reads is ordered after nothing.** `has_subscribers()` is a
+     relaxed load, and the registration's store is ordered before nothing a writer does. A write can
+     read the flag before the registration is visible while its own stores are still unseen by the
+     subscriber's next read: store buffering, which only sequentially consistent fences on both sides
+     forbid. `Engine::subscribe()` takes the write lock once after registering instead (#239), which
+     puts every write on one side of the call for one lock on a rare path. No test can open that
+     window, so a static test holds the lock where it is.
 
 ## Current state and open problems
 

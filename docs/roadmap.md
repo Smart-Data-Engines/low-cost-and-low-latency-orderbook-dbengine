@@ -2677,6 +2677,92 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 239. A client resuming a subscription from a book, as documented, lost updates ✅ **P2**
+
+**Found reading `BOOK`'s documentation against the code**, looking for what #45's subscriptions still
+lacked. A client that joins a stream under way needs a state to start from, and `docs/cli.md` gave
+the recipe: take the book, then subscribe, and discard every push at or below the book's
+`sequence_number`. The README, `book()`'s docstring and `docs/python.md` called that the number to
+resume from, after #145. Spec: `smart-data-engine-workspace/specs/resume-from-a-book/`.
+
+**Two ways to lose an update, both measured before the fix:**
+- **The order.** An update written between the book and the subscription is in neither. A probe ran a
+  writer against a local node, 50 trials each way (`resume_probe.py`). The documented order lost
+  updates in 50 of 50 trials on master's server, 62 in all, and in 48 of 50 on this branch's, since
+  the order is the documentation's and not the server's. Subscribing first lost none on either.
+- **The label.** `read_book()` read the buffer's sequence number and timestamp after
+  `read_snapshot()` had copied the sides. A write between a side's copy and that load labelled the
+  book with an update the side did not hold yet, and the client dropped that update's push as
+  already in the book. In `QueryBook.ABookHoldsEveryUpdateUpToTheSequenceNumberItReports` both sides
+  hold a thousand levels and a writer sets the best bid's quantity to each update's number. In three
+  runs on master, 22, 33 and 24 books of 2 599, 1 111 and 2 120 reported a number their contents did
+  not hold yet, in a Debug build.
+
+And two that the recipe rests on just the same, the second of which no test reaches:
+- the number and the timestamp were two loads, so they could be two updates'. Two books of those
+  runs did pair one update's number with another's timestamp. The timestamp was a plain field, read
+  by another thread than the one writing it;
+- a write asks whether anyone is subscribed with a relaxed load, which nothing orders after a
+  registration. A write could miss a subscription registered just before it while its own stores
+  were still unseen by the book taken next. Its update was then neither pushed nor in the book.
+
+**Done.**
+- `read_snapshot()` returns the label, `SnapshotLabel`, read before the sides and under both sides'
+  versions: both even and unchanged around its two loads. It is one update's pair, and a lower bound.
+  Each side holds every update up to it, and may hold one applied between the label and that side's
+  copy. `BOOK` and the aggregates take it from there.
+- `last_timestamp_ns` is atomic. The writer's code did not change on x86: GCC 15 at `-O3` emits the
+  same instructions for `apply_delta()`. On ARM, GCC 14 adds one `mov` to put the timestamp's
+  address in a register, and the store is a plain `str` as before.
+- `Engine::subscribe()` takes the write lock once after registering. A write that takes it after
+  that sees the subscription, and one that released it before is held by any read made after
+  `subscribe()` returns.
+- In the Python client a pushed row's `side` is `"bid"` or `"ask"`, as in a book's rows. It was the
+  wire's 0 or 1, so a client applying pushes to the rows `book()` returned matched no side.
+- The recipe, in `docs/query-language.md` with `BOOK`, `book()` and the README pointing at it:
+  subscribe, then take the book, then apply the pushes numbered above its number, in order.
+  - A push the book already holds applies again harmlessly: it sets a level to a quantity rather
+    than adding to it.
+  - On a multi-master mesh the numbers are per origin, and neither a push nor a book says whose. The
+    recipe is for a primary and its replicas.
+- #145 had `BOOK` read the sides one after the other, and said that making it atomic needed a change
+  on the write path. It does not: a reader can check both versions around both copies. The cost is
+  that a write to either side would then restart the whole read, and `docs/cli.md` says that now.
+
+**Tests.** Six tests:
+- `QueryBook.ABookHoldsEveryUpdateUpToTheSequenceNumberItReports`, the race in process. It fails on
+  master as above, and on this branch no book of a run is behind its number or pairs two updates.
+- `SoABuffer.TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt`: a writer alternating the
+  sides of a book of one level each, and about a million labels a run held to the lower bound on both
+  sides and to the pair.
+- `SoABuffer.TheLabelWaitsForAnUpdateUnderWay`: an update held half written by hand, its number
+  stored and its timestamp not, which the race reaches only by chance.
+- `QueryBookStatic.TheLabelComesFromTheSnapshotAndASubscriptionIsInForceWhenItReturns`: no query
+  reads the label from the buffer, and `subscribe()` takes the lock after it registers.
+- `test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss` holds the recipe end to
+  end. On a live node, under a writer in batches, every update above the first book's number has to
+  arrive as a push, and every book has to show its own update. Master's server passes it too: no book
+  of 4 171 was behind its number. Through a node a write rarely lands inside a book's read, and the
+  race is found in process.
+- `test_a_pushed_row_names_its_side_as_every_other_row_does`, against a scripted server: a bid, an
+  ask, and a push whose side is neither, dropped.
+
+**Mutations.** Fourteen, eleven of them killed by a named test:
+- the label read after the sides, the defect as it was: the race test in process, 19 books of 356;
+- `BOOK` taking the label from the buffer after the snapshot: the same, 39 of 962. The aggregates
+  doing so are killed by the static test alone;
+- the versions not checked again, or one side's only; the label read during an update; either half
+  of the pair stored outside the writer's seqlock. The SoA race test kills each, with 43 to 77 167
+  labels in a million from two updates;
+- the lock gone from `subscribe()`, or taken before the registration: the static test.
+
+Three survive, as they should. A reworded log line, and the pair's two loads swapped inside the
+window the versions check, which is still a correct read. And the label's version loads relaxed
+rather than acquire: x86 orders loads anyway, so no test on this machine can see that one go.
+
+- Effort: S | Impact: a client that joins a stream under way, by the recipe the documentation gives,
+  holds every update
+
 ### 238. A renewed certificate needed a restart of every node ✅ **P3**
 
 **One of the known gaps until now.** The certificate, key and CA of the three TLS surfaces were read
