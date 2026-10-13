@@ -1386,10 +1386,13 @@ bool MultiMasterManager::attach_tls(PeerConnection& peer) {
         return true;
     }
 
-    const TlsContext& ctx = peer.we_accepted ? *config_.tls_server : *config_.tls_client;
+    // The context in force now: a reload (#238) changes it for the connections after it, and the
+    // channel's `SSL` keeps this one alive for as long as this connection lasts.
+    const std::shared_ptr<const TlsContext> ctx =
+        (peer.we_accepted ? config_.tls_server : config_.tls_client)->current();
     try {
-        peer.tls = ctx.open_channel(peer.fd, /*server_side=*/peer.we_accepted,
-                                    peer.address.empty() ? std::string("(accepted)") : peer.address);
+        peer.tls = ctx->open_channel(peer.fd, /*server_side=*/peer.we_accepted,
+                                     peer.address.empty() ? std::string("(accepted)") : peer.address);
     } catch (const std::exception& e) {
         OB_LOG_ERROR("mm", "cannot start a TLS handshake on fd=%d (%s): %s", peer.fd,
                      peer.address.c_str(), e.what());

@@ -283,6 +283,33 @@ TlsContext::~TlsContext() {
     if (ctx_ != nullptr) SSL_CTX_free(ctx_);
 }
 
+std::string TlsContext::certificate_subject() const {
+    if (ctx_ == nullptr) return {};
+    X509* cert = SSL_CTX_get0_certificate(ctx_);   // the context's, not ours to free
+    if (cert == nullptr) return {};
+    char* line = X509_NAME_oneline(X509_get_subject_name(cert), nullptr, 0);
+    if (line == nullptr) {
+        ERR_clear_error();
+        return {};
+    }
+    std::string out = sanitise_for_log(line);
+    OPENSSL_free(line);
+    return out;
+}
+
+std::optional<int64_t> TlsContext::certificate_not_after() const {
+    if (ctx_ == nullptr) return std::nullopt;
+    X509* cert = SSL_CTX_get0_certificate(ctx_);
+    if (cert == nullptr) return std::nullopt;
+    const ASN1_TIME* t = X509_get0_notAfter(cert);
+    struct tm tm {};
+    if (t == nullptr || ASN1_TIME_to_tm(t, &tm) != 1) {
+        ERR_clear_error();
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(timegm(&tm));
+}
+
 TlsContext::TlsContext(TlsContext&& other) noexcept
     : ctx_(other.ctx_), peer_names_(std::move(other.peer_names_)) {
     other.ctx_ = nullptr;

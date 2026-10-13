@@ -14955,7 +14955,8 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   verify the chain *and* the name; on the node links verification is mutual and cannot be configured
   otherwise. Three things are still worth a reviewer's notice. **Every one of those flags defaults
   to off**, so a cluster that nobody configured is plaintext on all three surfaces and says so only
-  in its startup log. **Certificate rotation needs a restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
+  in its startup log. **`--tls-peer-names` is read only at the start**: a certificate is replaced
+  with `SIGHUP` since #238, but narrowing who may join is a restart. And **`--tls-peer-names` empty means chain-only verification**,
   which under a company-wide CA means any host it signs may join the cluster — the list is the
   mechanism that narrows that, and the startup log names which mode is in force.
   *(This bullet used to say the replication link and the mesh were plaintext. That was true until

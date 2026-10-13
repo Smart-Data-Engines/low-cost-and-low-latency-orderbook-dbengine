@@ -5,24 +5,38 @@
 //
 // Signals:
 //   SIGINT / SIGTERM → graceful shutdown
+//   SIGHUP           → read the TLS certificate, key and CA again (#238)
 
 #include "orderbook/tcp_server.hpp"
 #include "orderbook/version.hpp"
 
+#include <pthread.h>
+
 #include <atomic>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <string>
 #include <thread>
 
-// ── Global shutdown flag ──────────────────────────────────────────────────────
+// ── Global signal flags ───────────────────────────────────────────────────────
 
 static std::atomic<bool> g_shutdown_requested{false};
 
+/// SIGHUPs received, for the monitor to compare with the ones it has handled (#238). A count
+/// rather than a flag, so a signal arriving while a reload runs is not lost to the reset of a flag.
+static std::atomic<uint32_t> g_reload_requested{0};
+// What a signal handler may touch: a lock-free atomic. Not a mutex, not the logger.
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+
 static void signal_handler(int /*signum*/) {
     g_shutdown_requested.store(true, std::memory_order_relaxed);
+}
+
+static void reload_handler(int /*signum*/) {
+    g_reload_requested.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ── Help ──────────────────────────────────────────────────────────────────────
@@ -66,6 +80,27 @@ static int run_server(int argc, char* argv[]) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // SIGHUP reads the TLS files again (#238). Its default action ends the process, and that was
+    // this server's answer to it until then - so installed here, before anything is loaded, and a
+    // `systemctl reload` sent during the start is a reload once the monitor runs, not a stop.
+    struct sigaction hup{};
+    hup.sa_handler = reload_handler;
+    sigemptyset(&hup.sa_mask);
+    hup.sa_flags = SA_RESTART;
+    sigaction(SIGHUP, &hup, nullptr);
+
+    // And delivered to the monitor thread alone. The kernel hands a signal sent to the process to
+    // any thread that does not block it, and a handler run on a thread in `epoll_wait`, or in a
+    // `recv` on a socket with a receive timeout, makes that call fail with EINTR whatever
+    // SA_RESTART says. The replica's stream reader counts that failure as a disconnect. It did not
+    // matter while every signal handled here ended the process; a reload must interrupt nothing
+    // that goes on after it. Blocked before the server makes a thread, so every thread it makes
+    // inherits the block, and the monitor lifts it for itself.
+    sigset_t hup_only;
+    sigemptyset(&hup_only);
+    sigaddset(&hup_only, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &hup_only, nullptr);
+
     // Ignore SIGPIPE. Writing to a socket whose peer has gone raises it, and the
     // default action is to kill the process — one disconnecting client would take
     // the server and every other session down with it. Individual writes use
@@ -90,7 +125,8 @@ static int run_server(int argc, char* argv[]) {
 
     ob::TcpServer server(std::move(config));
 
-    // Monitor thread: polls g_shutdown_requested and calls server.shutdown().
+    // Monitor thread: polls g_shutdown_requested and calls server.shutdown(), and reloads TLS on
+    // SIGHUP - here rather than in the handler, which may not take a lock or allocate.
     //
     // `monitor_done` is a second flag rather than a reuse of the first, and the difference is what
     // the log says. Reusing it made a failed bind print "Shutdown requested - the epoll loop will
@@ -98,9 +134,20 @@ static int run_server(int argc, char* argv[]) {
     // announcing something nobody asked for is the same defect as a line announcing a guarantee the
     // code does not give.
     std::atomic<bool> monitor_done{false};
-    std::thread monitor([&server, &monitor_done]() {
+    std::thread monitor([&server, &monitor_done, hup_only]() {
+        pthread_setname_np(pthread_self(), "ob-signals");
+        pthread_sigmask(SIG_UNBLOCK, &hup_only, nullptr);
+        // Starts at 0, not at the count now: a SIGHUP between the handler and this thread was held
+        // pending, and was sent by someone who replaced the files after the constructor read them.
+        uint32_t reloads_handled = 0;
         while (!g_shutdown_requested.load(std::memory_order_relaxed) &&
                !monitor_done.load(std::memory_order_relaxed)) {
+            // Every SIGHUP since the last pass is one reload: they all read the same files.
+            const uint32_t asked = g_reload_requested.load(std::memory_order_relaxed);
+            if (asked != reloads_handled) {
+                reloads_handled = asked;
+                server.reload_tls();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (g_shutdown_requested.load(std::memory_order_relaxed)) {

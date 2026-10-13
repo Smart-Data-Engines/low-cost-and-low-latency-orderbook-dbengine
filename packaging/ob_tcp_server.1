@@ -112,17 +112,35 @@ so the package does not have to create it and then hope nothing changes its owne
 .I /lib/systemd/system/ob_tcp_server.service
 Shipped unit.
 .SH SECURITY
-.B The wire protocol authenticates and does not encrypt.
 Client sessions authenticate with
 .B \-\-auth\-secret\-file
 and the replication and multi\-master links with
 .BR \-\-cluster\-secret\-file ,
 by challenge\-response over HMAC\-SHA256, so a secret never crosses the wire. Both are off by
-default and the startup log warns for each disabled surface. Nothing is encrypted, so every query
-and every row is readable by anything on the path: do not expose a node outside a trusted network.
+default and the startup log warns for each disabled surface.
+.B TLS 1.3
+encrypts the client port
+.RB ( \-\-tls\-client )
+and the two node links
+.RB ( \-\-tls\-replication ", " \-\-tls\-multi\-master );
+on a node link each end verifies the other's certificate. It is off by default too, and without it every
+query and every row is readable by anything on the path: do not expose such a node outside a
+trusted network.
 The two secret files must not contain the same secret \- a client holding the cluster secret can
 present itself as a replica \- and the start is refused if they do. See
 .IR SECURITY.md .
+.SH SIGNALS
+.TP
+.BR SIGTERM ", " SIGINT
+Stop: new connections are refused, open sessions get up to
+.BR \-\-drain\-timeout\-ms ,
+and the exit status is 0.
+.TP
+.B SIGHUP
+Read the TLS certificate, key and CA again from the paths the server started with, for the
+connections opened after it. Files it refuses leave the certificate in force, and the log says why.
+.B systemctl reload
+sends it. Without TLS it is logged and changes nothing.
 .SH EXIT STATUS
 .TP
 .B 0

@@ -17,6 +17,11 @@ Type=simple
 # and changing one setting would have meant editing a unit file and running daemon-reload.
 ExecStart=/usr/bin/ob_tcp_server --config /etc/orderbook/ob.conf
 
+# `systemctl reload` reads the TLS certificate, key and CA again from the paths ob.conf names (#238):
+# new connections get the new certificate, open ones finish on theirs, and files the engine refuses
+# leave the old one in force. Nothing else is reloaded - a change to ob.conf is a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=on-failure
 RestartSec=5s
 

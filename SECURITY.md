@@ -124,6 +124,16 @@ A node link needs a trust anchor (`--tls-ca-file`) and the process refuses to st
 There is deliberately no "encrypt but do not verify the peer" mode for those links: it would leave
 this relay open while looking like protection.
 
+**A certificate is replaced without a restart** (#238). `SIGHUP`, which `systemctl reload` sends,
+reads the certificate, the key and the CA again. The files are held to the start's rules: a key
+readable beyond its owner, or one that does not match its certificate, is refused. A refused reload
+leaves the certificate in force rather than a node without one, and every surface changes or none
+does. Connections already open keep the certificate they were opened with.
+`ob_tls_certificate_not_after_seconds` says when the one in force expires, and the shipped rules
+alert two weeks before. A reload does not read `--tls-peer-names`, so taking one node's identity out
+of a cluster is still a restart. [docs/operations.md](docs/operations.md), "Replacing a
+certificate".
+
 What has not changed: an attacker with that level of network control over a **plaintext** cluster
 link already reads every row and can inject records into the stream, authentication or not. So
 **authentication alone is not a reason to move a node onto a network you do not trust** — with TLS

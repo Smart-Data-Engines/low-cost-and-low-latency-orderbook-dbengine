@@ -1146,8 +1146,8 @@ void ReplicationManager::accept_replica() {
         // the "this reader now belongs to a different connection" call.
         if (config_.tls_server != nullptr) {
             try {
-                info.tls = config_.tls_server->open_channel(client_fd, /*server_side=*/true,
-                                                            info.address);
+                info.tls = config_.tls_server->current()->open_channel(
+                    client_fd, /*server_side=*/true, info.address);
                 info.reader.set_tls(info.tls);
                 OB_LOG_DEBUG("repl_mgr", "tls handshake started for replica fd=%d from %s",
                              client_fd, info.address.c_str());
@@ -2298,7 +2298,8 @@ void ReplicationClient::connect_to_primary() {
     // 5-second `SO_RCVTIMEO`, so a primary that accepts TCP and then says nothing is a transient
     // failure that `run_loop()` retries, not a stalled event loop.
     if (config_.tls_client != nullptr) {
-        tls_ = config_.tls_client->open_channel(fd_, /*server_side=*/false, config_.primary_host);
+        tls_ = config_.tls_client->current()->open_channel(fd_, /*server_side=*/false,
+                                                           config_.primary_host);
         // The name check, and it is not what SSL_VERIFY_PEER does. Without it any certificate this
         // CA signed authenticates any host, so with a private CA signing the cluster another node's
         // certificate would be accepted here and the relay in SECURITY.md would still work

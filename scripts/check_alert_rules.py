@@ -50,6 +50,9 @@ FAULTS = {
     "OrderbookBackupFailed": ([("ob_backup_failures_total", "0 0 0 1 1 1")], 4),
     # A backup at t=60 s and none since: 27 hours on, time() is past the cut by more than 26.
     "OrderbookBackupStale": ([("ob_backup_last_success_timestamp_seconds", "60x1700")], 27 * 60),
+    # A certificate that ends ten days after t=0.
+    "OrderbookCertificateExpiring": ([("ob_tls_certificate_not_after_seconds", "864000x20")], 10),
+    "OrderbookTlsReloadFailed": ([("ob_tls_reload_failures_total", "0 0 0 1 1 1")], 4),
 }
 
 # alert -> (input series, minute) at which it must **not** fire: the cases a fault's shape could be
@@ -57,6 +60,8 @@ FAULTS = {
 QUIET = {
     # A node that never took a backup exports 0, and is not paged for a schedule it does not have.
     "OrderbookBackupStale": ([("ob_backup_last_success_timestamp_seconds", "0x1700")], 27 * 60),
+    # A node without TLS exports 0, which is not a certificate that expired in 1970.
+    "OrderbookCertificateExpiring": ([("ob_tls_certificate_not_after_seconds", "0x20")], 10),
 }
 
 # What a healthy primary with two replicas and two mesh peers exports for twenty minutes.
@@ -71,6 +76,8 @@ HEALTHY = [
     ("ob_mm_peer_dropped_clock_total", "0x20"), ("ob_auth_failures_total", "0x20"),
     ("ob_subscription_overflow_disconnects_total", "0x20"),
     ("ob_backup_failures_total", "0x20"), ("ob_backup_last_success_timestamp_seconds", "600x20"),
+    # A certificate with thirty days left, and no refused reload.
+    ("ob_tls_certificate_not_after_seconds", "2592000x20"), ("ob_tls_reload_failures_total", "0x20"),
 ]
 
 

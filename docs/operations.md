@@ -871,6 +871,8 @@ Two files ship with the engine (#35):
 | `OrderbookSubscribersDisconnected` | warning | subscribers closed for reading too slowly | below, `ob_subscription_queued_bytes` |
 | `OrderbookBackupFailed` | warning | a backup failed; it left nothing that looks like one | "Backing up and restoring a node" |
 | `OrderbookBackupStale` | warning | a node that has taken backups has no complete one from the last 26 hours; one that never took any is not paged | "Backing up and restoring a node" |
+| `OrderbookCertificateExpiring` | warning | the TLS certificate in force ends within 14 days, or has ended; a node without TLS is not paged | "Replacing a certificate" |
+| `OrderbookTlsReloadFailed` | warning | a TLS reload was refused, and the node still presents the certificate it had | "Replacing a certificate" |
 
 The thresholds are starting points for a deployment to tune: 64 MiB of replication lag is seconds of
 writes at the ceiling and hours of a quiet market. What is not left to taste is checked in CI:
@@ -2225,10 +2227,8 @@ The start is **refused**, not degraded, on each of these:
 **TLS 1.3 is the floor and is not configurable.** A client offering only 1.2 is refused. That is
 deliberate: the version floor is the one setting where "configurable" means "misconfigurable".
 
-**Certificate rotation needs a restart.** Reloading in place would mean two live contexts and a
-question about sessions established on the old one; that is a separate item rather than a silent
-half-measure. Plan the restart the way you plan any other: one node at a time, and the cluster
-keeps serving.
+**A certificate is replaced without a restart**: new files, then `SIGHUP`
+([replacing a certificate](#replacing-a-certificate)).
 
 ### TLS on the replication link and the mesh
 
@@ -2338,6 +2338,65 @@ sense that a cluster can run on mTLS alone — the certificate proves who the pe
 bound to the channel, which the secret cannot. It is not an alternative in the sense of one
 switching the other off: two mechanisms combined by AND mean a failure of either is visible, and
 combined by OR mean neither can be seen to have stopped working.
+
+### Replacing a certificate
+
+Put the new files at the paths the node was started with and send it `SIGHUP`; the shipped unit's
+`ExecReload` does that for `systemctl reload` (#238). The node reads the certificate, the key and the
+CA again, for every TLS surface at once. It reads nothing before the signal, so the order in which
+the files are replaced does not matter:
+
+```bash
+sudo install -m 644 -o orderbook -g orderbook renewed.pem     /etc/orderbook/tls/cert.pem
+sudo install -m 600 -o orderbook -g orderbook renewed-key.pem /etc/orderbook/tls/key.pem
+sudo systemctl reload ob_tcp_server
+journalctl -u ob_tcp_server -n 20 | grep 'TLS reload'
+```
+
+```
+TLS reloaded, new connections present subject /CN=db1.internal, valid until 2027-10-13T09:30:00Z; connections already open keep the certificate they were opened with
+```
+
+- **New connections, accepted or dialled, get the new certificate. A connection already open
+  finishes on the one it was opened with**, because its session holds it. A client session ends when
+  the client leaves, but a replication or mesh link lasts as long as both nodes do, so it presents
+  the new certificate from its next connection.
+- **A reload the node refuses changes nothing.** The files are held to the start's rules in the
+  table above: a key that does not match the certificate, a key others may read, a file it cannot
+  read or that is empty. Every surface keeps the certificate it had, the node goes on serving, and
+  the log says which file and why:
+
+  ```
+  TLS reload refused, every surface keeps the certificate it had: TLS private key '/etc/orderbook/tls/key.pem' rejected: error:05800074:x509 certificate routines::key values mismatch
+  ```
+
+  Fix the files and send the signal again.
+- **All the surfaces or none.** When one surface's files are refused, no surface changes - not
+  even the client port when the refusal is a CA bundle, which only the node links read - so a node
+  never presents one certificate on one surface and another on the next.
+- **What is read again is the three files.** The paths, `--tls-peer-names` and the `--tls-*` flags
+  are what the node started with, and changing them is a restart. So are the secret files and the
+  permissions file.
+
+Three metrics follow it: `ob_tls_reloads_total`, `ob_tls_reload_failures_total`, and
+`ob_tls_certificate_not_after_seconds`, when the certificate in force expires in Unix time (0 on a
+node without TLS). The shipped rules page on each:
+- `OrderbookCertificateExpiring` fires two weeks before that time;
+- `OrderbookTlsReloadFailed` fires on a refused reload.
+
+A node without TLS logs `nothing to reload` and goes on serving. **Before #238 `SIGHUP` stopped the
+server:** nothing handled it, and the signal's default action ends a process. A script that relied
+on that stops nothing now, and `SIGTERM` is the signal that drains and stops a node.
+
+**Moving a cluster to a new CA takes three reloads on every node, and no restart.** The CA file is
+read again too:
+1. a bundle holding both CAs (`cat old-ca.pem new-ca.pem > cluster-ca.pem`);
+2. each node's certificate signed by the new CA;
+3. the bundle with only the new CA.
+
+Each step is done on every node before the next begins, so every node trusts whatever certificate
+any other presents. A client that verifies the client port needs the new CA in its own trust store
+before step 2.
 
 ### Connecting over TLS
 

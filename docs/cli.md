@@ -616,10 +616,10 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
 | `--snapshot-staging-dir` | `<DIR>` | Where an incoming snapshot is staged before install |
-| `--tls-ca-file` | `<PATH>` | Trust anchor (PEM) for verifying peer certificates on node links; required by `--tls-replication` and `--tls-multi-master` |
-| `--tls-cert-file` | `<PATH>` | This node's certificate chain (PEM), used on every TLS surface and in both roles |
+| `--tls-ca-file` | `<PATH>` | Trust anchor (PEM) for verifying peer certificates on node links; required by `--tls-replication` and `--tls-multi-master`; read again on `SIGHUP` |
+| `--tls-cert-file` | `<PATH>` | This node's certificate chain (PEM), used on every TLS surface and in both roles; read again on `SIGHUP` |
 | `--tls-client` | — (boolean) | TLS on the client port; needs --tls-cert-file and --tls-key-file |
-| `--tls-key-file` | `<PATH>` | This node's private key (PEM); mode 600 |
+| `--tls-key-file` | `<PATH>` | This node's private key (PEM); mode 600; read again on `SIGHUP` |
 | `--tls-multi-master` | — (boolean) | TLS with mutual certificate verification on the multi-master mesh; needs `--tls-ca-file` |
 | `--tls-peer-names` | `<NAMES>` | Comma-separated identities an accepted peer's certificate may carry; empty accepts any name this CA signed |
 | `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |
@@ -832,6 +832,17 @@ A configuration file with a mistake in it does not start a server. Same rule as 
 Duplicate keys are refused rather than resolved last-wins, because last-wins is a silent choice
 between two things you wrote. A chain of config files is refused outright rather than depth-limited,
 because a depth limit answers "how deep" when the question is "why".
+
+## Signals
+
+| Signal | What `ob_tcp_server` does |
+|---|---|
+| `SIGTERM`, `SIGINT` | stops: new connections are refused, open sessions get up to `--drain-timeout-ms`, and the exit is 0 |
+| `SIGHUP` | reads the TLS certificate, key and CA again from the paths it started with, for the connections after it (#238): "Replacing a certificate" in `docs/operations.md`. Files it refuses leave the certificate in force. Without TLS it logs `nothing to reload` |
+| `SIGPIPE` | ignored: a client that leaves in the middle of a response ends its own session, not the server |
+
+`systemctl reload ob_tcp_server` sends `SIGHUP`. Until #238 nothing handled it, and its default
+action ended the server.
 
 ## Multi-Master Replication
 
