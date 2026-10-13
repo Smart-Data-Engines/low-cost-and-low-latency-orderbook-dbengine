@@ -1247,7 +1247,7 @@ An hour on an m8a.xlarge (`evidence/2026-10-12-binance-live-example/`):
 **Why.** Ingestion is solved. What a trading firm actually asks next is analytical: bars, windows,
 and getting data into their existing Python stack without a copy.
 
-### 44. Time-bucketed aggregation in the query language
+### 44. Time-bucketed aggregation in the query language ✅
 - `GROUP BY time_bucket(interval)`, OHLCV bar generation, time-weighted mid price, rolling windows
 - **Step 1 done: aggregates over the rows of each bucket** (spec `smart-data-engine-workspace/specs/time-buckets/`).
   `SELECT <aggregates> FROM ... [WHERE ...] GROUP BY TIME_BUCKET(<n><unit>) [LIMIT n]`, the unit one
@@ -1303,7 +1303,31 @@ and getting data into their existing Python stack without a copy.
   the division went, step 2 ran the same 171.5 M instructions a query in 2.6% more cycles (`perf
   stat`), all in the row callback it had moved into `bucket_rows()`, whose hot path is the same
   instructions in other registers. Raw rounds, the disassembly and the mutation table in
-  `evidence/2026-10-03-book-series/`, with SHA-256 sums. Step 3 (rolling windows) is not built.
+  `evidence/2026-10-03-book-series/`, with SHA-256 sums.
+- **Step 3 done: rolling windows** (the same spec, requirements 9). Each bucket of
+  `GROUP BY TIME_BUCKET(<step>) ROLLING <window>` answers the window that ends with it,
+  `[b + step - window, b + step)`. A window is a whole number of buckets, up to 10 000 of them and
+  366 d. Every bucket of the range is answered. The first windows reach back before the range and
+  read its rows and, for a series, the book before it. The ceiling counts the buckets they reach back
+  to, before anything is read. Each aggregate is what a bucket as wide as the window answers:
+  - step 1's bucket states and step 2's series windows each got an associative `merge()`;
+  - the window slides over two stacks of them, O(1) amortized a bucket and `k` states of memory,
+    which is the reason for the 10 000;
+  - step 2's sweep of the series became one function, which both steps call.
+  An oracle property holds it, for thirteen aggregates of rows and series at once: a window that
+  starts on a multiple of its own width equals `TIME_BUCKET(<window>)` there, and every window's
+  count and sum equal the rows'. Seven mutants are each caught: the two merges, the time weighting,
+  the slide, the reach back, the ceiling, and the sweep's start. A reworded log line is not.
+  Measured, Release, one symbol of 1 M rows over two hours, `COUNT(*), SUM(quantity), MIN(price),
+  MAX(price), VWAP(price)` every minute over fifteen (`scripts/measure_rolling_windows.py`, 4 rounds
+  of 10 queries, the three ways alternating):
+  - on the m9g.xlarge, **9.01-9.05 ms of the engine's time a query** against 8.96-8.98 without
+    `ROLLING`, and 7.9 KB of reply. A client computing the same windows from `SELECT *` took
+    936-945 ms (p50), and 42.6 MB;
+  - on the i3-7100U, 23.73-24.48 ms against 23.47-24.43 without, and 2008-2059 ms for the client.
+
+  The window costs nothing the scan does not. Raw rounds and the mutation table are in
+  `evidence/2026-10-13-rolling-windows/`, with SHA-256 sums.
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
 
 ### 45. Streaming subscriptions ✅
@@ -14825,7 +14849,6 @@ The capability items are in the table below.
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
-| **P3** | Time-bucketed aggregation (#44) | L | The most-requested analytical capability for this data |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Point-in-time recovery (#34, what is left of it) | M | A restore to a moment between two backups; backup and restore themselves shipped |
 | **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |

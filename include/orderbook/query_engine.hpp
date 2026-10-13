@@ -81,6 +81,13 @@ struct BucketAgg {
 /// The longest bucket a query may ask for: a leap year (#44, requirement 1.2).
 inline constexpr uint64_t kMaxBucketNs = 366ULL * 86'400ULL * 1'000'000'000ULL;
 
+/// The most buckets one `ROLLING` window may span (#44 step 3, requirement 9.1).
+///
+/// Ten thousand, because the window keeps two stacks of that many bucket states - rows and every
+/// series of the book, under a kilobyte each - and a query holding a hundred thousand of them would
+/// hold more memory than any answer it can give.
+inline constexpr uint64_t kMaxRollingBuckets = 10'000;
+
 // ── QueryAST ──────────────────────────────────────────────────────────────────
 // Internal representation of a parsed query.
 
@@ -114,6 +121,11 @@ struct QueryAST {
     /// `bucket_aggs` what it means; without it, `bucket_aggs` is empty.
     std::optional<uint64_t>  bucket_ns;
     std::vector<BucketAgg>   bucket_aggs;
+
+    /// `... TIME_BUCKET(<step>) ROLLING <window>` (#44 step 3): each bucket answered carries the
+    /// aggregates of the window that ends with it - itself and the `window / step - 1` before it.
+    /// A whole number of buckets, set only with `bucket_ns`.
+    std::optional<uint64_t>  rolling_ns;
 };
 
 // ── RowCallback ───────────────────────────────────────────────────────────────
@@ -281,6 +293,11 @@ private:
     /// best levels, then `scan_by_time()` of their rows - and the row aggregates beside it from
     /// the scan above.
     std::string execute_series(const QueryAST& ast, const RowCallback& cb);
+
+    /// One with `ROLLING` (#44 step 3): every bucket of the range answered with the aggregates of
+    /// the window that ends with it, the buckets of the window before the range read as well, and
+    /// the window kept as it slides in O(1) amortized a bucket.
+    std::string execute_rolling(const QueryAST& ast, const RowCallback& cb);
 
     // ── Subscription tracking ────────────────────────────────────────────────────────────────
     //

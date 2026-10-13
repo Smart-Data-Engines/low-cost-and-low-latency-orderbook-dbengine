@@ -29,7 +29,7 @@ enum class TokKind {
     // Keywords
     KW_SELECT, KW_SUBSCRIBE, KW_FROM, KW_WHERE, KW_LIMIT,
     KW_AND, KW_BETWEEN, KW_AT,
-    KW_GROUP, KW_BY, KW_TIME_BUCKET,
+    KW_GROUP, KW_BY, KW_TIME_BUCKET, KW_ROLLING,
     // Aggregation function names
     KW_SUM, KW_AVG, KW_MIN, KW_MAX, KW_VWAP,
     KW_COUNT, KW_FIRST, KW_LAST,
@@ -80,6 +80,8 @@ static const KwEntry KEYWORDS[] = {
     {"GROUP",             TokKind::KW_GROUP},
     {"BY",                TokKind::KW_BY},
     {"TIME_BUCKET",       TokKind::KW_TIME_BUCKET},
+    // A window of time buckets (#44 step 3), for the same reason.
+    {"ROLLING",           TokKind::KW_ROLLING},
     {"COUNT",             TokKind::KW_COUNT},
     {"FIRST",             TokKind::KW_FIRST},
     {"LAST",              TokKind::KW_LAST},
@@ -308,6 +310,11 @@ private:
             const Token group_tok = consume();
             if (auto e = parse_group_by(out, group_tok); !e.empty()) return e;
         }
+        if (at(TokKind::KW_ROLLING)) {
+            // parse_group_by() takes one after TIME_BUCKET(...), so this one has none before it.
+            return make_error("ROLLING is a window of time buckets - it follows GROUP BY "
+                              "TIME_BUCKET(...)");
+        }
         if (at(TokKind::KW_LIMIT)) {
             consume();
             if (auto e = parse_limit(out); !e.empty()) return e;
@@ -317,8 +324,9 @@ private:
 
     // ── GROUP BY TIME_BUCKET (#44) ────────────────────────────────────────────
 
-    // group_by ::= "GROUP" "BY" "TIME_BUCKET" "(" integer unit ")", unit one of ns us ms s m h d.
-    // The lexer gives `1m` as an integer and a word, so `1m` and `1 m` read the same.
+    // group_by ::= "GROUP" "BY" "TIME_BUCKET" "(" integer unit ")" [ "ROLLING" integer unit ],
+    // unit one of ns us ms s m h d. The lexer gives `1m` as an integer and a word, so `1m` and
+    // `1 m` read the same.
     std::string parse_group_by(QueryAST& out, const Token& group_tok) {
         if (!at(TokKind::KW_BY)) return make_error("expected BY after GROUP");
         consume();
@@ -349,6 +357,10 @@ private:
         if (!at(TokKind::RPAREN)) return make_error("expected ')' after the interval");
         consume();
         out.bucket_ns = n * unit_ns;
+        if (at(TokKind::KW_ROLLING)) {
+            consume();
+            if (auto e = parse_rolling(out, n_tok.text + unit_tok.text); !e.empty()) return e;
+        }
         if (out.snapshot_ts_ns.has_value()) {
             return make_error_at(group_tok, "AT reads the book at one moment and GROUP BY a stretch "
                                             "of rows - not both in one query");
@@ -357,8 +369,49 @@ private:
         // What the select list means is decided now that GROUP BY is known: the same function name
         // reads the live book without it (#200) and a bucket's rows with it.
         if (auto e = build_bucket_aggs(out, group_tok); !e.empty()) return e;
-        OB_LOG_DEBUG("query", "GROUP BY time_bucket: %llu ns, %zu aggregate(s)",
-                     static_cast<unsigned long long>(*out.bucket_ns), out.bucket_aggs.size());
+        OB_LOG_DEBUG("query", "GROUP BY time_bucket: %llu ns, rolling %llu ns, %zu aggregate(s)",
+                     static_cast<unsigned long long>(*out.bucket_ns),
+                     static_cast<unsigned long long>(out.rolling_ns.value_or(0)),
+                     out.bucket_aggs.size());
+        return {};
+    }
+
+    // rolling ::= "ROLLING" integer unit (#44 step 3): a whole number of buckets of `bucket`, the
+    // interval as the query wrote it, and at most kMaxRollingBuckets of them.
+    std::string parse_rolling(QueryAST& out, const std::string& bucket) {
+        if (!at(TokKind::INT_LIT)) return make_error("expected the window after ROLLING, e.g. ROLLING 15m");
+        const Token n_tok = consume();
+        uint64_t n = 0;
+        if (n_tok.text.empty() || n_tok.text[0] == '-' || !parse_decimal_u64(n_tok.text, n) || n == 0) {
+            return make_error_at(n_tok, "a window is a positive integer and a unit, got '" +
+                                            n_tok.text + "'");
+        }
+        if (!at(TokKind::UNKNOWN)) {
+            return make_error("expected the window's unit - ns, us, ms, s, m, h or d - after " +
+                              n_tok.text);
+        }
+        const Token unit_tok = consume();
+        const uint64_t unit_ns = bucket_unit_ns(unit_tok.text);
+        if (unit_ns == 0) {
+            return make_error_at(unit_tok, "unknown unit '" + unit_tok.text +
+                                               "' - a window's is ns, us, ms, s, m, h or d");
+        }
+        if (n > kMaxBucketNs / unit_ns) {
+            return make_error_at(n_tok, "a window is at most 366 d, got " + n_tok.text + unit_tok.text);
+        }
+        const uint64_t window = n * unit_ns;
+        const uint64_t step = *out.bucket_ns;
+        if (window % step != 0) {
+            return make_error_at(n_tok, "a window is a whole number of buckets, and " + n_tok.text +
+                                            unit_tok.text + " is not one of " + bucket);
+        }
+        if (window / step > kMaxRollingBuckets) {
+            return make_error_at(n_tok, "a window spans at most " +
+                                            std::to_string(kMaxRollingBuckets) + " buckets, and " +
+                                            n_tok.text + unit_tok.text + " spans " +
+                                            std::to_string(window / step) + " of " + bucket);
+        }
+        out.rolling_ns = window;
         return {};
     }
 
@@ -1901,6 +1954,263 @@ uint64_t bucket_last_ns(uint64_t start, uint64_t width) {
     return start > UINT64_MAX - (width - 1) ? UINT64_MAX : start + (width - 1);
 }
 
+using SeriesWindows = std::array<SeriesWindow, 5>;   // by Series
+
+/// Two adjacent stretches of rows as one, `left` the earlier (#44 step 3): what a bucket of their
+/// joint width would have seen. They do not overlap in time, so no tie on the time is between them
+/// - a tie inside either was broken by its own bucket.
+BucketState merged(const BucketState& left, const BucketState& right) {
+    if (left.count == 0) return right;
+    if (right.count == 0) return left;
+    BucketState out = left;
+    out.count += right.count;
+    out.last_ts = right.last_ts;
+    out.last_price = right.last_price;
+    out.last_qty = right.last_qty;
+    out.min_price = std::min(left.min_price, right.min_price);
+    out.max_price = std::max(left.max_price, right.max_price);
+    out.min_qty = std::min(left.min_qty, right.min_qty);
+    out.max_qty = std::max(left.max_qty, right.max_qty);
+    out.sum_qty += right.sum_qty;
+    out.sum_price += right.sum_price;
+    if (__builtin_add_overflow(left.sum_px_qty, right.sum_px_qty, &out.sum_px_qty)) {
+        out.px_qty_overflow = true;
+    }
+    out.px_qty_overflow = out.px_qty_overflow || right.px_qty_overflow;
+    return out;
+}
+
+/// The same for a series through two adjacent windows: in force at the first's start and at the
+/// second's end, the extremes of both - each window's own already holds the value in force at its
+/// start - and the time-weighted sums added. A window of at most 366 days keeps those under 2^121.
+SeriesWindow merged(const SeriesWindow& left, const SeriesWindow& right) {
+    SeriesWindow out;
+    out.open = left.open;
+    out.close = right.close;
+    const auto pick = [](const std::optional<__int128>& a, const std::optional<__int128>& b, bool high) {
+        if (!a.has_value()) return b;
+        if (!b.has_value()) return a;
+        return std::optional<__int128>(high ? std::max(*a, *b) : std::min(*a, *b));
+    };
+    out.high = pick(left.high, right.high, true);
+    out.low = pick(left.low, right.low, false);
+    out.weighted = left.weighted + right.weighted;
+    out.defined_ns = left.defined_ns + right.defined_ns;
+    return out;
+}
+
+/// The merge of the last `k` states pushed, kept in O(1) amortized a push however large `k` is: a
+/// sliding window over two stacks. The back stack holds the newer states and their running merge;
+/// the front one the older, each with the merge of itself and every newer state beside it, so the
+/// oldest is dropped by popping it. `Merge` is associative and takes the earlier state first.
+template <typename State, typename Merge>
+class Sliding {
+public:
+    Sliding(size_t k, Merge merge) : k_(k), merge_(std::move(merge)) {}
+
+    void push(State s) {
+        back_all_ = back_.empty() ? s : merge_(back_all_, s);
+        back_.push_back(std::move(s));
+        if (front_.size() + back_.size() > k_) drop_oldest();
+    }
+
+    /// The merge of every state in the window; at least one has been pushed.
+    State all() const {
+        if (front_.empty()) return back_all_;
+        if (back_.empty()) return front_.back();
+        return merge_(front_.back(), back_all_);
+    }
+
+private:
+    void drop_oldest() {
+        if (front_.empty()) {
+            // The back stack moves to the front, newest first, so the oldest lands on top.
+            State acc = back_.back();
+            front_.push_back(acc);
+            for (size_t i = back_.size() - 1; i-- > 0;) {
+                acc = merge_(back_[i], acc);
+                front_.push_back(acc);
+            }
+            back_.clear();
+        }
+        front_.pop_back();
+    }
+
+    size_t k_;
+    Merge merge_;
+    std::vector<State> front_;
+    std::vector<State> back_;
+    State back_all_{};
+};
+
+/// A series function beside a condition on price, side or level, refused (#44 step 2): a series
+/// is read from the best level of each side, not from rows a condition picks. Empty when none.
+std::string series_filter_refusal(const QueryAST& ast) {
+    const char* narrowed = ast.price_lo.has_value() || ast.price_hi.has_value()   ? "price"
+                         : ast.side_lo.has_value() || ast.side_hi.has_value()     ? "side"
+                         : ast.level_lo.has_value() || ast.level_hi.has_value()   ? "level"
+                                                                                  : nullptr;
+    if (narrowed == nullptr) return {};
+    OB_LOG_WARN("query", "Rejecting GROUP BY %s.%s: a series function beside a condition on %s",
+                ast.symbol.c_str(), ast.exchange.c_str(), narrowed);
+    return std::string("SERIES_FILTER: a series reads level 0 of both sides of the book, so a "
+                       "condition on ") + narrowed + " narrows nothing it reads; ask the rows' "
+                       "aggregates it would narrow in a query of their own";
+}
+
+/// The range every bucket of which is answered (#44 steps 2 and 3): the time conditions', and where
+/// one is missing the stored rows'. False when there is no bucket to answer.
+bool answered_range(const ColumnarStore& store, const QueryAST& ast, uint64_t& lo, uint64_t& hi) {
+    if (ast.ts_start_ns.has_value() && ast.ts_end_ns.has_value()) {
+        lo = *ast.ts_start_ns;
+        hi = *ast.ts_end_ns;
+    } else {
+        const auto span = store.time_span(ast.symbol, ast.exchange);
+        if (!span.has_value()) {
+            OB_LOG_DEBUG("query", "GROUP BY %s.%s: a symbol with no stored row and a range open at an "
+                                  "end - no bucket",
+                         ast.symbol.c_str(), ast.exchange.c_str());
+            return false;
+        }
+        lo = ast.ts_start_ns.value_or(span->first);
+        hi = ast.ts_end_ns.value_or(span->second);
+    }
+    if (hi < lo) {
+        OB_LOG_DEBUG("query", "GROUP BY %s.%s: the range [%llu, %llu] is empty - no bucket",
+                     ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(lo),
+                     static_cast<unsigned long long>(hi));
+        return false;
+    }
+    return true;
+}
+
+/// The series a bucket query names, each once, in the order first named.
+std::vector<Series> used_series(const QueryAST& ast) {
+    std::vector<Series> used;
+    for (const BucketAgg& agg : ast.bucket_aggs) {
+        if (agg.series != Series::None &&
+            std::find(used.begin(), used.end(), agg.series) == used.end()) {
+            used.push_back(agg.series);
+        }
+    }
+    return used;
+}
+
+/// What a sweep of the series read, for the query's log line.
+struct SeriesSweep {
+    size_t before_read{0};
+    size_t before_skipped{0};
+    ColumnarStore::TimeOrderedCost cost{};
+};
+
+/// The series `used` through consecutive buckets of `width` from the one starting at `first`, in
+/// time order (#44 steps 2 and 3). The first window begins at `lo` - inside the first bucket, which
+/// cuts it, or at its start - and the last ends at `hi`. Each window closed is handed to
+/// `on_window(bucket, windows)`, in order; false from it ends the sweep, and it must eventually
+/// return false, since the windows after the last row carry what it left in force.
+///
+/// The book just before `lo` is read with `latest_per_level()` of the best levels, and the rows
+/// from `lo` to `read_to` with `scan_by_time()` of level 0 of either side.
+template <typename OnWindow>
+SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64_t lo, uint64_t hi,
+                         uint64_t read_to, uint64_t first, uint64_t width,
+                         const std::vector<Series>& used, OnWindow&& on_window) {
+    SeriesSweep out;
+    // The book just before the range, its best levels only.
+    Top top;
+    if (lo > 0) {
+        LevelSet best{};
+        best.bid[0] = 1;
+        best.ask[0] = 1;
+        const ColumnarStore::BookAt before = store.latest_per_level(lo - 1, ast.symbol, ast.exchange, &best);
+        for (const SnapshotRow& r : before.rows) top.apply(r);
+        out.before_read = before.segments_read;
+        out.before_skipped = before.segments_skipped;
+    }
+
+    SeriesWindows windows{};
+    const auto window_of = [&](Series s) -> SeriesWindow& { return windows[static_cast<size_t>(s)]; };
+
+    uint64_t bucket = first;
+    uint64_t ws = lo;                                            // the window's first instant
+    uint64_t we = std::min(hi, bucket_last_ns(bucket, width));   // and its last
+    uint64_t since = ws;   // when the value in force began to count in this window
+
+    const auto start_window = [&]() {
+        for (Series s : used) window_of(s).start(series_at(s, top));
+        since = ws;
+    };
+    // The window ends: what was in force holds to its last instant. False once the consumer has
+    // what it asked for.
+    const auto finish_window = [&]() {
+        for (Series s : used) {
+            SeriesWindow& w = window_of(s);
+            w.hold(series_at(s, top), we - since + 1);
+            w.close = series_at(s, top);
+        }
+        return on_window(bucket, static_cast<const SeriesWindows&>(windows));
+    };
+    const auto next_window = [&]() {
+        bucket += width;
+        ws = bucket;
+        we = std::min(hi, bucket_last_ns(bucket, width));
+        start_window();
+    };
+    start_window();
+
+    // The rows of one instant are applied together - the last of a side is the one in force - and
+    // then the windows before that instant are closed, and the value it brings is observed.
+    Top next = top;
+    uint64_t at_ts = 0;
+    bool pending = false;
+    const auto apply_instant = [&](uint64_t t) {
+        while (t > we) {
+            if (!finish_window()) return false;
+            next_window();
+        }
+        if (t == ws) {
+            // At the window's first instant: what is in force there is what its rows made it.
+            top = next;
+            start_window();
+        } else {
+            for (Series s : used) window_of(s).hold(series_at(s, top), t - since);
+            top = next;
+            for (Series s : used) window_of(s).observe(series_at(s, top));
+            since = t;
+        }
+        return true;
+    };
+
+    ColumnSet columns;
+    columns.add(QueryColumn::TimestampNs);
+    columns.add(QueryColumn::Side);
+    columns.add(QueryColumn::Level);
+    columns.add(QueryColumn::Price);
+    bool going = true;
+    out.cost = store.scan_by_time(
+        lo, read_to, ast.symbol, ast.exchange, columns, level0_of_either_side(),
+        [&](const SnapshotRow& r) {
+            if (pending && r.timestamp_ns != at_ts) {
+                pending = false;
+                if (!apply_instant(at_ts)) return going = false;
+            }
+            if (!pending) {
+                next = top;
+                at_ts = r.timestamp_ns;
+                pending = true;
+            }
+            next.apply(r);
+            return true;
+        });
+    if (going && pending) going = apply_instant(at_ts);
+    // The buckets after the last row: what it left in force, carried to the last one wanted.
+    while (going) {
+        if (!finish_window()) break;
+        next_window();
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback& cb,
@@ -1913,6 +2223,7 @@ std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback&
         shape.bucket_columns.push_back({agg.text, bucket_scale(agg)});
         if (agg.series != Series::None) series = true;
     }
+    if (ast.rolling_ns.has_value()) return execute_rolling(ast, cb);
     if (series) return execute_series(ast, cb);
 
     const size_t ceiling = max_query_buckets();
@@ -1953,43 +2264,10 @@ std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback&
 
 std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& cb) {
     const uint64_t width = *ast.bucket_ns;
+    if (std::string refusal = series_filter_refusal(ast); !refusal.empty()) return refusal;
 
-    // A series is read from the best level of each side, not from rows a condition picks: a
-    // condition on price, side or level would narrow nothing it reads.
-    const char* narrowed = ast.price_lo.has_value() || ast.price_hi.has_value()   ? "price"
-                         : ast.side_lo.has_value() || ast.side_hi.has_value()     ? "side"
-                         : ast.level_lo.has_value() || ast.level_hi.has_value()   ? "level"
-                                                                                  : nullptr;
-    if (narrowed != nullptr) {
-        OB_LOG_WARN("query", "Rejecting GROUP BY %s.%s: a series function beside a condition on %s",
-                    ast.symbol.c_str(), ast.exchange.c_str(), narrowed);
-        return std::string("SERIES_FILTER: a series reads level 0 of both sides of the book, so a "
-                           "condition on ") + narrowed + " narrows nothing it reads; ask the rows' "
-                           "aggregates it would narrow in a query of their own";
-    }
-
-    // The range: the time conditions', and where one is missing the stored rows'.
     uint64_t lo = 0, hi = 0;
-    if (ast.ts_start_ns.has_value() && ast.ts_end_ns.has_value()) {
-        lo = *ast.ts_start_ns;
-        hi = *ast.ts_end_ns;
-    } else {
-        const auto span = store_.time_span(ast.symbol, ast.exchange);
-        if (!span.has_value()) {
-            OB_LOG_DEBUG("query", "GROUP BY %s.%s: a series of a symbol with no stored row and a "
-                                  "range open at an end - no bucket",
-                         ast.symbol.c_str(), ast.exchange.c_str());
-            return {};
-        }
-        lo = ast.ts_start_ns.value_or(span->first);
-        hi = ast.ts_end_ns.value_or(span->second);
-    }
-    if (hi < lo) {
-        OB_LOG_DEBUG("query", "GROUP BY %s.%s: the range [%llu, %llu] is empty - no bucket",
-                     ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(lo),
-                     static_cast<unsigned long long>(hi));
-        return {};
-    }
+    if (!answered_range(store_, ast, lo, hi)) return {};
 
     // Every bucket of the range is answered, so their number is known before anything is read.
     const uint64_t first = lo - lo % width;
@@ -2012,62 +2290,133 @@ std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& 
     uint64_t rows = 0;
     if (row_aggs) bucket_rows(store_, ast, lo, read_to, SIZE_MAX, row_buckets, rows);
 
-    // The book just before the range, its best levels only.
-    Top top;
-    size_t before_read = 0, before_skipped = 0;
-    if (lo > 0) {
-        LevelSet best{};
-        best.bid[0] = 1;
-        best.ask[0] = 1;
-        const ColumnarStore::BookAt before = store_.latest_per_level(lo - 1, ast.symbol, ast.exchange, &best);
-        for (const SnapshotRow& r : before.rows) top.apply(r);
-        before_read = before.segments_read;
-        before_skipped = before.segments_skipped;
+    const std::vector<Series> used = used_series(ast);
+    std::vector<QueryResult> answer;
+    answer.reserve(static_cast<size_t>(answered));
+    std::string refusal;
+    const SeriesSweep sweep = sweep_series(
+        store_, ast, lo, hi, read_to, first, width, used,
+        [&](uint64_t bucket, const SeriesWindows& windows) {
+            QueryResult qr{};
+            qr.timestamp_ns = bucket;
+            qr.agg_values.reserve(ast.bucket_aggs.size());
+            const auto it = row_buckets.find(bucket);
+            for (const BucketAgg& agg : ast.bucket_aggs) {
+                AggValue v;
+                bool fits = true;
+                if (agg.series != Series::None) {
+                    fits = series_value(agg, windows[static_cast<size_t>(agg.series)], v);
+                } else if (it != row_buckets.end()) {
+                    fits = bucket_value(agg, it->second, v);
+                } else {
+                    // A bucket no row of which was stored: none counted, nothing else to compute from.
+                    v.name = agg.text;
+                    v.scale = bucket_scale(agg);
+                    v.value = 0;
+                    v.empty = agg.fn != BucketFn::Count;
+                }
+                if (!fits) {
+                    refusal = bucket_overflow(ast, agg, bucket);
+                    return false;
+                }
+                qr.agg_values.push_back(std::move(v));
+            }
+            answer.push_back(std::move(qr));
+            return answer.size() < answered;
+        });
+    if (!refusal.empty()) return refusal;
+
+    OB_LOG_DEBUG("query", "GROUP BY %s.%s with %zu series: [%llu, %llu], %llu bucket(s) of %llu ns "
+                          "in range, %zu answered; the book before it from %zu segment(s), %zu "
+                          "skipped; %llu best-level row(s) of %zu segment(s) and %zu block(s), at most "
+                          "%llu held%s; %llu row(s) for the rows' aggregates",
+                 ast.symbol.c_str(), ast.exchange.c_str(), used.size(),
+                 static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
+                 static_cast<unsigned long long>(in_range), static_cast<unsigned long long>(width),
+                 answer.size(), sweep.before_read, sweep.before_skipped,
+                 static_cast<unsigned long long>(sweep.cost.kept), sweep.cost.candidates,
+                 sweep.cost.blocks, static_cast<unsigned long long>(sweep.cost.max_held),
+                 sweep.cost.stopped ? ", the read ended by LIMIT" : "",
+                 static_cast<unsigned long long>(rows));
+    for (const QueryResult& qr : answer) cb(qr);
+    return {};
+}
+
+std::string QueryEngine::execute_rolling(const QueryAST& ast, const RowCallback& cb) {
+    const uint64_t width = *ast.bucket_ns;
+    const uint64_t k = *ast.rolling_ns / width;
+    const std::vector<Series> used = used_series(ast);
+    bool row_aggs = false;
+    for (const BucketAgg& agg : ast.bucket_aggs) {
+        if (agg.series == Series::None) row_aggs = true;
+    }
+    if (!used.empty()) {
+        if (std::string refusal = series_filter_refusal(ast); !refusal.empty()) return refusal;
     }
 
-    std::vector<Series> used;
-    for (const BucketAgg& agg : ast.bucket_aggs) {
-        if (agg.series != Series::None &&
-            std::find(used.begin(), used.end(), agg.series) == used.end()) {
-            used.push_back(agg.series);
-        }
+    uint64_t lo = 0, hi = 0;
+    if (!answered_range(store_, ast, lo, hi)) return {};
+
+    // Every bucket of the range is answered, and the window of the first one reaches back k - 1
+    // buckets before it, as far as the epoch: all of them counted against the ceiling before
+    // anything is read.
+    const uint64_t first = lo - lo % width;
+    const uint64_t in_range = (hi - hi % width - first) / width + 1;
+    const uint64_t answered = ast.limit.has_value() ? std::min<uint64_t>(in_range, *ast.limit)
+                                                    : in_range;
+    const uint64_t lookback = std::min<uint64_t>(k - 1, first / width);
+    const uint64_t back = first - lookback * width;
+    const size_t ceiling = max_query_buckets();
+    if (answered > ceiling || lookback > ceiling - answered) return buckets_too_many(ast, ceiling);
+    if (answered == 0) return {};
+    const uint64_t read_to = std::min(hi, bucket_last_ns(first + (answered - 1) * width, width));
+
+    // The rows of every window: the range's conditions, with the time widened back to the first
+    // window's start.
+    std::unordered_map<uint64_t, BucketState> row_buckets;
+    uint64_t rows = 0;
+    if (row_aggs) {
+        QueryAST widened = ast;
+        widened.ts_start_ns = back;
+        widened.ts_end_ns = read_to;
+        bucket_rows(store_, widened, back, read_to, SIZE_MAX, row_buckets, rows);
     }
-    std::array<SeriesWindow, 5> windows{};   // by Series
-    const auto window_of = [&](Series s) -> SeriesWindow& { return windows[static_cast<size_t>(s)]; };
+
+    struct Rolled {
+        BucketState   rows;
+        SeriesWindows series;
+    };
+    const auto merge = [](const Rolled& left, const Rolled& right) {
+        Rolled out;
+        out.rows = merged(left.rows, right.rows);
+        for (size_t i = 0; i < out.series.size(); ++i) out.series[i] = merged(left.series[i], right.series[i]);
+        return out;
+    };
+    Sliding<Rolled, decltype(merge)> window(static_cast<size_t>(k), merge);
 
     std::vector<QueryResult> answer;
     answer.reserve(static_cast<size_t>(answered));
     std::string refusal;
-    uint64_t bucket = first;
-    uint64_t ws = lo;                                            // the window's first instant
-    uint64_t we = std::min(hi, bucket_last_ns(bucket, width));   // and its last
-    uint64_t since = ws;   // when the value in force began to count in this window
-
-    const auto start_window = [&]() {
-        for (Series s : used) window_of(s).start(series_at(s, top));
-        since = ws;
-    };
-    // The window ends: what was in force holds to its last instant. False once the answer is
-    // whole or refused.
-    const auto finish_window = [&]() {
-        for (Series s : used) {
-            SeriesWindow& w = window_of(s);
-            w.hold(series_at(s, top), we - since + 1);
-            w.close = series_at(s, top);
-        }
+    // Each bucket from `back` joins the window, and from `first` on the window is answered.
+    const auto take = [&](uint64_t bucket, const SeriesWindows& series) {
+        Rolled r;
+        if (const auto it = row_buckets.find(bucket); it != row_buckets.end()) r.rows = it->second;
+        r.series = series;
+        window.push(std::move(r));
+        if (bucket < first) return true;
+        const Rolled all = window.all();
         QueryResult qr{};
         qr.timestamp_ns = bucket;
         qr.agg_values.reserve(ast.bucket_aggs.size());
-        const auto it = row_buckets.find(bucket);
         for (const BucketAgg& agg : ast.bucket_aggs) {
             AggValue v;
             bool fits = true;
             if (agg.series != Series::None) {
-                fits = series_value(agg, window_of(agg.series), v);
-            } else if (it != row_buckets.end()) {
-                fits = bucket_value(agg, it->second, v);
+                fits = series_value(agg, all.series[static_cast<size_t>(agg.series)], v);
+            } else if (all.rows.count > 0) {
+                fits = bucket_value(agg, all.rows, v);
             } else {
-                // A bucket no row of which was stored: none counted, nothing else to compute from.
+                // A window no row of which was stored: none counted, nothing else to compute from.
                 v.name = agg.text;
                 v.scale = bucket_scale(agg);
                 v.value = 0;
@@ -2082,78 +2431,25 @@ std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& 
         answer.push_back(std::move(qr));
         return answer.size() < answered;
     };
-    const auto next_window = [&]() {
-        bucket += width;
-        ws = bucket;
-        we = std::min(hi, bucket_last_ns(bucket, width));
-        start_window();
-    };
-    start_window();
 
-    // The rows of one instant are applied together - the last of a side is the one in force - and
-    // then the windows before that instant are closed, and the value it brings is observed.
-    Top next = top;
-    uint64_t at_ts = 0;
-    bool pending = false;
-    const auto apply_instant = [&](uint64_t t) {
-        while (t > we) {
-            if (!finish_window()) return false;
-            next_window();
-        }
-        if (t == ws) {
-            // At the window's first instant: what is in force there is what its rows made it.
-            top = next;
-            start_window();
-        } else {
-            for (Series s : used) window_of(s).hold(series_at(s, top), t - since);
-            top = next;
-            for (Series s : used) window_of(s).observe(series_at(s, top));
-            since = t;
-        }
-        return true;
-    };
-
-    ColumnSet columns;
-    columns.add(QueryColumn::TimestampNs);
-    columns.add(QueryColumn::Side);
-    columns.add(QueryColumn::Level);
-    columns.add(QueryColumn::Price);
-    bool going = true;
-    const ColumnarStore::TimeOrderedCost cost = store_.scan_by_time(
-        lo, read_to, ast.symbol, ast.exchange, columns, level0_of_either_side(),
-        [&](const SnapshotRow& r) {
-            if (pending && r.timestamp_ns != at_ts) {
-                pending = false;
-                if (!apply_instant(at_ts)) return going = false;
-            }
-            if (!pending) {
-                next = top;
-                at_ts = r.timestamp_ns;
-                pending = true;
-            }
-            next.apply(r);
-            return true;
-        });
-    if (going && pending) going = apply_instant(at_ts);
-    // The buckets after the last row: what it left in force, carried to the last one answered.
-    while (going) {
-        if (!finish_window()) break;
-        next_window();
+    SeriesSweep sweep;
+    if (!used.empty()) {
+        // From `back`, a bucket's start: the first window is whole, where step 2's is cut at `lo`.
+        sweep = sweep_series(store_, ast, back, hi, read_to, back, width, used, take);
+    } else {
+        const SeriesWindows none{};
+        for (uint64_t bucket = back; take(bucket, none); bucket += width) {}
     }
     if (!refusal.empty()) return refusal;
 
-    OB_LOG_DEBUG("query", "GROUP BY %s.%s with %zu series: [%llu, %llu], %llu bucket(s) of %llu ns "
-                          "in range, %zu answered; the book before it from %zu segment(s), %zu "
-                          "skipped; %llu best-level row(s) of %zu segment(s) and %zu block(s), at most "
-                          "%llu held%s; %llu row(s) for the rows' aggregates",
-                 ast.symbol.c_str(), ast.exchange.c_str(), used.size(),
+    OB_LOG_DEBUG("query", "GROUP BY %s.%s ROLLING: windows of %llu bucket(s) of %llu ns, %zu series; "
+                          "[%llu, %llu] answered from %llu, %zu bucket(s); %llu row(s) for the rows' "
+                          "aggregates, %llu best-level row(s) for the series",
+                 ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(k),
+                 static_cast<unsigned long long>(width), used.size(),
                  static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
-                 static_cast<unsigned long long>(in_range), static_cast<unsigned long long>(width),
-                 answer.size(), before_read, before_skipped,
-                 static_cast<unsigned long long>(cost.kept), cost.candidates, cost.blocks,
-                 static_cast<unsigned long long>(cost.max_held),
-                 cost.stopped ? ", the read ended by LIMIT" : "",
-                 static_cast<unsigned long long>(rows));
+                 static_cast<unsigned long long>(back), answer.size(),
+                 static_cast<unsigned long long>(rows), static_cast<unsigned long long>(sweep.cost.kept));
     for (const QueryResult& qr : answer) cb(qr);
     return {};
 }
@@ -2222,13 +2518,15 @@ std::string QueryEngine::format(const QueryAST& ast) {
             {"m", 60ULL * 1'000'000'000ULL}, {"s", 1'000'000'000ULL}, {"ms", 1'000'000ULL},
             {"us", 1'000ULL}, {"ns", 1ULL},
         };
-        const uint64_t ns = *ast.bucket_ns;
-        for (const auto& u : kUnits) {
-            if (ns % u.ns == 0) {
-                os << " GROUP BY TIME_BUCKET(" << ns / u.ns << u.name << ")";
-                break;
+        const auto interval = [&](uint64_t ns) {
+            for (const auto& u : kUnits) {
+                if (ns % u.ns == 0) return std::to_string(ns / u.ns) + u.name;
             }
-        }
+            return std::to_string(ns) + "ns";
+        };
+        os << " GROUP BY TIME_BUCKET(" << interval(*ast.bucket_ns) << ")";
+        // A window of them (#44 step 3), the same way.
+        if (ast.rolling_ns.has_value()) os << " ROLLING " << interval(*ast.rolling_ns);
     }
 
     // 6. LIMIT (SELECT only)

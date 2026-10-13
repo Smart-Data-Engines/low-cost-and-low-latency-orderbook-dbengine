@@ -10,7 +10,7 @@ select_query = "SELECT" select_list "FROM" symbol_ref
                [ "WHERE" where_clause ]
                [ "GROUP" "BY" bucket ]
                [ "LIMIT" integer ] ;
-bucket      = "TIME_BUCKET" "(" integer unit ")" ;
+bucket      = "TIME_BUCKET" "(" integer unit ")" [ "ROLLING" integer unit ] ;
 unit        = "ns" | "us" | "ms" | "s" | "m" | "h" | "d" ;
 subscribe_query = "SUBSCRIBE" select_list "FROM" symbol_ref
                   [ "WHERE" where_clause ] ;
@@ -290,6 +290,38 @@ GROUP BY TIME_BUCKET(1m)
 | `HIGH(s)`, `LOW(s)` | the highest, the lowest in force at any instant of the window | the series' |
 | `TWAP(s)` | Σ value × time it held / Σ time with a value | 10^6 |
 
+### Rolling windows
+
+`ROLLING <window>` after `TIME_BUCKET(<step>)` answers each bucket with the aggregates of the window
+that **ends with it**, rather than of the bucket alone (#44, step 3):
+
+```sql
+-- Every minute, the volume and the volume-weighted price of the last fifteen
+SELECT SUM(quantity), VWAP(price) FROM 'BTC-USD'.'BINANCE'
+WHERE timestamp BETWEEN 1700000000000000000 AND 1700003599999999999
+GROUP BY TIME_BUCKET(1m) ROLLING 15m
+
+-- Every five minutes, the highest bid and the time-weighted mid of the last hour
+SELECT HIGH(bid), TWAP(mid) FROM 'BTC-USD'.'BINANCE'
+GROUP BY TIME_BUCKET(5m) ROLLING 1h
+```
+
+- **The window** is written as an interval is, and is a whole number of buckets, at most 10 000 of
+  them and 366 d. The bucket starting at `b` answers `[b + step - window, b + step)`: itself and the
+  buckets before it.
+- **Every bucket of the range is answered**, as beside a series, and the range is decided the same
+  way. The windows of the first buckets **reach back before the range**: their rows, and the book
+  for a series, are read from before it, so the first bucket's window is as wide as every other. A
+  window that ends past the range is cut at its end.
+- **Each aggregate is what a bucket as wide as the window would answer** for the same stretch, the
+  rows' and the series' alike. A window that starts on a multiple of its own width is exactly the
+  `TIME_BUCKET(<window>)` bucket starting there. A window without rows answers `COUNT(*)` 0 and
+  `NULL` for the rows' other aggregates.
+- **The ceiling** (`--max-query-buckets`) counts the buckets answered and the ones before them that
+  the first window reaches back to, and the query is refused before anything is read. `LIMIT n`
+  answers the first `n` buckets. The window is kept as it slides over two stacks of bucket states,
+  so its cost per bucket does not grow with the window.
+
 ### Response format
 
 ```
@@ -313,12 +345,13 @@ an `AggValue` per aggregate (`.real` divides by the scale), the C++ client's `qu
 | Error | Meaning |
 |-------|---------|
 | `Parse error ... interval` | An interval that is zero, negative, without a unit, in a unit not listed, or past 366 d - said where it stands |
+| `Parse error ... window` | A `ROLLING` window that is not an interval, not a whole number of buckets (`90s` of `1m`), wider than 10 000 of them, or without `GROUP BY TIME_BUCKET(...)` before it |
 | `Parse error ... is not one` | A column or `*` in the list of a `GROUP BY` query, which answers aggregates of each bucket |
 | `Parse error ... aggregates the live book` | `SPREAD`, `DEPTH` and the other functions of the live book under `GROUP BY` |
 | `Parse error ... takes` | A function given a column it does not aggregate - `COUNT(price)`, `SUM(price)`, `VWAP(quantity)` - or a side, `SUM(bid)`, which a bucket takes from `WHERE side = …` |
 | `Parse error ... bid, ask, mid or spread` | A series function given anything else - `OPEN(price)`, `TWAP(*)` |
 | `SERIES_FILTER` | A condition on price, side or level beside a series, which reads level 0 of both sides whatever it says: ask the rows' aggregates it would narrow in a query of their own |
-| `BUCKETS_TOO_MANY` | The answer would have more buckets than the server allows (`--max-query-buckets`, 100 000 by default): narrow the time range or widen the interval. Refused rather than cut short. Beside a series every bucket of the range counts, so it is known - and refused - before anything is read |
+| `BUCKETS_TOO_MANY` | The answer would have more buckets than the server allows (`--max-query-buckets`, 100 000 by default): narrow the time range or widen the interval. Refused rather than cut short. Beside a series every bucket of the range counts, so it is known - and refused - before anything is read; with `ROLLING`, so do the buckets the first window reaches back to |
 | `BUCKET_OVERFLOW` | An aggregate of one bucket that does not fit a 64-bit integer, named with the bucket |
 
 ## SNAPSHOT Queries
