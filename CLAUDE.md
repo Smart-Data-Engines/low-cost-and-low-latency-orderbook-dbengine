@@ -4219,6 +4219,11 @@ Learned the hard way. Check here before debugging.
 575. **`/proc/net/tcp` is IPv4's table.** A port with no bind is a `::` socket since #236 and is
      listed in `/proc/net/tcp6` alone, so a test reading only the first finds nothing listening.
      `test_bind_addresses.py` reads both.
+576. **A poll that raises on what has not arrived yet is a race, not a wait.** `test_mm_restart.py`'s
+     `rows()` asked a node for symbols the mesh had not delivered to it yet, and the
+     `OB_ERR_NOT_FOUND` it got ended the test where the next poll would have found the rows. It
+     passed alone every time and failed once in a battery under load. A helper that waits counts
+     what is not there yet as none.
 
 ## Current state and open problems
 
