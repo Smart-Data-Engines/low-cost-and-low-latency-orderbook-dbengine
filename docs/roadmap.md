@@ -3207,6 +3207,36 @@ cent of decoding saved costs about a per cent of bytes, taken out of what the RE
 comparison publishes. On the synthetic set a 10% margin decodes in 1.84 ns a row rather than 3.19 at the same 1.77 bytes, but no
 margin under 20% moves the recordings.
 
+**Measured again on master, 13 October 2026, and the first way built** (spec
+`smart-data-engine-workspace/specs/held-columns-memory/`, `evidence/2026-10-13-first-read-on-master/`
+and `evidence/2026-10-13-held-columns-memory/`, both hosts, three rounds). Since #47 step 2 a
+`LIMIT` ends a read, so the first query after a load, `SELECT * ... LIMIT 10`, reads one segment
+where it read every one. What a first read costs over format 2's now has two causes:
+- **Holding.** Each column a read held was a fresh vector - 2 MiB at 262 144 rows - whose pages the
+  read faulted in, and an eviction gave them back to the kernel for the next miss to fault again. A
+  one-second window of a synthetic segment, cold, took 1.118 ms and 1 264 faults with holding
+  against 0.372 ms and 1 fault without (x86): 3.2 times format 2's, and 2.9 times on ARM.
+- **The decoders,** on the recordings: `binance-diff`'s first query, 1.30 - 1.37 times format 2's
+  with holding or without.
+
+The held columns are now made in an arena (`ColumnArena`): slots of a size class, 64 KiB to 2 MiB, in
+2 MiB regions, those of the classes from 512 KiB advised for transparent huge pages, given back by
+an eviction and taken by the next miss. The arena maps at most the budget and a slack of an eighth
+of it, at least 16 MiB - one segment's columns, or a miss past the first reads would decode on the
+heap what its own eviction frees. On the synthetic set's cold window: 0.707 ms and 40 faults on the
+x86 host, 0.280 ms and 110 on ARM - 0.58 and 0.38 of master's - and every query of the three
+datasets within 2% of master's or faster. A node past its first reads, its budget a segment and a
+half: 4 794 - 5 336 faults over 48 windows against 6 881 - 7 139 on x86, 498 - 512 against
+6 694 - 8 259 on ARM.
+
+The spec asked for the cold window at most 1.25 times the time without holding and ten times fewer
+faults, and neither host meets both: 1.80 times and 31 times fewer on x86, 1.18 and 5.4 on ARM. A
+fresh node's first read needs memory nobody touched, which the kernel zeroes - a 2 MiB page took
+about 80 µs on the x86 host - and the read without holding writes into buffers earlier reads faulted
+in. Advising every class for huge pages took ARM's faults 197 times down, and made a small
+recording's first query slower: a 70 KB column opened a 2 MiB region zeroed whole. What is left of
+#223 is the decoders on the recordings, #49's.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 

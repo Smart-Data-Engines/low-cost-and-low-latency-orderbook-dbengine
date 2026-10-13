@@ -2052,11 +2052,24 @@ as before this build.
   from a query reading them: what the process holds can pass the budget by the columns of the
   queries in progress, and never by more. A segment holds at most 262 144 rows, 39 bytes a row
   decoded - about 10 MB.
+- **Where they are held** (#223). A column of 64 KiB or more takes a slot of its size class - a
+  power of two up to 2 MiB - in a region of 2 MiB; the regions of the classes from 512 KiB are
+  advised for transparent huge pages. A column evicted gives its slot back for the next, so a node
+  past its first reads decodes into memory it already has, where each column was a fresh vector
+  whose pages the read faulted in: a one-second window of a large segment, read cold, faulted 1 258
+  pages on the x86 host and 40 after. The arena maps at most the budget and a slack - an eighth of
+  the budget, at least 16 MiB, one segment's columns - and gives back to the kernel what is free
+  beyond the slack. A column that finds no room under it is decoded on the heap, as before, and so
+  is one under 64 KiB, whose few pages cost little.
 
 `ob_decoded_columns_hits_total` and `ob_decoded_columns_misses_total` count columns read from
 memory and from files, `ob_decoded_columns_evictions_total` segments whose columns made room, and
 `ob_decoded_columns_bytes` against `ob_decoded_columns_budget_bytes` what is held. Misses that keep
 pace with hits on a node whose queries repeat say the budget is smaller than what they read.
+`ob_decoded_columns_arena_bytes` and `ob_decoded_columns_arena_free_bytes` say what the arena maps
+and what of it no column holds, `ob_decoded_columns_arena_regions` its regions, and
+`ob_decoded_columns_arena_fallbacks_total` the columns decoded on the heap for want of room under
+it - a count that keeps growing says the slack is short of the columns the queries read at once.
 
 ## Stopping a node
 

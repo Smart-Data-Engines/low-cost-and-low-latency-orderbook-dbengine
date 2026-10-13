@@ -7,8 +7,10 @@
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <string>
@@ -361,6 +363,60 @@ TEST(ColumnCodec, ADecodeInAKeptScratchGivesWhatADecodeOfItsOwnDoes) {
         }
     }
     EXPECT_GT(scratch.held_bytes(), 0u) << "the scratch keeps what it grew to, for the caller to count";
+}
+
+/// decode_into() over `column`'s block, into memory filled with 0xAB first: the return, and the
+/// values when it decoded, must be decode_as()'s into a vector of the same type.
+template <typename T>
+void expect_into_as_as(std::span<const char> block, size_t count, const std::string& name) {
+    DecodeScratch a, b;
+    std::vector<T> as;
+    std::vector<T> into(count + 1);
+    std::memset(into.data(), 0xAB, into.size() * sizeof(T));
+    std::string why_as, why_into;
+    const bool ok_as = decode_as(block, count, as, a, &why_as);
+    const bool ok_into = decode_into(block, count, into.data(), b, &why_into);
+    ASSERT_EQ(ok_into, ok_as) << name << ": " << why_as << " / " << why_into;
+    if (!ok_as) return;
+    EXPECT_TRUE(std::equal(as.begin(), as.end(), into.begin())) << name;
+    T guard;
+    std::memset(&guard, 0xAB, sizeof(T));
+    EXPECT_EQ(into[count], guard) << name << ": a value written past `count`";
+}
+
+TEST(ColumnCodec, ADecodeIntoTheCallersMemoryGivesWhatDecodeAsDoes) {
+    // #223: a held column is decoded into a slot of the store's arena, not into a vector.
+    for (const auto& column : edge_columns()) {
+        for (const Encoding& e : all_encodings()) {
+            std::string block;
+            encode_as(column, e, 3, block);
+            const std::string name = e.name() + " on " + std::to_string(column.size()) + " values";
+            expect_into_as_as<uint64_t>(bytes(block), column.size(), name);
+            expect_into_as_as<int64_t>(bytes(block), column.size(), name);
+            expect_into_as_as<uint32_t>(bytes(block), column.size(), name);
+            expect_into_as_as<uint16_t>(bytes(block), column.size(), name);
+            expect_into_as_as<uint8_t>(bytes(block), column.size(), name);
+        }
+    }
+}
+
+TEST(ColumnCodec, ADecodeIntoWritesNothingForABlockWhoseHeaderOrPayloadFails) {
+    std::vector<uint64_t> column(500);
+    for (size_t i = 0; i < column.size(); ++i) column[i] = i * 3;
+    std::string block;
+    encode_as(column, Encoding{Transform::kDelta, Packing::kNarrow, Compressor::kNone}, 3, block);
+    DecodeScratch scratch;
+    std::string why;
+    std::vector<uint64_t> into(column.size(), 0xABABABABABABABABULL);
+    const auto untouched = into;
+    // A count the block does not hold, and a block cut inside its payload.
+    EXPECT_FALSE(decode_into(bytes(block), column.size() + 1, into.data(), scratch, &why));
+    EXPECT_EQ(into, untouched) << "written before the header was checked: " << why;
+    const std::string cut = block.substr(0, block.size() - 9);
+    EXPECT_FALSE(decode_into(bytes(cut), column.size(), into.data(), scratch, &why));
+    EXPECT_EQ(into, untouched) << "written before the payload was checked: " << why;
+    ASSERT_TRUE(decode_into(bytes(block), column.size(), into.data(), scratch, &why)) << why;
+    EXPECT_EQ(into, column) << "the control: the whole block decodes";
 }
 
 TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {

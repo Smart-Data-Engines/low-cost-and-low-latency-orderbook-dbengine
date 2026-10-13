@@ -309,7 +309,8 @@ target_link_libraries(orderbook_codec PUBLIC orderbook_core)
 add_library(orderbook_query_columns STATIC src/query_columns.cpp)
 target_link_libraries(orderbook_query_columns PUBLIC orderbook_logger)
 
-add_library(orderbook_columnar STATIC src/columnar_store.cpp src/decoded_columns.cpp)
+add_library(orderbook_columnar STATIC src/columnar_store.cpp src/decoded_columns.cpp
+            src/column_arena.cpp src/huge_region.cpp)
 target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_logger orderbook_query_columns)
 
 # ── LZ4 compression library ────────────────────────────────────────────────────

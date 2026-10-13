@@ -11,6 +11,12 @@ here as `#N`.
 
 ### Added
 
+- The decoded columns a node holds between queries (#220) are held in an arena of 2 MiB regions
+  (#223): a column evicted gives its memory back to the next, and the regions of the larger columns
+  are advised for transparent huge pages. A query's first read of a large segment measured 0.38 to
+  0.92 of the time it took, its narrow window faulting 40 pages where it faulted 1 258 (x86), and no
+  query slower. `ob_decoded_columns_arena_bytes`, `..._free_bytes`, `..._regions` and
+  `..._fallbacks_total` say what it holds.
 - Books on huge pages (#51). Each symbol's book is made in a 2 MiB region the kernel is asked to
   back with transparent huge pages, 43 books to a region. On an EPYC and a Graviton host a write to
   one of 4 000 books measured 16-22% faster and a write through the engine 1.5-4.7% faster, with no

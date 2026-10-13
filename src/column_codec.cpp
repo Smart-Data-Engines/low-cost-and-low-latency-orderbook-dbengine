@@ -853,15 +853,16 @@ bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, s
     return decode_as(block, count, out, scratch, why);
 }
 
-template <typename T>
-bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, DecodeScratch& scratch,
-               std::string* why) {
+/// decode_as() and decode_into() alike: `place(count)` gives where the values go, asked only once the
+/// header and the payload have passed their checks.
+template <typename T, typename Place>
+bool decode_placed(std::span<const char> block, size_t count, Place&& place, DecodeScratch& scratch,
+                   std::string* why) {
     Header h;
     if (!read_header(block, count, h, why)) return false;
     std::span<const char> payload;
     if (!payload_of(block, h, scratch.plain, payload, why)) return false;
-    out.resize(count);
-    T* o = out.data();
+    T* o = place(count);
     bool fits = true;
     switch (h.packing) {
     case Packing::kNarrow: {
@@ -897,6 +898,21 @@ bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, D
     return true;
 }
 
+template <typename T>
+bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, DecodeScratch& scratch,
+               std::string* why) {
+    return decode_placed<T>(block, count, [&out](size_t n) {
+        out.resize(n);
+        return out.data();
+    }, scratch, why);
+}
+
+template <typename T>
+bool decode_into(std::span<const char> block, size_t count, T* out, DecodeScratch& scratch,
+                 std::string* why) {
+    return decode_placed<T>(block, count, [out](size_t) { return out; }, scratch, why);
+}
+
 template bool decode_as<uint64_t>(std::span<const char>, size_t, std::vector<uint64_t>&, std::string*);
 template bool decode_as<int64_t>(std::span<const char>, size_t, std::vector<int64_t>&, std::string*);
 template bool decode_as<uint32_t>(std::span<const char>, size_t, std::vector<uint32_t>&, std::string*);
@@ -912,5 +928,10 @@ template bool decode_as<uint16_t>(std::span<const char>, size_t, std::vector<uin
                                   std::string*);
 template bool decode_as<uint8_t>(std::span<const char>, size_t, std::vector<uint8_t>&, DecodeScratch&,
                                  std::string*);
+template bool decode_into<uint64_t>(std::span<const char>, size_t, uint64_t*, DecodeScratch&, std::string*);
+template bool decode_into<int64_t>(std::span<const char>, size_t, int64_t*, DecodeScratch&, std::string*);
+template bool decode_into<uint32_t>(std::span<const char>, size_t, uint32_t*, DecodeScratch&, std::string*);
+template bool decode_into<uint16_t>(std::span<const char>, size_t, uint16_t*, DecodeScratch&, std::string*);
+template bool decode_into<uint8_t>(std::span<const char>, size_t, uint8_t*, DecodeScratch&, std::string*);
 
 }  // namespace ob::column_codec

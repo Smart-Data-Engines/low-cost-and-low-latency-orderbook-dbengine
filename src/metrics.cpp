@@ -120,6 +120,8 @@ MetricsRegistry::MetricsRegistry() {
                                      "Columns queries read from a segment's file and decoded"));
     counters_.push_back(make_counter("ob_decoded_columns_evictions_total",
                                      "Segments whose held columns were evicted to make room"));
+    counters_.push_back(make_counter("ob_decoded_columns_arena_fallbacks_total",
+                                     "Held columns decoded on the heap: no slot under the arena's cap (#223)"));
     counters_.push_back(make_counter("ob_backup_failures_total",
                                      "Backups that failed, and left nothing that looks like one"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
@@ -245,6 +247,12 @@ MetricsRegistry::MetricsRegistry() {
                                  "Bytes of decoded columns held between queries (#220)"));
     gauges_.push_back(make_gauge("ob_decoded_columns_budget_bytes",
                                  "What the decoded columns may hold; 0 with holding off (#220)"));
+    gauges_.push_back(make_gauge("ob_decoded_columns_arena_bytes",
+                                 "Bytes of 2 MiB regions mapped for the held columns (#223)"));
+    gauges_.push_back(make_gauge("ob_decoded_columns_arena_free_bytes",
+                                 "Of them, bytes in slots no column holds: the next columns' (#223)"));
+    gauges_.push_back(make_gauge("ob_decoded_columns_arena_regions",
+                                 "Regions of 2 MiB mapped for the held columns (#223)"));
     // #165 part 2a: rows drained into blocks that no seal has written yet, and how many seals ran.
     gauges_.push_back(make_gauge("ob_unsealed_rows",
                                  "Rows drained and readable but not yet written to a segment"));

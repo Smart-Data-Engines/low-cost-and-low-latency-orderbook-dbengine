@@ -1699,7 +1699,8 @@ enum class ColumnsLoad { kOk, kMissing, kBad };
 /// Simple8b word decodes into other numbers without a sound.
 ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet columns,
                             SegmentReadBuffers& b, std::string& why,
-                            std::array<DecodedColumns::Column, kColumns>* fresh = nullptr) {
+                            std::array<DecodedColumns::Column, kColumns>* fresh = nullptr,
+                            ColumnArena* arena = nullptr) {
     std::ifstream f(dir + "/" + kColumnsV3File, std::ios::binary);
     if (!f.is_open()) return ColumnsLoad::kMissing;
     f.seekg(0, std::ios::end);
@@ -1739,12 +1740,21 @@ ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet col
         bool ok = false;
         if (fresh != nullptr) {
             // Into a column of its own, which the segment's slot can then hold (#220): the pool's
-            // buffers are the next read's.
+            // buffers are the next read's. Into a slot of the arena when it has one, memory a column
+            // held before (#223); into a vector of its own when it has not.
             auto values = std::make_shared<ColumnValues>();
             const auto into = [&](auto type) {
                 using T = decltype(type);
-                return column_codec::decode_as(block, count, values->values.emplace<std::vector<T>>(),
-                                               b.scratch, &reason);
+                std::vector<T>& heap = values->values.emplace<std::vector<T>>();
+                ArenaBlock slot = arena != nullptr ? arena->allocate(count * sizeof(T)) : ArenaBlock{};
+                if (!slot) return column_codec::decode_as(block, count, heap, b.scratch, &reason);
+                if (!column_codec::decode_into(block, count, static_cast<T*>(slot.data()), b.scratch,
+                                               &reason)) {
+                    return false;
+                }
+                values->block = std::move(slot);
+                values->count = count;
+                return true;
             };
             switch (c) {
             case 0:  ok = into(uint64_t{}); break;
@@ -1870,7 +1880,8 @@ void ColumnarStore::set_decoded_columns_budget(size_t bytes) {
 
 DecodedColumnsBudget::Stats ColumnarStore::decoded_columns_stats() const {
     std::shared_lock<std::shared_mutex> lock(index_mtx_);
-    return decoded_budget_ ? decoded_budget_->stats() : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0};
+    return decoded_budget_ ? decoded_budget_->stats()
+                           : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0, ColumnArena::Stats{0, 0, 0, 0}};
 }
 
 namespace {
@@ -2191,7 +2202,7 @@ ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
         std::array<DecodedColumns::Column, kColumns> fresh{};
         std::string why;
         const ColumnsLoad loaded = load_columns_v3(dir, meta.row_count, missing, lease.buffers(), why,
-                                                   &fresh);
+                                                   &fresh, slot.arena());
         if (loaded == ColumnsLoad::kMissing) {
             if (!still_indexed(dir)) {
                 OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "

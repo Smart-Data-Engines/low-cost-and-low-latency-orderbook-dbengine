@@ -587,3 +587,112 @@ TEST(DecodedColumnsStore, HoldingOffReadsAsBeforeAndTakesTheSlotsAway) {
     EXPECT_EQ(store.decoded_columns_stats().held_bytes, 0u);
     EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), 100u);
 }
+
+// ── The memory they are held in (#223) ───────────────────────────────────────────────────
+
+namespace {
+
+/// `n` rows from `t0`, a millisecond apart: one segment, where rows_from()'s second apart would cut
+/// ten thousand into segments of an hour's - columns the arena's classes leave to the heap.
+std::vector<ob::SnapshotRow> dense_rows(uint64_t t0, size_t n, int64_t price0) {
+    std::vector<ob::SnapshotRow> rows;
+    rows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        rows.push_back(row_at(t0 + i * 1'000'000ULL, price0 + static_cast<int64_t>(i),
+                              static_cast<uint16_t>(i % 20)));
+    }
+    return rows;
+}
+
+}  // namespace
+
+TEST(DecodedColumnsArena, TheArenasSlackIsOneLargestSegmentsColumnsAtLeast) {
+    // 262 144 rows of the seven columns are 9.75 MiB: a miss past the first reads must find that
+    // free, or it decodes on the heap what its eviction would have given it.
+    EXPECT_EQ(ob::DecodedColumnsBudget::arena_slack(0), size_t{16} << 20);
+    EXPECT_EQ(ob::DecodedColumnsBudget::arena_slack(64 * kMiB), size_t{16} << 20);
+    EXPECT_EQ(ob::DecodedColumnsBudget::arena_slack(256 * kMiB), size_t{32} << 20) << "an eighth";
+    EXPECT_GE(ob::DecodedColumnsBudget::kArenaSlackFloor, size_t{262'144} * (8 + 8 + 8 + 4 + 1 + 2 + 8));
+}
+
+TEST(DecodedColumnsArena, TheColumnsOfTheArenasSizesAreInSlotsAndTheSmallerOnTheHeap) {
+    TempDir dir;
+    written(dir.str(), dense_rows(kBase, 10'000, 1000));
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(64 * kMiB);
+    store.open_existing();
+    ASSERT_EQ(read(store, ob::ColumnSet::all()).size(), 10'000u);
+    // Ten thousand values: the four 8-byte columns are 80 000 bytes, a 128 KiB slot each; the
+    // order count's 40 000, the level's 20 000 and the side's 10 000 are the heap's.
+    const auto s = store.decoded_columns_stats().arena;
+    EXPECT_EQ(s.regions, 1u);
+    EXPECT_EQ(s.mapped_bytes - s.free_bytes, 4 * (size_t{128} << 10));
+    EXPECT_EQ(s.fallbacks, 0u);
+    // The budget counts the slots, not the values in them.
+    EXPECT_GE(store.decoded_columns_stats().held_bytes, 4 * (size_t{128} << 10) + 70'000);
+}
+
+TEST(DecodedColumnsArena, AnEvictedSegmentsSlotsAreTheNextOnesAndTheArenaDoesNotGrow) {
+    TempDir dir;
+    written(dir.str(), dense_rows(kBase, 10'000, 1000), "A");
+    written(dir.str(), dense_rows(kBase, 10'000, 90'000), "B");
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    // Room for one segment's columns - four slots of 128 KiB and 70 000 bytes on the heap - so
+    // each read of the other evicts it.
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(700 << 10);
+    store.open_existing();
+    for (int i = 0; i < 6; ++i) {
+        const std::string symbol = i % 2 == 0 ? "A" : "B";
+        EXPECT_TRUE(same_rows(read(store, ob::ColumnSet::all(), symbol),
+                              read(plain, ob::ColumnSet::all(), symbol))) << symbol;
+        const auto s = store.decoded_columns_stats();
+        EXPECT_EQ(s.arena.regions, 1u) << "read " << i;
+        EXPECT_EQ(s.arena.mapped_bytes - s.arena.free_bytes, 4 * (size_t{128} << 10)) << "read " << i;
+        EXPECT_EQ(s.arena.fallbacks, 0u);
+    }
+    EXPECT_GE(store.decoded_columns_stats().evictions, 5u) << "the control: each read evicted the other";
+}
+
+TEST(DecodedColumnsArena, ReadsFromColumnsInTheArenaAnswerAsReadsWithoutHolding) {
+    // ReadsWithAndWithoutHoldingAnswerTheSame's segments are an hour's at a row a second, columns the
+    // heap holds; this one's twenty thousand rows are one segment, and its columns the arena's.
+    TempDir dir;
+    written(dir.str(), dense_rows(kBase, 20'000, 3000));
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    ob::ColumnarStore holding(dir.str());
+    holding.set_decoded_columns_budget(64 * kMiB);
+    holding.open_existing();
+    const std::vector<ob::ColumnSet> sets = {
+        ob::ColumnSet::all(),
+        set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::Price}),
+        set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::Side, ob::QueryColumn::Level}),
+        set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::SequenceNumber,
+                ob::QueryColumn::Quantity, ob::QueryColumn::OrderCount}),
+    };
+    const uint64_t lo = kBase + 5'000'000'000ULL, hi = kBase + 5'300'000'000ULL;
+    for (const auto& columns : sets) {
+        const auto expected = read(plain, columns);
+        ASSERT_EQ(expected.size(), 20'000u);
+        EXPECT_TRUE(same_rows(read(holding, columns), expected));
+        EXPECT_TRUE(same_rows(read(holding, columns), expected));
+        EXPECT_TRUE(same_rows(read(holding, columns, "A", lo, hi), read(plain, columns, "A", lo, hi)));
+    }
+    const uint64_t instant = kBase + 7'000'000'000ULL;
+    EXPECT_TRUE(same_rows(holding.latest_per_level(instant, "A", "EX").rows,
+                          plain.latest_per_level(instant, "A", "EX").rows));
+    std::vector<ob::SnapshotRow> a, b;
+    holding.scan_by_time(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), ob::RowFilter{},
+                         [&](const ob::SnapshotRow& r) { a.push_back(r); return true; });
+    plain.scan_by_time(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), ob::RowFilter{},
+                       [&](const ob::SnapshotRow& r) { b.push_back(r); return true; });
+    EXPECT_TRUE(same_rows(a, b));
+    const auto s = holding.decoded_columns_stats();
+    EXPECT_GT(s.hits, 0u);
+    EXPECT_GT(s.arena.mapped_bytes - s.arena.free_bytes, 0u)
+        << "the control: the columns compared were the arena's, not the heap's";
+}
