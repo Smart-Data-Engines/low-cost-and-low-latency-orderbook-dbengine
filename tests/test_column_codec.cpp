@@ -211,6 +211,24 @@ std::vector<uint64_t> short_runs(size_t n, unsigned repeat_per_mille, uint64_t s
     return out;
 }
 
+// A period of `period` random values twenty bits wide, each repeated `len` times, over and over: LZ4
+// takes the repeats of the period from a packing of every value, and the period's length sets how
+// much. Runs of two and a period of 1160 put LZ4's best between the runs' bytes and their weight,
+// where weighing the two by bytes chooses the runs and by weight does not (#223).
+std::vector<uint64_t> periodic_runs(unsigned len, unsigned period, size_t n) {
+    std::vector<uint64_t> pattern;
+    uint64_t x = 12345 + period;
+    for (unsigned k = 0; k < period; ++k) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        pattern.push_back(1 + ((x >> 33) & ((uint64_t{1} << 20) - 1)));
+    }
+    std::vector<uint64_t> out;
+    for (size_t i = 0; out.size() < n; ++i) {
+        for (unsigned k = 0; k < len && out.size() < n; ++k) out.push_back(pattern[i % period]);
+    }
+    return out;
+}
+
 TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
     // The rule, held exactly (#223): no candidate weighs less than the chosen one, a runs candidate
     // weighed as larger by its charge - for every charge, the default's included, with ZSTD and as a
@@ -220,6 +238,12 @@ TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
     std::vector<uint64_t> long_runs;
     for (uint64_t i = 0; i < 5'000; ++i) long_runs.push_back(1'000 + (i / 23) * 7 % 101);
     columns.push_back(long_runs);
+    columns.push_back(periodic_runs(2, 1'160, 4'000));
+    // A short stepping column on which a delta stream's runs per value, counted over its 26 values
+    // rather than over the column's 27, decide the choice.
+    columns.push_back({1004001, 1004001, 1004001, 1008002, 1012003, 1016004, 1017958, 1021959, 1025960,
+                       1029961, 1029961, 1029961, 1033962, 1035916, 1039917, 1039917, 1043918, 1047826,
+                       1051827, 1055828, 1059829, 1063830, 1067831, 1067831, 1067831, 1067831, 1071832});
     for (const int zstd_level : {3, 0}) {   // with ZSTD, and as a seal searches, without it
         for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u, std::numeric_limits<unsigned>::max()}) {
             EncodeOptions options;
