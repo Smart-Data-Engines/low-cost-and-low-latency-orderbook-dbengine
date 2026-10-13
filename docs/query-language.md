@@ -447,12 +447,12 @@ Five things worth knowing before writing a client:
   numbered above the book's `sequence_number`, in order. Those at or below it are in the book
   already. Nothing falls between the two: every write after `OK SUB` is pushed, and every write
   before it is in a book taken after it. The other way round loses whatever is written between the
-  book and the subscription (#239). A write applied
-  while the book was being read may be in it and pushed as well, and applying that push again is
-  harmless: it sets a level to the quantity the level already has, or, where the book also holds a
-  later write to that level, to an older one that the later write's own push then replaces. On a
-  multi-master mesh the numbers are per origin and neither a push nor a book says whose a number is,
-  so a book cannot be matched to a mesh node's pushes this way: resume on a primary or its replicas.
+  book and the subscription (#239). A write applied while the book was being read may be in it and
+  pushed as well, and applying that push again is harmless: it sets a level to the quantity the
+  level already has, or, where the book also holds a later write to that level, to an older one that
+  the later write's own push then replaces. On a multi-master mesh the numbers are per origin and
+  neither a push nor a book says whose a number is, so a book cannot be matched to a mesh node's
+  pushes this way: resume on a primary or its replicas.
 
 There is a limit per session (`--max-subscriptions-per-session`, 16 by default), because without one
 a single connection can order an unbounded amount of work onto every other client's write path.

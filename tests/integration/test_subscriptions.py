@@ -336,10 +336,14 @@ def test_a_command_still_works_while_rows_are_being_pushed(cluster) -> None:
 # round, which loses whatever is written between them - in 48 of 50 trials of the probe that found
 # it. And the book's number was read after its levels, so it could name an update a side did not
 # hold yet, and the push of that update was the one the client dropped as already in the book.
+#
+# This holds the recipe end to end. Through a node, a write landing inside a book's read is rare:
+# master's server passed it too, with no book of 4 171 behind its number. The race is found in
+# process, by `QueryBook.ABookHoldsEveryUpdateUpToTheSequenceNumberItReports`.
 
 @pytest.mark.subscriptions
 def test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss(cluster) -> None:
-    from orderbook_engine import OrderbookEngine
+    from orderbook_engine import BookUpdate, OrderbookEngine
 
     port = cluster.primary().tcp_port
     symbol, exchange = "RESUMESYM", "RESUMEX"
@@ -354,7 +358,8 @@ def test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss(cluste
         setup.close()
 
     # The writer sets the best bid's quantity to a counter of its own, so the quantity in a book or
-    # in a push says which of its updates that is.
+    # in a push says which of its updates that is. In batches, which the node applies back to back,
+    # so that the books are taken among dense writes.
     stop = threading.Event()
     failures: list[BaseException] = []
 
@@ -363,8 +368,10 @@ def test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss(cluste
         try:
             k = 1
             while not stop.is_set():
-                k += 1
-                writer.insert(symbol, exchange, "bid", [best], [k])
+                batch = [BookUpdate(symbol, exchange, "bid", [best], [k + i]) for i in range(1, 33)]
+                refused = [o for o in writer.insert_batch(batch) if not o.ok]
+                assert not refused, f"the node refused a write: {refused[0]}"
+                k += len(batch)
         except BaseException as e:  # noqa: BLE001 - reported by the assertion below
             failures.append(e)
         finally:
