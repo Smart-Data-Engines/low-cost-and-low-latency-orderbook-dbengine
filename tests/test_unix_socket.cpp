@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,14 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+/// As `ob_tcp_server`'s main does (#59): a server in this process writes to peers that may have gone,
+/// its TLS writes through OpenSSL without MSG_NOSIGNAL, and the signal's default action would end the
+/// test binary instead of failing the one test that met it.
+[[maybe_unused]] const bool kSigpipeIgnored = [] {
+    std::signal(SIGPIPE, SIG_IGN);
+    return true;
+}();
 
 /// A directory of its own for each test: the servers' data, and the socket. Under the temp
 /// directory like `NetUnix`'s, whose path a socket's address has room for.
