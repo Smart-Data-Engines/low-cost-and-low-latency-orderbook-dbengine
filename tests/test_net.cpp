@@ -14,14 +14,22 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace {
 
 using ob::net::address_of;
 using ob::net::dial;
+using ob::net::dial_unix;
+using ob::net::listen_unix;
+using ob::net::valid_unix_path;
 using ob::net::join_host_port;
 using ob::net::listen_on;
 using ob::net::literal_family;
@@ -285,6 +293,139 @@ TEST(NetDial, SaysWhyNothingAnswered) {
     why.clear();
     EXPECT_LT(dial("127.0.0.1", 0, 1000, false, why, "test"), 0);
     EXPECT_NE(why.find("port 0"), std::string::npos) << why;
+}
+
+// ── Unix sockets (#52) ────────────────────────────────────────────────────────
+
+/// A directory of its own under the temporary directory, removed with everything in it at the end.
+struct UnixDir {
+    std::filesystem::path dir;
+    UnixDir() {
+        dir = std::filesystem::temp_directory_path() /
+              ("ob_unix_" + std::to_string(::getpid()) + "_" + std::to_string(::gettid()));
+        std::filesystem::create_directories(dir);
+    }
+    ~UnixDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    std::string at(const char* name) const { return (dir / name).string(); }
+};
+
+TEST(NetUnix, APathMustFitASocketsAddress) {
+    std::string why;
+    EXPECT_TRUE(valid_unix_path("/run/orderbook/ob.sock", why)) << why;
+    EXPECT_FALSE(valid_unix_path("", why));
+    EXPECT_NE(why.find("empty"), std::string::npos) << why;
+    EXPECT_FALSE(valid_unix_path(std::string("/tmp/a\0b", 8), why));
+    EXPECT_NE(why.find("NUL"), std::string::npos) << why;
+    const std::string longest = "/" + std::string(sizeof(sockaddr_un{}.sun_path) - 2, 'x');
+    EXPECT_TRUE(valid_unix_path(longest, why)) << why;
+    EXPECT_FALSE(valid_unix_path(longest + "x", why));
+    EXPECT_NE(why.find("at most 107"), std::string::npos) << why;
+}
+
+TEST(NetUnix, AListenerTakesAConnectionAndSeesTheProcessThatMadeIt) {
+    UnixDir d;
+    const std::string path = d.at("ob.sock");
+    std::string error;
+    const int listener = listen_unix(path, 0660, 16, 0, error);
+    ASSERT_GE(listener, 0) << error;
+    std::string why;
+    const int client = dial_unix(path, 1000, false, why);
+    ASSERT_GE(client, 0) << why;
+    const int served = accept_one(listener);
+    ASSERT_GE(served, 0);
+    // The server's end names the client's process, which is this one.
+    EXPECT_EQ(peer_address(served), "unix pid=" + std::to_string(::getpid()) + " uid=" +
+                                        std::to_string(::getuid()) + " gid=" + std::to_string(::getgid()));
+    const char ping[] = "PING\n";
+    ASSERT_EQ(::send(client, ping, 5, 0), 5);
+    char got[8] = {};
+    ASSERT_EQ(::recv(served, got, sizeof(got), 0), 5);
+    EXPECT_EQ(std::string(got, 5), "PING\n");
+    ::close(served);
+    ::close(client);
+    ::close(listener);
+}
+
+TEST(NetUnix, TheSocketsFileTakesTheModeAsked) {
+    UnixDir d;
+    for (const uint32_t mode : {0600u, 0660u, 0666u}) {
+        const std::string path = d.at(("m" + std::to_string(mode) + ".sock").c_str());
+        std::string error;
+        const int listener = listen_unix(path, mode, 16, 0, error);
+        ASSERT_GE(listener, 0) << error;
+        struct stat st{};
+        ASSERT_EQ(::lstat(path.c_str(), &st), 0);
+        EXPECT_TRUE(S_ISSOCK(st.st_mode));
+        EXPECT_EQ(st.st_mode & 0777, mode) << std::oct << (st.st_mode & 0777);
+        ::close(listener);
+    }
+}
+
+TEST(NetUnix, ASocketNobodyListensOnIsReplaced) {
+    // What a process killed while it listened leaves: the file, and nothing behind it.
+    UnixDir d;
+    const std::string path = d.at("stale.sock");
+    std::string error;
+    const int first = listen_unix(path, 0660, 16, 0, error);
+    ASSERT_GE(first, 0) << error;
+    ::close(first);   // gone without removing its file
+    struct stat st{};
+    ASSERT_EQ(::lstat(path.c_str(), &st), 0) << "the stale file is not there, so this tests nothing";
+    const int second = listen_unix(path, 0660, 16, 0, error);
+    ASSERT_GE(second, 0) << error;
+    std::string why;
+    const int client = dial_unix(path, 1000, false, why);
+    EXPECT_GE(client, 0) << why;
+    if (client >= 0) ::close(client);
+    ::close(second);
+}
+
+TEST(NetUnix, ASocketSomebodyListensOnIsRefusedAndKeepsWorking) {
+    UnixDir d;
+    const std::string path = d.at("busy.sock");
+    std::string error;
+    const int first = listen_unix(path, 0660, 16, 0, error);
+    ASSERT_GE(first, 0) << error;
+    EXPECT_LT(listen_unix(path, 0660, 16, 0, error), 0);
+    EXPECT_NE(error.find("another process listens on it"), std::string::npos) << error;
+    EXPECT_NE(error.find(path), std::string::npos) << error;
+    // The refusal took nothing from the first: its file is there and it still answers.
+    std::string why;
+    const int client = dial_unix(path, 1000, false, why);
+    ASSERT_GE(client, 0) << why;
+    const int served = accept_one(first);
+    EXPECT_GE(served, 0);
+    if (served >= 0) ::close(served);
+    ::close(client);
+    ::close(first);
+}
+
+TEST(NetUnix, AFileThatIsNotASocketIsRefusedAndLeftAsItWas) {
+    UnixDir d;
+    const std::string path = d.at("notes.txt");
+    { std::ofstream(path) << "an operator's file"; }
+    std::string error;
+    EXPECT_LT(listen_unix(path, 0660, 16, 0, error), 0);
+    EXPECT_NE(error.find("is not a socket"), std::string::npos) << error;
+    std::ifstream in(path);
+    std::string kept((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(kept, "an operator's file");
+}
+
+TEST(NetUnix, ADialSaysWhyNothingAnswered) {
+    UnixDir d;
+    std::string why;
+    EXPECT_LT(dial_unix(d.at("nothing.sock"), 200, false, why), 0);
+    EXPECT_NE(why.find("No such file"), std::string::npos) << why;
+    std::string error;
+    const int listener = listen_unix(d.at("closed.sock"), 0660, 16, 0, error);
+    ASSERT_GE(listener, 0) << error;
+    ::close(listener);
+    EXPECT_LT(dial_unix(d.at("closed.sock"), 200, false, why), 0);
+    EXPECT_NE(why.find("refused"), std::string::npos) << why;
 }
 
 }  // namespace
