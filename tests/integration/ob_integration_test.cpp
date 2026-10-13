@@ -43,6 +43,16 @@ static void apply_auth_from_env(ob::ClientConfig& cfg) {
     if (const char* v = std::getenv("OB_TLS_VERIFY")) {
         cfg.tls_verify = !(std::strcmp(v, "0") == 0);
     }
+
+    // The node's Unix socket and its rings (#52) the same way, so every subcommand runs through
+    // them too: `OB_UNIX_SOCKET`, `OB_RINGS=1` and `OB_RING_SPIN_US`.
+    if (const char* path = std::getenv("OB_UNIX_SOCKET")) cfg.unix_socket = path;
+    if (const char* r = std::getenv("OB_RINGS"); r != nullptr && std::strcmp(r, "1") == 0) {
+        cfg.rings.enabled = true;
+    }
+    if (const char* spin = std::getenv("OB_RING_SPIN_US")) {
+        cfg.rings.spin_us = static_cast<uint32_t>(std::strtoul(spin, nullptr, 10));
+    }
 }
 
 // ── Test: ping ───────────────────────────────────────────────────────────────
