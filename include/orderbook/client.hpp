@@ -37,9 +37,12 @@ struct RingOptions {
     bool     enabled = false;
     /// Each direction's size; 0 takes the server's (`--ring-bytes`).
     uint64_t bytes = 0;
-    /// How long a read polls the answer ring before it sleeps on its bell, in microseconds. Polling
-    /// keeps a round trip off the scheduler, at the cost of the core it polls on; 0 sleeps at once.
-    uint32_t spin_us = 0;
+    /// How long a read polls the answer ring before it sleeps on its bell, in microseconds; 0 sleeps
+    /// at once. 20 by default, from a measurement: a node answers a PING through rings in well under
+    /// a microsecond, so a client that sleeps at once is caught going to sleep and pays the whole
+    /// wake-up - 3.50 us a PING on an EPYC 9R45 against 0.51 for one that polled 5 us first, and
+    /// 2.00 through the plain socket. The cost is the core it polls on, for at most this long.
+    uint32_t spin_us = 20;
 };
 
 struct ClientConfig {
