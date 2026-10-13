@@ -581,13 +581,55 @@ bool apply_inverse(const Header& h, size_t count, Get get, T* o) {
     return above == 0;
 }
 
+/// The `W` bytes at `p` as the value they hold, little-endian (as the WAL is): loads of their own
+/// sizes, put together in a register. A memcpy of three bytes into a zeroed uint64_t compiles to
+/// three stores into a stack slot and one load of all eight, which no store can forward - the load
+/// waits for the stores to retire, every value. That was most of a narrow column's decode: 5.2 ns a
+/// value for the quantities of binance-top20, three bytes wide, on the EPYC host (#223).
+template <unsigned W>
+inline uint64_t load_narrow(const char* p) {
+    const auto byte = [p](unsigned at) { return uint64_t{static_cast<unsigned char>(p[at])}; };
+    if constexpr (W == 1) {
+        return byte(0);
+    } else if constexpr (W == 2) {
+        uint16_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v;
+    } else if constexpr (W == 3) {
+        uint16_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v | byte(2) << 16;
+    } else if constexpr (W == 4) {
+        uint32_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v;
+    } else if constexpr (W == 5) {
+        uint32_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v | byte(4) << 32;
+    } else if constexpr (W == 6) {
+        uint32_t v;
+        uint16_t w;
+        std::memcpy(&v, p, sizeof v);
+        std::memcpy(&w, p + 4, sizeof w);
+        return v | uint64_t{w} << 32;
+    } else if constexpr (W == 7) {
+        uint32_t v;
+        uint16_t w;
+        std::memcpy(&v, p, sizeof v);
+        std::memcpy(&w, p + 4, sizeof w);
+        return v | uint64_t{w} << 32 | byte(6) << 48;
+    } else {
+        static_assert(W == 8, "a narrow value is one to eight bytes");
+        uint64_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v;
+    }
+}
+
 template <typename T, unsigned W>
 bool narrow_inverse(const Header& h, const char* p, size_t count, T* o) {
-    return apply_inverse<T>(h, count, [p](size_t i) {
-        uint64_t x = 0;
-        std::memcpy(&x, p + i * W, W);   // little-endian hosts only, as the WAL is
-        return x;
-    }, o);
+    return apply_inverse<T>(h, count, [p](size_t i) { return load_narrow<W>(p + i * W); }, o);
 }
 
 /// Runs, unpacked straight into the column: a value filled run by run for none and for, and the
