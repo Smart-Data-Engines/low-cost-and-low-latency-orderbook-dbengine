@@ -89,6 +89,14 @@ int main(int argc, char** argv) {
     }
     const std::string label = command;
     command += '\n';
+    // As a JSON string: a `MINSERT` is several lines - one argument holding its level lines - and a
+    // raw newline in the output would make the line unreadable as JSON.
+    std::string json_label;
+    for (const char c : label) {
+        if (c == '\n') json_label += "\\n";
+        else if (c == '"' || c == '\\') { json_label += '\\'; json_label += c; }
+        else json_label += c;
+    }
     // `PING` answers one line; an `OK` answer ends in a blank line, so a reader that took one
     // `recv` would time a fraction of a large answer and call it fast.
     const bool one_line = label == "PING";
@@ -198,7 +206,7 @@ int main(int argc, char** argv) {
                 "\"p50_ns\": %lld, \"p99_ns\": %lld, "
                 "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
                 "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu}\n",
-                label.c_str(), (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
+                json_label.c_str(), (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
                 iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
                 ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),
