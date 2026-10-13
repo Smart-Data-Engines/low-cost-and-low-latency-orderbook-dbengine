@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "orderbook/codec.hpp"
 #include "orderbook/column_codec.hpp"
 
 using namespace ob::column_codec;
@@ -441,6 +442,164 @@ TEST(ColumnCodec, EveryNarrowWidthGivesItsValuesBack) {
         ASSERT_TRUE(decode(bytes(block), column.size(), back, &why)) << w << ": " << why;
         EXPECT_EQ(back, column) << w << " bytes a value";
     }
+}
+
+namespace {
+
+/// decode_into() of `block` as T into memory with sixteen guard values past `column`'s end: true when
+/// it decodes the values `column` holds and leaves every guard as it was. Sixteen, because a short run
+/// is written as eight.
+template <typename T>
+bool decodes_into_with_guards(const std::string& block, const std::vector<uint64_t>& column) {
+    DecodeScratch scratch;
+    std::vector<T> into(column.size() + 16);
+    std::memset(into.data(), 0xAB, into.size() * sizeof(T));
+    T guard;
+    std::memset(&guard, 0xAB, sizeof(T));
+    std::string why;
+    if (!decode_into(bytes(block), column.size(), into.data(), scratch, &why)) return false;
+    for (size_t i = 0; i < column.size(); ++i) {
+        if (into[i] != static_cast<T>(column[i])) return false;
+    }
+    for (size_t i = column.size(); i < into.size(); ++i) {
+        if (into[i] != guard) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+RC_GTEST_PROP(ColumnCodec, RunsOfEveryLengthDecodeIntoEveryColumnType, ()) {
+    // #223: where runs average two to eight values, a run of at most eight values, with room for eight
+    // before the column ends, is written as eight and the next run writes over the rest. Runs of one
+    // value up to a longest drawn from one to twenty, so that both ways of writing a column, both ways
+    // of writing a run and the column's last slots are reached, in columns every type holds.
+    const auto longest = *rc::gen::inRange<size_t>(1, 21);
+    const auto lengths =
+        *rc::gen::nonEmpty(rc::gen::container<std::vector<size_t>>(rc::gen::inRange<size_t>(1, longest + 1)));
+    const auto steps = *rc::gen::container<std::vector<int>>(lengths.size(), rc::gen::inRange(-3, 4));
+    const auto levels =
+        *rc::gen::container<std::vector<uint64_t>>(lengths.size(), rc::gen::inRange<uint64_t>(0, 256));
+    // The delta-shaped column steps by one difference a run, from 128, kept inside 0 - 255; the
+    // value-shaped one holds one value a run.
+    std::vector<uint64_t> stepping{128};
+    std::vector<uint64_t> holding;
+    int64_t v = 128;
+    for (size_t r = 0; r < lengths.size(); ++r) {
+        const int64_t end = v + static_cast<int64_t>(lengths[r]) * steps[r];
+        const int64_t step = end < 0 || end > 255 ? 0 : steps[r];
+        for (size_t k = 0; k < lengths[r]; ++k) stepping.push_back(static_cast<uint64_t>(v += step));
+        holding.insert(holding.end(), lengths[r], levels[r]);
+    }
+    for (const auto& [column, encoding] :
+         {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
+          std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kLz4}},
+          std::pair{holding, Encoding{Transform::kFor, Packing::kRuns, Compressor::kNone}},
+          std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kLz4}}}) {
+        std::string block;
+        encode_as(column, encoding, 1, block);
+        RC_ASSERT(decodes_into_with_guards<uint8_t>(block, column));
+        RC_ASSERT(decodes_into_with_guards<uint16_t>(block, column));
+        RC_ASSERT(decodes_into_with_guards<uint32_t>(block, column));
+        RC_ASSERT(decodes_into_with_guards<uint64_t>(block, column));
+        RC_ASSERT(decodes_into_with_guards<int64_t>(block, column));
+    }
+}
+
+TEST(ColumnCodec, AShortRunNearTheColumnsEndWritesNothingPastIt) {
+    // #223: a short run is written as a block only where the whole block fits before the column ends.
+    // Columns of every length from 1 to 40, of runs two and three values long in turn - long enough on
+    // average to be written in blocks - so that a run starts at every distance from the end.
+    for (size_t length = 1; length <= 40; ++length) {
+        std::vector<uint64_t> stepping{0};
+        std::vector<uint64_t> holding;
+        for (size_t r = 0; holding.size() < length; ++r) {
+            const size_t run = r % 2 == 0 ? 2 : 3;
+            for (size_t k = 0; k < run; ++k) {
+                if (stepping.size() < length) stepping.push_back(stepping.back() + (r % 2 == 0 ? 1 : 2));
+                if (holding.size() < length) holding.push_back(r % 2 == 0 ? 7 : 9);
+            }
+        }
+        for (const auto& [column, encoding] :
+             {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
+              std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}}}) {
+            std::string block;
+            encode_as(column, encoding, 1, block);
+            EXPECT_TRUE(decodes_into_with_guards<uint8_t>(block, column)) << encoding.name() << ", " << length;
+            EXPECT_TRUE(decodes_into_with_guards<uint16_t>(block, column)) << encoding.name() << ", " << length;
+            EXPECT_TRUE(decodes_into_with_guards<uint64_t>(block, column)) << encoding.name() << ", " << length;
+        }
+    }
+}
+
+TEST(ColumnCodec, RunsThatDoNotCoverTheValuesExactlyAreRefused) {
+    // #223: whether the runs cover the values is two sums now rather than a running total. A run
+    // longer than all the values together is refused first: past that, a length could wrap the sum
+    // round to exactly the values' count.
+    const std::vector<uint64_t> column(10, 6);
+    std::string block;
+    encode_as(column, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}, 1, block);
+    // The header is the encoding byte and the count; none has no anchor.
+    size_t at = 1;
+    uint64_t count = 0;
+    ASSERT_TRUE(get_varint(bytes(block), at, count));
+    ASSERT_EQ(count, column.size());
+    const std::string header = block.substr(0, at);
+    // A runs payload: how many runs and how many words their values take, then the values' words and
+    // the lengths' words - each length stored as one less than the run.
+    const auto with_runs = [&](const std::vector<uint64_t>& values, const std::vector<uint64_t>& lengths) {
+        const auto value_words = ob::encode_simple8b(values).words;
+        const auto length_words = ob::encode_simple8b(lengths).words;
+        std::string b = header;
+        put_varint(b, values.size());
+        put_varint(b, value_words.size());
+        b.append(reinterpret_cast<const char*>(value_words.data()), value_words.size() * sizeof(uint64_t));
+        b.append(reinterpret_cast<const char*>(length_words.data()), length_words.size() * sizeof(uint64_t));
+        return b;
+    };
+    std::vector<uint64_t> out;
+    std::string why;
+    ASSERT_TRUE(decode(bytes(with_runs({5, 6}, {2, 6})), 10, out, &why)) << "the control: " << why;
+    EXPECT_EQ(out, (std::vector<uint64_t>{5, 5, 5, 6, 6, 6, 6, 6, 6, 6}));
+    EXPECT_FALSE(decode(bytes(with_runs({5, 6}, {4, 9})), 10, out, &why)) << "fifteen values";
+    EXPECT_FALSE(decode(bytes(with_runs({5, 6}, {2, 3})), 10, out, &why)) << "seven values";
+    EXPECT_FALSE(decode(bytes(with_runs({5, 6}, {~uint64_t{0}, 9})), 10, out, &why)) << "a sum wrapped to ten";
+}
+
+TEST(ColumnCodec, AShortRunIsRefusedWhereverItsValuesLeaveTheType) {
+    // #223: a short run is checked at its two ends, which bound it. Each column is a short run and a
+    // run of twelve after it, so that the short one is written as a block, and is decoded as 8-bit.
+    const Encoding delta_runs{Transform::kDelta, Packing::kRuns, Compressor::kNone};
+    const auto refused_as_u8 = [&](std::vector<uint64_t> column) {
+        const uint64_t last = column.back();
+        column.insert(column.end(), 12, last);   // the run of twelve: a step of zero
+        std::string block;
+        encode_as(column, delta_runs, 1, block);
+        std::vector<uint8_t> as8;
+        std::vector<uint64_t> as64;
+        std::string why;
+        EXPECT_TRUE(decode_as(bytes(block), column.size(), as64, &why)) << "the control: " << why;
+        EXPECT_EQ(as64, column);
+        return !decode_as(bytes(block), column.size(), as8, &why) && why.find("type") != std::string::npos;
+    };
+    // Its last value past 255, and the next run, a short one too, back inside it: 0, 100, 200, 300,
+    // then 200, 100, 0. Only the first run's last value is outside, so only its check can see it.
+    EXPECT_TRUE(refused_as_u8({0, 100, 200, 300, 200, 100, 0}));
+    // Its first value past 255, and its last back at 0: a step of 2^63, twice.
+    EXPECT_TRUE(refused_as_u8({0, uint64_t{1} << 63, 0}));
+    // The control: in range at both ends, and so throughout.
+    EXPECT_FALSE(refused_as_u8({55, 155, 255}));
+
+    // The values a block writes past a short run's end are the next run's to write, and are not
+    // checked: 0, 100, 200 is a run of two whose block reaches 800, then twelve values down by one.
+    std::vector<uint64_t> column{0, 100, 200};
+    for (uint64_t k = 1; k <= 12; ++k) column.push_back(200 - k);
+    std::string block;
+    encode_as(column, delta_runs, 1, block);
+    std::vector<uint8_t> as8;
+    std::string why;
+    ASSERT_TRUE(decode_as(bytes(block), column.size(), as8, &why)) << why;
+    EXPECT_TRUE(std::equal(column.begin(), column.end(), as8.begin()));
 }
 
 TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {

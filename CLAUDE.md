@@ -4238,6 +4238,19 @@ Learned the hard way. Check here before debugging.
      "keyUsage=critical,keyCertSign,cRLSign"`. An older OpenSSL's `x509 -req` also adds no authority
      key identifier, which strict verification wants too; `authorityKeyIdentifier=keyid` in the
      extension file covers both.
+579. **A branchless write that stores more can lose where the branch was predicted.** Writing every
+     short run as a block of eight took a third off the decode of binance-diff's levels, whose run
+     lengths follow no pattern, and made its prices 8% slower: their runs are one value long nearly
+     throughout, a branch the predictor already got right, and a block stored eight 64-bit values for
+     each one kept. binance-top20's sequence numbers, runs of one and nineteen in turn, lost 10% the
+     same way. The decision is per column now, from the runs' average length (#223). Before trading a
+     branch for work, measure the columns whose branch was cheap as well as the one whose was not.
+580. **A cold query on a fresh node is bimodal by memory state, and three rounds cannot tell that from
+     a regression.** Three rounds put a branch at 1.24 and 1.32 of master on two cold queries; six more
+     put it at 1.01 and 0.85. The time followed the page faults in both builds: 0.38-0.43 ms after
+     207-230 faults and 0.51-0.54 after 313-318, or 0.64-0.75 ms after 37-50 faults - a 2 MiB page to
+     zero - and 0.46-0.51 after 81-98. Print the faults beside the time, and when the ranges are wide,
+     run more rounds before reading the ratio (#223).
 
 ## Current state and open problems
 

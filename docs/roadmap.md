@@ -3315,6 +3315,37 @@ narrow window 0.63 and 0.72; binance-diff's queries and the synthetic set's, who
 and two bytes wide, stayed within master's ranges. What is left on binance-diff is its runs, behind
 delta and LZ4.
 
+**The runs, profiled next, were mispredicted at about every other run**
+(`evidence/2026-10-13-runs-decode/`). On binance-diff the seal chose runs for the timestamps, the
+levels and the sequence numbers: three to five values a run on average, and one value long more often
+than not. `perf` on the EPYC host put a third of the levels' decode where the loop resumed after a
+run's end, because the loop stopped at each run's end and the lengths follow no pattern. Now:
+- a run of at most eight values, with room for eight before the column ends, writes eight, and the
+  next run writes over the rest;
+- a delta run is checked for the column's type at its two ends, which bound it;
+- a 16-bit column's eight are one vector;
+- whether the runs cover the values is two reductions rather than a running total.
+
+300 decodes of the levels missed 18.08 million branches on master and 6.82 million now. Blocks are
+written only where runs average two to eight values. Written for every short run, they made
+binance-diff's prices 8% slower: runs of one value nearly throughout. Written wherever runs average two
+or more, they made binance-top20's sequence numbers 10% slower: runs of one and nineteen in turn,
+which the old loop's branch learns.
+
+The seal's choices, median of three rounds, ns a value on x86 and on ARM:
+- binance-diff's levels from 2.01 to 1.30 and from 1.73 to 1.18;
+- its sequence numbers from 1.87 to 1.13 and from 1.66 to 1.05;
+- its timestamps from 1.69 to 1.25 and from 1.45 to 1.14;
+- all seven of its columns from 8.91 - 9.01 to 7.08 - 7.21 ns a row and from 8.79 - 8.91 to
+  7.04 - 7.10, where format 2 reads them in 3.58 - 3.74;
+- binance-top20 within master's ranges.
+
+On a node, cold, binance-diff's first query took 0.89 (x86) and 0.92 (ARM) of master's time: 1.17 and
+1.28 of format 2's, where master's took 1.31 and 1.39. The other queries of the three datasets stayed
+within master's ranges, which six more rounds showed to be bimodal by memory state, on master as on
+the branch. What is left on binance-diff: 7.1 ns a row against format 2's 3.7, of which the prices
+and quantities, narrow behind LZ4, are 3.1 and the three columns of runs 3.7.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 
