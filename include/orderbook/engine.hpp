@@ -259,6 +259,10 @@ public:
     std::string format(const QueryAST& ast);
 
     /// Register a streaming subscription; returns subscription id.
+    ///
+    /// In force for every write applied after this returns, and a read made after it - `read_book()`
+    /// - holds every write applied before. So a book taken after subscribing, and the pushes above
+    /// its sequence number, miss nothing between the two (#239).
     uint64_t subscribe(std::string_view sql, RowCallback cb);
 
     /// Unregister a streaming subscription.

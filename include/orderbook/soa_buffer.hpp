@@ -58,8 +58,11 @@ struct SoABuffer {
     SoASide bid;                            // bid side (Requirement 2.4)
     SoASide ask;                            // ask side (Requirement 2.4)
 
-    std::atomic<uint64_t> sequence_number;  // monotonically increasing (Requirement 1.4, 1.5)
-    uint64_t last_timestamp_ns;             // nanosecond-precision Unix timestamp (Requirement 1.4)
+    // The last update applied, as one pair: `apply_delta()` writes both inside that update's side's
+    // seqlock, and `read_snapshot()` reads them under both sides' versions (#239). Atomic, both, so
+    // that a reader of the pair is not a data race.
+    std::atomic<uint64_t> sequence_number;    // monotonically increasing (Requirement 1.4, 1.5)
+    std::atomic<uint64_t> last_timestamp_ns;  // nanosecond-precision Unix timestamp (Requirement 1.4)
 
     char symbol[32];                        // null-terminated symbol string (Requirement 1.1)
     char exchange[32];                      // null-terminated exchange string (Requirement 1.1)
@@ -89,8 +92,18 @@ ob_status_t remove_level(SoASide& side, int64_t price);
 ob_status_t apply_delta(SoABuffer& buf, const DeltaUpdate& update,
                         const Level* levels, bool& gap_detected);
 
-/// Read a consistent snapshot of both sides using the seqlock reader protocol.
-/// Spins until a stable (even-versioned) read is obtained for each side.
-void read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out_ask);
+/// The update a snapshot is as of: one update's sequence number and timestamp.
+struct SnapshotLabel {
+    uint64_t sequence_number;
+    uint64_t timestamp_ns;
+};
+
+/// Read a consistent snapshot of each side using the seqlock reader protocol, and its label.
+/// Spins until a stable (even-versioned) read is obtained for the label and for each side.
+///
+/// The label is read first, so it is a lower bound (#239): each side holds every update up to the
+/// label's sequence number, and may hold a later one too - one applied to it between the label and
+/// its copy. The sides are read one after the other, so they are not one moment either.
+SnapshotLabel read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out_ask);
 
 } // namespace ob

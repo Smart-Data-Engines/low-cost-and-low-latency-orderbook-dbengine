@@ -13,12 +13,16 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
 #include <fstream>
 #include <string>
 #include <unistd.h>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -155,6 +159,71 @@ TEST(QueryBook, EveryRowCarriesTheSameSnapshotIdentity) {
     fs::remove_all(dir);
 }
 
+TEST(QueryBook, ABookHoldsEveryUpdateUpToTheSequenceNumberItReports) {
+    // #239: a client resumes a subscription from a book's sequence number, dropping the pushes at
+    // or below it. That is safe only if the book holds every update up to the number it reports: a
+    // number newer than the book's contents loses the updates in between. Both sides are full, as a
+    // live book is, and a writer sets the best bid's quantity to each update's sequence number - a
+    // change of an existing level, the commonest update there is - so a book reporting update S must
+    // show the best bid's quantity at S or later. Before the fix, 35 to 73 of 600-750 reads a second
+    // (a Debug build) reported a number their contents did not hold yet.
+    //
+    // The timestamp is the other half of the label, and `write_level()` makes it the sequence
+    // number plus a constant, so a pair taken from two updates shows.
+    const std::string dir = temp_dir("ob_book_label_");
+    {
+        ob::Engine engine(dir, 60'000'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        constexpr int64_t kBase = 1'000'000;
+        constexpr int64_t kBest = kBase + 999;
+        constexpr uint64_t kTimeBase = 1'700'000'000'000'000'000ULL;   // as `write_level()` stamps
+        uint64_t seq = 1;
+        for (int64_t l = 0; l < 1000; ++l) {
+            write_level(engine, seq, ob::SIDE_ASK, 5 * kBase + l, 1);
+            ++seq;
+            write_level(engine, seq, ob::SIDE_BID, kBase + l, seq);
+            ++seq;
+        }
+        std::atomic<bool> stop{false};
+        std::thread writer([&, first = seq] {
+            for (uint64_t s = first; !stop.load(std::memory_order_relaxed); ++s) {
+                write_level(engine, s, ob::SIDE_BID, kBest, s);
+            }
+        });
+        size_t reads = 0;
+        size_t newer = 0;
+        size_t unpaired = 0;
+        uint64_t first_seq = 0;
+        uint64_t last_seq = 0;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < until) {
+            const auto rows = book_of(engine, 1);
+            ASSERT_FALSE(rows.empty());
+            const auto& best = rows.front();
+            ASSERT_EQ(best.price, kBest);
+            if (best.quantity < best.sequence_number) ++newer;
+            if (best.timestamp_ns != kTimeBase + best.sequence_number) ++unpaired;
+            if (first_seq == 0) first_seq = best.sequence_number;
+            last_seq = best.sequence_number;
+            ++reads;
+        }
+        stop.store(true, std::memory_order_relaxed);
+        writer.join();
+        std::printf("reads %zu, books newer than their contents %zu, labels from two updates %zu, "
+                    "seq %llu -> %llu\n", reads, newer, unpaired,
+                    static_cast<unsigned long long>(first_seq),
+                    static_cast<unsigned long long>(last_seq));
+        EXPECT_EQ(newer, 0u) << newer << " of " << reads
+                             << " books reported an update their contents did not hold yet";
+        EXPECT_EQ(unpaired, 0u) << unpaired << " of " << reads
+                                << " books carried the timestamp of another update than their number";
+        // The control: the reads raced the writer rather than reading a book that stood still.
+        EXPECT_GT(last_seq, first_seq + 1000) << "the writer barely moved during " << reads << " reads";
+        engine.close();
+    }
+    fs::remove_all(dir);
+}
+
 TEST(QueryBook, ASymbolWithNoLiveBufferIsNotFound) {
     const std::string dir = temp_dir("ob_book_absent_");
     {
@@ -236,4 +305,51 @@ TEST(QueryBookStatic, OneSnapshotPerAnswerAndAnOwningHandleForTheWholeOfIt) {
            "install during the read frees what it is reading (#92)";
     EXPECT_EQ(body.find("live_buffer_(key).get()"), std::string::npos)
         << "read_book() drops the owning handle and keeps a raw pointer, which is #92 exactly";
+}
+
+TEST(QueryBookStatic, TheLabelComesFromTheSnapshotAndASubscriptionIsInForceWhenItReturns) {
+    // #239, the two orderings a client resuming a subscription from a book rests on. The first has
+    // a behavioural test, which races a writer; this pins where it lives. The second has none that
+    // could fail: the window it closes is a write that read the subscriber flag before the
+    // registration was visible, with its own stores still unseen by the book taken after it.
+    //
+    // **The label comes from `read_snapshot()`**, which reads it before the sides. A query that
+    // reads the buffer's sequence number or timestamp itself reads it after the snapshot, which is
+    // the defect: a book labelled with an update it does not hold.
+    const auto read = [](const char* file) {
+        const std::filesystem::path path = std::filesystem::path(OB_SOURCE_DIR) / file;
+        std::ifstream in(path);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_FALSE(text.empty()) << "cannot read " << path << ", so this test checks nothing";
+        return text;
+    };
+    const std::string queries = read("src/query_engine.cpp");
+    ASSERT_NE(queries.find("read_snapshot("), std::string::npos)
+        << "src/query_engine.cpp no longer takes a snapshot - this test's anchor has moved";
+    EXPECT_EQ(queries.find("sequence_number.load("), std::string::npos)
+        << "a query reads the buffer's sequence number itself rather than the label "
+           "read_snapshot() returns, so it can label a book with an update it does not hold";
+    EXPECT_EQ(queries.find("last_timestamp_ns"), std::string::npos)
+        << "a query reads the buffer's timestamp itself rather than the label read_snapshot() "
+           "returns, so it can pair one update's number with another's time";
+
+    // **A subscription is in force for every write after `subscribe()` returns**: the engine takes
+    // the write lock once, after registering.
+    const std::string engine = read("src/engine.cpp");
+    const std::size_t at = engine.find("uint64_t Engine::subscribe(");
+    ASSERT_NE(at, std::string::npos) << "Engine::subscribe() is not in src/engine.cpp - this "
+                                        "test's anchor has moved, so it is asserting about nothing";
+    const std::size_t end = engine.find("\n}\n", at);
+    const std::string body = engine.substr(at, end == std::string::npos ? std::string::npos
+                                                                        : end - at);
+    const std::size_t registered = body.find("query_engine_->subscribe(");
+    const std::size_t locked = body.find("std::lock_guard<std::mutex> in_force(mtx_);");
+    ASSERT_NE(registered, std::string::npos) << "Engine::subscribe() no longer registers through "
+                                                "the query engine - this test's anchor has moved";
+    EXPECT_NE(locked, std::string::npos)
+        << "Engine::subscribe() does not take the write lock: a write may then read the subscriber "
+           "flag before the registration is visible, and its update is neither pushed nor in a book "
+           "taken after subscribing";
+    EXPECT_GT(locked, registered) << "Engine::subscribe() takes the write lock before registering, "
+                                     "which orders nothing after the registration";
 }

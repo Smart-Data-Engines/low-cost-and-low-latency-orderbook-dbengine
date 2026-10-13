@@ -201,13 +201,14 @@ in the harness installs anything, and a containerised competitor would measure t
   `CLOSE`, `TWAP` of the bid, the ask, the mid or the spread), and `ROLLING 15m` the same over the
   window that ends with each bucket ([query language](docs/query-language.md#time-buckets))
 - **The live book, on the wire** — `BOOK <symbol> <exchange> [depth]` returns the current levels of
-  both sides from the structure the engine updates in place, under one seqlock read, bids first and
-  each side in its own order. Distinct from `SELECT`, which reads history and answers with every
+  both sides from the structure the engine updates in place, each side under its seqlock, bids first
+  and each side in its own order. Distinct from `SELECT`, which reads history and answers with every
   version of a level it has stored: this answers with one row per level. Measured on an m9g.xlarge
   over loopback, ten levels per side is **9.7 µs p50** of which 8.0 µs is the round trip, and the
   marginal cost is 45–53 ns per level. Two of the seven columns are properties of the read rather
-  than of a level, so every row carries the same `timestamp_ns` and `sequence_number` — which is
-  the number to resume a `SUBSCRIBE` from. Also in the Python client (`book()`) and in `ob_cli`
+  than of a level, so every row carries the same `timestamp_ns` and `sequence_number`. Every update
+  up to that number is in the book, which makes it the number to resume a `SUBSCRIBE` from:
+  subscribe first, then take the book. Also in the Python client (`book()`) and in `ob_cli`
 - **Streaming subscriptions, pushed** — `SUBSCRIBE 'SYM'.'EXCH'` over the wire and the server sends
   rows as they are written, prefixed `PUSH <id>` with all seven columns, whatever select list the
   subscription named: a `PUSH` line has no header, so a narrowed push would change what a field

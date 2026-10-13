@@ -162,9 +162,10 @@ ob_status_t apply_delta(SoABuffer& buf, const DeltaUpdate& update,
         }
     }
 
-    // Update buffer metadata.
+    // Update buffer metadata, inside this side's seqlock: `read_snapshot()` reads the pair under
+    // both sides' versions, so a pair it accepts is one update's.
     buf.sequence_number.store(update.sequence_number, std::memory_order_relaxed);
-    buf.last_timestamp_ns = update.timestamp_ns;
+    buf.last_timestamp_ns.store(update.timestamp_ns, std::memory_order_relaxed);
 
     // ── Seqlock: end write (version → even) ───────────────────────────────
     std::atomic_thread_fence(std::memory_order_release);
@@ -174,13 +175,37 @@ ob_status_t apply_delta(SoABuffer& buf, const DeltaUpdate& update,
 }
 
 // ── read_snapshot ─────────────────────────────────────────────────────────────
-// Reads a consistent snapshot of both sides using the seqlock reader protocol:
-//   For each side:
+// Reads the label, then a consistent snapshot of both sides, using the seqlock reader protocol:
+//   For the label, under both sides' versions; then for each side:
 //     1. Spin until version is even (no write in progress).
 //     2. Copy all data.
 //     3. Re-read version; if changed, retry.
-void read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out_ask)
+SnapshotLabel read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out_ask)
 {
+    // The label first (#239). Its callers used to read it after the sides, and then it could name
+    // an update applied after a side was copied: a book labelled newer than what it holds. A client
+    // that resumes a subscription from that number drops the push of the update in between, which
+    // the book does not hold. Read before the sides, it is a lower bound instead: the update it
+    // names was complete when the label was read, so every update up to it is in each side's copy.
+    //
+    // Under both sides' versions, because an update writes the pair inside its own side's seqlock
+    // and nothing says which side the last one was. Both even and both unchanged around the two
+    // loads: no update wrote either in between, so the two are one update's. Every update moves
+    // one version, so the pair cannot change with both versions standing still.
+    SnapshotLabel label{};
+    while (true) {
+        const uint64_t bid1 = buf.bid.version.load(std::memory_order_acquire);
+        const uint64_t ask1 = buf.ask.version.load(std::memory_order_acquire);
+        if (((bid1 | ask1) & 1u) != 0) continue;   // an update under way on one side
+        label.sequence_number = buf.sequence_number.load(std::memory_order_relaxed);
+        label.timestamp_ns    = buf.last_timestamp_ns.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (buf.bid.version.load(std::memory_order_relaxed) == bid1 &&
+            buf.ask.version.load(std::memory_order_relaxed) == ask1) {
+            break;
+        }
+    }
+
     // Helper lambda for one side.
     auto read_side = [](const SoASide& src, SoASide& dst) {
         while (true) {
@@ -209,6 +234,7 @@ void read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out_ask)
 
     read_side(buf.bid, out_bid);
     read_side(buf.ask, out_ask);
+    return label;
 }
 
 } // namespace ob

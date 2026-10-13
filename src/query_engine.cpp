@@ -1183,11 +1183,15 @@ std::string QueryEngine::read_book(const std::string& symbol, const std::string&
     // One snapshot for the whole answer. Reading per side while emitting rows would compose the
     // answer from two moments separated by the formatting of up to two thousand levels, and a
     // book assembled that way can show a crossed spread the market never had.
+    //
+    // The label comes with it and was read before the sides (#239), so every update up to it is in
+    // this book. Read from the buffer after the snapshot, as it was, it could name an update applied
+    // after a side was copied, and a client resuming a subscription from it lost that update.
     SoASide bid, ask;
-    read_snapshot(*buf, bid, ask);
+    const SnapshotLabel as_of = read_snapshot(*buf, bid, ask);
 
-    const uint64_t ts  = buf->last_timestamp_ns;
-    const uint64_t seq = buf->sequence_number.load(std::memory_order_relaxed);
+    const uint64_t ts  = as_of.timestamp_ns;
+    const uint64_t seq = as_of.sequence_number;
 
     const auto emit = [&](const SoASide& side, uint8_t side_code) {
         const uint32_t have = side.depth;
@@ -1481,14 +1485,13 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         }
         const SoABuffer* buf = live_buf.get();
 
-        // Read a consistent snapshot of both sides
+        // Read a consistent snapshot of both sides, and the update it holds everything up to (#239)
         SoASide snap_bid, snap_ask;
-        read_snapshot(*buf, snap_bid, snap_ask);
-
+        const SnapshotLabel as_of = read_snapshot(*buf, snap_bid, snap_ask);
 
         QueryResult qr{};
-        qr.timestamp_ns    = buf->last_timestamp_ns;
-        qr.sequence_number = buf->sequence_number.load(std::memory_order_relaxed);
+        qr.timestamp_ns    = as_of.timestamp_ns;
+        qr.sequence_number = as_of.sequence_number;
 
         for (const auto& expr : ast.select_exprs) {
             if (!is_agg_expr(expr)) continue;

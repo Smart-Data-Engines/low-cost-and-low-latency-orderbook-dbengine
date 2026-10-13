@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -442,6 +443,90 @@ TEST(SoABuffer, GapDetectionConsecutive) {
     ob::apply_delta(*buf, upd2, &lv2, gap2);
 
     EXPECT_FALSE(gap2);
+}
+
+// #239: `read_snapshot()` returns the update its snapshot is as of. Read before the sides, the label
+// is a lower bound on both: each side holds every update up to it. Read under both sides' versions,
+// it is one update's sequence number and timestamp. The writer alternates the sides - bids on even
+// numbers, asks on odd - and sets the side's one level to the update's number, so the last update
+// to each side at or below a label is known, and `make_update()` stamps the number times 1000.
+//
+// A book of one level a side, so that a read costs little more than its label and the reads are
+// many: what this races is the label against the copies, not the copies against the writer.
+TEST(SoABuffer, TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt) {
+    auto buf = make_buffer();
+    constexpr uint64_t kUpdates = 2'000'000;
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        for (uint64_t k = 1; k <= kUpdates; ++k) {
+            ob::Level lv{1000LL, k, 1U, 0U};
+            ob::DeltaUpdate upd = make_update(k % 2 == 0 ? ob::SIDE_BID : ob::SIDE_ASK, k, 1);
+            bool gap = false;
+            ob::apply_delta(*buf, upd, &lv, gap);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    size_t reads = 0;
+    size_t behind = 0;
+    size_t unpaired = 0;
+    size_t moves = 0;
+    uint64_t previous = 0;
+    ob::SoASide bid{}, ask{};
+    while (!done.load(std::memory_order_acquire)) {
+        const ob::SnapshotLabel label = ob::read_snapshot(*buf, bid, ask);
+        const uint64_t s = label.sequence_number;
+        if (label.timestamp_ns != s * 1000ULL) ++unpaired;
+        const uint64_t last_bid = s - s % 2;                       // the last even number up to s
+        const uint64_t last_ask = s % 2 == 1 ? s : (s == 0 ? 0 : s - 1);
+        if (last_bid > 0 && (bid.depth != 1 || bid.quantities[0] < last_bid)) ++behind;
+        if (last_ask > 0 && (ask.depth != 1 || ask.quantities[0] < last_ask)) ++behind;
+        if (s != previous) ++moves;
+        previous = s;
+        ++reads;
+    }
+    writer.join();
+
+    EXPECT_EQ(behind, 0u) << behind << " sides of " << reads
+                          << " snapshots lacked an update their label named or preceded";
+    EXPECT_EQ(unpaired, 0u) << unpaired << " of " << reads
+                            << " labels paired one update's number with another's timestamp";
+    // The control: the label moved under the reads, so they raced the writer.
+    EXPECT_GT(moves, 1000u) << "the label moved " << moves << " times in " << reads << " reads";
+}
+
+// #239: the label is not read while an update is under way. A writer stores the pair inside its
+// side's seqlock, and between its two stores the pair is half one update's and half the last one's.
+// Set up by hand: the bid side's version odd and update 2's number stored, its timestamp not yet -
+// what a reader would find between the writer's two stores. The race test above reaches that
+// moment only by chance; this one holds it open.
+TEST(SoABuffer, TheLabelWaitsForAnUpdateUnderWay) {
+    auto buf = make_buffer();
+    ob::Level lv{1000LL, 1ULL, 1U, 0U};
+    ob::DeltaUpdate first = make_update(ob::SIDE_BID, 1, 1);
+    bool gap = false;
+    ob::apply_delta(*buf, first, &lv, gap);
+
+    const uint64_t v = buf->bid.version.load(std::memory_order_relaxed);
+    buf->bid.version.store(v + 1, std::memory_order_relaxed);   // update 2 under way
+    buf->sequence_number.store(2, std::memory_order_relaxed);   // its number stored, its time not
+
+    std::atomic<bool> returned{false};
+    ob::SnapshotLabel label{};
+    std::thread reader([&] {
+        ob::SoASide bid{}, ask{};
+        label = ob::read_snapshot(*buf, bid, ask);
+        returned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(returned.load(std::memory_order_acquire))
+        << "the snapshot was taken with an update under way";
+
+    buf->last_timestamp_ns.store(2000, std::memory_order_relaxed);
+    buf->bid.version.store(v + 2, std::memory_order_release);   // update 2 complete
+    reader.join();
+    EXPECT_EQ(label.sequence_number, 2u);
+    EXPECT_EQ(label.timestamp_ns, 2000u) << "a label paired update 2's number with update 1's time";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

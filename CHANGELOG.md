@@ -76,6 +76,15 @@ here as `#N`.
 
 ### Fixed
 
+- A client resuming a subscription from a book, as documented, could lose updates (#239). The
+  documentation said to take the book, then subscribe, and drop the pushes at or below the book's
+  sequence number. That order loses what is written between the two: with a writer running, 48 of 50
+  trials of a probe lost updates. And the book's number was read after its levels, so it could name
+  an update a side did not hold yet, whose push the client then dropped as already in the book. The
+  number and timestamp are now read before the levels, as one update's pair, so every update up to
+  the number is in the book. The documented order is subscribe, then the book, and a subscription
+  is in force for every write after `SUBSCRIBE` answers. The aggregates' `timestamp_ns` and
+  `sequence_number` come from the same pair.
 - The man page said nothing on the wire is encrypted, which stopped being true with #30. It names the
   three TLS surfaces now, and the signals the server takes (#238).
 - The Python client finds and cuts an answer in bytes, and decodes it after. It cut by the length

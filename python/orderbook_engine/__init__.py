@@ -2389,8 +2389,9 @@ class OrderbookEngine:
         asks because a level index is a position within a side.
 
         **Two of the seven columns are properties of the read rather than of a level**: every row
-        carries the same `timestamp_ns` and `sequence_number`, which say *as of which update* this
-        book is. That is the number to resume a `subscribe()` from.
+        carries the same `timestamp_ns` and `sequence_number`, one update's. Every update up to
+        that number is in the book, so it is the number to resume a `subscribe()` from: subscribe
+        first, then take the book, and apply the pushes numbered above it (#239).
 
         Refused in local mode. The embedded path goes through the C API, which has no entry point
         for this - and adding one is a change to a published ABI, so it is a separate piece of work
