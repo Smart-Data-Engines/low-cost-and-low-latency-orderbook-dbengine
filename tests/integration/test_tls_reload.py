@@ -1,11 +1,12 @@
-"""The certificate read again on SIGHUP, against a live node (#238).
+"""The certificate read again on SIGHUP, against live nodes (#238).
 
 A renewal is a file replaced under a running node and a signal. What it has to do is about
 connections, so every claim here is read off a handshake: a connection opened after the reload is
-shown the new certificate, on the client port and on the replication link alike, and one opened
-before it goes on working. A renewal that goes wrong - a key that does not match - leaves the old
-certificate in force and the node up, and says so in its log and its metrics. A node without TLS,
-which until #238 died of the signal's default action, logs that there is nothing to reload.
+shown the new certificate - on the client port, the replication link and the mesh, accepted and
+dialled - and one opened before it goes on working. A renewal that goes wrong - a key that does not
+match - leaves the old certificate in force and the node up, and says so in its log and its metrics.
+A node without TLS, which until #238 died of the signal's default action, logs that there is
+nothing to reload; and the signal reaches one thread of a node and no other.
 """
 from __future__ import annotations
 
