@@ -418,6 +418,17 @@ def _split_host_port(address: str, default_port: int) -> Tuple[str, int]:
     return address, default_port
 
 
+# How every answer of the text protocol begins, and a pushed row ("PUSH "). Bytes that begin none of
+# them, and are not the start of one still arriving, are no answer this client can read.
+_ANSWER_STARTS = (b"OK", b"ERR ", b"PONG", b"PRIMARY", b"REPLICA", b"STANDALONE", b"MULTI_MASTER",
+                  b"PUSH ")
+
+
+def _may_begin_an_answer(data: bytes) -> bool:
+    """Whether `data` is, or may still become, the start of an answer or of a pushed row."""
+    return any(data.startswith(start) or start.startswith(data) for start in _ANSWER_STARTS)
+
+
 class _TcpBackend:
     """Communicates with ob_tcp_server over a TCP socket."""
 
@@ -598,12 +609,10 @@ class _TcpBackend:
     def _read_banner(self):
         """Read the welcome banner from the server (terminated by \\n\\n)."""
         while True:
-            decoded = self._buf.decode("utf-8", errors="replace")
-            end = decoded.find("\n\n")
+            # Found and cut in bytes, as an answer is (`_recv_plain_response()`).
+            end = self._buf.find(b"\n\n")
             if end != -1:
-                # Consume the banner including the double newline
-                consumed = decoded[:end + 2].encode("utf-8")
-                self._buf = self._buf[len(consumed):]
+                self._buf = self._buf[end + 2:]
                 return
             chunk = self._sock.recv(4096)
             if not chunk:
@@ -779,46 +788,42 @@ class _TcpBackend:
         return self.take_pushes()
 
     def _recv_plain_response(self) -> str:
-        """Receive an uncompressed response (original logic)."""
+        """Receive one uncompressed answer.
+
+        Found and cut in bytes, and decoded only once it is cut. The buffer used to be decoded first
+        and the answer cut by the length of its text encoded again: a byte that is not UTF-8 decodes
+        to U+FFFD, three bytes encoded, so the cut took bytes of the next answer with it, and that
+        answer began in the wrong place (finding 36 of the C++ SDK port).
+        """
         while True:
             # Before matching anything: a pushed row may sit in front of the reply.
             self._take_pushes()
-            decoded = self._buf.decode("utf-8", errors="replace")
+            buf = self._buf
+            end = -1
 
-            # ERR line
-            if decoded.startswith("ERR "):
-                nl = decoded.find("\n")
+            if buf.startswith((b"ERR ", b"PONG", b"PRIMARY", b"REPLICA", b"STANDALONE",
+                               b"MULTI_MASTER")):
+                # One line: an error, PONG, or the answer to ROLE.
+                nl = buf.find(b"\n")
                 if nl != -1:
-                    resp = decoded[:nl + 1]
-                    self._buf = self._buf[len(resp.encode("utf-8")):]
-                    return resp
-
-            # PONG line
-            if decoded.startswith("PONG"):
-                nl = decoded.find("\n")
-                if nl != -1:
-                    resp = decoded[:nl + 1]
-                    self._buf = self._buf[len(resp.encode("utf-8")):]
-                    return resp
-
-            # ROLE responses: single-line, terminated by \n
-            if (decoded.startswith("PRIMARY") or
-                decoded.startswith("REPLICA") or
-                decoded.startswith("STANDALONE") or
-                decoded.startswith("MULTI_MASTER")):
-                nl = decoded.find("\n")
-                if nl != -1:
-                    resp = decoded[:nl + 1]
-                    self._buf = self._buf[len(resp.encode("utf-8")):]
-                    return resp
-
-            # OK response — terminated by \n\n
-            if decoded.startswith("OK"):
-                pos = decoded.find("\n\n")
+                    end = nl + 1
+            elif buf.startswith(b"OK"):
+                # OK, alone or with a body, ends at an empty line.
+                pos = buf.find(b"\n\n")
                 if pos != -1:
-                    resp = decoded[:pos + 2]
-                    self._buf = self._buf[len(resp.encode("utf-8")):]
-                    return resp
+                    end = pos + 2
+            elif buf and not _may_begin_an_answer(buf):
+                # Bytes no answer begins with. Reading on would only wait out the timeout and then
+                # report a timeout (finding 35); the exchange fails here, and its connection with it
+                # (#171).
+                raise OrderbookError(
+                    -1, f"the server sent {bytes(buf[:64])!r}, which begins no answer this client "
+                        f"reads")
+
+            if end != -1:
+                answer = bytes(buf[:end])
+                self._buf = buf[end:]
+                return answer.decode("utf-8", errors="replace")
 
             # Read more data
             try:

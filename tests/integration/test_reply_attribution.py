@@ -442,3 +442,103 @@ def test_close_does_not_wait_for_a_poll_in_another_thread(node) -> None:
     finally:
         client.close()
         poller.join(timeout=35.0)
+
+
+class ScriptedServer:
+    """A listener on 127.0.0.1 that sends a banner, then answers each command line with the next of
+    `replies`, in order. A reply is bytes, or a list of byte strings sent apart from each other - an
+    answer that arrives in pieces. This is the only way to put bytes on the wire that the engine
+    does not send: no server of ours sends text that is not UTF-8, or an answer that begins with
+    nothing the protocol has."""
+
+    def __init__(self, replies: list) -> None:
+        self.replies = list(replies)
+        self.port = free_port()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", self.port))
+        self._listener.listen(1)
+        self._listener.settimeout(10)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        try:
+            conn, _ = self._listener.accept()
+        except OSError:
+            return
+        with conn:
+            conn.sendall(b"OK ob_tcp_server v0.0.0-scripted\n\n")
+            pending = b""
+            while self.replies:
+                try:
+                    chunk = conn.recv(4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                pending += chunk
+                while b"\n" in pending and self.replies:
+                    _, pending = pending.split(b"\n", 1)
+                    reply = self.replies.pop(0)
+                    for piece in (reply if isinstance(reply, list) else [reply]):
+                        conn.sendall(piece)
+                        time.sleep(0.05)
+            # Hold the connection open: a client still reading must time out, not see a close.
+            time.sleep(15)
+
+    def close(self) -> None:
+        self._listener.close()
+
+
+def test_an_answer_holding_a_byte_that_is_not_utf8_leaves_the_next_answer_where_it_starts() -> None:
+    """Finding 36 of the C++ SDK port. The client decoded its buffer with `errors="replace"` and cut
+    the answer out by the length of that text encoded again. A byte that is not UTF-8 decodes to
+    U+FFFD, three bytes encoded, so the cut took two bytes of whatever followed in the buffer - the
+    next answer of a pipelined batch, which here arrives with the first in one write."""
+    first = b"OK\nab\xffcd\n\n"
+    server = ScriptedServer([first + b"PONG\n", b""])
+    client = OrderbookEngine(host="127.0.0.1", port=server.port, timeout=3.0)
+    try:
+        answers = client._tcp.execute_pipelined(["STATUS", "PING"])
+        assert answers == [first.decode("utf-8", errors="replace"), "PONG\n"], answers
+    finally:
+        client.close()
+        server.close()
+
+
+def test_an_answer_no_reader_can_parse_is_refused_at_once_rather_than_waited_out() -> None:
+    """Finding 35. Bytes that begin no answer of this protocol were read until the timeout and then
+    reported as one. They are refused as they arrive, by name, and the connection goes with the
+    exchange (#171)."""
+    server = ScriptedServer([b"HELLO from somewhere else\n"])
+    client = OrderbookEngine(host="127.0.0.1", port=server.port, timeout=10.0)
+    try:
+        started = time.monotonic()
+        with pytest.raises(OrderbookError) as refused:
+            client._tcp.execute("PING")
+        took = time.monotonic() - started
+        assert took < 5.0, f"the refusal took {took:.1f} s, the timeout is 10"
+        assert "HELLO" in str(refused.value), refused.value
+        with pytest.raises(OrderbookError) as after:
+            client._tcp.execute("PING")
+        assert "was closed because" in str(after.value), after.value
+    finally:
+        client.close()
+        server.close()
+
+
+def test_an_answer_and_a_pushed_row_that_arrive_in_pieces_are_read_whole() -> None:
+    """The other side of refusing at once: bytes that may still become an answer, or a pushed row,
+    are waited for - `P` could be `PONG` or `PUSH `, and `O` could be `OK`."""
+    push = b"PUSH 7\t1700000000000000000\t100\t5\t1\t0\t0\t42\n"
+    server = ScriptedServer([[b"P", b"U", push[2:20], push[20:] + b"O", b"K\n\n"], [b"P", b"ONG\n"]])
+    client = OrderbookEngine(host="127.0.0.1", port=server.port, timeout=5.0)
+    try:
+        assert client._tcp.execute("FLUSH") == "OK\n\n"
+        assert [(sub, row.price, row.sequence_number) for sub, row in client._tcp.take_pushes()] == \
+            [(7, 100, 42)]
+        assert client._tcp.execute("PING") == "PONG\n"
+    finally:
+        client.close()
+        server.close()

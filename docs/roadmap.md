@@ -2593,6 +2593,34 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 237. The Python client cut an answer by the length of its text encoded again, and waited out its timeout on bytes no answer begins with ✅ **P3**
+
+**Found by the C++ SDK port, findings 35 and 36.** Both are in `_recv_plain_response()`, which
+decoded the whole buffer with `errors="replace"` and matched the answer on the text:
+- **The cut.** The answer was removed from the buffer by the length of its text encoded again. A
+  byte that is not UTF-8 decodes to U+FFFD, three bytes encoded, so the cut took two bytes of
+  whatever followed. In a pipelined batch that is the next answer, which then began in the wrong
+  place and was waited for until the timeout. The engine does send such a byte back: a refusal
+  names the token it refused, as it arrived (`FLUSH` with a token of one byte `0xff` is answered
+  `ERR unexpected token '<0xff>'; FLUSH takes: FLUSH`, measured 13 October 2026). The Python client
+  sends UTF-8 alone, so its own commands cannot provoke this; a byte from anywhere else could.
+- **The wait.** Bytes that begin no answer of the protocol matched nothing, and the client read on
+  until its timeout and reported `TCP recv timeout`.
+
+**Fixed.** The answer is found and cut in bytes and decoded once it is cut; the banner the same
+way. Bytes that are not an answer's start, and cannot become one as more arrive, are refused at once
+by name. The exchange fails there, and its connection with it (#171). A start still arriving is
+waited for: `P` may be `PONG` or a pushed row, `O` may be `OK`.
+
+`test_reply_attribution.py` holds all three with a scripted server: an answer holding `\xff` in a
+pipelined batch, an answer that begins `HELLO`, and a pushed row and an answer arriving a few bytes
+at a time. On the client before the fix the first two fail - a timeout, and a refusal after the
+whole 10 s - and the third passes, as the control. Three mutants, one per rule, are each caught, and
+a reworded refusal is not.
+
+- Effort: S | Impact: a pipelined batch after a byte that is not UTF-8 lost its next answer; an
+  unreadable answer cost a whole timeout and was reported as one
+
 ### 236. The engine listened and dialled on IPv4 alone ✅ **P3**
 
 **Found by the C++ SDK port's finding 28**: the Python client could not reach `[::1]`. The client was

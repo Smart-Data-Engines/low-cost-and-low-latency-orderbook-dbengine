@@ -34,6 +34,13 @@ here as `#N`.
   dpkg and rpm all order after 0.1.0 and before 0.1.1. Everything built from `master` after v0.1.0
   had called itself 0.1.0 (#234).
 
+### Fixed
+
+- The Python client finds and cuts an answer in bytes, and decodes it after. It cut by the length
+  of the decoded text encoded again, so a byte that is not UTF-8 took two bytes of the next answer
+  of a pipelined batch with it. Bytes that begin no answer are refused at once by name, where they
+  were read until the timeout (#237).
+
 ### Known issues
 
 - The live book applies a write by price, and history keys it by its position in the update, so
