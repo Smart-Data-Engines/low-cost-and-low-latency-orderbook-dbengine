@@ -1,5 +1,7 @@
 #pragma once
 
+#include "orderbook/huge_region.hpp"
+
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -21,7 +23,7 @@ namespace ob {
 /// kernel only with the arena.
 class BookArena {
 public:
-    static constexpr size_t kRegionBytes = size_t{2} << 20;
+    static constexpr size_t kRegionBytes = kHugeRegionBytes;
     static constexpr size_t kSlotAlign = 64;   ///< a cache line, and SoASide's alignment
 
     /// `huge_pages` false gives the same arena without the advice.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "orderbook/column_arena.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -13,22 +15,31 @@
 
 namespace ob {
 
-/// One column of a format-3 segment, decoded (#220): the values `column_codec::decode_as()`
-/// decodes a block into, in the type the read path reads them as.
+/// One column of a format-3 segment, decoded (#220), in the type the read path reads it as: in a
+/// slot of the store's column arena (#223), or - a column too small for the arena's classes, or one
+/// that found no room under its cap - in a vector of its own.
 struct ColumnValues {
+    /// The type, always; the values, when they are on the heap. A column in the arena keeps the
+    /// alternative of its type here, empty, so that as<T>() checks the type the same way for both.
     std::variant<std::vector<uint64_t>,   // timestamp_ns, quantity
                  std::vector<int64_t>,    // price, sequence_number
                  std::vector<uint32_t>,   // order_count
                  std::vector<uint8_t>,    // side
                  std::vector<uint16_t>>   // level_index
         values;
+    /// The slot the values are in, when they are the arena's, and how many there are.
+    ArenaBlock block;
+    size_t count{0};
 
-    /// What holding it costs: the vector's allocation and this object.
+    /// What holding it costs: the slot's class or the vector's allocation, and this object.
     size_t bytes() const;
 
+    /// std::bad_variant_access for a type the column is not.
     template <typename T>
     std::span<const T> as() const {
-        return std::get<std::vector<T>>(values);
+        const std::vector<T>& v = std::get<std::vector<T>>(values);
+        if (block) return {static_cast<const T*>(block.data()), count};
+        return v;
     }
 };
 
@@ -64,6 +75,9 @@ public:
     /// What this segment's held columns cost.
     size_t bytes() const;
 
+    /// The arena a column of this segment is decoded into to be held (#223).
+    ColumnArena* arena() const;
+
 private:
     friend class DecodedColumnsBudget;
 
@@ -91,7 +105,17 @@ private:
 /// the reads in progress, and never by more.
 class DecodedColumnsBudget {
 public:
+    /// Its arena maps at most `limit_bytes` and a slack, arena_slack(), so that a read can take its
+    /// slots before its put() evicts to make room, and keeps that slack free for the next read.
     explicit DecodedColumnsBudget(size_t limit_bytes);
+
+    /// An eighth of the budget, and never under kArenaSlackFloor: the columns of one segment at its
+    /// most rows, 262 144, are 9.75 MiB, and a miss past the first reads must find them free, or it
+    /// decodes on the heap what the eviction its put() makes would have given it.
+    static constexpr size_t kArenaSlackFloor = size_t{16} << 20;
+    static size_t arena_slack(size_t limit_bytes);
+
+    ColumnArena* arena() const { return arena_.get(); }
 
     struct Stats {
         uint64_t hits;        ///< columns a read took from memory
@@ -99,6 +123,7 @@ public:
         uint64_t evictions;   ///< segments whose columns were evicted to make room
         size_t   held_bytes;
         size_t   limit_bytes;
+        ColumnArena::Stats arena;   ///< the memory the columns are held in (#223)
     };
     Stats stats() const;
     size_t held() const { return held_.load(std::memory_order_relaxed); }
@@ -126,6 +151,7 @@ private:
     std::atomic<size_t> held_{0};
     const size_t limit_;
     std::atomic<uint64_t> hits_{0}, misses_{0}, evictions_{0};
+    std::shared_ptr<ColumnArena> arena_;
 };
 
 } // namespace ob

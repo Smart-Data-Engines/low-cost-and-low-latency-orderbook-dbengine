@@ -121,6 +121,13 @@ template <typename T>
 bool decode_as(std::span<const char> block, size_t count, std::vector<T>& out, DecodeScratch& scratch,
                std::string* why);
 
+/// The same into `count` values at `out`, which the caller owns - a held column's slot in its arena
+/// (#223). Nothing is written before the block's header and payload pass their checks; a block that
+/// fails later leaves `out` partly written, as decode_as() leaves its vector.
+template <typename T>
+bool decode_into(std::span<const char> block, size_t count, T* out, DecodeScratch& scratch,
+                 std::string* why);
+
 /// LEB128, as the blocks and the file holding them write their lengths.
 void put_varint(std::string& out, uint64_t v);
 /// The varint at `at`, moving `at` past it; false for one cut short or longer than 64 bits.

@@ -2,6 +2,7 @@
 
 #include "orderbook/logger.hpp"
 
+#include <algorithm>
 #include <type_traits>
 #include <utility>
 
@@ -15,6 +16,7 @@ constexpr const char* kSlotNames[DecodedColumns::kSlots] = {"ts",   "price", "qt
 } // namespace
 
 size_t ColumnValues::bytes() const {
+    if (block) return sizeof(*this) + block.bytes();
     const size_t held = std::visit(
         [](const auto& v) {
             using T = typename std::decay_t<decltype(v)>::value_type;
@@ -87,6 +89,8 @@ DecodedColumns::Column DecodedColumns::put(size_t slot, Column values, std::stri
     return values;
 }
 
+ColumnArena* DecodedColumns::arena() const { return budget_ ? budget_->arena() : nullptr; }
+
 size_t DecodedColumns::bytes() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return bytes_;
@@ -108,11 +112,18 @@ size_t DecodedColumns::evict() {
 
 // ── DecodedColumnsBudget ────────────────────────────────────────────────────────
 
-DecodedColumnsBudget::DecodedColumnsBudget(size_t limit_bytes) : limit_(limit_bytes) {}
+size_t DecodedColumnsBudget::arena_slack(size_t limit_bytes) {
+    return std::max(kArenaSlackFloor, limit_bytes / 8);
+}
+
+DecodedColumnsBudget::DecodedColumnsBudget(size_t limit_bytes)
+    : limit_(limit_bytes),
+      arena_(std::make_shared<ColumnArena>(limit_bytes + arena_slack(limit_bytes),
+                                           arena_slack(limit_bytes), /*huge_pages=*/true)) {}
 
 DecodedColumnsBudget::Stats DecodedColumnsBudget::stats() const {
     return Stats{hits_.load(std::memory_order_relaxed), misses_.load(std::memory_order_relaxed),
-                 evictions_.load(std::memory_order_relaxed), held(), limit_};
+                 evictions_.load(std::memory_order_relaxed), held(), limit_, arena_->stats()};
 }
 
 bool DecodedColumnsBudget::charge(size_t bytes, const DecodedColumns* charging) {
