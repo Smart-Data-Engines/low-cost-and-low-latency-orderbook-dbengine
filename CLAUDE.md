@@ -4271,6 +4271,24 @@ Learned the hard way. Check here before debugging.
      binance-diff's merged quantities went from blocks, 0.51 ns a value, to ZSTD, 1.95-2.49 (#223).
      Each margin was right alone. A change to how one group is weighed is measured on every policy
      that compares against that group - here the merge, which charges nothing now.
+584. **`client.hpp` and the server's headers define the same names in `ob`** - `Level`, `QueryResult`,
+     `NodeRole` - so one translation unit cannot include both. A test that runs a `TcpServer` in
+     its own process talks to it by hand (`tests/test_unix_socket.cpp`), and the C++ client is
+     tested against a stub (`ClientUnixSocket` in `tests/test_client.cpp`). Found writing #52's
+     server tests against the real client first.
+585. **A Unix socket's path holds 107 bytes, and a temporary directory can take most of them.** The
+     session's scratch directory with `ob.sock` came to 118, and pytest's `tmp_path` grows with the
+     test's name. `--unix-socket` refuses a longer path when the flag is read, naming the limit, and
+     the tests make a short directory of their own and assert its length first (#52).
+586. **`connect()` to a path that is not a socket answers `ECONNREFUSED`, the same as a stale
+     socket.** Measured: a regular file and a socket nobody listens on give the same errno. A
+     replacement rule built on the probe alone would unlink an operator's file at that path, so
+     `listen_unix()` checks `S_ISSOCK` before it probes, and mutant N1 of #52 is what says the check
+     carries weight.
+587. **A file removed at stop has to be the file bound at start.** Another process may unlink the
+     path and bind its own socket there while the server runs; an unconditional `unlink()` at stop
+     removes that one. `run()` keeps the device and inode `lstat()` gave after `bind()` and removes
+     the file only while they match (#52).
 
 ## Current state and open problems
 

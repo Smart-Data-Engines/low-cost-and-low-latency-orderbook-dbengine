@@ -1665,6 +1665,76 @@ two benchmarks wrote to N books in a fixed pseudo-random order.
 - Zero-copy ring buffer for co-located processes, bypassing TCP entirely
 - Effort: L | Impact: Sub-microsecond local writes; a genuine HFT differentiator
 
+**Measured before choosing a first step** (`evidence/2026-10-13-local-transport-probe/` in the
+workspace): 32 bytes there and back between two processes of one host, p50.
+
+| | x86, blocking | x86, polling | ARM, blocking | ARM, polling |
+|---|---|---|---|---|
+| TCP loopback | 4.26 µs | 2.52 µs | 7.03 µs | 3.75 µs |
+| Unix socket | 3.82 µs | 0.95 µs | 3.71 µs | 2.05 µs |
+| shared memory | 0.17 µs | 0.13 µs | 0.34 µs | 0.29 µs |
+
+A Unix socket takes 1.5-1.7 µs off a round trip with both ends polling, and half of a blocking one on
+ARM, with no change to the protocol, the parser or the session. It is also what step 2, rings in
+shared memory, passes the memory's descriptor through.
+
+**Step 1 is in: a Unix socket beside the port** (spec `specs/unix-socket-transport/` in the
+workspace). `--unix-socket <path>` serves the same protocol, `AUTH` and `--max-sessions` on a Unix
+stream socket as well as the port, and `--unix-socket-mode` (0660) is the file's mode before it takes
+a connection. It is not encrypted - `--tls-client` covers the port - and each connection is logged
+with the pid, uid and gid at its other end. A stale socket at the path is replaced; a live one, or a
+path that is not a socket, stops the start. The node removes the file when it stops, unless another
+process has bound that path since. The Python client (`unix_socket=`), the C++ client
+(`ClientConfig::unix_socket`) and `ob_backup --unix-socket` connect through it.
+
+What a command costs a client through the port and through the socket, on a node of the branch, with
+master's TCP beside it (`evidence/2026-10-13-unix-socket/`). The node runs on CPUs 1-3 and the client
+on CPU 0, in the default profile (`boost`), with a client that polls for its answer, which is what
+the probe's 1.5-1.7 µs was measured on. The median of seven rounds of 50 000:
+
+| | m8a.xlarge (EPYC 9R45), TCP | socket | m9g.xlarge (Graviton), TCP | socket |
+|---|---|---|---|---|
+| `PING`, p50 | 3.06 µs | 1.68 µs | 4.87 µs | 3.01 µs |
+| `BOOK`, ten levels, p50 | 4.27 µs | 2.89 µs | 6.65 µs | 4.77 µs |
+| `MINSERT`, twenty levels, p50 | 5.86 µs | 4.12 µs | 8.45 µs | 6.08 µs |
+| `PING`, p99 | 3.29 µs | 1.83 µs | 5.33 µs | 3.38 µs |
+| `BOOK`, p99 | 5.06 µs | 3.14 µs | 6.99 µs | 5.17 µs |
+| `MINSERT`, p99 | 9.45 µs | 6.42 µs | 10.77 µs | 7.66 µs |
+
+So the socket takes 1.4-1.7 µs off a command on the EPYC and 1.9-2.4 µs on the Graviton, and about
+3 µs off a write's p99.
+
+**How much of it a client keeps depends on who sleeps.** With a client that blocks in `recv()`:
+- On the Graviton the socket takes 2.7-2.9 µs off `PING` (6.60 to 3.74 at p50 in `boost`) and
+  1.6-2.8 µs off the rest, in both profiles, at p50 and p99.
+- On the EPYC it takes 1.7-1.9 µs off `PING` and 0.9-1.8 µs off the rest at p50, but `BOOK`'s p99 is
+  worse through the socket, 7.41 µs against 6.50. This host's idle CPUs can sleep in C2, with a
+  declared exit latency of 100 µs; the Graviton's have no idle state but WFI. An answer that comes
+  back quickly finds a blocking client still awake, and one that takes longer finds it asleep. A
+  one-level `BOOK` cost 4.10 µs through the socket against `PING`'s 2.20; through TCP the two were
+  4.40 and 4.12. Every answer arrived in one read, so it is the wake-up and not a
+  split answer. With the client polling, the socket was ahead at every depth from one level to
+  twenty, at p50, p99 and p99.9 (`BOOK`, ten levels: 2.86 against 4.23, 3.11 against 5.03, 8.19
+  against 9.96).
+- In `eco` on the EPYC the node itself blocks between events, and a polling client's median is the
+  node's wake-up. The socket did not change it (`PING` 4.28 against 4.14), though p99 dropped by
+  1.0-1.6 µs.
+
+**The rest of the engine is the code master runs.** 43 of the 51 object files both Release builds
+made have byte-identical `.text`. Among them are the engine, the WAL, the books, the codecs, the
+store, the session and the parser. The eight that differ are the ones whose source changed, or which
+use `ServerConfig` or `ClientConfig`, both of which have a new field. Inside `tcp_server.cpp`,
+functions whose source did not change compiled differently too, `execute_writes` among them. GCC
+weighs inlining against the size of the whole unit, and the unit grew. The round trip says what that
+costs. Across the four series, both hosts, both profiles and the three commands, the branch's TCP
+median sat inside master's range in 70 of 96 cells (p50 and p99), above it in 12 and below it in 14,
+and the median ratio of the branch's to master's was 0.997. The cells furthest out on either side
+are in the most bimodal series, `eco` on the EPYC with a polling client.
+
+Twenty mutants of the server, the socket and the clients, each killed by a named test; the
+control, the socket's backlog at 127, survives. What is left of the item is step 2: rings in shared
+memory for a client on the node's host, set up through this socket.
+
 ### 53. Kernel-bypass experiment
 - AF_XDP or DPDK prototype measured against the io_uring path, published as an engineering write-up
   even if we do not ship it

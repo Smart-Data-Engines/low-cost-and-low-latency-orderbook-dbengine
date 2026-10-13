@@ -66,6 +66,12 @@ MetricsRegistry::MetricsRegistry() {
                                      "at all is a client sending something it thinks is being "
                                      "stored (#107). Logged once per connection, counted every "
                                      "time - the count is the alertable half."));
+    // The Unix socket (#52). The sessions gauge counts both transports, so this is what says how
+    // many connections came this way.
+    counters_.push_back(make_counter("ob_unix_connections_total",
+                                     "Connections accepted through the Unix socket "
+                                     "(--unix-socket), including those refused at "
+                                     "--max-sessions"));
     counters_.push_back(make_counter("ob_wal_records_written",
                                      "WAL records appended, of every type - so checkpoints, "
                                      "epochs, version vectors and gaps are in it as well as "
@@ -231,7 +237,8 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_backup_last_bytes", "Bytes the last complete backup holds"));
     gauges_.push_back(make_gauge("ob_backup_last_pinned_ms",
                                  "Milliseconds the last backup held merges and retention back"));
-    gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
+    gauges_.push_back(make_gauge("ob_active_sessions",
+                                 "Number of active client sessions, over TCP and the Unix socket"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
                                  "Response bytes queued across sessions (a slow client shows up here)"));
     // Streaming subscriptions (#45). Registered in the same task that writes them, because

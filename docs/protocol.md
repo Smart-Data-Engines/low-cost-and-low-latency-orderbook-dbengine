@@ -1,7 +1,8 @@
 # Wire protocol
 
-The client port speaks a line protocol over TCP, or over TLS with `--tls-client`. It is what both
-shipped clients speak, and what `nc` speaks. This page covers what a client needs in order to read
+The client port speaks a line protocol over TCP, or over TLS with `--tls-client`, and a node with
+`--unix-socket` speaks the same protocol on that Unix socket, for clients on its host (`nc -U`). It is
+what both shipped clients speak, and what `nc` speaks. This page covers what a client needs in order to read
 it: how a command is sent, how each answer is framed, and what can arrive in between. The commands
 themselves are in [Query language](query-language.md) and [Server and flags](cli.md).
 

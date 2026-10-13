@@ -323,3 +323,32 @@ TEST(CliArgsDeath, ADecodedColumnsBudgetThatIsNotAWholeNumberIsRefused) {
     EXPECT_EXIT(parse({"--decoded-cache-mb", "4294967296"}), ::testing::ExitedWithCode(1),
                 "--decoded-cache-mb expects a value in range");
 }
+
+// ── #52: a Unix socket for clients on this host ─────────────────────────────────────────────
+
+TEST(CliArgs, AUnixSocketIsAPathAndItsModeIsOctal) {
+    const auto none = parse({});
+    EXPECT_TRUE(none.unix_socket.empty()) << "no socket unless asked for";
+    EXPECT_EQ(none.unix_socket_mode, 0660u) << "the default the documents name";
+    const auto config = parse({"--unix-socket", "/run/orderbook/ob.sock", "--unix-socket-mode", "0600"});
+    EXPECT_EQ(config.unix_socket, "/run/orderbook/ob.sock");
+    EXPECT_EQ(config.unix_socket_mode, 0600u);
+    EXPECT_EQ(parse({"--unix-socket-mode", "777"}).unix_socket_mode, 0777u) << "the leading zero is optional";
+    EXPECT_EQ(parse({"--unix-socket-mode", "0"}).unix_socket_mode, 0u);
+}
+
+TEST(CliArgsDeath, AUnixSocketPathTooLongForASocketIsRefused) {
+    const std::string longest = "/" + std::string(106, 'x');
+    EXPECT_EQ(parse({"--unix-socket", longest}).unix_socket, longest) << "107 bytes fit";
+    EXPECT_EXIT(parse({"--unix-socket", longest + "x"}), ::testing::ExitedWithCode(1),
+                "--unix-socket: the unix socket path '/x+' is 108 bytes, and a unix socket's path holds at most 107");
+    EXPECT_EXIT(parse({"--unix-socket", ""}), ::testing::ExitedWithCode(1), "--unix-socket: a unix socket's path is empty");
+}
+
+TEST(CliArgsDeath, AUnixSocketModeThatIsNotAnOctalModeIsRefused) {
+    for (const char* bad : {"0800", "1000", "rw-rw----", "", "0x1b6", "-1"}) {
+        EXPECT_EXIT(parse({"--unix-socket-mode", bad}), ::testing::ExitedWithCode(1),
+                    "--unix-socket-mode expects an octal mode from 0 to 0777")
+            << bad;
+    }
+}

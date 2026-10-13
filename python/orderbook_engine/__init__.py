@@ -439,10 +439,17 @@ class _TcpBackend:
     def __init__(self, host: str, port: int, timeout: float = 10.0,
                  compress: bool = False,
                  auth: Optional[Tuple[str, str]] = None,
-                 tls_ctx: Optional["ssl.SSLContext"] = None):
+                 tls_ctx: Optional["ssl.SSLContext"] = None,
+                 unix_socket: Optional[str] = None):
         # An IPv6 literal may come in the brackets of an address; the socket takes it bare.
         self._host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
         self._port = port
+        # The server's Unix socket (#52) in place of the address, for a client on its host. The
+        # engine's constructor refuses it beside TLS, so the two never meet here.
+        self._unix_socket = unix_socket
+        # What every message calls the server.
+        self._where = (f"unix socket {unix_socket}" if unix_socket is not None
+                       else _join_host_port(self._host, self._port))
         # A ready context, not the three arguments that build one: the refusals belong at the
         # engine's constructor, outside the pool's except-Exception, and building one per backend
         # would re-read the CA bundle once per node.
@@ -501,7 +508,7 @@ class _TcpBackend:
                     self._abandon("", quietly=True)
                     if isinstance(e, (OrderbookError, OSError)):
                         raise OrderbookError(
-                            -1, f"the connection to {_join_host_port(self._host, self._port)} was "
+                            -1, f"the connection to {self._where} was "
                                 f"closed while this call was in flight") from e
                     raise
                 self._abandon(f"an exchange ({label}) did not finish: {str(e) or type(e).__name__}",
@@ -511,7 +518,7 @@ class _TcpBackend:
     def _check_open(self) -> None:
         if self._sock is not None:
             return
-        where = _join_host_port(self._host, self._port)
+        where = self._where
         if self._closed_because is None:
             raise OrderbookError(-1, f"the connection to {where} is closed")
         raise OrderbookError(
@@ -532,10 +539,9 @@ class _TcpBackend:
             self._closed_because = reason
         if self._sock is not None:
             if quietly:
-                logger.debug("closing the connection to %s:%d: %s", self._host, self._port, reason)
+                logger.debug("closing the connection to %s: %s", self._where, reason)
             else:
-                logger.warning("closing the connection to %s:%d: %s", self._host, self._port,
-                               reason)
+                logger.warning("closing the connection to %s: %s", self._where, reason)
             try:
                 self._sock.close()
             except OSError:
@@ -546,11 +552,22 @@ class _TcpBackend:
         self._buf = b""
 
     def _connect(self):
-        # Every address of the host, of either family, in the resolver's order - an IPv6 literal,
-        # an IPv4 one or a name - each within the timeout. It was AF_INET alone, so `[::1]` failed
-        # here with "Address family for hostname not supported" (finding 28 of the C++ SDK port).
-        sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
-        sock.settimeout(self._timeout)
+        if self._unix_socket is not None:
+            # The server's Unix socket (#52): nothing to resolve, and no TLS on it.
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(self._timeout)
+            try:
+                sock.connect(self._unix_socket)
+            except OSError:
+                sock.close()
+                raise
+        else:
+            # Every address of the host, of either family, in the resolver's order - an IPv6
+            # literal, an IPv4 one or a name - each within the timeout. It was AF_INET alone, so
+            # `[::1]` failed here with "Address family for hostname not supported" (finding 28 of
+            # the C++ SDK port).
+            sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
+            sock.settimeout(self._timeout)
         if self._tls_ctx is not None:
             # Before the banner: the banner is the server's first application bytes and it sends
             # them once the handshake finishes, so a read here would consume a TLS record as text.
@@ -566,7 +583,7 @@ class _TcpBackend:
                 # "wrong version number" here almost always means the port is not running with
                 # --tls-client: the plaintext banner arrives where a ServerHello was expected.
                 raise OrderbookTlsError(
-                    f"TLS handshake with {_join_host_port(self._host, self._port)} failed: {e}") from e
+                    f"TLS handshake with {self._where} failed: {e}") from e
             except OSError:
                 sock.close()
                 raise
@@ -1969,6 +1986,8 @@ class OrderbookEngine:
     Two modes:
       Local:  OrderbookEngine("/tmp/ob_data")
       TCP:    OrderbookEngine(host="10.0.0.1", port=5555)
+              OrderbookEngine(unix_socket="/run/orderbook/ob.sock"), the server's --unix-socket,
+              for a client on its host (#52)
 
     Both expose the same API.
     """
@@ -1987,7 +2006,8 @@ class OrderbookEngine:
                  auth: Optional[Tuple[str, str]] = None,
                  tls: bool = False,
                  tls_ca_file: Optional[str] = None,
-                 tls_verify: bool = True):
+                 tls_verify: bool = True,
+                 unix_socket: Optional[str] = None):
         self._seq = 0
         self._closed = False
         # Filled by the first call to server_capabilities(), never at construction: a read-only
@@ -1998,6 +2018,18 @@ class OrderbookEngine:
         # Before any socket, and before the mode branch, so a contradictory configuration is
         # refused identically in every mode - including local mode, where TLS arguments mean
         # nothing and passing them means the caller believes something false about the connection.
+        if unix_socket is not None:
+            # One transport per client: an address beside the socket is a contradiction rather than
+            # a fallback, and TLS, which the socket does not have, is refused rather than quietly
+            # not applied (#52).
+            if tls:
+                raise OrderbookTlsError(
+                    "tls=True with unix_socket: the server's unix socket has no TLS; the socket "
+                    "file's permissions decide who may connect")
+            if hosts is not None:
+                raise ValueError("unix_socket with hosts: a pool dials every node at its address")
+            if host is not None or data_dir is not None:
+                raise ValueError("unix_socket replaces host and port, and data_dir: give one of them")
         tls_ctx = _build_tls_context(tls, tls_ca_file, tls_verify)
 
         if hosts is not None:
@@ -2010,11 +2042,11 @@ class OrderbookEngine:
                                      auth=auth, tls_ctx=tls_ctx)
             self._tcp = None
             self._local = None
-        elif host is not None:
-            # TCP mode
+        elif host is not None or unix_socket is not None:
+            # TCP mode: the wire protocol, over TCP or the server's Unix socket.
             self._mode = "tcp"
-            self._tcp = _TcpBackend(host, port, timeout, compress=compress, auth=auth,
-                                    tls_ctx=tls_ctx)
+            self._tcp = _TcpBackend(host or "", port, timeout, compress=compress, auth=auth,
+                                    tls_ctx=tls_ctx, unix_socket=unix_socket)
             self._local = None
         elif data_dir is not None:
             # Local mode
@@ -2026,11 +2058,12 @@ class OrderbookEngine:
             self._local = _LocalBackend(data_dir)
             self._tcp = None
         else:
-            raise ValueError("Provide data_dir for local mode, host for TCP mode, or hosts for pool mode")
+            raise ValueError("Provide data_dir for local mode, host or unix_socket for TCP mode, or "
+                             "hosts for pool mode")
 
     @property
     def mode(self) -> str:
-        """'local' or 'tcp'."""
+        """'local', 'tcp' (the wire protocol, over TCP or the server's Unix socket) or 'pool'."""
         return self._mode
 
     @property

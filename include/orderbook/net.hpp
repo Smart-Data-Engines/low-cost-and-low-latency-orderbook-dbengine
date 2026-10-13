@@ -60,8 +60,26 @@ int dial(std::string_view host, uint16_t port, uint32_t timeout_ms, bool leave_n
 /// listener hands over for an IPv4 client) as the IPv4 one; "unknown" for anything else.
 std::string address_of(const sockaddr_storage& addr, socklen_t len);
 
-/// The address of a connected socket's other end, as address_of() writes it; "unknown" when the
-/// socket will not say, or is not an IP socket (the unit tests use AF_UNIX pairs).
+/// The address of a connected socket's other end, as address_of() writes it; for a Unix socket the
+/// process at the other end, `unix pid=N uid=N gid=N` from SO_PEERCRED, or `unix` when the kernel
+/// will not say (#52); "unknown" when the socket will not say at all.
 std::string peer_address(int fd);
+
+/// Whether `path` can name a Unix socket: not empty, no NUL byte, and short enough for sun_path -
+/// 107 bytes and the NUL after them - with `why` saying which it is not (#52).
+bool valid_unix_path(std::string_view path, std::string& why);
+
+/// A Unix stream socket listening at `path`, its file given `mode`, or -1 with `error` (#52).
+///
+/// A file already at `path` is one of three things. A socket nobody listens on is what a process
+/// killed while it listened leaves, and it is removed and replaced. A socket somebody listens on is
+/// another server's, and a file that is not a socket is somebody's file: both refuse, naming the
+/// path. The mode is set between bind() and listen(), while the socket takes no connection, so no
+/// client meets the mode the umask gave the file. `extra_type` as listen_on() takes it.
+int listen_unix(const std::string& path, uint32_t mode, int backlog, int extra_type, std::string& error);
+
+/// A connection to the Unix socket at `path`, as dial() makes one to a host: within `timeout_ms`,
+/// blocking unless `leave_nonblocking`; -1 with `why` (#52).
+int dial_unix(const std::string& path, uint32_t timeout_ms, bool leave_nonblocking, std::string& why);
 
 }  // namespace ob::net

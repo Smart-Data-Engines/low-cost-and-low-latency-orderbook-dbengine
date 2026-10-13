@@ -11,6 +11,17 @@ here as `#N`.
 
 ### Added
 
+- A Unix socket beside the port, for clients on the node's host (#52, step 1). `--unix-socket <path>`
+  serves the same protocol, `AUTH` and `--max-sessions` without TCP, and `--unix-socket-mode` (0660)
+  is the file's mode before it takes a connection. It is not encrypted: the file's mode and its
+  directory decide who may connect. Each connection is logged with the pid, uid and gid at its other
+  end and counted in `ob_unix_connections_total`. A stale socket at the path is replaced, and a live
+  one or a path that is not a socket stops the start. The Python client (`unix_socket=`), the C++
+  client (`ClientConfig::unix_socket`) and `ob_backup --unix-socket` connect through it, and the
+  packaged unit creates `/run/orderbook` for it. With the default profile and a client that polls,
+  it took 1.4-1.7 µs off a command on an EPYC 9R45 and 1.9-2.4 µs on a Graviton (`PING` 3.06 to
+  1.68 µs and 4.87 to 3.01). A client that blocks keeps less of it on a host whose idle CPUs sleep
+  deeply ("Clients on the node's own host" in `docs/operations.md`).
 - A certificate is replaced without a restart (#238). `SIGHUP` - `systemctl reload`, through the
   unit's new `ExecReload` - reads the TLS certificate, key and CA again from the paths the node
   started with, for every surface at once. New connections get the new certificate and open ones

@@ -1,7 +1,10 @@
 // ob_backup — ask a running server for a backup and wait for it (#34).
 //
-//   ob_backup --host H --port P [--auth-identity I --auth-secret-file F] [--tls [--tls-ca-file F]]
-//             [--timeout-s N]
+//   ob_backup (--host H --port P | --unix-socket PATH) [--auth-identity I --auth-secret-file F]
+//             [--tls [--tls-ca-file F]] [--timeout-s N]
+//
+// `--unix-socket` is the server's own (#52), for a cron job on the node's host: the socket file's
+// permissions decide who may ask, and there is no TLS on it.
 //
 // The server writes the backup into its own --backup-dir; nothing here names a path. The secret is
 // read from a file in the server's client-secret format (`<identity> <secret>` lines), never from an
@@ -29,9 +32,15 @@ namespace {
 
 void usage(std::FILE* to) {
     std::fprintf(to,
-                 "usage: ob_backup --host <HOST> --port <PORT> [--auth-identity <ID> "
-                 "--auth-secret-file <PATH>]\n"
+                 "usage: ob_backup (--host <HOST> --port <PORT> | --unix-socket <PATH>)\n"
+                 "                 [--auth-identity <ID> --auth-secret-file <PATH>]\n"
                  "                 [--tls [--tls-ca-file <PATH>]] [--timeout-s <N>]\n");
+}
+
+/// What the messages call the server: its address, or its Unix socket (#52).
+std::string server_name(const ob::ClientConfig& c) {
+    return c.unix_socket.empty() ? c.host + ":" + std::to_string(c.port)
+                                 : "unix socket " + c.unix_socket;
 }
 
 /// `key: value` lines of an `OK` answer.
@@ -63,7 +72,7 @@ struct Options {
 /// anything it does not understand. A cursor over the arguments rather than a for loop's counter
 /// moved in its body (#36).
 int parse_options(int argc, char** argv, Options& o) {
-    std::string port, timeout_text;
+    std::string host, port, timeout_text;
     const std::vector<std::string> args(argv + 1, argv + argc);
     size_t at = 0;
     while (at < args.size()) {
@@ -76,8 +85,9 @@ int parse_options(int argc, char** argv, Options& o) {
             o.config.tls = true;
             continue;
         }
-        std::string* into = flag == "--host"             ? &o.config.host
+        std::string* into = flag == "--host"             ? &host
                           : flag == "--port"             ? &port
+                          : flag == "--unix-socket"      ? &o.config.unix_socket
                           : flag == "--auth-identity"    ? &o.identity
                           : flag == "--auth-secret-file" ? &o.secret_file
                           : flag == "--tls-ca-file"      ? &o.config.tls_ca_file
@@ -104,14 +114,24 @@ int parse_options(int argc, char** argv, Options& o) {
             return 2;
         }
     }
-    char* end = nullptr;
-    const long port_number = port.empty() ? 0 : std::strtol(port.c_str(), &end, 10);
-    if (port.empty() || *end != '\0' || port_number <= 0 || port_number > 65535) {
-        std::fprintf(stderr, "ob_backup: --port is required, 1 to 65535\n");
-        usage(stderr);
-        return 2;
+    if (!o.config.unix_socket.empty()) {
+        if (!host.empty() || !port.empty()) {
+            std::fprintf(stderr, "ob_backup: --unix-socket replaces --host and --port; give one or "
+                                 "the other\n");
+            usage(stderr);
+            return 2;
+        }
+    } else {
+        if (!host.empty()) o.config.host = host;
+        char* end = nullptr;
+        const long port_number = port.empty() ? 0 : std::strtol(port.c_str(), &end, 10);
+        if (port.empty() || *end != '\0' || port_number <= 0 || port_number > 65535) {
+            std::fprintf(stderr, "ob_backup: --port is required, 1 to 65535, or --unix-socket\n");
+            usage(stderr);
+            return 2;
+        }
+        o.config.port = static_cast<uint16_t>(port_number);
     }
-    o.config.port = static_cast<uint16_t>(port_number);
     if (o.identity.empty() != o.secret_file.empty()) {
         std::fprintf(stderr, "ob_backup: --auth-identity and --auth-secret-file go together\n");
         return 2;
@@ -150,9 +170,9 @@ std::string begin_backup(ob::OrderbookClient& client, const Options& o, int& sta
         return {};
     }
     if (caps.value().count("backup") == 0) {
-        std::fprintf(stderr, "ob_backup: %s:%u does not take backups (no 'backup' in its "
+        std::fprintf(stderr, "ob_backup: %s does not take backups (no 'backup' in its "
                              "capabilities): a build from before #34\n",
-                     o.config.host.c_str(), o.config.port);
+                     server_name(o.config).c_str());
         return {};
     }
     const auto begun = client.command("BACKUP");
@@ -218,8 +238,8 @@ static int run(int argc, char** argv) {
 
     ob::OrderbookClient client(o.config);
     if (auto c = client.connect(); !c) {
-        std::fprintf(stderr, "ob_backup: cannot connect to %s:%u: %s\n", o.config.host.c_str(),
-                     o.config.port, c.error_message().c_str());
+        std::fprintf(stderr, "ob_backup: cannot connect to %s: %s\n",
+                     server_name(o.config).c_str(), c.error_message().c_str());
         return 2;
     }
     int status = 0;

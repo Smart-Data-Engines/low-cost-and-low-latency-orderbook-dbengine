@@ -11,8 +11,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netdb.h>
+#include <cstddef>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 namespace ob::net {
@@ -95,6 +98,15 @@ int dial_one(const addrinfo& ai, uint32_t timeout_ms, std::string& why) {
         return -1;
     }
     return fd;
+}
+
+/// `path` as a Unix socket's address, and how many of its bytes bind() and connect() read. The path
+/// has passed valid_unix_path(), so it fits with the NUL after it.
+socklen_t unix_address(const std::string& path, sockaddr_un& addr) {
+    addr = sockaddr_un{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.data(), path.size());
+    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
 }
 
 }  // namespace
@@ -295,7 +307,139 @@ std::string peer_address(int fd) {
     sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
     if (::getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return "unknown";
+    if (addr.ss_family == AF_UNIX) {
+        // A Unix socket's address is a path, the same for every connection to it; the process at
+        // the other end is what tells one client from another (#52).
+        ucred cred{};
+        socklen_t cred_len = sizeof(cred);
+        if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) return "unix";
+        return "unix pid=" + std::to_string(cred.pid) + " uid=" + std::to_string(cred.uid) +
+               " gid=" + std::to_string(cred.gid);
+    }
     return address_of(addr, len);
+}
+
+bool valid_unix_path(std::string_view path, std::string& why) {
+    if (path.empty()) {
+        why = "a unix socket's path is empty";
+        return false;
+    }
+    if (path.find('\0') != std::string_view::npos) {
+        why = "a unix socket's path holds a NUL byte";
+        return false;
+    }
+    constexpr size_t kMax = sizeof(sockaddr_un{}.sun_path) - 1;
+    if (path.size() > kMax) {
+        why = "the unix socket path '" + std::string(path) + "' is " + std::to_string(path.size()) +
+              " bytes, and a unix socket's path holds at most " + std::to_string(kMax);
+        return false;
+    }
+    return true;
+}
+
+int listen_unix(const std::string& path, uint32_t mode, int backlog, int extra_type, std::string& error) {
+    std::string why;
+    if (!valid_unix_path(path, why)) {
+        error = why;
+        return -1;
+    }
+    sockaddr_un addr{};
+    const socklen_t addr_len = unix_address(path, addr);
+
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) {
+            error = "unix socket " + path + ": the path exists and is not a socket";
+            return -1;
+        }
+        // Somebody's socket, or what a process killed while it listened left: a connection says.
+        // OB_NO_TCP_NODELAY: an AF_UNIX probe that writes nothing; the option is TCP's.
+        const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (probe < 0) {
+            error = "unix socket " + path + ": socket() failed: " + std::strerror(errno);
+            return -1;
+        }
+        const int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&addr), addr_len);
+        const int probe_errno = errno;
+        ::close(probe);
+        if (rc == 0 || probe_errno == EAGAIN) {
+            error = "unix socket " + path + ": another process listens on it";
+            return -1;
+        }
+        if (probe_errno != ECONNREFUSED) {
+            error = "unix socket " + path + ": " + std::strerror(probe_errno);
+            return -1;
+        }
+        if (::unlink(path.c_str()) != 0) {
+            error = "unix socket " + path + ": a stale socket could not be removed: " + std::strerror(errno);
+            return -1;
+        }
+        OB_LOG_INFO("net", "removed a stale unix socket at %s: nothing listened on it", path.c_str());
+    } else if (errno != ENOENT) {
+        error = "unix socket " + path + ": " + std::strerror(errno);
+        return -1;
+    }
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | extra_type, 0);
+    if (fd < 0) {
+        error = std::string("socket() failed: ") + std::strerror(errno);
+        return -1;
+    }
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_len) < 0) {
+        error = "bind() failed on unix socket " + path + ": " + std::strerror(errno);
+        ::close(fd);
+        return -1;
+    }
+    // Before listen(): until then a connection is refused, so none meets the umask's mode.
+    if (::chmod(path.c_str(), static_cast<mode_t>(mode)) < 0) {
+        error = "unix socket " + path + ": chmod() failed: " + std::strerror(errno);
+        ::close(fd);
+        ::unlink(path.c_str());
+        return -1;
+    }
+    if (::listen(fd, backlog) < 0) {
+        error = "listen() failed on unix socket " + path + ": " + std::strerror(errno);
+        ::close(fd);
+        ::unlink(path.c_str());
+        return -1;
+    }
+    OB_LOG_INFO("net", "listening on unix socket %s (mode %04o), fd=%d", path.c_str(), mode, fd);
+    return fd;
+}
+
+int dial_unix(const std::string& path, uint32_t timeout_ms, bool leave_nonblocking, std::string& why) {
+    if (!valid_unix_path(path, why)) return -1;
+    sockaddr_un addr{};
+    const socklen_t addr_len = unix_address(path, addr);
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        why = std::string("socket(): ") + std::strerror(errno);
+        return -1;
+    }
+    // A Unix socket connects at once or not at all - except with the server's backlog full, which
+    // answers EAGAIN until it has room: tried again until the deadline.
+    // OB_NO_TCP_NODELAY: an AF_UNIX stream has no Nagle to switch off; the option is TCP's.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (::connect(fd, reinterpret_cast<sockaddr*>(&addr), addr_len) != 0) {
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN || std::chrono::steady_clock::now() >= deadline) {
+            why = errno == EAGAIN
+                      ? "no room in the server's backlog within the connect deadline (" +
+                            std::to_string(timeout_ms) + " ms)"
+                      : std::string(std::strerror(errno));
+            OB_LOG_DEBUG("net", "dial unix %s: %s", path.c_str(), why.c_str());
+            ::close(fd);
+            return -1;
+        }
+        ::poll(nullptr, 0, 1);
+    }
+    if (!leave_nonblocking && !set_blocking(fd, true)) {
+        why = "the socket could not be put back in blocking mode";
+        ::close(fd);
+        return -1;
+    }
+    OB_LOG_DEBUG("net", "dial unix %s: connected, fd=%d", path.c_str(), fd);
+    return fd;
 }
 
 }  // namespace ob::net
