@@ -39,6 +39,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -1215,6 +1216,8 @@ const std::vector<std::string>& known_flags() {
         "tls-replication",
         "ttl-hours",
         "ttl-scan-interval-seconds",
+        "unix-socket",
+        "unix-socket-mode",
         "wal-dir",
         "wal-rotate-bytes",
         "write-admission",
@@ -1318,6 +1321,10 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
                                  "link, in both roles; needs --tls-ca-file"}},
         {"ttl-hours", {"<N>", "Retention in hours; 0 keeps everything"}},
         {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
+        {"unix-socket", {"<PATH>", "A Unix socket the client protocol is served on too, for clients "
+                                   "on this host; not encrypted, its file's mode decides who may "
+                                   "connect (#52)"}},
+        {"unix-socket-mode", {"<OCTAL>", "The mode of --unix-socket's file (default: 0660)"}},
         {"wal-dir", {"<DIR>", "Where the WAL files live (default: the data directory). Give the WAL "
                               "a filesystem of its own when the data directory holds thousands of "
                               "instruments: on ext4 a WAL append waits for the journal, which "
@@ -1678,6 +1685,26 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.metrics_port = cursor.value_as<uint16_t>();
         } else if (arg == "--metrics-bind") {
             config.metrics_bind = std::string{cursor.value()};
+        } else if (arg == "--unix-socket") {
+            // Checked here, as --bind is (#203): a path that cannot be a socket's is a refusal to
+            // start that names the flag, not a failure at the bind.
+            const std::string val{cursor.value()};
+            std::string why;
+            if (!net::valid_unix_path(val, why)) {
+                std::fprintf(stderr, "Error: --unix-socket: %s\n", why.c_str());
+                std::exit(1);
+            }
+            config.unix_socket = val;
+        } else if (arg == "--unix-socket-mode") {
+            const std::string val{cursor.value()};
+            uint32_t mode = 0;
+            const auto [end, ec] = std::from_chars(val.data(), val.data() + val.size(), mode, 8);
+            if (val.empty() || ec != std::errc{} || end != val.data() + val.size() || mode > 0777) {
+                std::fprintf(stderr, "Error: --unix-socket-mode expects an octal mode from 0 to 0777, "
+                                     "such as 0660, got '%s'\n", val.c_str());
+                std::exit(1);
+            }
+            config.unix_socket_mode = mode;
         } else if (arg == "--bind" || arg == "--replication-bind" || arg == "--mm-bind") {
             // Checked here rather than at the bind (#203): an address that does not parse is a
             // refusal to start, said with the flag that carried it - not a listener on every
@@ -2145,6 +2172,12 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("tls-replication", c.tls_replication ? "true" : "false");
     line("ttl-hours", std::to_string(c.ttl_hours));
     line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
+    line("unix-socket", c.unix_socket.empty() ? "(none)" : c.unix_socket);
+    {
+        char mode[8];
+        std::snprintf(mode, sizeof(mode), "%04o", c.unix_socket_mode);
+        line("unix-socket-mode", mode);
+    }
     line("wal-dir", c.wal_dir.empty() ? c.data_dir : c.wal_dir);
     line("wal-rotate-bytes", std::to_string(c.wal_rotate_bytes));
     return out;
@@ -2300,6 +2333,7 @@ TcpServer::~TcpServer() {
     // returns by; this is the way out it throws from, a port that would not bind.
     engine_.reset();
     if (listen_fd_ >= 0) ::close(listen_fd_);
+    if (unix_listen_fd_ >= 0) ::close(unix_listen_fd_);
 }
 
 // ── Reactor ───────────────────────────────────────────────────────────────────
@@ -2346,9 +2380,10 @@ struct ReactorShared {
 class Reactor {
 public:
     /// `listen_fd` is the server's listening socket for the reactor that accepts, and a descriptor
-    /// of -1 for any other. A reference, because the reactor that accepts is also the one that
-    /// closes it when a drain begins, and the server's destructor must see that.
-    Reactor(int index, const ReactorShared& shared, int& listen_fd);
+    /// of -1 for any other; `unix_listen_fd` the same for the Unix socket (#52), -1 without one. A
+    /// reference, because the reactor that accepts is also the one that closes it when a drain
+    /// begins, and the server's destructor must see that.
+    Reactor(int index, const ReactorShared& shared, int& listen_fd, int& unix_listen_fd);
     ~Reactor();
 
     Reactor(const Reactor&) = delete;
@@ -2361,14 +2396,23 @@ public:
     /// Give this reactor a connection another one accepted. Called on the accepting reactor's
     /// thread; the descriptor is registered, wrapped for TLS and greeted on this one's, because a
     /// `Session` belongs to the thread that serves it from its first byte.
-    void hand_off(int fd, uint64_t conn_id);
+    /// `local`: the connection came through the Unix socket (#52), which has no TLS.
+    void hand_off(int fd, uint64_t conn_id, bool local);
 
     int index() const { return index_; }
 
 private:
     /// Take ownership of an accepted connection: session, epoll registration, TLS, banner. The
-    /// session count was taken at accept, so every failure here gives it back.
-    void adopt(int fd, uint64_t conn_id);
+    /// session count was taken at accept, so every failure here gives it back. A `local` connection,
+    /// from the Unix socket, is plaintext whatever the client port's TLS says (#52).
+    void adopt(int fd, uint64_t conn_id, bool local);
+
+    /// Every connection waiting on a listening socket: refused while draining, otherwise counted
+    /// against --max-sessions and dealt to a reactor. `local` for the Unix socket (#52).
+    void accept_from(int listen_fd, bool local);
+
+    /// A listening socket out of this reactor's epoll set and closed, at a drain's start.
+    void close_listener(int& fd, const char* what);
 
     /// Everything handed off since the last pass, adopted in the order it was accepted.
     void adopt_handed_off();
@@ -2403,12 +2447,18 @@ private:
     BackupRunner*            backups_;
     MetricsServer*           metrics_server_;
     int&                     listen_fd_;
+    int&                     unix_listen_fd_;
     int                      epoll_fd_{-1};
 
     /// An eventfd in this reactor's epoll set: written by `hand_off()` from the accepting thread.
     int                      wake_fd_{-1};
     std::mutex               handoff_mtx_;
-    std::vector<std::pair<int, uint64_t>> handoff_;   ///< (descriptor, conn_id), under handoff_mtx_
+    struct HandedOff {
+        int      fd;
+        uint64_t conn_id;
+        bool     local;
+    };
+    std::vector<HandedOff>   handoff_;   ///< under handoff_mtx_
 
     /// Where the next accepted connection goes. Only the accepting reactor reads it.
     size_t                   next_reactor_{0};
@@ -2461,7 +2511,7 @@ private:
     std::vector<std::string> write_answers_;
 };
 
-Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
+Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& unix_listen_fd)
     : index_(index)
     , config_(shared.config)
     , reactors_(shared.reactors)
@@ -2477,6 +2527,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
     , backups_(shared.backups)
     , metrics_server_(shared.metrics_server)
     , listen_fd_(listen_fd)
+    , unix_listen_fd_(unix_listen_fd)
     , sessions_(shared.config.max_sessions)
     , hub_(shared.config.max_subscriber_queue_bytes, shared.config.max_subscriptions_per_session)
     , event_what_("serving a client event on reactor " + std::to_string(index))
@@ -2487,12 +2538,14 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
         throw std::runtime_error(std::string("epoll_create1() failed: ") + std::strerror(errno));
     }
 
-    // 6. Add the listening socket to epoll, on the reactor that accepts.
-    if (listen_fd_ >= 0) {
+    // 6. Add the listening sockets to epoll, on the reactor that accepts: the port's, and the Unix
+    //    socket's when there is one (#52).
+    for (const int fd : {listen_fd_, unix_listen_fd_}) {
+        if (fd < 0) continue;
         struct epoll_event ev{};
         ev.events  = EPOLLIN;
-        ev.data.fd = listen_fd_;
-        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0) {
+        ev.data.fd = fd;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
             const std::string why = std::strerror(errno);
             ::close(epoll_fd_);
             epoll_fd_ = -1;
@@ -2531,8 +2584,9 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
         throw std::runtime_error("epoll_ctl() failed for reactor " + std::to_string(index_) +
                                  "'s wake descriptor: " + why);
     }
-    OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, wake fd=%d, accepts=%s", index_,
-                 epoll_fd_, wake_fd_, listen_fd_ >= 0 ? "yes" : "no");
+    OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, wake fd=%d, accepts=%s%s", index_,
+                 epoll_fd_, wake_fd_, listen_fd_ >= 0 ? "yes" : "no",
+                 unix_listen_fd_ >= 0 ? ", and on the unix socket" : "");
 }
 
 Reactor::~Reactor() {
@@ -2542,10 +2596,10 @@ Reactor::~Reactor() {
     }
     // A connection handed off and never adopted belongs to nobody else, so it is closed here and
     // its place in the session count given back.
-    for (const auto& [fd, conn_id] : handoff_) {
+    for (const HandedOff& h : handoff_) {
         OB_LOG_INFO("tcp_server", "Reactor %d closing fd=%d (conn_id=%llu): handed off, never "
-                    "adopted", index_, fd, static_cast<unsigned long long>(conn_id));
-        ::close(fd);
+                    "adopted", index_, h.fd, static_cast<unsigned long long>(h.conn_id));
+        ::close(h.fd);
         stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
         engine_->registry().increment_gauge("ob_active_sessions", -1);
     }
@@ -2588,10 +2642,10 @@ void Reactor::arm_epollout(int fd) {
     }
 }
 
-void Reactor::hand_off(int fd, uint64_t conn_id) {
+void Reactor::hand_off(int fd, uint64_t conn_id, bool local) {
     {
         std::lock_guard<std::mutex> lock(handoff_mtx_);
-        handoff_.emplace_back(fd, conn_id);
+        handoff_.push_back(HandedOff{fd, conn_id, local});
     }
     const uint64_t one = 1;
     const ssize_t wr = ::write(wake_fd_, &one, sizeof(one));
@@ -2609,17 +2663,17 @@ void Reactor::adopt_handed_off() {
     uint64_t counter = 0;
     const ssize_t rd = ::read(wake_fd_, &counter, sizeof(counter));
     (void)rd;   // EAGAIN just means a previous pass already took the wake-up; the queue decides
-    std::vector<std::pair<int, uint64_t>> taken;
+    std::vector<HandedOff> taken;
     {
         std::lock_guard<std::mutex> lock(handoff_mtx_);
         taken.swap(handoff_);
     }
-    for (const auto& [fd, conn_id] : taken) {
-        adopt(fd, conn_id);
+    for (const HandedOff& h : taken) {
+        adopt(h.fd, h.conn_id, h.local);
     }
 }
 
-void Reactor::adopt(int fd, uint64_t conn_id) {
+void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
     // Every failure below gives back the place in the session count the accepting reactor took.
     const auto give_back = [&] {
         stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
@@ -2649,7 +2703,7 @@ void Reactor::adopt(int fd, uint64_t conn_id) {
     }
 
     Session* s = sessions_.get_session(fd);
-    if (s && tls_.client_port) {
+    if (s && tls_.client_port && !local) {
         // Wrap before anything is written: the banner is application data and must not precede
         // the handshake. It is queued here and goes out with the first flush after the handshake
         // completes, which is what send_response() on a handshaking session does - the bytes sit in
@@ -2681,6 +2735,84 @@ void Reactor::adopt(int fd, uint64_t conn_id) {
             "OK ob_tcp_server v" + std::string(version()) + "\n\n";
         s->send_response(banner);
     }
+}
+
+void Reactor::accept_from(int listen_fd, bool local) {
+    // Draining: stop accepting new connections.
+    if (draining_.load(std::memory_order_relaxed)) {
+        // Reject all pending connections.
+        //
+        // OB_NO_TCP_NODELAY: one line and a close, so there is never an earlier
+        // unacknowledged byte for Nagle to hold a second write behind (#140).
+        while (true) {
+            int reject_fd = ::accept4(listen_fd, nullptr, nullptr, SOCK_NONBLOCK);
+            if (reject_fd < 0) break;
+            const char* msg = "ERR server shutting down\n";
+            auto wr = ::send(reject_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+            (void)wr;
+            ::close(reject_fd);
+        }
+        return;
+    }
+
+    // Accept new connection(s).
+    while (true) {
+        sockaddr_storage client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = ::accept4(listen_fd,
+                                  reinterpret_cast<struct sockaddr*>(&client_addr),
+                                  &client_len,
+                                  SOCK_NONBLOCK);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break; // accept error, continue loop
+        }
+
+        if (local) {
+            // A Unix stream has no Nagle to switch off; what it has is a count of its own (#52).
+            engine_->registry().increment_counter("ob_unix_connections_total");
+        } else {
+            // Before anything is written to it, including the banner: a client that
+            // pipelines pays a delayed-ACK timer per round trip without this (#140).
+            set_tcp_nodelay(client_fd, "tcp_server");
+        }
+
+        // The limit is global and it is taken here, on the reactor that accepts. Counted
+        // wherever the connection is adopted instead, a burst of accepts would be checked against
+        // a number that had not caught up and let more than --max-sessions in. One limit for both
+        // transports: a session costs the same whichever way it came.
+        const int admitted = stats_.active_sessions.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (admitted > config_.max_sessions) {
+            stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+            // Server full — reject.
+            OB_LOG_DEBUG("tcp_server", "Reactor %d: refused fd=%d over %s, server full (%d)", index_,
+                         client_fd, local ? "the unix socket" : "tcp", config_.max_sessions);
+            const char* msg = "ERR server full\n";
+            auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+            (void)wr;
+            ::close(client_fd);
+            continue;
+        }
+        engine_->registry().increment_gauge("ob_active_sessions");
+
+        // Dealt in turn, so four connections on four reactors are one each, and a
+        // connection stays where it is dealt for its whole life.
+        const uint64_t conn_id = next_conn_id_++;
+        Reactor* target = (*reactors_)[next_reactor_++ % reactors_->size()];
+        if (target == this) {
+            adopt(client_fd, conn_id, local);
+        } else {
+            target->hand_off(client_fd, conn_id, local);
+        }
+    }
+}
+
+void Reactor::close_listener(int& fd, const char* what) {
+    if (fd < 0) return;
+    OB_LOG_INFO("tcp_server", "Drain requested: closing the %s, fd=%d", what, fd);
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
+    fd = -1;
 }
 
 void Reactor::publish_gauge(const char* name, int64_t now, int64_t& published) {
@@ -2777,68 +2909,8 @@ void Reactor::run_loop() {
                     continue;
                 }
 
-                if (fd == listen_fd_) {
-                    // Draining: stop accepting new connections.
-                    if (draining_.load(std::memory_order_relaxed)) {
-                        // Reject all pending connections.
-                        //
-                        // OB_NO_TCP_NODELAY: one line and a close, so there is never an earlier
-                        // unacknowledged byte for Nagle to hold a second write behind (#140).
-                        while (true) {
-                            int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
-                            if (reject_fd < 0) break;
-                            const char* msg = "ERR server shutting down\n";
-                            auto wr = ::send(reject_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
-                            (void)wr;
-                            ::close(reject_fd);
-                        }
-                        continue;
-                    }
-
-                    // Accept new connection(s).
-                    while (true) {
-                        sockaddr_storage client_addr{};
-                        socklen_t client_len = sizeof(client_addr);
-                        int client_fd = ::accept4(listen_fd_,
-                                                  reinterpret_cast<struct sockaddr*>(&client_addr),
-                                                  &client_len,
-                                                  SOCK_NONBLOCK);
-                        if (client_fd < 0) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                            break; // accept error, continue loop
-                        }
-
-                        // Before anything is written to it, including the banner: a client that
-                        // pipelines pays a delayed-ACK timer per round trip without this (#140).
-                        set_tcp_nodelay(client_fd, "tcp_server");
-
-                        // The limit is global and it is taken here, on the reactor that accepts.
-                        // Counted wherever the connection is adopted instead, a burst of accepts
-                        // would be checked against a number that had not caught up and let more
-                        // than --max-sessions in.
-                        const int admitted =
-                            stats_.active_sessions.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (admitted > config_.max_sessions) {
-                            stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                            // Server full — reject.
-                            const char* msg = "ERR server full\n";
-                            auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
-                            (void)wr;
-                            ::close(client_fd);
-                            continue;
-                        }
-                        engine_->registry().increment_gauge("ob_active_sessions");
-
-                        // Dealt in turn, so four connections on four reactors are one each, and a
-                        // connection stays where it is dealt for its whole life.
-                        const uint64_t conn_id = next_conn_id_++;
-                        Reactor* target = (*reactors_)[next_reactor_++ % reactors_->size()];
-                        if (target == this) {
-                            adopt(client_fd, conn_id);
-                        } else {
-                            target->hand_off(client_fd, conn_id);
-                        }
-                    }
+                if (fd == listen_fd_ || fd == unix_listen_fd_) {
+                    accept_from(fd, fd == unix_listen_fd_);
                 } else {
                     // Writable first: a session with queued output is waiting on this,
                     // and draining it may be the only thing that lets the client send
@@ -3160,15 +3232,14 @@ void Reactor::run_loop() {
             drain_started_at_ = std::chrono::steady_clock::now();
             OB_LOG_INFO("tcp_server", "Reactor %d: drain requested, %d session(s) open here",
                         index_, sessions_.active_count());
-            if (listen_fd_ >= 0) {
-                OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
-                            listen_fd_);
+            // The reactor that accepts holds both listening sockets (#52), and the metrics server
+            // stops with them.
+            if (listen_fd_ >= 0 || unix_listen_fd_ >= 0) {
+                close_listener(listen_fd_, "listen socket");
+                close_listener(unix_listen_fd_, "unix socket");
                 if (metrics_server_) {
                     metrics_server_->stop();
                 }
-                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
-                ::close(listen_fd_);
-                listen_fd_ = -1;
             }
         }
 
@@ -3290,6 +3361,56 @@ void TcpServer::run() {
                 config_.bind.empty() ? "every interface" : config_.bind.c_str(),
                 std::string(version()).c_str(), config_.data_dir.c_str());
 
+    // The Unix socket (#52), beside the port and after it, so a port that would not bind leaves no
+    // file behind. Its file goes on every way out of run() from here - but only while it is still
+    // the file bound here: one another server has bound at that path since is not ours to remove.
+    struct UnixSocketFile {
+        std::string path;
+        dev_t       dev{};
+        ino_t       ino{};
+        bool        bound{false};
+        ~UnixSocketFile() {
+            if (!bound) return;
+            struct stat st{};
+            if (::lstat(path.c_str(), &st) != 0) {
+                OB_LOG_WARN("tcp_server", "unix socket %s: gone before the server stopped: %s",
+                            path.c_str(), std::strerror(errno));
+            } else if (st.st_dev != dev || st.st_ino != ino) {
+                OB_LOG_WARN("tcp_server", "unix socket %s is no longer the file this server bound; "
+                            "left in place", path.c_str());
+            } else if (::unlink(path.c_str()) != 0) {
+                OB_LOG_WARN("tcp_server", "unix socket %s could not be removed: %s", path.c_str(),
+                            std::strerror(errno));
+            } else {
+                OB_LOG_INFO("tcp_server", "removed unix socket %s", path.c_str());
+            }
+        }
+    } unix_file;
+    if (!config_.unix_socket.empty()) {
+        std::string unix_error;
+        unix_listen_fd_ = net::listen_unix(config_.unix_socket, config_.unix_socket_mode, 128,
+                                           SOCK_NONBLOCK, unix_error);
+        if (unix_listen_fd_ < 0) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            throw std::runtime_error(unix_error);
+        }
+        struct stat st{};
+        if (::lstat(config_.unix_socket.c_str(), &st) == 0) {
+            // Field by field: a temporary assigned from would remove the file as it died.
+            unix_file.path  = config_.unix_socket;
+            unix_file.dev   = st.st_dev;
+            unix_file.ino   = st.st_ino;
+            unix_file.bound = true;
+        } else {
+            OB_LOG_WARN("tcp_server", "unix socket %s: cannot stat it after bind (%s); it will not "
+                        "be removed at stop", config_.unix_socket.c_str(), std::strerror(errno));
+        }
+        OB_LOG_INFO("tcp_server", "listening on unix socket %s (mode %04o), not encrypted: the "
+                    "file's permissions decide who may connect", config_.unix_socket.c_str(),
+                    static_cast<unsigned>(config_.unix_socket_mode));
+    }
+
     ServerStats stats;
     std::vector<Reactor*> dealt_to;
     std::mutex            admin_mtx;
@@ -3297,7 +3418,7 @@ void TcpServer::run() {
                          draining_,  read_only_, stats, shard_coord.get(), metrics_server_.get(),
                          &dealt_to, admin_mtx, backups.get()};
 
-    // 7-8. Reactor 0 holds the listening socket and runs on this thread; the others have a thread
+    // 7-8. Reactor 0 holds the listening sockets and runs on this thread; the others have a thread
     // each. Every one is built before any of them runs, so the list reactor 0 deals from is complete
     // and never changes while it is read.
     int no_listener = -1;
@@ -3305,7 +3426,8 @@ void TcpServer::run() {
     reactors.reserve(config_.io_threads);
     for (uint32_t i = 0; i < config_.io_threads; ++i) {
         reactors.push_back(std::make_unique<Reactor>(static_cast<int>(i), shared,
-                                                     i == 0 ? listen_fd_ : no_listener));
+                                                     i == 0 ? listen_fd_ : no_listener,
+                                                     i == 0 ? unix_listen_fd_ : no_listener));
         dealt_to.push_back(reactors.back().get());
     }
     OB_LOG_INFO("tcp_server", "%u io thread(s): connections are dealt to them in turn",
@@ -3367,10 +3489,14 @@ void TcpServer::run() {
     }
     reactors.clear();   // closes every reactor's descriptors, and anything still handed off
 
-    // listen_fd_ may already be closed by the reactor during drain.
+    // listen_fd_ may already be closed by the reactor during drain, and unix_listen_fd_ with it.
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
+    }
+    if (unix_listen_fd_ >= 0) {
+        ::close(unix_listen_fd_);
+        unix_listen_fd_ = -1;
     }
 
     // A fatal epoll error leaves the loop without ever seeing draining_, so the metrics server

@@ -623,6 +623,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--tls-cert-file` | `<PATH>` | This node's certificate chain (PEM), used on every TLS surface and in both roles; read again on `SIGHUP` |
 | `--tls-client` | — (boolean) | TLS on the client port; needs --tls-cert-file and --tls-key-file |
 | `--tls-key-file` | `<PATH>` | This node's private key (PEM); mode 600; read again on `SIGHUP` |
+| `--unix-socket` | `<PATH>` | A Unix stream socket the client protocol is served on as well as the port, for clients on this host: the same commands, `AUTH` and limits, one round trip shorter by the TCP stack (#52). Not encrypted, `--tls-client` or not - the file's mode decides who may connect. A socket nobody listens on is replaced at the start, one somebody listens on refuses it, and the file goes when the server stops |
+| `--unix-socket-mode` | `<OCTAL>` | The mode `--unix-socket`'s file is given before the socket takes a connection (default: `0660`) |
 | `--tls-multi-master` | — (boolean) | TLS with mutual certificate verification on the multi-master mesh; needs `--tls-ca-file` |
 | `--tls-peer-names` | `<NAMES>` | Comma-separated identities an accepted peer's certificate may carry; empty accepts any name this CA signed |
 | `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |

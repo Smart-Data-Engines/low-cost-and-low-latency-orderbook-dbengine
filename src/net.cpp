@@ -353,6 +353,7 @@ int listen_unix(const std::string& path, uint32_t mode, int backlog, int extra_t
             return -1;
         }
         // Somebody's socket, or what a process killed while it listened left: a connection says.
+        // OB_NO_TCP_NODELAY: an AF_UNIX probe that writes nothing; the option is TCP's.
         const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (probe < 0) {
             error = "unix socket " + path + ": socket() failed: " + std::strerror(errno);
@@ -417,6 +418,7 @@ int dial_unix(const std::string& path, uint32_t timeout_ms, bool leave_nonblocki
     }
     // A Unix socket connects at once or not at all - except with the server's backlog full, which
     // answers EAGAIN until it has room: tried again until the deadline.
+    // OB_NO_TCP_NODELAY: an AF_UNIX stream has no Nagle to switch off; the option is TCP's.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (::connect(fd, reinterpret_cast<sockaddr*>(&addr), addr_len) != 0) {
         if (errno == EINTR) continue;

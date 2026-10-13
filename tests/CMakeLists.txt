@@ -552,6 +552,12 @@ ob_add_tcp_test(test_query_response_builder
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )
+
+# The server's Unix socket (#52): a real TcpServer in the process, so a sanitizer build runs the
+# accept path, the hand-off and the drain of both listeners.
+ob_add_tcp_test(test_unix_socket
+    test_unix_socket.cpp
+)
 # The drain rule (#106) is checked by reading the server's source: the bound has to live in one
 # place.
 target_compile_definitions(test_tcp_server

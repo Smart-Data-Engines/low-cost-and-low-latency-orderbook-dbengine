@@ -142,6 +142,10 @@ struct ServerConfig {
     /// exceed this by one record.
     size_t      wal_rotate_bytes{512ULL << 20};   // 512 MB
     std::string wal_dir;                          // empty: the data directory (#186)
+    /// --unix-socket: a Unix stream socket the client protocol is served on too, for clients on this
+    /// host (#52). Empty: none. Not encrypted - the file's mode decides who may connect.
+    std::string unix_socket;
+    uint32_t    unix_socket_mode{0660};           // --unix-socket-mode, octal
     std::string backup_dir;                       // empty: BACKUP is refused (#34)
 
     /// Background flush interval. Shorter means less unflushed data at any moment and
@@ -527,6 +531,9 @@ private:
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
     int                      listen_fd_{-1};
+    /// The Unix socket's listener (#52), -1 without --unix-socket. Closed by the accepting reactor
+    /// at a drain's start, like the port's.
+    int                      unix_listen_fd_{-1};
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────
