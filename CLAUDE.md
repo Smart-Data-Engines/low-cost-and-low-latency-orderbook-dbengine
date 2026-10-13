@@ -102,7 +102,9 @@ peer_id, epoch, addresses, sizes. Rule of thumb: if it can go wrong, it must be 
 Learned the hard way. Check here before debugging.
 
 1. **Port conflicts in tests** — always `ctest -j1`.
-2. **AF_INET vs AF_INET6** — `socket()` must match the `sockaddr` struct in use (we use AF_INET).
+2. **AF_INET vs AF_INET6** — `socket()` must match the `sockaddr` struct in use. Both families are
+   in use since #236, and every socket is opened in `ob::net`: accept into `sockaddr_storage` and
+   write an address with `net::address_of()`, never `inet_ntop(AF_INET)` on a `sockaddr_in`.
 3. **`read_only_flag_` in multi-master mode** — must be reset after `FailoverManager` initialisation,
    or the node rejects writes it should accept.
 4. **`peer_registry_` wiring order** — init in the constructor, `register_self()` + `start_watch()` in
@@ -4200,6 +4202,23 @@ Learned the hard way. Check here before debugging.
      replica was 0.4 s into a join from zero, left by the test before. `healthy_cluster` now waits,
      before and after each test, until no node reports `joining:` in STATUS
      (`ClusterManager.wait_until_no_node_is_joining()`).
+572. **A count per source file moves with the code.** `SocketOptionsStatic` counts `::accept` and
+     `::connect` against `set_tcp_nodelay` calls in each file of `src/`. Moving the dials into
+     `src/net.cpp` (#236) left three files calling it with no connection of their own and `net.cpp`
+     holding one with no call. The fix goes where the connection now is - `ob::net::dial()` sets the
+     option - and not into an exemption.
+573. **`::` is not IPv6 alone unless the socket says so.** On most hosts `net.ipv6.bindv6only` is 0,
+     so a socket bound to `::` takes IPv4 as well. `listen_on()` turns `IPV6_V6ONLY` off for no bind
+     and on for every IPv6 literal: `--bind ::` is every IPv6 interface and `0.0.0.0` every IPv4 one,
+     on any host.
+574. **A host in brackets is text, not an address.** `[::1]` is how an address with a port writes its
+     host, and `getaddrinfo()`, `inet_pton()` and `X509_VERIFY_PARAM_set1_ip_asc()` all refuse it.
+     `split_host_port()` returns the host bare, and `dial()` and `tls_expect_host()` strip what a user
+     typed. The TLS check did not, until #236's test of it: `--primary-host [::1]` refused a correct
+     `IP:::1` certificate. A new consumer of a host strips them too.
+575. **`/proc/net/tcp` is IPv4's table.** A port with no bind is a `::` socket since #236 and is
+     listed in `/proc/net/tcp6` alone, so a test reading only the first finds nothing listening.
+     `test_bind_addresses.py` reads both.
 
 ## Current state and open problems
 
