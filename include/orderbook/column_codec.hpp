@@ -52,6 +52,9 @@ struct Encoding {
     bool operator==(const Encoding&) const = default;
 };
 
+/// The charge a seal and a merge put on a runs candidate, `EncodeOptions::runs_charge_pct` (#223).
+inline constexpr unsigned kRunsChargePct = 50;
+
 struct EncodeOptions {
     /// Whether runs and narrow of each transform are tried under LZ4.
     bool lz4{true};
@@ -63,6 +66,12 @@ struct EncodeOptions {
     /// How much smaller, in percent, a ZSTD candidate must be than the smallest LZ4 one, when LZ4
     /// is tried: ZSTD's decompression costs several times LZ4's.
     unsigned zstd_margin_pct{0};
+    /// What a runs candidate is charged for its runs (#223): it is weighed as if it were larger by
+    /// this many percent times its runs per value, at most 90%, so it is chosen only where it is that
+    /// much smaller. Decoding a run costs a step its length decides, and a column of runs a value or
+    /// two long decodes several times slower as runs than in any other packing, for the few percent
+    /// they save. 0 charges nothing: the smallest candidate is chosen.
+    unsigned runs_charge_pct{kRunsChargePct};
     /// The encoding to write in without searching - what the column's last segment chose - or
     /// null to search. One whose compressor these options leave out is searched for instead.
     const Encoding* hint{nullptr};
@@ -71,10 +80,11 @@ struct EncodeOptions {
 struct Choice {
     Encoding encoding;
     size_t bytes{0};               ///< the block's
-    size_t uncompressed_bytes{0};  ///< the smallest uncompressed candidate's
+    size_t uncompressed_bytes{0};  ///< the uncompressed candidate's the compressed ones were weighed against
 };
 
-/// Appends to `out` the block of `values` in the smallest candidate, as `options` weighs them.
+/// Appends to `out` the block of `values` in the smallest candidate, as `options` weighs them -
+/// a runs candidate charged for its runs.
 Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, std::string& out);
 
 /// Appends to `out` the block of `values` in `encoding` - for the tests and the cost benchmark;

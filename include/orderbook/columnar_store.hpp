@@ -431,7 +431,9 @@ public:
         uint32_t version{kColumnarFormatVersion};
         /// The search over the candidates: which compressors it tries, and their margins.
         column_codec::EncodeOptions search{.lz4 = true, .zstd_level = 0, .compressed_margin_pct = 0,
-                                           .zstd_margin_pct = 0, .hint = nullptr};
+                                           .zstd_margin_pct = 0,
+                                           .runs_charge_pct = column_codec::kRunsChargePct,
+                                           .hint = nullptr};
         /// A segment reuses the encoding this store's last one chose for each column, and searches
         /// again every this many segments - and always when it has none to reuse. 1: every segment
         /// searches.

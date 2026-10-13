@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -115,9 +116,12 @@ RC_GTEST_PROP(ColumnCodec, EveryEncodingGivesBackAnyColumn, ()) {
 }
 
 TEST(ColumnCodec, TheChoiceIsTheSmallestCandidateAndGivesItsValuesBack) {
+    // With nothing charged for runs (#223); the charge has its tests below.
+    EncodeOptions by_size;
+    by_size.runs_charge_pct = 0;
     for (const auto& column : edge_columns()) {
         std::string chosen;
-        const Choice c = encode(column, EncodeOptions{}, chosen);
+        const Choice c = encode(column, by_size, chosen);
         ASSERT_EQ(c.bytes, chosen.size());
         std::vector<uint64_t> back;
         std::string why;
@@ -143,6 +147,134 @@ TEST(ColumnCodec, TheChoiceIsTheSmallestCandidateAndGivesItsValuesBack) {
             EXPECT_LE(chosen.size(), other.size()) << c.encoding.name() << " chosen over " << e.name();
         }
     }
+}
+
+// The runs of what each transform leaves (#223): equal values for `for`, equal differences for
+// `delta` - subtracting the minimum or dividing by a divisor changes neither - and how many values
+// each counts them over.
+struct RunsPerTransform {
+    size_t for_runs{0}, for_values{0}, delta_runs{0}, delta_values{0};
+};
+RunsPerTransform runs_of(const std::vector<uint64_t>& v) {
+    RunsPerTransform r;
+    r.for_values = v.size();
+    r.for_runs = v.empty() ? 0 : 1;
+    for (size_t i = 1; i < v.size(); ++i) r.for_runs += v[i] != v[i - 1];
+    r.delta_values = v.size() < 2 ? 0 : v.size() - 1;
+    r.delta_runs = v.size() < 2 ? 0 : 1;
+    for (size_t i = 2; i < v.size(); ++i) r.delta_runs += (v[i] - v[i - 1]) != (v[i - 1] - v[i - 2]);
+    return r;
+}
+
+// A candidate's bytes as the choice weighs them: a runs one larger by its charge, the charge being
+// `pct` percent times its runs per value, at most 90%.
+double weighed(const Encoding& e, size_t bytes, const RunsPerTransform& r, unsigned pct) {
+    if (e.packing != Packing::kRuns) return static_cast<double>(bytes);
+    const size_t runs = e.transform == Transform::kDelta ? r.delta_runs : r.for_runs;
+    const size_t values = e.transform == Transform::kDelta ? r.delta_values : r.for_values;
+    if (values == 0) return static_cast<double>(bytes);
+    const double per_mille = std::min(900.0, std::floor(10.0 * pct * static_cast<double>(runs) /
+                                                        static_cast<double>(values)));
+    return std::floor(static_cast<double>(bytes) * 1000.0 / (1000.0 - per_mille));
+}
+
+std::vector<Encoding> every_candidate() {
+    std::vector<Encoding> out = {
+        {Transform::kFor, Packing::kSimple8b, Compressor::kNone},
+        {Transform::kFor, Packing::kRuns, Compressor::kNone},
+        {Transform::kFor, Packing::kBlocks, Compressor::kNone},
+        {Transform::kDelta, Packing::kSimple8b, Compressor::kNone},
+        {Transform::kDelta, Packing::kRuns, Compressor::kNone},
+    };
+    for (Compressor z : {Compressor::kLz4, Compressor::kZstd}) {
+        for (Transform t : {Transform::kFor, Transform::kDelta}) {
+            for (Packing p : {Packing::kRuns, Packing::kNarrow}) out.push_back(Encoding{t, p, z});
+        }
+    }
+    return out;
+}
+
+// Values drawn from a fixed sequence, each repeated once with a probability that sets the runs per
+// value - short runs of values twenty bits wide, which no compressor takes anything from.
+std::vector<uint64_t> short_runs(size_t n, unsigned repeat_per_mille, uint64_t seed) {
+    std::vector<uint64_t> out;
+    uint64_t x = seed;
+    const auto next = [&x] {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        return x >> 33;
+    };
+    while (out.size() < n) {
+        const uint64_t v = next() & ((uint64_t{1} << 20) - 1);
+        out.push_back(v);
+        if (out.size() < n && next() % 1000 < repeat_per_mille) out.push_back(v);
+    }
+    return out;
+}
+
+TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
+    // The rule, held exactly (#223): no candidate weighs less than the chosen one, a runs candidate
+    // weighed as larger by its charge - for every charge, the default's included, on columns of runs
+    // short and long and on the edge columns.
+    std::vector<std::vector<uint64_t>> columns = edge_columns();
+    for (unsigned repeat : {0u, 300u, 600u, 900u}) columns.push_back(short_runs(5'000, repeat, repeat + 1));
+    std::vector<uint64_t> long_runs;
+    for (uint64_t i = 0; i < 5'000; ++i) long_runs.push_back(1'000 + (i / 23) * 7 % 101);
+    columns.push_back(long_runs);
+    for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u}) {
+        EncodeOptions options;
+        options.runs_charge_pct = pct;
+        for (const auto& column : columns) {
+            SCOPED_TRACE(::testing::Message() << "charge " << pct << "%, " << column.size() << " values");
+            const RunsPerTransform r = runs_of(column);
+            std::string chosen;
+            const Choice c = encode(column, options, chosen);
+            std::vector<uint64_t> back;
+            std::string why;
+            ASSERT_TRUE(decode(bytes(chosen), column.size(), back, &why)) << c.encoding.name() << ": " << why;
+            ASSERT_EQ(back, column);
+            const double mine = weighed(c.encoding, chosen.size(), r, pct);
+            for (const Encoding& e : every_candidate()) {
+                std::string other;
+                encode_as(column, e, options.zstd_level, other);
+                EXPECT_LE(mine, weighed(e, other.size(), r, pct)) << c.encoding.name() << " chosen over " << e.name();
+            }
+        }
+    }
+}
+
+TEST(ColumnCodec, RunsAValueOrTwoLongAreNotChosenForAFewPercent) {
+    // Values each repeated with probability 0.43: 0.7 runs a value. Runs store a value and a length
+    // a run, fewer bytes than any packing that stores every value - which made them the choice by
+    // size - and their decode takes a step a run. Charged 35%, they lose to one of those.
+    const auto column = short_runs(10'000, 430, 7);
+    const RunsPerTransform r = runs_of(column);
+    ASSERT_GT(r.for_runs * 10, r.for_values * 6) << "the column's runs are not short: " << r.for_runs;
+    EncodeOptions by_size;
+    by_size.runs_charge_pct = 0;
+    std::string a, b;
+    const Choice smallest = encode(column, by_size, a);
+    ASSERT_EQ(smallest.encoding.packing, Packing::kRuns) << "by size alone the runs are not the smallest, "
+                                                            "so this column tests nothing: " << smallest.encoding.name();
+    const Choice charged = encode(column, EncodeOptions{}, b);
+    EXPECT_NE(charged.encoding.packing, Packing::kRuns) << charged.encoding.name();
+    EXPECT_GT(charged.bytes, smallest.bytes) << "the charge chose a block no larger, which the old rule would have";
+}
+
+TEST(ColumnCodec, LongRunsKeepTheirRunsUnderTheCharge) {
+    // Runs twenty values long, as a book's timestamps are - 0.05 runs a value, a charge of 2.5% -
+    // are chosen as they were by size.
+    std::vector<uint64_t> ts;
+    for (uint64_t u = 0; u < 500; ++u) {
+        for (int l = 0; l < 20; ++l) ts.push_back(1'790'000'000'000'000'000ULL + u * 50'000'000ULL + (u % 7) * 13);
+    }
+    EncodeOptions by_size;
+    by_size.runs_charge_pct = 0;
+    std::string a, b;
+    const Choice smallest = encode(ts, by_size, a);
+    ASSERT_EQ(smallest.encoding.packing, Packing::kRuns) << smallest.encoding.name();
+    const Choice charged = encode(ts, EncodeOptions{}, b);
+    EXPECT_EQ(charged.encoding, smallest.encoding) << charged.encoding.name();
+    EXPECT_EQ(b, a);
 }
 
 TEST(ColumnCodec, ACompressedCandidateMustSaveTheMarginToBeChosen) {
