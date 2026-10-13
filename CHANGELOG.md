@@ -11,6 +11,12 @@ here as `#N`.
 
 ### Added
 
+- Books on huge pages (#51). Each symbol's book is made in a 2 MiB region the kernel is asked to
+  back with transparent huge pages, 43 books to a region. On an EPYC and a Graviton host a write to
+  one of 4 000 books measured 16-22% faster and a write through the engine 1.5-4.7% faster, with no
+  difference at 64 books or fewer. `--book-huge-pages off` makes books on the heap as before, and `ob_book_arena_regions`
+  counts the regions. One first write to a new symbol in 43 pays for zeroing a 2 MiB page
+  (`docs/operations.md`, "Huge pages for the books").
 - Rolling windows: `GROUP BY TIME_BUCKET(1m) ROLLING 15m` answers every bucket with the aggregates
   of the fifteen minutes that end with it - the rows' and the series' of the book alike, each what a
   bucket as wide as the window would answer (#44, step 3). The first windows reach back before the

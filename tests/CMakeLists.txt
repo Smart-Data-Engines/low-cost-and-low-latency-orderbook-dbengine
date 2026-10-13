@@ -384,6 +384,11 @@ ob_add_engine_test(test_engine
     test_engine.cpp
 )
 
+# #51: the books' arena and the engine's use of it.
+ob_add_engine_test(test_book_arena
+    test_book_arena.cpp
+)
+
 ob_add_engine_test(test_wal_recovery
     test_wal_recovery.cpp
 )

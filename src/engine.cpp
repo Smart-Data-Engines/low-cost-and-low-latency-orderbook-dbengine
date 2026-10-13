@@ -3172,7 +3172,8 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     auto it = buffers_.find(key);
     if (it != buffers_.end()) return *it->second;
 
-    auto buf = std::make_shared<SoABuffer>();
+    auto buf = book_arena_ ? std::allocate_shared<SoABuffer>(BookArenaAllocator<SoABuffer>(book_arena_))
+                           : std::make_shared<SoABuffer>();
     buf->bid.depth = 0;
     buf->ask.depth = 0;
     buf->bid.version.store(0, std::memory_order_relaxed);
@@ -3187,8 +3188,22 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
 
     // Update gauge: symbol count after adding new symbol.
     registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
+    registry_.set_gauge("ob_book_arena_regions", static_cast<int64_t>(book_arena_regions()));
 
     return ref;
+}
+
+void Engine::set_book_huge_pages(bool on) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (on == (book_arena_ != nullptr)) return;
+    if (!buffers_.empty()) {
+        throw std::logic_error("--book-huge-pages decides where books are made, and " +
+                               std::to_string(buffers_.size()) + " are made already");
+    }
+    book_arena_ = on ? std::make_shared<BookArena>(/*huge_pages=*/true) : nullptr;
+    registry_.set_gauge("ob_book_arena_regions", 0);
+    OB_LOG_INFO("engine", "books are made %s", on ? "in 2 MiB regions advised for huge pages"
+                                                  : "on the heap, each its own allocation");
 }
 
 void Engine::set_segment_version(uint32_t version) {

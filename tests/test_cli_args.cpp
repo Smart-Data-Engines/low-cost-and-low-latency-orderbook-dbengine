@@ -63,6 +63,17 @@ TEST(CliArgs, BooleanFlagsTakeNoValue) {
     EXPECT_EQ(config.port, 5556) << "a boolean flag must not swallow the next argument";
 }
 
+TEST(CliArgs, BooksAreOnHugePagesUnlessToldOff) {
+    EXPECT_TRUE(parse({}).book_huge_pages) << "on by default (#51)";
+    EXPECT_FALSE(parse({"--book-huge-pages", "off"}).book_huge_pages);
+    EXPECT_TRUE(parse({"--book-huge-pages", "on"}).book_huge_pages);
+}
+
+TEST(CliArgsDeath, BookHugePagesTakesOnOrOff) {
+    EXPECT_EXIT(parse({"--book-huge-pages", "yes"}), ::testing::ExitedWithCode(1),
+                "--book-huge-pages expects on or off, got 'yes'");
+}
+
 TEST(CliArgs, SplitsCoordinatorEndpointsAndDropsEmptyOnes) {
     const auto config = parse({"--coordinator-endpoints",
                                "http://a:2379,http://b:2379,,http://c:2379,"});

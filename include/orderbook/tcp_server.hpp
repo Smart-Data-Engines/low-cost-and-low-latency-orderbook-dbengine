@@ -208,6 +208,10 @@ struct ServerConfig {
     /// a process that rewrites what is stored, not a tuning knob.
     bool compaction{true};
 
+    /// --book-huge-pages on|off: whether the books are made in 2 MiB regions the kernel is asked to
+    /// back with transparent huge pages (#51), or each on the heap as before.
+    bool book_huge_pages{true};
+
     /// --write-admission on|off: whether writes are paced at the rate the device takes once a flush
     /// tick shows it behind (#190 step 5), rather than every writer stopping at a full queue.
     bool write_admission{true};
