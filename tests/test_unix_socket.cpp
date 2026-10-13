@@ -73,6 +73,11 @@ uint16_t port_at(uint16_t offset) {
     return static_cast<uint16_t>(ob::test::kPortsUnixSocket + offset);
 }
 
+/// The rings' tests have a block of their own: with the socket's they would not fit in one.
+uint16_t ring_port_at(uint16_t offset) {
+    return static_cast<uint16_t>(ob::test::kPortsRings + offset);
+}
+
 /// A server listening on `port` and on `dir`'s socket, two loops so connections are handed off as
 /// well as adopted (requirement 1.3), and a short drain: every test closes its connections first.
 ob::ServerConfig config_in(const Dir& dir, uint16_t port) {
@@ -259,6 +264,8 @@ public:
     const std::string& rings_answer() const { return answer_; }
     ob::ring::Mapping& mapping() { return mapping_; }
     int server_bell() const { return server_bell_; }
+    /// How many times a command found the node asleep and rang it.
+    uint64_t bells_rung() const { return bells_rung_; }
 
     bool send_raw(const std::string& bytes) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -266,7 +273,10 @@ public:
         while (done < bytes.size()) {
             const size_t n = commands_.write(bytes.data() + done, bytes.size() - done);
             done += n;
-            if (commands_.publish()) ob::ring::ring_bell(server_bell_);
+            if (commands_.publish()) {
+                ob::ring::ring_bell(server_bell_);
+                ++bells_rung_;
+            }
             if (n > 0) continue;
             if (std::chrono::steady_clock::now() > deadline) return false;
             if (commands_.prepare_to_wait_for_room()) {
@@ -329,6 +339,7 @@ public:
 
 private:
     int                socket_fd_;
+    uint64_t           bells_rung_{0};
     bool               ok_{false};
     std::string        error_;
     std::string        answer_;
@@ -714,11 +725,33 @@ void the_protocol_goes_through_rings(uint16_t port, bool polling) {
 }  // namespace
 
 TEST(RingsServer, TheProtocolGoesThroughRingsToALoopThatSleeps) {
-    the_protocol_goes_through_rings(port_at(100), false);
+    the_protocol_goes_through_rings(ring_port_at(0), false);
 }
 
 TEST(RingsServer, TheProtocolGoesThroughRingsToALoopThatPolls) {
-    the_protocol_goes_through_rings(port_at(110), true);
+    the_protocol_goes_through_rings(ring_port_at(10), true);
+}
+
+TEST(RingsServer, ALoopThatPollsFindsACommandNobodyRang) {
+    // A client rings only a loop that said it sleeps, so a loop that polls has to find each command
+    // itself. The test above cannot tell: its client sleeps until each answer, and waking it takes
+    // longer than the loop's spin, so every command there finds the loop asleep and rings. Here the
+    // spin outlasts the test, the loop never sleeps, and no command may ring.
+    Dir dir;
+    auto config       = ring_config(dir, ring_port_at(90), true);
+    config.io_spin_us = 30'000'000;
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w);
+    ASSERT_TRUE(r.ok()) << r.error();
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_EQ(r.ask("PING"), "PONG\n") << "command " << i;
+    }
+    EXPECT_EQ(r.bells_rung(), 0u) << "the loop slept, so the commands were not found by polling";
+    w.reset();
+    server.stop();
 }
 
 TEST(RingsServer, OnlyASessionThroughTheSocketMovesAndOnlyWhenAsked) {
@@ -730,7 +763,7 @@ TEST(RingsServer, OnlyASessionThroughTheSocketMovesAndOnlyWhenAsked) {
         out << "ops " << secret << "\n";
     }
     ASSERT_EQ(::chmod(secrets.c_str(), 0600), 0);
-    auto config             = config_in(dir, port_at(120));
+    auto config             = config_in(dir, ring_port_at(20));
     config.auth_secret_file = secrets;
     config.ring_bytes       = 65536 * 4;
     Running server(config);
@@ -773,7 +806,7 @@ TEST(RingsServer, OnlyASessionThroughTheSocketMovesAndOnlyWhenAsked) {
 
 TEST(RingsServer, ASwitchedOffNodeRefusesToMove) {
     Dir dir;
-    auto config  = config_in(dir, port_at(130));
+    auto config  = config_in(dir, ring_port_at(30));
     config.rings = false;
     Running server(config);
     auto w = through(config.unix_socket);
@@ -786,7 +819,7 @@ TEST(RingsServer, ASwitchedOffNodeRefusesToMove) {
 
 TEST(RingsServer, PushesComeThroughTheRing) {
     Dir dir;
-    const auto config = ring_config(dir, port_at(140), false);
+    const auto config = ring_config(dir, ring_port_at(40), false);
     Running server(config);
     auto w = through(config.unix_socket);
     ASSERT_TRUE(w);
@@ -813,7 +846,7 @@ TEST(RingsServer, AnAnswerLargerThanTheRingWaitsForTheReader) {
     // 64 KiB a direction and an answer over twice that: the loop fills the ring, says it waits for
     // room, and the client's reads ring it back.
     Dir dir;
-    const auto config = ring_config(dir, port_at(150), false);
+    const auto config = ring_config(dir, ring_port_at(50), false);
     Running server(config);
     auto writer = to_port(config.port);
     ASSERT_TRUE(writer);
@@ -846,7 +879,7 @@ TEST(RingsServer, AnAnswerLargerThanTheRingWaitsForTheReader) {
 
 TEST(RingsServer, ACounterTheClientCouldNotHaveLeftEndsTheSession) {
     Dir dir;
-    const auto config = ring_config(dir, port_at(160), false);
+    const auto config = ring_config(dir, ring_port_at(60), false);
     Running server(config);
     auto w = through(config.unix_socket);
     ASSERT_TRUE(w);
@@ -865,7 +898,7 @@ TEST(RingsServer, ACounterTheClientCouldNotHaveLeftEndsTheSession) {
 TEST(RingsServer, ClosingTheSocketEndsTheSessionInRings) {
     // One session a node: the place the session in rings held is given back when its socket closes.
     Dir dir;
-    auto config         = ring_config(dir, port_at(170), false);
+    auto config         = ring_config(dir, ring_port_at(70), false);
     config.max_sessions = 1;
     Running server(config);
     {
@@ -894,7 +927,7 @@ TEST(RingsServer, ABurstLargerThanTheCommandRingIsTakenAsTheNodeReadsIt) {
     // bell, and the node rings it as it reads. The answers pile up in the node's queue meanwhile, and
     // go out once the client reads them.
     Dir dir;
-    const auto config = ring_config(dir, port_at(180), false);
+    const auto config = ring_config(dir, ring_port_at(80), false);
     Running server(config);
     auto w = through(config.unix_socket);
     ASSERT_TRUE(w);
