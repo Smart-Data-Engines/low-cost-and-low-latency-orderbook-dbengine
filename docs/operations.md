@@ -2527,7 +2527,8 @@ has one, the median of seven rounds of 50 000 (the roadmap, #52, has the series)
   wake-up above.
 - **Memory:** `--ring-bytes` (1 MiB by default) a direction, so 2 MiB a session plus a page.
   `ob_ring_bytes` is what the sessions in rings hold, `ob_ring_sessions_total` counts the moves, and
-  `ob_ring_bells_total` the answers that had to wake a sleeping client.
+  `ob_ring_bells_total` the times the node woke a sleeping client, for an answer or for room in its
+  command ring.
 - **Who may:** a session through the socket, after `AUTH` where it is required. TCP, TLS and
   compressed sessions are refused, and `--rings off` refuses every one. The memory is shared with
   the process at the other end of the socket alone, through descriptors passed on it, and sealed

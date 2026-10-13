@@ -448,13 +448,15 @@ void Session::set_local(bool local, uint64_t ring_limit) {
     ring_limit_ = local ? ring_limit : 0;
 }
 
-void Session::enable_rings(ring::Mapping mapping, int server_bell, int client_bell) {
+void Session::enable_rings(ring::Mapping mapping, int server_bell, int client_bell,
+                           uint64_t& bells_rung) {
     auto r          = std::make_unique<RingTransport>();
     r->commands     = ring::Reader(mapping.to_server(), mapping.to_server_data(), mapping.capacity());
     r->answers      = ring::Writer(mapping.to_client(), mapping.to_client_data(), mapping.capacity());
     r->mapping      = std::move(mapping);
     r->server_bell  = server_bell;
     r->client_bell  = client_bell;
+    r->bells_rung   = &bells_rung;
     rings_          = std::move(r);
     transport_      = Transport::Rings;
     io_want_        = IoWant::Read;
@@ -487,12 +489,6 @@ void Session::ring_room_wait_done() {
     if (rings_) rings_->answers.done_waiting_for_room();
 }
 
-uint64_t Session::take_ring_bells() {
-    if (!rings_) return 0;
-    const uint64_t n  = rings_->bells_rung;
-    rings_->bells_rung = 0;
-    return n;
-}
 
 bool Session::ring_broken() const {
     return rings_ != nullptr && (rings_->commands.broken() || rings_->answers.broken());
@@ -511,7 +507,7 @@ Session::IoResult Session::receive_rings(char* buf, size_t len, size_t& out_n) {
     // The room just made may be what a client with a full ring of commands waits for.
     if (r.commands.producer_waiting()) {
         ring::ring_bell(r.client_bell);
-        ++r.bells_rung;
+        ++*r.bells_rung;
     }
     return IoResult::Data;
 }
@@ -532,7 +528,7 @@ bool Session::flush_output_rings() {
     if (done > 0) {
         if (r.answers.publish()) {
             ring::ring_bell(r.client_bell);
-            ++r.bells_rung;
+            ++*r.bells_rung;
         }
         send_buf_.erase(0, done);
     }

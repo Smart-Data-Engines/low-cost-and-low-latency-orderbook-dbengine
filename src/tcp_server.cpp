@@ -2525,6 +2525,9 @@ private:
     /// it was a fifth of a polling loop's cycles on the Graviton. Removed in `close_session()`, the
     /// one place a session goes.
     std::vector<std::pair<int, Session*>> ring_sessions_;
+    /// Bells the sessions in rings have rung for their clients since the loop last published them
+    /// as `ob_ring_bells_total`: each session adds to it as it rings (`Session::enable_rings()`).
+    uint64_t ring_bells_unpublished_{0};
 
     /// Where the next accepted connection goes. Only the accepting reactor reads it.
     size_t                   next_reactor_{0};
@@ -2697,9 +2700,6 @@ void Reactor::close_session(int fd, const char* reason) {
             ring_sessions_.erase(std::remove_if(ring_sessions_.begin(), ring_sessions_.end(),
                                                 [fd](const auto& r) { return r.first == fd; }),
                                  ring_sessions_.end());
-            if (const uint64_t rung = s->take_ring_bells(); rung > 0) {
-                engine_->registry().increment_counter("ob_ring_bells_total", rung);
-            }
             engine_->registry().increment_gauge("ob_ring_bytes", -static_cast<int64_t>(s->ring_bytes()));
         }
     }
@@ -2757,7 +2757,7 @@ bool Reactor::move_to_rings(int fd, Session& s, uint64_t bytes, const std::strin
         return give_up("sending the answer: " + why);
     }
     const size_t mapped = mapping.bytes();
-    s.enable_rings(std::move(mapping), server_bell, client_bell);
+    s.enable_rings(std::move(mapping), server_bell, client_bell, ring_bells_unpublished_);
     ring_bells_[server_bell] = fd;
     ring_sessions_.emplace_back(fd, &s);
     engine_->registry().increment_counter("ob_ring_sessions_total");
@@ -3065,10 +3065,11 @@ void Reactor::run_loop() {
         publish_gauge("ob_session_pending_bytes",
                       static_cast<int64_t>(sessions_.total_pending_output_bytes()),
                       published_session_pending_bytes_);
-        if (!ring_sessions_.empty()) {
-            uint64_t rung = 0;
-            for (const auto& [sfd, rs] : ring_sessions_) rung += rs->take_ring_bells();
-            if (rung > 0) engine_->registry().increment_counter("ob_ring_bells_total", rung);
+        // Counted as they were rung and published once a pass, so a pass that rang nothing neither
+        // walks the sessions in rings nor writes to any of them.
+        if (ring_bells_unpublished_ != 0) {
+            engine_->registry().increment_counter("ob_ring_bells_total", ring_bells_unpublished_);
+            ring_bells_unpublished_ = 0;
         }
 
         // One event is the unit a failure costs, not the reactor: an exception while serving one

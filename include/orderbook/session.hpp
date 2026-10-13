@@ -217,7 +217,9 @@ public:
 
     /// Move this session's bytes to the rings of `mapping`, with the two bells: the server's, rung
     /// by the client, and the client's, rung by this side. The session owns all three from here.
-    void enable_rings(ring::Mapping mapping, int server_bell, int client_bell);
+    /// Each time it rings the client it adds one to `bells_rung`, the loop's count, which the loop
+    /// publishes as `ob_ring_bells_total` and which outlives the session.
+    void enable_rings(ring::Mapping mapping, int server_bell, int client_bell, uint64_t& bells_rung);
     bool in_rings() const { return transport_ == Transport::Rings; }
     int  server_bell() const;
     size_t ring_bytes() const;
@@ -234,9 +236,6 @@ public:
     /// appeared meanwhile, and the caller flushes again.
     bool ring_wait_for_room();
     void ring_room_wait_done();
-
-    /// Bells rung for the client since the last call, for `ob_ring_bells_total`.
-    uint64_t take_ring_bells();
 
     /// Whether the client left either ring in a state this side never wrote.
     bool ring_broken() const;
@@ -335,7 +334,7 @@ private:
         ring::Writer  answers;    ///< to the client
         int           server_bell{-1};
         int           client_bell{-1};
-        uint64_t      bells_rung{0};
+        uint64_t*     bells_rung{nullptr};   ///< the loop's count, see `enable_rings()`
         ~RingTransport();
     };
     std::unique_ptr<RingTransport> rings_;
