@@ -155,3 +155,47 @@ With `--tls-client` the port speaks TLS 1.3 and nothing else. The banner is the 
 data after the handshake, and everything on this page then runs inside the TLS stream. Both shipped
 clients verify the server's certificate and its name. Certificates and names are covered in
 [Operations](operations.md#turning-on-tls), and the two cluster surfaces right after it.
+
+## Rings in shared memory
+
+A session through the node's Unix socket (`--unix-socket`) may move its bytes to a pair of rings in
+shared memory: the same protocol, without a system call a round trip when both ends poll (#52).
+`RINGS` asks for them, after `AUTH` where the node asks for it, and nothing may follow it on the
+socket before its answer:
+
+```
+C: RINGS 1048576
+S: OK RINGS 1048576
+S:
+```
+
+The size is each direction's, a power of two the node takes (`--ring-bytes`); `RINGS` alone takes the
+node's. The answer arrives with three descriptors (`SCM_RIGHTS`): the rings' memory (a `memfd`), the
+node's bell and the client's bell (two `eventfd`s). From there commands go into one ring and answers
+and pushed rows come out of the other, byte for byte what the socket would have carried, and the
+socket carries nothing: closing it ends the session. A refusal is an `ERR rings: ...` line on the
+socket, and the session goes on there.
+
+The memory, mapped `MAP_SHARED` at its full size and sealed against shrinking and growing:
+
+| Offset | Size | What |
+|---|---|---|
+| 0 | 64 | `magic` (8 bytes, `OBRING1\0`), `version` (4, `1`), 4 reserved, `capacity` (8): little-endian |
+| 64 | 256 | the commands' header: four 64-byte lines holding `tail`, `head` (64-bit), `consumer_asleep`, `producer_asleep` (32-bit) |
+| 320 | 256 | the answers' header, the same |
+| 576 | `capacity` | the commands' bytes |
+| 576 + `capacity` | `capacity` | the answers' bytes |
+
+A counter is the number of bytes ever written (`tail`, by the producer) or read (`head`, by the
+consumer); a byte's place is the counter modulo `capacity`. The node writes the answers' `tail` and
+the commands' `head`, the client the other two, and each side checks the other's against its own:
+the node ends a session whose counters say more was read than written, or read went back.
+
+Waking is by flag, so a side that polls is never rung:
+- a producer publishes `tail` (release), then a sequentially consistent fence, then rings the
+  consumer's bell only if `consumer_asleep` is set;
+- a consumer about to sleep sets `consumer_asleep`, fences, and looks at `tail` again: bytes that
+  arrived in between mean it does not sleep; after waking it clears the flag;
+- the same with `producer_asleep` and `head` for room in a full ring.
+
+The shipped C++ client does this with `ClientConfig::rings` ([Operations](operations.md)).

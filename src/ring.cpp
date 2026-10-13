@@ -141,7 +141,8 @@ Writer::Writer(Header* header, char* data, size_t capacity)
     : header_(header), data_(data), capacity_(capacity) {}
 
 size_t Writer::room() const {
-    const uint64_t head = header_->head.load(std::memory_order_acquire);
+    // seq_cst, not acquire: it is the second half of `prepare_to_wait_for_room()`'s Dekker pair.
+    const uint64_t head = header_->head.load(std::memory_order_seq_cst);
     const uint64_t used = tail_ - head;   // wraps past the capacity when head is ahead of tail
     if (used > capacity_ || head < last_head_) {
         broken_ = true;
@@ -162,15 +163,18 @@ size_t Writer::write(const char* p, size_t n) {
     return take;
 }
 
+// The wake-up rule is a Dekker pair - store mine, then load yours - and sequentially consistent
+// operations on both halves are what forbid the outcome where each misses the other. They rather
+// than a relaxed pair around a fence, because on ARMv8 a seq_cst store followed by a seq_cst load
+// is STLR then LDAR, which the architecture keeps in order, where the fence is a full DMB: measured,
+// the two fences of a round trip were 15% of a polling loop's cycles on the Graviton.
 bool Writer::publish() {
-    header_->tail.store(tail_, std::memory_order_release);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    return header_->consumer_asleep.load(std::memory_order_relaxed) != 0;
+    header_->tail.store(tail_, std::memory_order_seq_cst);
+    return header_->consumer_asleep.load(std::memory_order_seq_cst) != 0;
 }
 
 bool Writer::prepare_to_wait_for_room() {
-    header_->producer_asleep.store(1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    header_->producer_asleep.store(1, std::memory_order_seq_cst);
     if (room() > 0 || broken_) {
         header_->producer_asleep.store(0, std::memory_order_relaxed);
         return false;
@@ -188,7 +192,8 @@ Reader::Reader(Header* header, char* data, size_t capacity)
     : header_(header), data_(data), capacity_(capacity) {}
 
 size_t Reader::available() const {
-    const uint64_t tail  = header_->tail.load(std::memory_order_acquire);
+    // seq_cst for the same reason as `Writer::room()`: the second half of `prepare_to_sleep()`.
+    const uint64_t tail  = header_->tail.load(std::memory_order_seq_cst);
     const uint64_t ready = tail - head_;   // wraps past the capacity when tail is behind head
     if (ready > capacity_) {
         broken_ = true;
@@ -205,18 +210,16 @@ size_t Reader::read(char* p, size_t n) {
     std::memcpy(p, data_ + pos, first);
     std::memcpy(p + first, data_, take - first);
     head_ += take;
-    header_->head.store(head_, std::memory_order_release);
+    header_->head.store(head_, std::memory_order_seq_cst);
     return take;
 }
 
 bool Reader::producer_waiting() {
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    return header_->producer_asleep.load(std::memory_order_relaxed) != 0;
+    return header_->producer_asleep.load(std::memory_order_seq_cst) != 0;
 }
 
 bool Reader::prepare_to_sleep() {
-    header_->consumer_asleep.store(1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    header_->consumer_asleep.store(1, std::memory_order_seq_cst);
     if (available() > 0 || broken_) {
         header_->consumer_asleep.store(0, std::memory_order_relaxed);
         return false;

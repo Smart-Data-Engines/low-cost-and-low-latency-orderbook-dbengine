@@ -2521,7 +2521,10 @@ private:
     /// Sessions in rings (#52, step 2): each one's bell, which epoll reports, to the socket the
     /// session is kept under, and the sessions themselves, for the loop to poll.
     std::unordered_map<int, int> ring_bells_;
-    std::vector<int>             ring_sessions_;
+    /// With the session itself, so a pass that polls them takes no lock: `get_session()` locks, and
+    /// it was a fifth of a polling loop's cycles on the Graviton. Removed in `close_session()`, the
+    /// one place a session goes.
+    std::vector<std::pair<int, Session*>> ring_sessions_;
 
     /// Where the next accepted connection goes. Only the accepting reactor reads it.
     size_t                   next_reactor_{0};
@@ -2691,7 +2694,8 @@ void Reactor::close_session(int fd, const char* reason) {
             const int bell = s->server_bell();
             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, bell, nullptr);
             ring_bells_.erase(bell);
-            ring_sessions_.erase(std::remove(ring_sessions_.begin(), ring_sessions_.end(), fd),
+            ring_sessions_.erase(std::remove_if(ring_sessions_.begin(), ring_sessions_.end(),
+                                                [fd](const auto& r) { return r.first == fd; }),
                                  ring_sessions_.end());
             if (const uint64_t rung = s->take_ring_bells(); rung > 0) {
                 engine_->registry().increment_counter("ob_ring_bells_total", rung);
@@ -2755,7 +2759,7 @@ bool Reactor::move_to_rings(int fd, Session& s, uint64_t bytes, const std::strin
     const size_t mapped = mapping.bytes();
     s.enable_rings(std::move(mapping), server_bell, client_bell);
     ring_bells_[server_bell] = fd;
-    ring_sessions_.push_back(fd);
+    ring_sessions_.emplace_back(fd, &s);
     engine_->registry().increment_counter("ob_ring_sessions_total");
     engine_->registry().increment_gauge("ob_ring_bytes", static_cast<int64_t>(mapped));
     OB_LOG_INFO("tcp_server", "Reactor %d: fd=%d conn_id=%llu moved to rings of %llu bytes a direction, "
@@ -2986,28 +2990,26 @@ constexpr uint32_t kRingPolled = EPOLLMSG;
 void Reactor::run_loop() {
     last_event_at_ = std::chrono::steady_clock::now();
     while (running_.load(std::memory_order_relaxed)) {
-        int wait_ms = io_wait_ms(last_event_at_, config_.io_spin_us, 100,
-                                 std::chrono::steady_clock::now());
+        const int wait_ms = io_wait_ms(last_event_at_, config_.io_spin_us, 100,
+                                       std::chrono::steady_clock::now());
         // Sessions in rings (#52, step 2) are polled while the loop polls; before it sleeps, each
-        // client is told to ring - and a ring that filled in between keeps the loop awake.
+        // client is told to ring. A ring that filled in between keeps this one pass awake: the wait
+        // is still the decision above, and the pass does not sleep it.
         const bool rings_told = wait_ms != 0 && !ring_sessions_.empty();
+        bool ring_filled = false;
         if (rings_told) {
-            for (const int sfd : ring_sessions_) {
-                Session* rs = sessions_.get_session(sfd);
-                if (rs != nullptr && !rs->ring_prepare_to_sleep()) wait_ms = 0;
+            for (const auto& [sfd, rs] : ring_sessions_) {
+                if (!rs->ring_prepare_to_sleep()) ring_filled = true;
             }
         }
-        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, wait_ms);
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, ring_filled ? 0 : wait_ms);
         if (rings_told) {
-            for (const int sfd : ring_sessions_) {
-                if (Session* rs = sessions_.get_session(sfd)) rs->ring_woke();
-            }
+            for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();
         }
         if (nfds >= 0 && !ring_sessions_.empty()) {
-            for (const int sfd : ring_sessions_) {
+            for (const auto& [sfd, rs] : ring_sessions_) {
                 if (nfds >= MAX_EVENTS) break;   // the rest is polled on the next pass
-                Session* rs = sessions_.get_session(sfd);
-                if (rs != nullptr && rs->ring_input_waiting()) {
+                if (rs->ring_input_waiting()) {
                     events_[nfds].events  = EPOLLIN | EPOLLOUT | kRingPolled;
                     events_[nfds].data.fd = sfd;
                     ++nfds;
@@ -3065,9 +3067,7 @@ void Reactor::run_loop() {
                       published_session_pending_bytes_);
         if (!ring_sessions_.empty()) {
             uint64_t rung = 0;
-            for (const int sfd : ring_sessions_) {
-                if (Session* rs = sessions_.get_session(sfd)) rung += rs->take_ring_bells();
-            }
+            for (const auto& [sfd, rs] : ring_sessions_) rung += rs->take_ring_bells();
             if (rung > 0) engine_->registry().increment_counter("ob_ring_bells_total", rung);
         }
 
@@ -3258,6 +3258,10 @@ void Reactor::run_loop() {
                             const char* close_after_flush = nullptr;
                             bool        quit              = false;
                             bool        queue_refused     = false;
+                            // RINGS as the read's last command (#52, step 2): its size and its
+                            // answer, for after the flush.
+                            uint64_t    rings_bytes       = 0;
+                            std::string rings_answer;
 
                             // One answer into the session's buffer. False: the session is to
                             // close, because a client that has stopped reading cannot be sent
@@ -3341,34 +3345,19 @@ void Reactor::run_loop() {
                                 if (cmd.type == CommandType::RINGS &&
                                     response.rfind("OK RINGS", 0) == 0) {
                                     // Answered with the rings' descriptors on the socket, so not
-                                    // queued (#52, step 2). Everything before it goes out on the
-                                    // socket first, and nothing may come after it there.
+                                    // queued (#52, step 2): the move happens after this read's one
+                                    // flush, once everything before it has gone out on the socket.
+                                    // Nothing may come after it there.
                                     if (&line != &lines.back() || session->unparsed_bytes() > 0) {
                                         (void)session->queue_response(format_error(
                                             "rings: nothing may follow RINGS before its answer"));
                                         close_after_flush = "bytes after RINGS";
                                         break;
                                     }
-                                    if (!session->flush_output()) {
-                                        queue_refused = true;
-                                        break;
-                                    }
-                                    if (session->has_pending_output()) {
-                                        if (!enqueue(format_error("rings: earlier answers are still "
-                                                                  "being sent; ask again once they "
-                                                                  "are read"))) {
-                                            queue_refused = true;
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    const uint64_t bytes = cmd.ring_bytes != 0 ? cmd.ring_bytes
-                                                                               : session->ring_limit();
-                                    if (!move_to_rings(fd, *session, bytes, response)) {
-                                        close_after_flush = "moving to rings failed";
-                                        break;
-                                    }
-                                    continue;
+                                    rings_bytes  = cmd.ring_bytes != 0 ? cmd.ring_bytes
+                                                                       : session->ring_limit();
+                                    rings_answer = std::move(response);
+                                    break;
                                 }
 
                                 if (!enqueue(response)) {
@@ -3404,6 +3393,23 @@ void Reactor::run_loop() {
                             if (close_after_flush) {
                                 close_session(fd, close_after_flush);
                                 goto next_event;
+                            }
+
+                            if (rings_bytes != 0) {
+                                // Everything before RINGS has gone out on the socket, unless the
+                                // socket would not take it all: then the move waits for a RINGS
+                                // asked again, and the answers come first.
+                                if (session->has_pending_output()) {
+                                    if (!session->queue_response(format_error(
+                                            "rings: earlier answers are still being sent; ask again "
+                                            "once they are read"))) {
+                                        close_session(fd, "send failed");
+                                        goto next_event;
+                                    }
+                                } else if (!move_to_rings(fd, *session, rings_bytes, rings_answer)) {
+                                    close_session(fd, "moving to rings failed");
+                                    goto next_event;
+                                }
                             }
 
                             if (quit) {
