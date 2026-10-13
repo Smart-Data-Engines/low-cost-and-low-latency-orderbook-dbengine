@@ -4188,6 +4188,18 @@ Learned the hard way. Check here before debugging.
      the live book and rebuilds nothing from the segments (#235): after a clean stop `BOOK` refuses
      the symbol, after SIGKILL it holds the tail. A test of the live book that restarts a node is
      testing that, not recovery.
+570. **"Nothing has been flushed" is false on a node with a tick.** The default flush interval is
+     100 ms, and the shared cluster runs it, so a control that history holds nothing until the test
+     flushes races the tick - and loses where round trips are slowest, under TSan (PR #249's run).
+     A test that needs history empty runs its own node with `--flush-interval-ms 600000`, as
+     `test_live_book.py` and `test_crash_recovery.py` do. Check the control both ways: at a 1 ms
+     interval it has to fail.
+571. **A role check does not say a replica can take over.** ROLE says REPLICA from the moment a node
+     demotes, and since #215 a replica joining a stream does not stand for election. A test that
+     kills the primary inside that window sees no failover, by design. In PR #250's TSan run a
+     replica was 0.4 s into a join from zero, left by the test before. `healthy_cluster` now waits,
+     before and after each test, until no node reports `joining:` in STATUS
+     (`ClusterManager.wait_until_no_node_is_joining()`).
 
 ## Current state and open problems
 

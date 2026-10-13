@@ -14,11 +14,65 @@ the current state and returns one row per level.
 
 from __future__ import annotations
 
+import socket
+import subprocess
+import time
+
 import pytest
 
+from conftest import free_port, open_node_log, patience, server_binary_path
 from orderbook_engine import OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.smoke
+
+
+@pytest.fixture(scope="module")
+def unflushed_client(tmp_path_factory):
+    """A node of its own whose flush tick does not come round while a test runs.
+
+    The shared cluster flushes every 100 ms, the server's default, so whether a tick falls between a
+    write and a history read depends on how long the round trips take. Under TSan they take longest:
+    in PR #249's run a tick fell between the two inserts of `test_both_sides_come_back_bids_first`,
+    and history held the three bids before any flush the test asked for. Ten minutes is longer than
+    any test here, so nothing reaches history unless a test flushes - the precedent is
+    `test_crash_recovery.py`'s node.
+    """
+    data_dir = str(tmp_path_factory.mktemp("live_book_unflushed"))
+    port = free_port()
+    log = open_node_log(data_dir)
+    proc = subprocess.Popen(
+        [server_binary_path(), "--port", str(port), "--data-dir", data_dir, "--metrics-port", "0",
+         "--flush-interval-ms", "600000", "--drain-timeout-ms", "1000"],
+        stdout=log, stderr=subprocess.STDOUT)
+    log.close()
+    deadline = time.time() + patience(30)
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
+                s.settimeout(2)
+                s.recv(4096)
+                s.sendall(b"PING\n")
+                if b"PONG" in s.recv(1024):
+                    break
+        except OSError:
+            pass
+        if proc.poll() is not None or time.time() > deadline:
+            proc.kill()
+            proc.wait(timeout=10)
+            with open(f"{data_dir}/node.log", encoding="utf-8", errors="replace") as f:
+                pytest.fail(f"the node never answered on port {port}:\n{f.read()[-1500:]}")
+        time.sleep(0.1)
+    client = OrderbookEngine(host="127.0.0.1", port=port, timeout=patience(10))
+    try:
+        yield client
+    finally:
+        client.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=patience(10))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def _history_rows(engine: OrderbookEngine, symbol: str) -> int:
@@ -53,20 +107,21 @@ def test_the_book_is_the_current_state_and_select_is_the_history(primary_client)
     assert book[0].level == 0
 
 
-def test_both_sides_come_back_bids_first(primary_client):
-    primary_client.insert("BOOK-SIDES", "EX", "bid", [100, 102, 101], [5, 7, 6])
-    primary_client.insert("BOOK-SIDES", "EX", "ask", [105, 103], [8, 9])
+def test_both_sides_come_back_bids_first(unflushed_client):
+    unflushed_client.insert("BOOK-SIDES", "EX", "bid", [100, 102, 101], [5, 7, 6])
+    unflushed_client.insert("BOOK-SIDES", "EX", "ask", [105, 103], [8, 9])
 
-    rows = primary_client.book("BOOK-SIDES", "EX")
+    rows = unflushed_client.book("BOOK-SIDES", "EX")
     assert [r.side for r in rows] == ["bid", "bid", "bid", "ask", "ask"], rows
     assert [r.price for r in rows] == [102, 101, 100, 103, 105], rows
     # `level` is a position within a side, so the best ask is level 0 and not row 3.
     assert [r.level for r in rows] == [0, 1, 2, 0, 1], rows
 
-    # No flush anywhere above: the book is the live structure, so it answers before anything is a
-    # segment. The control is that history has nothing yet - whether that arrives as zero rows or
-    # as a refusal is the store's business and not what this test is about.
-    assert _history_rows(primary_client, "BOOK-SIDES") == 0, (
+    # No flush anywhere above, and none from the node's tick (`unflushed_client`): the book is the
+    # live structure, so it answers before anything is a segment. The control is that history has
+    # nothing yet - whether that arrives as zero rows or as a refusal is the store's business and
+    # not what this test is about.
+    assert _history_rows(unflushed_client, "BOOK-SIDES") == 0, (
         "the history answered before a flush, so this test is not contrasting the two paths")
 
 
