@@ -20,7 +20,9 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from conftest import free_port, patience, server_binary_path
+from conftest import (ClusterManager, NodeTls, free_port, node_log_since, node_log_size, patience,
+                      server_binary_path)
+from test_tls_cluster import make_cluster_certs
 
 pytestmark = pytest.mark.smoke
 
@@ -75,12 +77,15 @@ class Node:
     these tests read the log for what the reload said.
     """
 
-    def __init__(self, tmp: Path, *, pki: Pki | None, replication: bool = False):
+    def __init__(self, tmp: Path, *, pki: Pki | None, replication: bool = False,
+                 primary_port: int = 0):
+        tmp.mkdir(parents=True, exist_ok=True)
         self.tmp = tmp
         self.pki = pki
         self.port = free_port()
         self.metrics_port = free_port()
         self.replication_port = free_port() if replication else 0
+        self.primary_port = primary_port   # a replica of the node on this replication port
         self.cert = tmp / "node.pem"
         self.key = tmp / "node-key.pem"
         self.log_path = tmp / "node.log"
@@ -100,11 +105,15 @@ class Node:
                      "--tls-key-file", str(self.key), "--tls-ca-file", str(self.pki.ca)]
         if self.replication_port:
             args += ["--replication-port", str(self.replication_port)]
-            if self.pki is not None:
-                args.append("--tls-replication")
+        if self.primary_port:
+            args += ["--primary-host", "127.0.0.1", "--primary-port", str(self.primary_port)]
+        if self.pki is not None and (self.replication_port or self.primary_port):
+            args.append("--tls-replication")
+        # Counted, so a restart waits for its own line and not for the one before it.
+        listening = self.log_text().count("listening on port")
         self.log = open(self.log_path, "a", buffering=1)
         self.proc = subprocess.Popen(args, stdout=self.log, stderr=self.log)
-        self.wait_for_log("listening on port", what="the node to listen")
+        self.wait_for_log("listening on port", what="the node to listen", count=listening + 1)
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -171,6 +180,27 @@ class Node:
         return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
 
 
+def renew_cluster_cert(tls: NodeTls, index: int, cn: str) -> None:
+    """A renewal of node `index`'s certificate from `make_cluster_certs()`, written over the files
+    the node reads: the same SAN entries, a new common name to tell it by."""
+    d = Path(tls.cert_dir)
+    cert, key = (Path(p) for p in tls.files_for(index))
+    staged_key, csr, ext, staged = (d / f"renew-{index}-key.pem", d / f"renew-{index}.csr",
+                                    d / f"renew-{index}.ext", d / f"renew-{index}.pem")
+    ext.write_text(f"subjectAltName=IP:127.0.0.1,DNS:node-{index}\n")
+    subprocess.run(
+        ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(staged_key),
+         "-out", str(csr), "-subj", f"/CN={cn}"],
+        check=True, capture_output=True, timeout=120)
+    subprocess.run(
+        ["openssl", "x509", "-req", "-in", str(csr), "-CA", tls.ca, "-CAkey", str(d / "ca-key.pem"),
+         "-CAcreateserial", "-out", str(staged), "-days", "1", "-extfile", str(ext)],
+        check=True, capture_output=True, timeout=120)
+    shutil.copyfile(staged, cert)
+    shutil.copyfile(staged_key, key)
+    key.chmod(0o600)
+
+
 def common_name(s: ssl.SSLSocket) -> str:
     cert = s.getpeercert()
     assert cert, "the server presented no certificate"
@@ -210,6 +240,9 @@ def test_a_new_connection_is_shown_the_new_certificate_and_an_open_one_goes_on(r
     node, a, b, peer = renewal
     before = node.client_port()
     assert common_name(before) == "reload-a"
+    link = node.replication_link(peer)
+    assert common_name(link) == "reload-a"
+    link.close()
     assert node.metrics()["ob_tls_certificate_not_after_seconds"] == not_after(a[0])
 
     node.install(*b)
@@ -262,6 +295,62 @@ def test_files_it_refuses_leave_the_old_certificate_in_force_and_the_node_up(ren
     s = node.client_port()
     assert common_name(s) == "reload-b"
     s.close()
+
+
+def test_a_replica_dials_with_the_certificate_it_reloaded(tmp) -> None:
+    """The dialling end of a node link: after its reload, the replica's next connection to its
+    primary presents the new certificate, which the primary logs as the replica's identity. The
+    primary is restarted to make that next connection; the replica is not, so what it presents can
+    only come from the reload."""
+    pki = Pki(tmp / "pki")
+    primary = Node(tmp / "primary", pki=pki, replication=True)
+    primary.install(*pki.sign("reload-primary", 1))
+    primary.start()
+    replica = Node(tmp / "replica", pki=pki, primary_port=primary.replication_port)
+    replica.install(*pki.sign("reload-replica-a", 1))
+    try:
+        replica.start()
+        primary.wait_for_log("authenticated by certificate: reload-replica-a",
+                             what="the replica's first connection")
+
+        replica.install(*pki.sign("reload-replica-b", 1))
+        replica.reload("TLS reloaded", count=1)
+        primary.stop()
+        primary.start()
+        primary.wait_for_log("authenticated by certificate: reload-replica-b",
+                             what="the replica's connection after its reload")
+    finally:
+        replica.stop()
+        primary.stop()
+
+
+def test_a_mesh_node_links_with_the_certificate_it_reloaded(tmp) -> None:
+    """The mesh, both of whose ends present a certificate: node 0 reloads a renewal, node 1 is
+    restarted, and the link between them is made again - by whichever of the two dials - with node
+    0's new certificate, which node 1 logs as its peer's identity."""
+    cm = ClusterManager()
+    cm.node_tls = make_cluster_certs(tmp, node_count=3)
+    cm.start_multi_master(node_count=3)
+    try:
+        cm.wait_for_mm_mesh(timeout=patience(60))
+        renew_cluster_cert(cm.node_tls, 0, "node-0-renewed")
+        offset0 = node_log_size(cm.nodes[0])
+        cm.nodes[0].process.send_signal(signal.SIGHUP)
+        deadline = time.monotonic() + patience(20)
+        while "TLS reloaded" not in node_log_since(cm.nodes[0], offset0):
+            assert time.monotonic() < deadline, node_log_since(cm.nodes[0], offset0)[-3000:]
+            time.sleep(0.1)
+
+        offset1 = node_log_size(cm.nodes[1])
+        cm.restart_node(1)
+        cm.wait_for_mm_mesh(timeout=patience(60))
+        deadline = time.monotonic() + patience(30)
+        while "authenticated by certificate: node-0-renewed" not in node_log_since(cm.nodes[1],
+                                                                                  offset1):
+            assert time.monotonic() < deadline, node_log_since(cm.nodes[1], offset1)[-3000:]
+            time.sleep(0.2)
+    finally:
+        cm.shutdown()
 
 
 def test_a_node_without_tls_lives_through_sighup(tmp) -> None:
