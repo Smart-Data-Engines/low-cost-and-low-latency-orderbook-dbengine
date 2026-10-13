@@ -2449,8 +2449,16 @@ against a TLS-only node still gets `ERR unauthenticated`.
 
 `--unix-socket /run/orderbook/ob.sock` makes the node listen on a Unix stream socket as well as its
 port (#52). It serves the same protocol, with the same sessions, `AUTH` and `--max-sessions`; what it
-leaves out is TCP, which is most of a round trip between two processes of one host (the figures are
-in the roadmap, #52).
+leaves out is TCP. With the default profile and a client that polls for its answer, that is 1.4-1.7
+µs off a command on an EPYC 9R45 and 1.9-2.4 µs on a Graviton - `PING` from 3.06 to 1.68 µs and from
+4.87 to 3.01, p50 - and about 3 µs off a write's p99.
+
+**A client that blocks in `recv()` keeps less of it on a host whose idle CPUs sleep deeply.** On the
+EPYC host, whose CPUs can sleep in C2, an answer that came back quickly found a blocking client still
+awake and one that took longer found it asleep: there the socket still took 0.9-1.9 µs off the p50,
+but a ten-level `BOOK`'s p99 was 7.41 µs through the socket against 6.50 through TCP. With the client
+polling, the socket was ahead at every percentile. On the Graviton, which has no idle state but WFI,
+a blocking client kept 1.6-2.9 µs. The figures and the series are in the roadmap, #52.
 
 - **Who may connect is decided by the file.** The socket gets `--unix-socket-mode` (0660 by default)
   before it takes a connection. The packaged unit creates `/run/orderbook` for it, open to the

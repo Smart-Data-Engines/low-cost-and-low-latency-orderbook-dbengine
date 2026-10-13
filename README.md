@@ -217,7 +217,10 @@ in the harness installs anything, and a containerised competitor would measure t
   bounded queue per subscriber, and a consumer that stops reading is disconnected rather than
   allowed to grow the server's memory. Also available embedded (`Engine::subscribe()`,
   `ob_subscribe()`) and from the Python client (`subscribe()` / `poll()`)
-- **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse
+- **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse, and on the node's
+  own host through a Unix socket beside the port (`--unix-socket`, #52): the same protocol without
+  TCP, 1.4-1.7 µs off a command on an EPYC 9R45 and 1.9-2.4 µs on a Graviton, measured with a client
+  that polls
 - **Backup and restore** — `BACKUP` takes a cut at one moment into the server's `--backup-dir`
   (hard links on the data directory's filesystem, a checksummed copy on another), `ob_backup` asks
   for one from cron, and `ob_restore` checks a backup whole before it writes anything and restores
@@ -292,7 +295,9 @@ QUIT
 ```
 
 The last field of `INSERT` is the time of the update in nanoseconds; leave it out and the node
-stamps arrival time. The [tutorial](docs/tutorial.md) goes from a release to this in five minutes,
+stamps arrival time. A client on the node's host can leave TCP out: `--unix-socket
+/run/orderbook/ob.sock` serves the same protocol there too (`nc -U /run/orderbook/ob.sock`), plain
+text, with the file's mode deciding who may connect. The [tutorial](docs/tutorial.md) goes from a release to this in five minutes,
 and the [wire protocol](docs/protocol.md) is what a client has to know to read the answers. The
 exchanges on both pages are replayed against the server in CI.
 
