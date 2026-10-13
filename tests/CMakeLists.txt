@@ -138,6 +138,13 @@ ob_add_test(test_net
 )
 target_link_libraries(test_net PRIVATE orderbook_net)
 
+# The ring pair in shared memory for a client on the node's host (#52, step 2): its memory, its
+# bytes and its wake-ups, with two threads in place of the two processes.
+ob_add_test(test_ring
+    test_ring.cpp
+)
+target_link_libraries(test_ring PRIVATE orderbook_net)
+
 # The drift guards read `CMakeLists.txt` and `pyproject.toml`, so the tree has to be findable at
 # test time — same reason `test_wal_position` and `test_cli_config` get this.
 target_compile_definitions(test_version

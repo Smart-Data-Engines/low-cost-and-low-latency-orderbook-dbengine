@@ -444,7 +444,7 @@ add_library(orderbook_shard_coordinator STATIC src/shard_coordinator.cpp src/sym
 target_link_libraries(orderbook_shard_coordinator PUBLIC orderbook_shard_map orderbook_coordinator orderbook_engine orderbook_logger orderbook_client)
 
 # ── Sockets and addresses (IPv4 and IPv6), for every listener and dialler ───────
-add_library(orderbook_net STATIC src/net.cpp)
+add_library(orderbook_net STATIC src/net.cpp src/ring.cpp)
 target_link_libraries(orderbook_net PUBLIC orderbook_core orderbook_logger)
 
 # ── Metrics HTTP server compiled library ───────────────────────────────────────
