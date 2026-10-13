@@ -442,4 +442,101 @@ int dial_unix(const std::string& path, uint32_t timeout_ms, bool leave_nonblocki
     return fd;
 }
 
+namespace {
+
+/// Room for this many descriptors in one message; the rings take three.
+constexpr size_t kMaxPassedFds = 8;
+
+}  // namespace
+
+bool send_with_fds(int sock, std::string_view bytes, const int* fds, size_t n_fds, std::string& why) {
+    if (n_fds == 0 || n_fds > kMaxPassedFds || bytes.empty()) {
+        why = "a message with " + std::to_string(n_fds) + " descriptor(s) and " +
+              std::to_string(bytes.size()) + " byte(s) is not one this sends";
+        return false;
+    }
+    iovec iov{const_cast<char*>(bytes.data()), bytes.size()};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * kMaxPassedFds)]{};
+    msghdr msg{};
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = control;
+    msg.msg_controllen = CMSG_SPACE(sizeof(int) * n_fds);
+    cmsghdr* c   = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type  = SCM_RIGHTS;
+    c->cmsg_len   = CMSG_LEN(sizeof(int) * n_fds);
+    std::memcpy(CMSG_DATA(c), fds, sizeof(int) * n_fds);
+    for (;;) {
+        const ssize_t n = ::sendmsg(sock, &msg, MSG_NOSIGNAL);
+        if (n == static_cast<ssize_t>(bytes.size())) {
+            OB_LOG_DEBUG("net", "sent %zu byte(s) and %zu descriptor(s) on fd=%d", bytes.size(), n_fds,
+                         sock);
+            return true;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        why = n < 0 ? std::string("sendmsg(): ") + std::strerror(errno)
+                    : "the socket took " + std::to_string(n) + " of " + std::to_string(bytes.size()) +
+                          " bytes";
+        return false;
+    }
+}
+
+bool recv_with_fds(int sock, size_t max_bytes, size_t max_fds, uint32_t timeout_ms,
+                   std::string& bytes, std::vector<int>& fds, std::string& why) {
+    fds.clear();
+    pollfd p{sock, POLLIN, 0};
+    int ready = 0;
+    do {
+        ready = ::poll(&p, 1, static_cast<int>(timeout_ms));
+    } while (ready < 0 && errno == EINTR);
+    if (ready < 0) {
+        why = std::string("poll(): ") + std::strerror(errno);
+        return false;
+    }
+    if (ready == 0) {
+        why = "nothing arrived within " + std::to_string(timeout_ms) + " ms";
+        return false;
+    }
+    bytes.assign(max_bytes, '\0');
+    iovec iov{bytes.data(), max_bytes};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * kMaxPassedFds)]{};
+    msghdr msg{};
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = control;
+    msg.msg_controllen = sizeof(control);
+    ssize_t n = 0;
+    do {
+        n = ::recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+    } while (n < 0 && errno == EINTR);
+    if (n <= 0) {
+        why = n == 0 ? std::string("the connection closed") : std::string("recvmsg(): ") + std::strerror(errno);
+        bytes.clear();
+        return false;
+    }
+    bytes.resize(static_cast<size_t>(n));
+    for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+        const size_t count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (size_t i = 0; i < count; ++i) {
+            int fd = -1;
+            std::memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
+            if (fds.size() < max_fds) {
+                fds.push_back(fd);
+            } else {
+                ::close(fd);
+            }
+        }
+    }
+    if ((msg.msg_flags & MSG_CTRUNC) != 0) {
+        for (const int fd : fds) ::close(fd);
+        fds.clear();
+        why = "the descriptors that came with the message were cut short";
+        return false;
+    }
+    OB_LOG_DEBUG("net", "received %zd byte(s) and %zu descriptor(s) on fd=%d", n, fds.size(), sock);
+    return true;
+}
+
 }  // namespace ob::net

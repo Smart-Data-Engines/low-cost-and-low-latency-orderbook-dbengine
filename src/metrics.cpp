@@ -72,6 +72,12 @@ MetricsRegistry::MetricsRegistry() {
                                      "Connections accepted through the Unix socket "
                                      "(--unix-socket), including those refused at "
                                      "--max-sessions"));
+    // Rings in shared memory (#52, step 2).
+    counters_.push_back(make_counter("ob_ring_sessions_total",
+                                     "Sessions moved from the Unix socket to rings in shared memory"));
+    counters_.push_back(make_counter("ob_ring_bells_total",
+                                     "Times the server rang a client's bell: an answer, or room, for a "
+                                     "client that slept rather than polled"));
     counters_.push_back(make_counter("ob_wal_records_written",
                                      "WAL records appended, of every type - so checkpoints, "
                                      "epochs, version vectors and gaps are in it as well as "
@@ -239,6 +245,8 @@ MetricsRegistry::MetricsRegistry() {
                                  "Milliseconds the last backup held merges and retention back"));
     gauges_.push_back(make_gauge("ob_active_sessions",
                                  "Number of active client sessions, over TCP and the Unix socket"));
+    gauges_.push_back(make_gauge("ob_ring_bytes",
+                                 "Shared memory the sessions in rings hold, in bytes"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
                                  "Response bytes queued across sessions (a slow client shows up here)"));
     // Streaming subscriptions (#45). Registered in the same task that writes them, because

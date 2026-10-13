@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/ring.hpp"
 #include "orderbook/tls.hpp"
 
 #include <cstddef>
@@ -146,12 +147,20 @@ public:
     /// repeat it: `flush_output_tls` contains `flush_output`, and a substring match concatenates
     /// the two and reports their sum as the first one's size - which is what the first run of that
     /// comparison did, giving 310 and then 335 for a function that is 148.
-    bool flush_output() { return ssl_ == nullptr ? flush_output_plain() : flush_output_tls(); }
+    ///
+    /// Since #52's rings there are three transports, and the plaintext socket still pays one
+    /// compare: of a byte that names the transport, which TLS and the rings share a branch behind.
+    bool flush_output() {
+        return transport_ == Transport::Plain ? flush_output_plain() : flush_output_other();
+    }
 
 private:
     bool flush_output_plain();
-    /// Never inlined into its caller: see `flush_output()`.
-    [[gnu::noinline]] bool flush_output_tls();
+    /// Never inlined into its caller: see `flush_output()`. TLS or the rings.
+    [[gnu::noinline]] bool flush_output_other();
+    bool flush_output_tls();
+    bool flush_output_rings();
+    IoResult receive_rings(char* buf, size_t len, size_t& out_n);
 
 public:
 
@@ -193,6 +202,44 @@ public:
     /// retried at loop frequency, logged with it). The first one is news; the rest is a pattern,
     /// and `ob_refused_commands_total` is what an operator alerts on (#107).
     bool first_refusal();
+
+    // ── Rings in shared memory (#52, step 2) ──────────────────────────────────
+    //
+    // A session through the Unix socket may move its bytes to a pair of rings: `receive()` reads
+    // commands from one and `flush_output()` writes answers and pushes to the other, and the rest
+    // of the session - the parser's buffer, the send queue and its cap - does not know.
+
+    /// Whether this session came through the Unix socket, and the largest rings it may move to:
+    /// 0 when it may not (TCP, or `--rings off`). Set once, at adoption.
+    void     set_local(bool local, uint64_t ring_limit);
+    bool     local() const { return local_; }
+    uint64_t ring_limit() const { return ring_limit_; }
+
+    /// Move this session's bytes to the rings of `mapping`, with the two bells: the server's, rung
+    /// by the client, and the client's, rung by this side. The session owns all three from here.
+    void enable_rings(ring::Mapping mapping, int server_bell, int client_bell);
+    bool in_rings() const { return transport_ == Transport::Rings; }
+    int  server_bell() const;
+    size_t ring_bytes() const;
+
+    /// Commands waiting in the ring, for a loop polling instead of sleeping.
+    bool ring_input_waiting() const;
+
+    /// Before the loop sleeps: tell the client to ring, then look once more. True if it may
+    /// sleep; false if commands arrived in between, and the flag is down again.
+    bool ring_prepare_to_sleep();
+    void ring_woke();
+
+    /// After a flush that left bytes: ask the client to ring when it frees room. False if room
+    /// appeared meanwhile, and the caller flushes again.
+    bool ring_wait_for_room();
+    void ring_room_wait_done();
+
+    /// Bells rung for the client since the last call, for `ob_ring_bells_total`.
+    uint64_t take_ring_bells();
+
+    /// Whether the client left either ring in a state this side never wrote.
+    bool ring_broken() const;
 
     // ── Authentication state (#30) ────────────────────────────────────────────
     //
@@ -276,6 +323,24 @@ private:
     std::shared_ptr<ssl_st> ssl_;
     bool        tls_handshaking_{false};
     IoWant      io_want_{IoWant::Read};
+
+    /// Which way the bytes go: one byte the hot paths compare, rather than a pointer each.
+    enum class Transport : uint8_t { Plain, Tls, Rings };
+    Transport   transport_{Transport::Plain};
+
+    // Rings (#52, step 2).
+    struct RingTransport {
+        ring::Mapping mapping;
+        ring::Reader  commands;   ///< to the server
+        ring::Writer  answers;    ///< to the client
+        int           server_bell{-1};
+        int           client_bell{-1};
+        uint64_t      bells_rung{0};
+        ~RingTransport();
+    };
+    std::unique_ptr<RingTransport> rings_;
+    bool        local_{false};
+    uint64_t    ring_limit_{0};
 
     // Authentication (#30)
     bool        authenticated_{false};

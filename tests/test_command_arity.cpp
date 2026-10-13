@@ -86,6 +86,8 @@ constexpr Canonical kCanonical[] = {
     {"BOOK AAA EX", CommandType::BOOK},
     {"BACKUP",                                  CommandType::BACKUP},
     {"BACKUP STATUS",                           CommandType::BACKUP},
+    {"RINGS",                                   CommandType::RINGS},
+    {"RINGS 1048576",                           CommandType::RINGS},   // the optional size
 };
 
 } // namespace
@@ -512,6 +514,8 @@ TEST(KnownCommandRefusals, EachSaysWhatItCouldNotRead) {
         {"ADOPT AAA.EX BEGIN",        "ADOPT BEGIN needs the shard the symbol comes from"},
         {"BACKUP NOW",                "not 'NOW'"},
         {"UNSUBSCRIBE seven",         "UNSUBSCRIBE id is not a number: 'seven'"},
+        {"RINGS big",                 "RINGS size is not a number of bytes: 'big'"},
+        {"RINGS 0",                   "RINGS size is not a number of bytes: '0'"},
     };
     for (const Case& c : cases) {
         const Command cmd = parse_command(c.line);
@@ -524,6 +528,7 @@ TEST(KnownCommandRefusals, EachSaysWhatItCouldNotRead) {
     EXPECT_EQ(parse_command("ADOPT AAA.EX begin shard-0").type, CommandType::ADOPT);
     EXPECT_EQ(parse_command("BACKUP status").type, CommandType::BACKUP);
     EXPECT_EQ(parse_command("UNSUBSCRIBE 0").type, CommandType::UNSUBSCRIBE);
+    EXPECT_EQ(parse_command("rings 65536").ring_bytes, 65536u);
 }
 
 TEST(KnownCommandRefusals, AnAuthLineOfTheWrongShapeStillSaysNothing) {

@@ -614,6 +614,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--read-only` | — (boolean) | Refuse writes regardless of role |
 | `--replication-compress` | — (boolean) | Compress the replication stream with LZ4 |
 | `--replication-port` | `<PORT>` | Port replicas connect to on this node |
+| `--rings` | `on\|off` | Whether a session through `--unix-socket` may move to a pair of rings in shared memory with `RINGS` (default: `on`, #52): the same protocol, without a system call a round trip when the node polls. Refused for TCP and TLS sessions, and before `AUTH` where it is required |
+| `--ring-bytes` | `<BYTES>` | The size of each direction of a session's rings: a power of two from 65536 to 67108864 (default: 1048576). A client may ask for less, never more |
 | `--replication-bind` | `<ADDR>` | IPv4 or IPv6 address the replication port listens on (default: every interface, both families) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
 | `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |

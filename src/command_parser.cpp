@@ -125,6 +125,7 @@ static constexpr CommandGrammar kGrammar[] = {
     {CommandType::BOOK,         "BOOK",         4,
      "BOOK <symbol> <exchange> [depth]", true},
     {CommandType::BACKUP,       "BACKUP",       2, "BACKUP, or BACKUP STATUS", true},
+    {CommandType::RINGS,        "RINGS",        2, "RINGS [bytes]", true},
 };
 
 static_assert(std::size(kGrammar) == static_cast<size_t>(CommandType::UNKNOWN),
@@ -493,6 +494,25 @@ Command parse_command(std::string_view line) {
         return cmd;
     }
 
+    if (iequals(first, "RINGS")) {
+        // RINGS [bytes] (#52, step 2): move this session to rings in shared memory. Whether the
+        // size is one the server takes is the server's to say; here only that it is a number.
+        cmd.type = CommandType::RINGS;
+        if (tokens.size() >= 2) {
+            uint64_t bytes = 0;
+            const auto sv = tokens[1];
+            const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), bytes);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size() || bytes == 0) {
+                return refuse(cmd, "RINGS size is not a number of bytes: '" + std::string(sv) +
+                                       "'; RINGS takes: RINGS [bytes]");
+            }
+            cmd.ring_bytes = bytes;
+        }
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: RINGS bytes=%llu",
+                     static_cast<unsigned long long>(cmd.ring_bytes));
+        return cmd;
+    }
+
     if (iequals(first, "MM_CONFLICTS")) {
         cmd.type = CommandType::MM_CONFLICTS;
         if (tokens.size() >= 2) {
@@ -801,6 +821,8 @@ std::string format_command(const Command& cmd) {
                (cmd.adopt_source_shard.empty() ? std::string() : " " + cmd.adopt_source_shard) + "\n";
     case CommandType::MM_PEERS:  return "MM_PEERS\n";
     case CommandType::BACKUP: return cmd.backup_status ? "BACKUP STATUS\n" : "BACKUP\n";
+    case CommandType::RINGS:
+        return cmd.ring_bytes != 0 ? "RINGS " + std::to_string(cmd.ring_bytes) + "\n" : "RINGS\n";
     case CommandType::SUBSCRIBE:
         return cmd.subscribe_sql + "\n";
 

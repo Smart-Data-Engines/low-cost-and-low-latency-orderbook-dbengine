@@ -132,7 +132,7 @@ TEST(AuthGateStatic, EverySensitiveCommandRequiresAuthentication) {
                    ob::CommandType::SHARD_MAP, ob::CommandType::SHARD_INFO,
                    ob::CommandType::MIGRATE, ob::CommandType::ADOPT, ob::CommandType::MM_PEERS,
                    ob::CommandType::MM_CONFLICTS, ob::CommandType::SUBSCRIBE,
-                   ob::CommandType::UNSUBSCRIBE}) {
+                   ob::CommandType::UNSUBSCRIBE, ob::CommandType::RINGS}) {
         EXPECT_FALSE(ob::allowed_before_authentication(t))
             << "CommandType " << static_cast<int>(t) << " reachable without authentication";
     }

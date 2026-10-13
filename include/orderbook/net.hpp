@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <sys/socket.h>
 
 namespace ob::net {
@@ -81,5 +82,15 @@ int listen_unix(const std::string& path, uint32_t mode, int backlog, int extra_t
 /// A connection to the Unix socket at `path`, as dial() makes one to a host: within `timeout_ms`,
 /// blocking unless `leave_nonblocking`; -1 with `why` (#52).
 int dial_unix(const std::string& path, uint32_t timeout_ms, bool leave_nonblocking, std::string& why);
+
+/// `bytes` and `fds` in one message on a Unix socket (`SCM_RIGHTS`), all of it or nothing: false and
+/// `why` when the socket took less. For the answer that hands a session its rings (#52, step 2).
+bool send_with_fds(int sock, std::string_view bytes, const int* fds, size_t n_fds, std::string& why);
+
+/// One message from a Unix socket, with the descriptors it carries: up to `max_bytes` into `bytes`
+/// and up to `max_fds` into `fds` (the rest closed). Waits up to `timeout_ms`. False and `why` on an
+/// error, a close, a timeout, or descriptors cut short by the kernel.
+bool recv_with_fds(int sock, size_t max_bytes, size_t max_fds, uint32_t timeout_ms,
+                   std::string& bytes, std::vector<int>& fds, std::string& why);
 
 }  // namespace ob::net
