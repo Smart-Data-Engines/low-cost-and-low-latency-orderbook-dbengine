@@ -1731,7 +1731,7 @@ median sat inside master's range in 70 of 96 cells (p50 and p99), above it in 12
 and the median ratio of the branch's to master's was 0.997. The cells furthest out on either side
 are in the most bimodal series, `eco` on the EPYC with a polling client.
 
-Seventeen mutants of the server, the socket and the clients, each killed by a named test; the
+Twenty mutants of the server, the socket and the clients, each killed by a named test; the
 control, the socket's backlog at 127, survives. What is left of the item is step 2: rings in shared
 memory for a client on the node's host, set up through this socket.
 
