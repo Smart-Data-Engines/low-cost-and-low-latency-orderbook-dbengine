@@ -51,6 +51,11 @@ here as `#N`.
 
 ### Changed
 
+- A column of short runs decodes faster (#223): where its runs average two to eight values, a run of
+  up to eight is written whole, with nothing branching on its length, and a 16-bit column's in one
+  vector. On a recording of an order book's changes, its levels, sequence numbers and timestamps
+  decoded 21-40% faster on an EPYC and a Graviton host, its seven columns a fifth faster, and the first
+  query after a load took 0.89-0.92 of the time.
 - `SIGHUP` does not stop the server (#238). Nothing handled it, so its default action ended the
   process. A node without TLS now logs that there is nothing to reload and goes on, and `SIGTERM` is
   the signal that stops a node.

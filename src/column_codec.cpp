@@ -632,8 +632,70 @@ bool narrow_inverse(const Header& h, const char* p, size_t count, T* o) {
     return apply_inverse<T>(h, count, [p](size_t i) { return load_narrow<W>(p + i * W); }, o);
 }
 
+/// How many values a short run writes: as many as this, whatever its length, so that nothing
+/// branches on the length (#223). On a recorded book most runs are one to four values long and their
+/// lengths follow no pattern; a loop that stopped at each run's end was mispredicted at about every
+/// other run of binance-diff's levels, and a third of their decode's samples sat where it resumed.
+inline constexpr size_t kRunBlock = 8;
+
+/// The values 1 to kRunBlock steps of `d` past `v`, as T keeps them, written to `run`. Worked out in
+/// the narrowest unsigned width that holds T: a store of T keeps T's bits alone, and they are the same
+/// bits whatever wider width they were added in.
+///
+/// A 16-bit column's eight are one vector of eight lanes - one multiply, one add, one store - written
+/// as a GCC and Clang vector because neither compiler made it one inside the decode, where it was
+/// eight scalar stores. 64-bit lanes have no vector multiply below AVX-512, and their scalar steps are
+/// an add and a store each.
+template <typename T>
+inline void step_block(T* run, uint64_t v, uint64_t d) {
+    if constexpr (sizeof(T) == 2) {
+        using U = std::make_unsigned_t<T>;
+        typedef U Lanes __attribute__((vector_size(kRunBlock * sizeof(U))));
+        static_assert(kRunBlock == 8, "the lanes below are written out");
+        const Lanes steps = {1, 2, 3, 4, 5, 6, 7, 8};
+        const Lanes x = static_cast<U>(v) + steps * static_cast<U>(d);
+        std::memcpy(run, &x, sizeof x);
+    } else {
+        using W = std::conditional_t<(sizeof(T) <= sizeof(uint32_t)), uint32_t, uint64_t>;
+        const W start = static_cast<W>(v);
+        const W step = static_cast<W>(d);
+        for (size_t k = 0; k < kRunBlock; ++k) {
+            run[k] = static_cast<T>(static_cast<W>(start + static_cast<W>(k + 1) * step));
+        }
+    }
+}
+
+/// The runs of a column without delta: each run's value, through the frame of reference when `kFor`
+/// (times `g`, plus the anchor `a`), filled as many times as the run is long - a short one as a whole
+/// block when `by_blocks`, as runs_inverse() writes the delta runs. Nonzero when a value is past T's
+/// range.
+template <typename T, bool kFor>
+uint64_t value_runs(const uint64_t* values, const uint64_t* lengths, size_t runs, uint64_t g, uint64_t a,
+                    bool by_blocks, size_t count, T* o) {
+    constexpr uint64_t kMax = kMaxOf<T>;
+    uint64_t above = 0;
+    size_t i = 0;
+    for (size_t r = 0; r < runs; ++r) {
+        const uint64_t v = kFor ? values[r] * g + a : values[r];
+        above |= v > kMax;
+        const size_t len = static_cast<size_t>(lengths[r]) + 1;
+        if (by_blocks && len <= kRunBlock && count - i >= kRunBlock) {
+            std::fill_n(o + i, kRunBlock, static_cast<T>(v));
+        } else {
+            std::fill_n(o + i, len, static_cast<T>(v));
+        }
+        i += len;
+    }
+    return above;
+}
+
 /// Runs, unpacked straight into the column: a value filled run by run for none and for, and the
 /// running sum stepped by one run's difference at a time for delta.
+///
+/// Where the runs average two to kRunBlock values, a run of at most kRunBlock values, with room for
+/// kRunBlock of them before the column ends, writes kRunBlock: the values past its end are the next
+/// run's to overwrite, and the runs are written in order, so each slot ends up holding its own run's
+/// value. The last runs, near the column's end, and longer ones are written value by value.
 template <typename T>
 bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, DecodeScratch& scratch,
                   std::string* why) {
@@ -653,18 +715,43 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
     if (!unpack_simple8b(p.subspan(at + value_bytes), static_cast<size_t>(runs), lengths, scratch.words, why)) {
         return false;
     }
-    // The runs cover the packed values exactly - checked before anything is written.
-    size_t total = 0;
-    for (size_t r = 0; r < runs; ++r) {
-        if (total >= n || lengths[r] > n - total - 1) return fail(why, "runs longer than the values");
-        total += static_cast<size_t>(lengths[r]) + 1;
+    // The runs cover the packed values exactly - checked before anything is written. Every run shorter
+    // than the values and the runs' lengths adding up to them is the same check as a running total
+    // that never passes the values and ends at them, without a branch a run: a run's stored length is
+    // one less than its length, so below n each, and below n^2 together, which a 64-bit sum holds for
+    // any n under 2^32.
+    if (n < (uint64_t{1} << 32)) {
+        uint64_t longest = 0;
+        uint64_t sum = 0;
+        for (size_t r = 0; r < runs; ++r) {
+            longest = std::max(longest, lengths[r]);
+            sum += lengths[r];
+        }
+        if ((runs > 0 && longest >= n) || sum + runs > n) return fail(why, "runs longer than the values");
+        if (sum + runs < n) return fail(why, "runs shorter than the values");
+    } else {
+        size_t total = 0;
+        for (size_t r = 0; r < runs; ++r) {
+            if (total >= n || lengths[r] > n - total - 1) return fail(why, "runs longer than the values");
+            total += static_cast<size_t>(lengths[r]) + 1;
+        }
+        if (total != n) return fail(why, "runs shorter than the values");
     }
-    if (total != n) return fail(why, "runs shorter than the values");
-    constexpr uint64_t kMax = kMaxOf<T>;
-    const uint64_t g = h.scale;
+    const uint64_t* rv = values.data();
+    const uint64_t* rl = lengths.data();
+    // Blocks pay where the runs average two to kRunBlock values. Where nearly every run is one value
+    // long - a book's prices on a recording of its changes, which move at almost every row - a block
+    // writes eight values for each one it keeps, and the loop's branch is predicted anyway. Where runs
+    // average more than a block, the long ones carry the column and their lengths repeat - twenty rows
+    // an update of a book's snapshots - and the branch is predicted again. Measured on the EPYC host,
+    // by blocks everywhere: binance-diff's prices decoded 8% slower and binance-top20's sequence
+    // numbers 10%. Either way a run decodes to the same values; this decides only how fast.
+    const bool by_blocks = runs * 2 <= n && n <= runs * kRunBlock;
     uint64_t above = 0;
     if (h.transform == Transform::kDelta) {
         if (count == 0) return true;
+        constexpr uint64_t kMax = kMaxOf<T>;
+        const uint64_t g = h.scale;
         uint64_t v = h.anchor;
         above |= v > kMax;
         o[0] = static_cast<T>(v);
@@ -672,25 +759,31 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
         for (size_t r = 0; r < runs; ++r) {
             // One run's difference d added len times: the k-th value is v + (k + 1) d, which has no
             // dependence on the value before it, so the run fills as a vector does.
-            const uint64_t d = unzigzag(values[r]) * g;
-            const size_t len = static_cast<size_t>(lengths[r]) + 1;
+            const uint64_t d = unzigzag(rv[r]) * g;
+            const size_t len = static_cast<size_t>(rl[r]) + 1;
             T* run = o + i;
-            for (size_t k = 0; k < len; ++k) {
-                const uint64_t x = v + (k + 1) * d;
-                above |= x > kMax;
-                run[k] = static_cast<T>(x);
+            if (by_blocks && len <= kRunBlock && count - i >= kRunBlock) {
+                // A run is a line, so its first and last values bound it. With v and v + d both in
+                // T's range, d is at most T's maximum either way, a run this short cannot wrap, and
+                // every value between the two ends is in range too. The values past the run's end are
+                // not checked: they are not the column's.
+                above |= (v + d) > kMax;
+                above |= (v + len * d) > kMax;
+                step_block(run, v, d);
+            } else {
+                for (size_t k = 0; k < len; ++k) {
+                    const uint64_t x = v + (k + 1) * d;
+                    above |= x > kMax;
+                    run[k] = static_cast<T>(x);
+                }
             }
             v += len * d;
             i += len;
         }
+    } else if (h.transform == Transform::kFor) {
+        above |= value_runs<T, true>(rv, rl, runs, h.scale, h.anchor, by_blocks, count, o);
     } else {
-        size_t i = 0;
-        for (size_t r = 0; r < runs; ++r) {
-            const uint64_t v = h.transform == Transform::kFor ? values[r] * g + h.anchor : values[r];
-            above |= v > kMax;
-            std::fill_n(o + i, static_cast<size_t>(lengths[r]) + 1, static_cast<T>(v));
-            i += static_cast<size_t>(lengths[r]) + 1;
-        }
+        above |= value_runs<T, false>(rv, rl, runs, 1, 0, by_blocks, count, o);
     }
     if (above != 0) return fail(why, "a value past the column's type");
     return true;
