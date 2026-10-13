@@ -29,12 +29,17 @@
 // `OB_UNIX_SOCKET=<path>` measures the node's Unix socket (`--unix-socket`, #52) instead of its
 // port, which is then not used: the round trip of a client on the node's own host.
 //
+// `OB_SPIN=1` makes the probe poll for its answer rather than sleep in `recv()`: a client that
+// blocks pays for its own wake-up, and on a host whose idle CPUs sleep deeply that is part of every
+// figure, more of a short round trip than of a long one (#52).
+//
 // One JSON object on stdout: percentiles of the round trip, the server's CPU for the timed loop
 // (read from /proc/<server-pid>/stat), and the size of one answer in bytes and in lines - the
 // second so a driver can check the answer is the shape it asked for, not only that it arrived.
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -154,15 +159,23 @@ int main(int argc, char** argv) {
     std::string answer;
     size_t answer_bytes = 0;
     size_t answer_lines = 0;
+    // How many reads the last answer took. An answer that arrives in two costs the client a second
+    // sleep and wake-up, which is a tail rather than a median, so the count is reported (#52).
+    size_t reads = 0;
+    const char* spin_env = std::getenv("OB_SPIN");
+    const bool spin = spin_env != nullptr && std::string(spin_env) == "1";
     // One round trip. Returns false on a transport failure; an ERR answer is reported through
     // `answer` and refused by the caller, because timing an error is how this probe lied once.
     const auto round_trip = [&]() -> bool {
         const auto sent = ::send(fd, command.data(), command.size(), MSG_NOSIGNAL);
         if (sent != static_cast<ssize_t>(command.size())) return false;
         answer.clear();
+        reads = 0;
         for (;;) {
-            const ssize_t got = ::recv(fd, buf, sizeof(buf), 0);
+            const ssize_t got = ::recv(fd, buf, sizeof(buf), spin ? MSG_DONTWAIT : 0);
+            if (got < 0 && spin && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             if (got <= 0) return false;
+            ++reads;
             answer.append(buf, static_cast<size_t>(got));
             const bool whole_line = answer.find('\n') != std::string::npos;
             if (whole_line && (one_line || answer.rfind("ERR", 0) == 0)) break;
@@ -184,12 +197,14 @@ int main(int argc, char** argv) {
 
     std::vector<long long> ns;
     ns.reserve(static_cast<size_t>(iterations));
+    size_t split_answers = 0;
     const double cpu_before = process_cpu_seconds(server_pid);
     const auto wall0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iterations; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
         if (!round_trip()) { std::fprintf(stderr, "round trip %d failed\n", i); return 1; }
         const auto t1 = std::chrono::steady_clock::now();
+        if (reads > 1) ++split_answers;
         ns.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
     const auto wall1 = std::chrono::steady_clock::now();
@@ -202,15 +217,17 @@ int main(int argc, char** argv) {
     // tick touches one round trip in hundreds, and p99 does not see it (#180).
     // The transport too, so a figure carries what it travelled on rather than leaving it to the
     // file it was saved in (#52).
-    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"iterations\": %d, "
+    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"iterations\": %d, "
                 "\"p50_ns\": %lld, \"p99_ns\": %lld, "
                 "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
-                "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu}\n",
+                "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu, "
+                "\"split_answers\": %zu}\n",
                 json_label.c_str(), (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
+                spin ? "true" : "false",
                 iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
                 ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),
                 (cpu_before < 0 || cpu_after < 0) ? -1.0 : cpu_after - cpu_before, answer_bytes,
-                answer_lines);
+                answer_lines, split_answers);
     return 0;
 }
