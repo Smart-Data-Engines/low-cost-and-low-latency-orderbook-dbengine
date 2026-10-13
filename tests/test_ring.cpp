@@ -255,6 +255,54 @@ TEST(Ring, AFullWriterIsWokenWhenTheReaderMakesRoom) {
     EXPECT_GT(waited, 0) << "the writer never waited, so the room protocol was not exercised";
 }
 
+TEST(Ring, AReaderAboutToSleepLooksAgain) {
+    // What a race between threads hides: a byte published after the reader found the ring empty
+    // and before it said it sleeps. The writer saw nobody asleep and rang nothing, so the reader's
+    // second look is all that keeps the byte from waiting for the next one. One thread, in that
+    // order.
+    Pair pair;
+    Writer w = pair.client_writer();
+    Reader r = pair.server_reader();
+    char c = 'r';
+    EXPECT_EQ(r.read(&c, 1), 0u);
+    ASSERT_EQ(w.write(&c, 1), 1u);
+    EXPECT_FALSE(w.publish()) << "nobody was asleep yet";
+    EXPECT_FALSE(r.prepare_to_sleep()) << "a reader slept with a byte in its ring";
+    EXPECT_EQ(r.read(&c, 1), 1u);
+    // The control: an empty ring lets it sleep, the next publish sees it asleep, and once it woke
+    // it is not seen asleep any more.
+    EXPECT_TRUE(r.prepare_to_sleep());
+    ASSERT_EQ(w.write(&c, 1), 1u);
+    EXPECT_TRUE(w.publish()) << "the writer did not see the reader asleep";
+    r.woke();
+    ASSERT_EQ(w.write(&c, 1), 1u);
+    EXPECT_FALSE(w.publish()) << "a reader that woke is still seen asleep";
+}
+
+TEST(Ring, AWriterAboutToWaitForRoomLooksAgain) {
+    // The same for the other direction of the rule: room made after the writer found the ring
+    // full and before it said it waits, by a reader that saw nobody waiting.
+    Pair pair;
+    Writer w = pair.client_writer();
+    Reader r = pair.server_reader();
+    std::vector<char> block(kMinBytes, 'w');
+    ASSERT_EQ(w.write(block.data(), block.size()), kMinBytes);
+    w.publish();
+    EXPECT_EQ(w.write(block.data(), 1), 0u);
+    ASSERT_EQ(r.read(block.data(), 10), 10u);
+    EXPECT_FALSE(r.producer_waiting()) << "nobody was waiting yet";
+    EXPECT_FALSE(w.prepare_to_wait_for_room()) << "a writer waited with room in its ring";
+    // The control: a full ring lets it wait, the next read sees it waiting, and once it is done
+    // waiting it is not seen waiting any more.
+    ASSERT_EQ(w.write(block.data(), 10), 10u);
+    w.publish();
+    EXPECT_TRUE(w.prepare_to_wait_for_room());
+    ASSERT_EQ(r.read(block.data(), 1), 1u);
+    EXPECT_TRUE(r.producer_waiting()) << "the reader did not see the writer waiting";
+    w.done_waiting_for_room();
+    EXPECT_FALSE(r.producer_waiting()) << "a writer done waiting is still seen waiting";
+}
+
 TEST(Ring, ACounterTheOtherSideCouldNotHaveLeftBreaksTheRing) {
     {
         // The writer's tail far past what the ring holds: more ready than was ever possible.
