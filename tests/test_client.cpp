@@ -13,6 +13,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <unistd.h>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -20,6 +22,7 @@
 
 #include "orderbook/client.hpp"
 #include "orderbook/command_parser.hpp"
+#include "orderbook/net.hpp"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Generators
@@ -1066,4 +1069,135 @@ TEST(ClientMinsertMany, AnAnswerThatIsNeitherOkNorErrIsAnError) {
     ASSERT_FALSE(stored) << "an answer no MINSERT gives was taken for one";
     // Refused as what it is, rather than waited on until the read timed out.
     EXPECT_EQ(stored.error_code(), ob::OB_ERR_PARSE) << stored.error_message();
+}
+
+// ── The server's Unix socket (#52) ───────────────────────────────────────────────────────────────
+//
+// What is under test is that the client goes through the path, and refuses what a path cannot give.
+// The server behind a real socket is `test_unix_socket.cpp`'s; this stub greets, answers PING and
+// records what it was sent.
+
+namespace {
+
+class UnixStub {
+public:
+    explicit UnixStub(std::string path) : path_(std::move(path)) {
+        std::string error;
+        listen_fd_ = ob::net::listen_unix(path_, 0600, 4, 0, error);
+        EXPECT_GE(listen_fd_, 0) << error;
+        if (listen_fd_ >= 0) thread_ = std::thread([this] { serve(); });
+    }
+    ~UnixStub() {
+        if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (listen_fd_ >= 0) ::close(listen_fd_);
+        ::unlink(path_.c_str());
+    }
+    UnixStub(const UnixStub&) = delete;
+    UnixStub& operator=(const UnixStub&) = delete;
+
+    std::vector<std::string> lines() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return lines_;
+    }
+
+private:
+    void serve() {
+        const int fd = ::accept(listen_fd_, nullptr, nullptr);
+        if (fd < 0) return;
+        static constexpr std::string_view kWelcome = "OK ob_tcp_server v0.1.0\n\n";
+        (void)::send(fd, kWelcome.data(), kWelcome.size(), MSG_NOSIGNAL);
+        std::string pending;
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            pending.append(buf, static_cast<size_t>(n));
+            size_t nl;
+            while ((nl = pending.find('\n')) != std::string::npos) {
+                const std::string line = pending.substr(0, nl);
+                pending.erase(0, nl + 1);
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    lines_.push_back(line);
+                }
+                const std::string reply = line == "PING" ? "PONG\n" : "ERR unknown command\n";
+                (void)::send(fd, reply.data(), reply.size(), MSG_NOSIGNAL);
+            }
+        }
+        ::close(fd);
+    }
+
+    std::string              path_;
+    int                      listen_fd_ = -1;
+    std::thread              thread_;
+    std::mutex               mtx_;
+    std::vector<std::string> lines_;
+};
+
+/// A socket path of this test's own, removed with the directory.
+struct UnixPath {
+    std::filesystem::path dir;
+    std::string           path;
+    UnixPath() {
+        dir = std::filesystem::temp_directory_path() /
+              ("ob_client_uds_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(dir);
+        path = (dir / "ob.sock").string();
+    }
+    ~UnixPath() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+}  // namespace
+
+TEST(ClientUnixSocket, ConnectsThroughThePathRatherThanTheAddress) {
+    UnixPath at;
+    UnixStub stub(at.path);
+    ob::ClientConfig cc;
+    cc.unix_socket = at.path;
+    // TEST-NET-1, where nothing answers: a client that dialled the address would time out instead.
+    cc.host                = "192.0.2.1";
+    cc.port                = 1;
+    cc.connect_timeout_sec = 1.0;
+    ob::OrderbookClient client(cc);
+    const auto c = client.connect();
+    ASSERT_TRUE(c) << c.error_message();
+    const auto pong = client.ping();
+    ASSERT_TRUE(pong) << pong.error_message();
+    EXPECT_TRUE(pong.value());
+    // Recorded before it was answered; the QUIT of a disconnect may or may not have arrived yet.
+    const auto lines = stub.lines();
+    ASSERT_FALSE(lines.empty());
+    EXPECT_EQ(lines.front(), "PING");
+}
+
+TEST(ClientUnixSocket, TlsWithAPathIsRefusedBeforeAnythingIsOpened) {
+    UnixPath at;
+    UnixStub stub(at.path);
+    ob::ClientConfig cc;
+    cc.unix_socket = at.path;
+    cc.tls         = true;
+    ob::OrderbookClient client(cc);
+    const auto c = client.connect();
+    ASSERT_FALSE(c) << "a client asked for TLS went through a socket that has none";
+    EXPECT_EQ(c.error_code(), ob::OB_ERR_INVALID_ARG) << c.error_message();
+    EXPECT_NE(c.error_message().find("unix socket has no TLS"), std::string::npos)
+        << c.error_message();
+    EXPECT_TRUE(stub.lines().empty());
+}
+
+TEST(ClientUnixSocket, APathWithNothingThereIsNamedInTheError) {
+    UnixPath at;   // the directory exists, the socket does not
+    ob::ClientConfig cc;
+    cc.unix_socket = at.path;
+    ob::OrderbookClient client(cc);
+    const auto c = client.connect();
+    ASSERT_FALSE(c);
+    EXPECT_EQ(c.error_code(), ob::OB_ERR_IO) << c.error_message();
+    EXPECT_EQ(c.error_message().rfind("connection refused", 0), 0u) << c.error_message();
+    EXPECT_NE(c.error_message().find(at.path), std::string::npos) << c.error_message();
+    EXPECT_NE(c.error_message().find("No such file"), std::string::npos) << c.error_message();
 }

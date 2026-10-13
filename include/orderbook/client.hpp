@@ -34,6 +34,13 @@ class ShardRouter;
 struct ClientConfig {
     std::string host = "127.0.0.1";
     uint16_t    port = 9090;
+
+    /// The server's Unix socket (`--unix-socket`, #52), for a client on the same host: when set,
+    /// `connect()` goes through it and `host` and `port` are not used. The socket is plain text
+    /// whatever the server's TLS - the file's permissions decide who may connect - so `tls` with a
+    /// path is refused. A pool and the shard router dial every node at its address.
+    std::string unix_socket;
+
     double      connect_timeout_sec = 5.0;
     double      read_timeout_sec    = 10.0;
     bool        compress            = false;  // negotiate LZ4

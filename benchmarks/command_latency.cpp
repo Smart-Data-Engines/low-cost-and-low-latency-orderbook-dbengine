@@ -26,6 +26,9 @@
 // rack pays, beside the loopback one (#217). Its CPU cannot be read from here: give 0 for the pid,
 // and `server_cpu_s` reads -1, the value it always gave for a figure it could not take.
 //
+// `OB_UNIX_SOCKET=<path>` measures the node's Unix socket (`--unix-socket`, #52) instead of its
+// port, which is then not used: the round trip of a client on the node's own host.
+//
 // One JSON object on stdout: percentiles of the round trip, the server's CPU for the timed loop
 // (read from /proc/<server-pid>/stat), and the size of one answer in bytes and in lines - the
 // second so a driver can check the answer is the shape it asked for, not only that it arrived.
@@ -42,6 +45,7 @@
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <vector>
 
@@ -89,24 +93,43 @@ int main(int argc, char** argv) {
     // `recv` would time a fraction of a large answer and call it fast.
     const bool one_line = label == "PING";
 
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { std::perror("socket"); return 1; }
-    int one = 1;
-    // One request in flight at a time, so Nagle has nothing to hold - set anyway, because the
-    // server side of this exact question was #140.
-    (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(static_cast<uint16_t>(port));
-    const char* host = std::getenv("OB_HOST");
-    if (host == nullptr || *host == '\0') host = "127.0.0.1";
-    if (::inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        std::fprintf(stderr, "OB_HOST is not an IPv4 address: %s\n", host);
-        return 2;
-    }
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        std::perror("connect");
-        return 1;
+    int fd = -1;
+    const char* unix_path = std::getenv("OB_UNIX_SOCKET");
+    if (unix_path != nullptr && *unix_path != '\0') {
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        if (std::strlen(unix_path) >= sizeof(addr.sun_path)) {
+            std::fprintf(stderr, "OB_UNIX_SOCKET is longer than a socket address holds: %s\n",
+                         unix_path);
+            return 2;
+        }
+        std::memcpy(addr.sun_path, unix_path, std::strlen(unix_path) + 1);
+        fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) { std::perror("socket"); return 1; }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            std::perror("connect");
+            return 1;
+        }
+    } else {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { std::perror("socket"); return 1; }
+        int one = 1;
+        // One request in flight at a time, so Nagle has nothing to hold - set anyway, because the
+        // server side of this exact question was #140.
+        (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(static_cast<uint16_t>(port));
+        const char* host = std::getenv("OB_HOST");
+        if (host == nullptr || *host == '\0') host = "127.0.0.1";
+        if (::inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            std::fprintf(stderr, "OB_HOST is not an IPv4 address: %s\n", host);
+            return 2;
+        }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            std::perror("connect");
+            return 1;
+        }
     }
 
     static char buf[1 << 17];
@@ -169,10 +192,14 @@ int main(int argc, char** argv) {
     const size_t n = ns.size();
     // p99.9 as well, for the reason pipelined_ingest reports it: a stall that comes once a flush
     // tick touches one round trip in hundreds, and p99 does not see it (#180).
-    std::printf("{\"command\": \"%s\", \"iterations\": %d, \"p50_ns\": %lld, \"p99_ns\": %lld, "
+    // The transport too, so a figure carries what it travelled on rather than leaving it to the
+    // file it was saved in (#52).
+    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"iterations\": %d, "
+                "\"p50_ns\": %lld, \"p99_ns\": %lld, "
                 "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
                 "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu}\n",
-                label.c_str(), iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
+                label.c_str(), (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
+                iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
                 ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),
                 (cpu_before < 0 || cpu_after < 0) ? -1.0 : cpu_after - cpu_before, answer_bytes,

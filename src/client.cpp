@@ -65,6 +65,11 @@ Result<void> OrderbookClient::connect() {
     // Refuse a configuration whose parts contradict each other, before opening anything. Both of
     // these describe a caller who believes the connection is protected in a way it is not, and the
     // useful moment to say so is now rather than after the first row has crossed the wire.
+    if (config_.tls && !config_.unix_socket.empty()) {
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 "tls with unix_socket: the server's unix socket has no TLS, and "
+                                 "the connection would not be what tls asks for");
+    }
     if (!config_.tls) {
         if (!config_.tls_ca_file.empty()) {
             return Result<void>::err(OB_ERR_INVALID_ARG,
@@ -94,22 +99,42 @@ Result<void> OrderbookClient::connect() {
 
     if (fd_ != -1) disconnect();
 
-    // The server's address of either family, or a name and every address of it in turn, each within
-    // the connect timeout (ob::net::dial()); the socket comes back blocking, as reads expect, and
-    // with Nagle off (#140).
     std::string why;
-    fd_ = net::dial(config_.host, config_.port,
-                    static_cast<uint32_t>(config_.connect_timeout_sec * 1000),
-                    /*leave_nonblocking=*/false, why, "client");
-    if (fd_ < 0) {
-        fd_ = -1;
-        // The words this client has always answered with, which its callers read.
-        const char* what = why.find("deadline") != std::string::npos  ? "connect timeout"
-                         : why.find("resolve") != std::string::npos   ? "invalid host address"
-                                                                      : "connection refused";
-        OB_LOG_DEBUG("client", "connect to %s failed: %s",
-                     net::join_host_port(config_.host, config_.port).c_str(), why.c_str());
-        return Result<void>::err(OB_ERR_IO, what);
+    if (!config_.unix_socket.empty()) {
+        // The server's Unix socket (#52). It comes back blocking, as reads expect.
+        fd_ = net::dial_unix(config_.unix_socket,
+                             static_cast<uint32_t>(config_.connect_timeout_sec * 1000),
+                             /*leave_nonblocking=*/false, why);
+        if (fd_ < 0) {
+            fd_ = -1;
+            OB_LOG_DEBUG("client", "connect to unix socket %s failed: %s",
+                         config_.unix_socket.c_str(), why.c_str());
+            // With the reason: a path that does not exist and one nobody listens on are different
+            // mistakes, and the TCP words would name neither.
+            const char* what = why.find("deadline") != std::string::npos ? "connect timeout"
+                                                                         : "connection refused";
+            return Result<void>::err(OB_ERR_IO, std::string(what) + ": unix socket " +
+                                                    config_.unix_socket + ": " + why);
+        }
+        OB_LOG_DEBUG("client", "connected to unix socket %s, fd=%d", config_.unix_socket.c_str(),
+                     fd_);
+    } else {
+        // The server's address of either family, or a name and every address of it in turn, each
+        // within the connect timeout (ob::net::dial()); the socket comes back blocking, as reads
+        // expect, and with Nagle off (#140).
+        fd_ = net::dial(config_.host, config_.port,
+                        static_cast<uint32_t>(config_.connect_timeout_sec * 1000),
+                        /*leave_nonblocking=*/false, why, "client");
+        if (fd_ < 0) {
+            fd_ = -1;
+            // The words this client has always answered with, which its callers read.
+            const char* what = why.find("deadline") != std::string::npos  ? "connect timeout"
+                             : why.find("resolve") != std::string::npos   ? "invalid host address"
+                                                                          : "connection refused";
+            OB_LOG_DEBUG("client", "connect to %s failed: %s",
+                         net::join_host_port(config_.host, config_.port).c_str(), why.c_str());
+            return Result<void>::err(OB_ERR_IO, what);
+        }
     }
 
     // SO_RCVTIMEO for read timeout
@@ -1330,6 +1355,7 @@ OrderbookPool::OrderbookPool(PoolConfig config)
         ClientConfig cc;
         cc.host                = ns.host;
         cc.port                = ns.port;
+        cc.unix_socket         = {};   // every node is dialled at its address (#52)
         cc.connect_timeout_sec = config_.connect_timeout_sec;
         cc.read_timeout_sec    = config_.read_timeout_sec;
         cc.compress            = config_.compress;
