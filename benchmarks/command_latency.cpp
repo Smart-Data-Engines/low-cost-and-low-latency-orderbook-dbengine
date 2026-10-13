@@ -208,6 +208,10 @@ int main(int argc, char** argv) {
     size_t reads = 0;
     const char* spin_env = std::getenv("OB_SPIN");
     const bool spin = spin_env != nullptr && std::string(spin_env) == "1";
+    // Through rings, poll this long before sleeping on the bell, as `ClientConfig::rings.spin_us`
+    // does; 0 sleeps at once. Ignored with OB_SPIN=1, which never sleeps.
+    const char* spin_us_env = std::getenv("OB_SPIN_US");
+    const long spin_us = spin_us_env != nullptr ? std::strtol(spin_us_env, nullptr, 10) : 0;
     // One round trip. Returns false on a transport failure; an ERR answer is reported through
     // `answer` and refused by the caller, because timing an error is how this probe lied once.
     // The answer is complete: one line for PING and errors, a blank line ending anything else.
@@ -226,6 +230,7 @@ int main(int argc, char** argv) {
         }
         answer.clear();
         reads = 0;
+        const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
         for (;;) {
             const size_t got = answers.read(buf, sizeof(buf));
             if (got > 0) {
@@ -236,7 +241,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (answers.broken()) return false;
-            if (spin || !answers.prepare_to_sleep()) continue;
+            if (spin || std::chrono::steady_clock::now() < spin_end) continue;
+            if (!answers.prepare_to_sleep()) continue;
             pollfd p{client_bell, POLLIN, 0};
             if (::poll(&p, 1, 5000) == 0) return false;
             ob::ring::drain_bell(client_bell);
@@ -298,14 +304,14 @@ int main(int argc, char** argv) {
     // tick touches one round trip in hundreds, and p99 does not see it (#180).
     // The transport too, so a figure carries what it travelled on rather than leaving it to the
     // file it was saved in (#52).
-    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"iterations\": %d, "
+    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"spin_us\": %ld, \"iterations\": %d, "
                 "\"p50_ns\": %lld, \"p99_ns\": %lld, "
                 "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
                 "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu, "
                 "\"split_answers\": %zu}\n",
                 json_label.c_str(),
                 use_rings ? "rings" : (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
-                spin ? "true" : "false",
+                spin ? "true" : "false", spin_us,
                 iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
                 ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),
