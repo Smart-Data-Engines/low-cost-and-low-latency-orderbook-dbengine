@@ -171,16 +171,19 @@ answer with every version of a level it has. `BOOK` reads the engine's own curre
 seqlock and is one `memcpy` per side.
 
 **Two of those seven columns come from the buffer rather than from a level, so every row of one
-answer carries the same `timestamp_ns` and `sequence_number`.** That is the identity of the
-snapshot — *as of which update* this book is — not the time a level changed. It is the number to
-resume a `SUBSCRIBE` from: take the book, then subscribe, and discard anything at or below that
-sequence number.
+answer carries the same `timestamp_ns` and `sequence_number`.** They are one update's, the last one
+the engine had applied when the read began, not the time a level changed. Every update up to that
+number is in the book, and one applied while the book was being read may be in it too. That makes
+it the number to resume a `SUBSCRIBE` from: subscribe first, then take the book, and apply the pushes
+numbered above it ([joining a stream under way](query-language.md#over-the-wire)). Until #239 the
+number was read after the levels, so it could name an update a side did not hold yet.
 
 `BOOK` is not an atomic read of both sides. Each side is read under its own seqlock, one after the
-other, so in principle the two halves are microseconds apart. Making it atomic means one seqlock
-per buffer instead of one per side, which is a change on the write path; the alternative that was
-rejected is worse — reading each side while emitting its rows puts the formatting of up to two
-thousand levels between the two halves.
+other, so in principle the two halves are microseconds apart. Making it atomic needs no change on
+the write path - a reader can check both sides' versions around both copies - but then a write to
+either side restarts the whole read, where today only a write to the side being copied restarts
+that side. The alternative that was rejected is worse — reading each side while emitting its rows
+puts the formatting of up to two thousand levels between the two halves.
 
 Refusals, all naming the token: a symbol with no live buffer is `OB_ERR_NOT_FOUND`, a non-numeric
 depth, a depth of `0` (omit the argument to ask for everything — an empty answer on request is

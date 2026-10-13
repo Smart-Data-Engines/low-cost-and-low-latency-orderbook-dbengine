@@ -1758,7 +1758,16 @@ std::string Engine::format(const QueryAST& ast) {
 }
 
 uint64_t Engine::subscribe(std::string_view sql, RowCallback cb) {
-    return query_engine_->subscribe(sql, std::move(cb));
+    const uint64_t id = query_engine_->subscribe(sql, std::move(cb));
+    // A write applies and notifies under `mtx_`, and asks whether anyone is subscribed with a
+    // relaxed load, which nothing orders after the registration above. Taking `mtx_` once, after
+    // it, puts every write on one side of this call (#239): a write that takes the lock after this
+    // sees the subscription, and one that released it before is held by any read made after this
+    // returns. A client that subscribes and then takes the book misses nothing in between.
+    { std::lock_guard<std::mutex> in_force(mtx_); }
+    OB_LOG_DEBUG("engine", "Subscription %llu in force for every write from here",
+                 static_cast<unsigned long long>(id));
+    return id;
 }
 
 void Engine::unsubscribe(uint64_t id) {
@@ -3179,7 +3188,7 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     buf->bid.version.store(0, std::memory_order_relaxed);
     buf->ask.version.store(0, std::memory_order_relaxed);
     buf->sequence_number.store(0, std::memory_order_relaxed);
-    buf->last_timestamp_ns = 0;
+    buf->last_timestamp_ns.store(0, std::memory_order_relaxed);
     std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
     std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
 

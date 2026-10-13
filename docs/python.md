@@ -226,15 +226,27 @@ and it is one `memcpy` per side on the server.
 ```python
 rows = engine.book("BTC-USD", "BINANCE", depth=5)   # five levels per side
 best_bid = next(r for r in rows if r.side == "bid")
-as_of    = rows[0].sequence_number                  # resume a subscribe() from here
 ```
 
 Bids come first, then asks, each side in its own order (bids descending, asks ascending), and
 `level` restarts at 0 for the asks because a level index is a position within a side.
 
 **Two of the seven fields are properties of the read rather than of a level**: every row carries
-the same `timestamp_ns` and `sequence_number`, which say *as of which update* this book is. They
-are not the time a level changed.
+the same `timestamp_ns` and `sequence_number`, one update's, and not the time a level changed.
+Every update up to that number is in the book, which makes it the number to resume a subscription
+from. Subscribe first, then take the book, and apply the pushes numbered above it, in order:
+
+```python
+sub_id = engine.subscribe("BTC-USD", "BINANCE")   # every write after this returns is pushed
+rows   = engine.book("BTC-USD", "BINANCE")        # and every write before it is in the book
+as_of  = rows[0].sequence_number
+for got, row in engine.poll(1.0):
+    if got == sub_id and row.sequence_number > as_of:
+        apply(row)                                # those at or below as_of are in the book
+```
+
+The other way round loses whatever is written between the book and the subscription (#239). Pushes
+that arrive while `book()` waits for its answer are kept for the next `poll()`.
 
 `depth` is per side and counts from the best level; `None` asks for everything the side has. A
 `depth` below 1 is refused by the client before it reaches the wire, and one above 1000 is refused

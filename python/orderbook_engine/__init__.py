@@ -109,6 +109,10 @@ def _normalise_levels(prices: List[int], qtys: List[int], counts: Optional[List[
 
 # ── Data types ─────────────────────────────────────────────────────────────────
 
+# A pushed row's side as the wire writes it, to the names every `OrderbookRow` carries.
+_PUSHED_SIDES = {"0": "bid", "1": "ask"}
+
+
 @dataclass
 class OrderbookRow:
     """A single row returned by a query."""
@@ -746,11 +750,14 @@ class _TcpBackend:
                     price=int(fields[2]),
                     quantity=int(fields[3]),
                     order_count=int(fields[4]),
-                    side=int(fields[5]),
+                    # Named as every other row names it (#239). A client resuming a subscription
+                    # applies these to the rows `book()` returned, and the wire's 0 and 1 matched
+                    # none of their "bid" and "ask".
+                    side=_PUSHED_SIDES[fields[5]],
                     level=int(fields[6]),
                     sequence_number=int(fields[7]),
                 )))
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, KeyError):
                 continue
 
     def take_pushes(self) -> List[Tuple[int, OrderbookRow]]:
@@ -2389,8 +2396,9 @@ class OrderbookEngine:
         asks because a level index is a position within a side.
 
         **Two of the seven columns are properties of the read rather than of a level**: every row
-        carries the same `timestamp_ns` and `sequence_number`, which say *as of which update* this
-        book is. That is the number to resume a `subscribe()` from.
+        carries the same `timestamp_ns` and `sequence_number`, one update's. Every update up to
+        that number is in the book, so it is the number to resume a `subscribe()` from: subscribe
+        first, then take the book, and apply the pushes numbered above it (#239).
 
         Refused in local mode. The embedded path goes through the C API, which has no entry point
         for this - and adding one is a change to a published ABI, so it is a separate piece of work

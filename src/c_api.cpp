@@ -172,7 +172,7 @@ extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
             buf->bid.version.store(0, std::memory_order_relaxed);
             buf->ask.version.store(0, std::memory_order_relaxed);
             buf->sequence_number.store(0, std::memory_order_relaxed);
-            buf->last_timestamp_ns = 0;
+            buf->last_timestamp_ns.store(0, std::memory_order_relaxed);
             std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
             std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
             engine->buffers[key] = std::move(buf);

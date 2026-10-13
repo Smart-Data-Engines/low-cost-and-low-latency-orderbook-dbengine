@@ -273,7 +273,7 @@ SoABuffer:
   bid    : SoASide
   ask    : SoASide
   sequence_number : atomic<uint64_t>
-  last_timestamp_ns : uint64_t
+  last_timestamp_ns : atomic<uint64_t>
   symbol[32]   : char
   exchange[32] : char
 ```
@@ -282,3 +282,6 @@ SoABuffer:
 - Asks are sorted ascending by price (best ask first)
 - Maximum 1000 levels per side
 - Seqlock protocol: version odd = write in progress, even = stable
+- `sequence_number` and `last_timestamp_ns` are the last update's, written inside its side's
+  seqlock. A snapshot reads them first, under both sides' versions, so they are one update's pair
+  and every update up to it is in both sides (#239)

@@ -4251,6 +4251,20 @@ Learned the hard way. Check here before debugging.
      207-230 faults and 0.51-0.54 after 313-318, or 0.64-0.75 ms after 37-50 faults - a 2 MiB page to
      zero - and 0.46-0.51 after 81-98. Print the faults beside the time, and when the ranges are wide,
      run more rounds before reading the ratio (#223).
+581. **A label read after a seqlock snapshot can be newer than the snapshot.** `read_book()` read the
+     buffer's sequence number after `read_snapshot()` had copied the sides, so a write between a
+     side's copy and that load labelled a book with an update it did not hold: 22 to 33 books of a
+     run of about a second, under a writer, in a Debug build (#239). Read before the copies, under
+     every seqlock a write to it goes through, a label is a lower bound instead. Which end of a read
+     a label is taken at decides what it promises, and a client resuming from it needs the lower
+     bound.
+582. **A relaxed flag the write path reads is ordered after nothing.** `has_subscribers()` is a
+     relaxed load, and the registration's store is ordered before nothing a writer does. A write can
+     read the flag before the registration is visible while its own stores are still unseen by the
+     subscriber's next read: store buffering, which only sequentially consistent fences on both sides
+     forbid. `Engine::subscribe()` takes the write lock once after registering instead (#239), which
+     puts every write on one side of the call for one lock on a rare path. No test can open that
+     window, so a static test holds the lock where it is.
 
 ## Current state and open problems
 
@@ -4377,6 +4391,13 @@ tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wa
 in the pending queue; and a joiner checks every path of a snapshot's manifest against the filesystem
 on its mesh io thread, 5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
 though the engine writes no such file.
+
+**#239**: a client resuming a subscription from a book loses nothing. The documented order was the
+book, then the subscription, which loses what is written between them (50 of 50 trials of a probe),
+and `read_book()` read the book's number after copying the sides, so a book could be labelled with
+an update it did not hold. The label is read before the sides now, `subscribe()` takes the write
+lock once after registering, and the recipe is subscribe, then the book, then the pushes above its
+number (pitfalls 581-582).
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
 does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%
@@ -4527,10 +4548,12 @@ Four things worth knowing before touching it. **One `read_snapshot()` per answer
 row is emitted: reading a side as its rows are formatted composes the answer from two moments
 separated by up to two thousand levels of formatting, and a book assembled that way can show a
 crossed spread the market never had. It is **not** an atomic read of both sides, and `docs/cli.md`
-says so — that needs one seqlock per buffer instead of one per side, which is a write-path change.
-**Two of the seven columns come from the buffer**, so every row of one answer carries the same
-`timestamp_ns` and `sequence_number`; that is the identity of the snapshot and the number to resume
-a `SUBSCRIBE` from, not a per-level time. And **at capacity a side evicts its worst-priced level**
+says so — making it one needs no write-path change, since a reader can check both versions around
+both copies, but a write to either side would then restart the whole read. **Two of the seven
+columns come from the buffer**, so every row of one answer carries the same `timestamp_ns` and
+`sequence_number`, read before the sides as one update's pair (#239): every update up to that number
+is in the book, which makes it the number to resume a `SUBSCRIBE` from - subscribe first, then take
+the book. And **at capacity a side evicts its worst-priced level**
 rather than refusing the new one, which is what makes "the best N levels" a question all three
 systems can be asked — a design property nobody had reason to write down until the benchmark needed
 it.

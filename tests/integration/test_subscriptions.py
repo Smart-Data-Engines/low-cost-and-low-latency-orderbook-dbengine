@@ -13,9 +13,12 @@ that the two can interleave.
 from __future__ import annotations
 
 import socket
+import threading
 import time
 
 import pytest
+
+from conftest import patience
 
 pytestmark = pytest.mark.subscriptions
 
@@ -324,3 +327,106 @@ def test_a_command_still_works_while_rows_are_being_pushed(cluster) -> None:
     finally:
         client.close()
         writer.close()
+
+
+# ── Resuming a subscription from a book (#239) ─────────────────────────────────────────────────────
+#
+# A client that joins a stream under way needs a state to start from: it subscribes, takes the book,
+# and applies the pushes numbered above the book's. The documentation had the first two the other way
+# round, which loses whatever is written between them - in 48 of 50 trials of the probe that found
+# it. And the book's number was read after its levels, so it could name an update a side did not
+# hold yet, and the push of that update was the one the client dropped as already in the book.
+#
+# This holds the recipe end to end. Through a node, a write landing inside a book's read is rare:
+# master's server passed it too, with no book of 4 065 behind its number. The race is found in
+# process, by `QueryBook.ABookHoldsEveryUpdateUpToTheSequenceNumberItReports`.
+
+@pytest.mark.subscriptions
+def test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss(cluster) -> None:
+    from orderbook_engine import BookUpdate, OrderbookEngine
+
+    port = cluster.primary().tcp_port
+    symbol, exchange = "RESUMESYM", "RESUMEX"
+    best = 2_000_999
+    # A thousand levels a side, as many as a side holds, so that a book takes as long to copy as a
+    # live one can: the label used to be read after the copies, and the copies were the window.
+    setup = OrderbookEngine(host="127.0.0.1", port=port, timeout=patience(10))
+    try:
+        setup.insert(symbol, exchange, "ask", [5_000_000 + i for i in range(1000)], [1] * 1000)
+        setup.insert(symbol, exchange, "bid", [2_000_000 + i for i in range(1000)], [1] * 1000)
+    finally:
+        setup.close()
+
+    # The writer sets the best bid's quantity to a counter of its own, so the quantity in a book or
+    # in a push says which of its updates that is. In batches, which the node applies back to back,
+    # so that the books are taken among dense writes.
+    stop = threading.Event()
+    failures: list[BaseException] = []
+
+    def write() -> None:
+        writer = OrderbookEngine(host="127.0.0.1", port=port, timeout=patience(10))
+        try:
+            k = 1
+            while not stop.is_set():
+                batch = [BookUpdate(symbol, exchange, "bid", [best], [k + i]) for i in range(1, 33)]
+                refused = [o for o in writer.insert_batch(batch) if not o.ok]
+                assert not refused, f"the node refused a write: {refused[0]}"
+                k += len(batch)
+        except BaseException as e:  # noqa: BLE001 - reported by the assertion below
+            failures.append(e)
+        finally:
+            writer.close()
+
+    reader = OrderbookEngine(host="127.0.0.1", port=port, timeout=patience(10))
+    books: list[tuple[int, int]] = []   # (sequence number, the best bid's quantity)
+    pushed: dict[int, int] = {}         # sequence number -> quantity, every push being the best bid
+
+    def take(rows) -> None:
+        for _, row in rows:
+            assert row.side == "bid" and row.price == best, row
+            pushed[row.sequence_number] = row.quantity
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    try:
+        time.sleep(0.2)   # the stream is under way before the client joins it
+        sub_id = reader.subscribe(symbol, exchange)
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            rows = reader.book(symbol, exchange, depth=1)
+            bid = next(r for r in rows if r.side == "bid")
+            assert bid.price == best, rows
+            books.append((bid.sequence_number, bid.quantity))
+            take(reader.poll(0.0))   # what arrived in front of the book's answer
+    finally:
+        stop.set()
+        thread.join(timeout=patience(30))
+    assert not failures, f"the writer failed: {failures[0]!r}"
+
+    # Every push up to the last update, which a book taken now names.
+    final = reader.book(symbol, exchange, depth=1)
+    last = next(r for r in final if r.side == "bid").sequence_number
+    deadline = time.time() + patience(10)
+    while last not in pushed and time.time() < deadline:
+        take(reader.poll(0.5))
+    reader.unsubscribe(sub_id)
+    reader.close()
+
+    first = books[0][0]
+    print(f"{len(books)} books, numbers {first} to {books[-1][0]}; {len(pushed)} pushes to {last}")
+    # The control: the books raced the writer rather than reading a book that stood still.
+    assert len(books) >= 50 and books[-1][0] - first >= 100, \
+        f"{len(books)} books, the writer moved {books[-1][0] - first} updates under them"
+
+    # The resumption: from the first book, every update above its number arrived as a push.
+    missing = [n for n in range(first + 1, last + 1) if n not in pushed]
+    assert not missing, (f"{len(missing)} of the {last - first} updates after the first book "
+                         f"({first}) were never pushed, the first of them {missing[:5]}")
+
+    # The label: a book holds every update up to its number, so its best bid shows at least the
+    # quantity that update set. A book labelled newer than it is shows less, and the push the client
+    # drops as already in the book is an update it never sees.
+    behind = [(s, q, pushed[s]) for s, q in books if s in pushed and pushed[s] > q]
+    assert not behind, (f"{len(behind)} of {len(books)} books did not hold the update they were "
+                        f"labelled with: (number, quantity shown, quantity of that update) "
+                        f"{behind[:5]}")
