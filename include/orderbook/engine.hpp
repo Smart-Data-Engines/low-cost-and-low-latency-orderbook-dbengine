@@ -15,6 +15,7 @@
 #include "orderbook/query_engine.hpp"
 #include "orderbook/snapshot.hpp"
 #include "orderbook/replication.hpp"
+#include "orderbook/book_arena.hpp"
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/sequence_tracker.hpp"
 #include "orderbook/version_vector.hpp"
@@ -272,6 +273,15 @@ public:
     /// Whether the flush tick merges small segments (#165 part 2b): on unless `--compaction off`.
     /// Not a tuning knob - a valve on a process that rewrites what is stored. Before open().
     void set_compaction_enabled(bool enabled) { compaction_enabled_ = enabled; }
+
+    /// Whether the books are carved out of 2 MiB regions the kernel is asked to back with huge
+    /// pages (#51, `--book-huge-pages`): on unless set off, which allocates each book from the heap
+    /// as before. Before the first book - a book already made stays where it is, so a later call
+    /// throws std::logic_error.
+    void set_book_huge_pages(bool on);
+    bool book_huge_pages() const { return book_arena_ != nullptr; }
+    /// The 2 MiB regions the books are in; 0 when they are the heap's.
+    size_t book_arena_regions() const { return book_arena_ ? book_arena_->regions() : 0; }
 
     /// The format this node writes segments in (`--segment-format`): 3 unless told 2. Before open(),
     /// so that nothing - a replay's seal included - is written in the other.
@@ -799,6 +809,8 @@ private:
     // index of the same keys, populated and cleared in the same three places; one map cannot
     // disagree with itself.
     std::unordered_map<std::string, std::shared_ptr<SoABuffer>> buffers_;
+    // Where a new book's memory comes from (#51): this arena, or the heap when it is null.
+    std::shared_ptr<BookArena> book_arena_ = std::make_shared<BookArena>(/*huge_pages=*/true);
 
     // Per-symbol ColumnarStores
     std::unordered_map<std::string, std::unique_ptr<ColumnarStore>> stores_;

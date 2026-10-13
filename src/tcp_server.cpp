@@ -1072,6 +1072,7 @@ const std::vector<std::string>& known_flags() {
         "auth-secret-file",
         "backup-dir",
         "bind",
+        "book-huge-pages",
         "cluster-secret-file",
         "compaction",
         "data-dir",
@@ -1164,6 +1165,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "
                                   "(default: on)"}},
+        {"book-huge-pages", {"on|off", "Whether the books are made in 2 MiB regions the kernel is asked "
+                                       "to back with transparent huge pages (default: on)"}},
         {"write-admission", {"on|off", "Whether writes are taken at the rate the device takes them once "
                                        "a flush tick shows it behind, rather than every writer stopping "
                                        "at a full pending queue (default: on)"}},
@@ -1639,6 +1642,17 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                              val.c_str());
                 std::exit(1);
             }
+        } else if (arg == "--book-huge-pages") {
+            const std::string val{cursor.value()};
+            if (val == "on") {
+                config.book_huge_pages = true;
+            } else if (val == "off") {
+                config.book_huge_pages = false;
+            } else {
+                std::fprintf(stderr, "Error: --book-huge-pages expects on or off, got '%s'\n",
+                             val.c_str());
+                std::exit(1);
+            }
         } else if (arg == "--segment-format") {
             const std::string val{cursor.value()};
             if (val == "2" || val == "3") {
@@ -1986,6 +2000,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("migration-identity", c.migration_identity.empty() ? "(none)" : c.migration_identity);
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
     line("compaction", c.compaction ? "on" : "off");
+    line("book-huge-pages", c.book_huge_pages ? "on" : "off");
     line("write-admission", c.write_admission ? "on" : "off");
     line("segment-format", std::to_string(c.segment_format));
     line("decoded-cache-mb", std::to_string(c.decoded_cache_mb));
@@ -3098,6 +3113,7 @@ void TcpServer::run() {
     // Wire up the dynamic read-only flag so failover transitions toggle it.
     engine_->set_read_only_flag(&read_only_);
     engine_->set_compaction_enabled(config_.compaction);
+    engine_->set_book_huge_pages(config_.book_huge_pages);
     engine_->set_write_admission_enabled(config_.write_admission);
     engine_->set_segment_version(config_.segment_format);
     engine_->set_decoded_columns_budget(static_cast<size_t>(config_.decoded_cache_mb) << 20);

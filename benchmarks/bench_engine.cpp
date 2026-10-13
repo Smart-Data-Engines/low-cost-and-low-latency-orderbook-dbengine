@@ -15,16 +15,21 @@
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include <sys/prctl.h>
 #include <sys/statfs.h>
 
 #include "orderbook/aggregation.hpp"
+#include "orderbook/book_arena.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/response_formatter.hpp"
@@ -191,6 +196,194 @@ static void BM_IngestionThroughputBatched(benchmark::State& state) {
 BENCHMARK(BM_IngestionThroughputBatched)
     ->Unit(benchmark::kNanosecond)
     ->MinTime(2.0);
+
+// ── BM_IngestionAcrossSymbols, BM_BookUpdateAcrossSymbols ─────────────────────
+//
+// Every benchmark above writes one book, and one book's pages never leave the TLB. A feed of
+// thousands of instruments writes a different book almost every update. A side of a book is 24 KB,
+// and an update to its top touches four of its 4 KiB pages - the prices, the quantities, the order
+// counts and the seqlock's version - and the book's header a fifth; 4 000 books are some 20 000
+// such pages, more than a core's TLB maps (#51).
+//
+// These two apply the batched benchmark's update - twenty levels, one side - to the next of N books
+// in a fixed pseudo-random order: through the engine, and through the book alone, which is the
+// part whose pages huge pages would change. Read them beside a run with huge pages to see what
+// the TLB costs; N = 1 is the benchmarks above.
+
+/// Where the books of the two benchmarks below are made, from OB_BENCH_BOOKS:
+///   - `huge` (the default, and the engine's): the book arena, its regions advised for huge pages;
+///   - `arena`: the same arena with transparent huge pages off for the whole process
+///     (PR_SET_THP_DISABLE), which leaves the advice nothing to act on;
+///   - `heap`: each book its own allocation, as before #51.
+/// `arena` against `huge` is the huge pages' share; `heap` against `arena`, the arena's own.
+enum class BookMemory { Huge, Arena, Heap };
+
+BookMemory book_memory() {
+    static const BookMemory mode = [] {
+        const char* v = std::getenv("OB_BENCH_BOOKS");
+        const std::string s = v ? v : "huge";
+        if (s == "arena") {
+            if (::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) != 0) {
+                std::fprintf(stderr, "bench_engine: PR_SET_THP_DISABLE failed: %s\n", std::strerror(errno));
+                std::exit(2);
+            }
+            return BookMemory::Arena;
+        }
+        if (s == "heap") return BookMemory::Heap;
+        if (s != "huge") {
+            std::fprintf(stderr, "bench_engine: OB_BENCH_BOOKS is huge, arena or heap, not '%s'\n", s.c_str());
+            std::exit(2);
+        }
+        return BookMemory::Huge;
+    }();
+    return mode;
+}
+
+/// A fixed order of books, so that every run - and every build - writes the same sequence.
+std::vector<uint32_t> book_order(size_t n_books) {
+    std::vector<uint32_t> order(1u << 16);
+    uint64_t x = 0;   // splitmix64, seeded the same every run
+    for (auto& o : order) {
+        x += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        o = static_cast<uint32_t>((z ^ (z >> 31)) % n_books);
+    }
+    return order;
+}
+
+static void BM_IngestionAcrossSymbols(benchmark::State& state) {
+    constexpr uint16_t kLevels = 20;
+    const auto n_books = static_cast<size_t>(state.range(0));
+
+    TempDir tmp;
+    ob::Engine engine(tmp.path.string(), /*flush_interval_ns=*/1'000'000'000ULL);
+    engine.set_book_huge_pages(book_memory() != BookMemory::Heap);
+    engine.open();
+
+    std::vector<std::string> symbols(n_books);
+    for (size_t i = 0; i < n_books; ++i) symbols[i] = "SYM" + std::to_string(i);
+    const auto order = book_order(n_books);
+
+    ob::DeltaUpdate du{};
+    std::vector<ob::Level> levels;
+    make_delta(du, levels, 0, 0, kLevels);
+    du.sequence_number = 0;   // the engine numbers each book's updates itself: no gaps to report
+    uint64_t ts = 1'700'000'000'000'000'000ULL;
+    // Every book exists before the clock starts: what is measured is a write, not a book's creation.
+    for (const auto& s : symbols) {
+        std::memset(du.symbol, 0, sizeof(du.symbol));
+        std::memcpy(du.symbol, s.data(), s.size());
+        du.timestamp_ns = ++ts;
+        engine.apply_delta(du, levels.data());
+    }
+
+    size_t next = 0;
+    int64_t applied_levels = 0;
+    for (auto _ : state) {
+        const std::string& s = symbols[order[next++ & (order.size() - 1)]];
+        std::memset(du.symbol, 0, sizeof(du.symbol));
+        std::memcpy(du.symbol, s.data(), s.size());
+        du.timestamp_ns = ++ts;
+        benchmark::DoNotOptimize(engine.apply_delta(du, levels.data()));
+        applied_levels += kLevels;
+    }
+
+    engine.close();
+    state.SetItemsProcessed(applied_levels);
+    state.SetLabel("levels/sec, twenty per update, each update to the next of N books");
+}
+BENCHMARK(BM_IngestionAcrossSymbols)
+    ->Arg(1)->Arg(64)->Arg(4000)
+    ->Unit(benchmark::kNanosecond)
+    ->MinTime(2.0);
+
+static void BM_BookUpdateAcrossSymbols(benchmark::State& state) {
+    constexpr uint16_t kLevels = 20;
+    const auto n_books = static_cast<size_t>(state.range(0));
+
+    // Made as the engine makes them.
+    std::vector<std::shared_ptr<ob::SoABuffer>> books(n_books);
+    const auto arena = std::make_shared<ob::BookArena>(/*huge_pages=*/true);
+    for (auto& b : books) {
+        b = book_memory() == BookMemory::Heap
+                ? std::make_shared<ob::SoABuffer>()
+                : std::allocate_shared<ob::SoABuffer>(ob::BookArenaAllocator<ob::SoABuffer>(arena));
+    }
+    const auto order = book_order(n_books);
+
+    ob::DeltaUpdate du{};
+    std::vector<ob::Level> levels;
+    make_delta(du, levels, 0, 0, kLevels);
+    std::vector<uint64_t> seq(n_books, 0);
+    bool gap = false;
+    for (size_t i = 0; i < n_books; ++i) {
+        du.sequence_number = ++seq[i];
+        ob::apply_delta(*books[i], du, levels.data(), gap);
+    }
+
+    size_t next = 0;
+    int64_t applied_levels = 0;
+    for (auto _ : state) {
+        const uint32_t i = order[next++ & (order.size() - 1)];
+        du.sequence_number = ++seq[i];
+        benchmark::DoNotOptimize(ob::apply_delta(*books[i], du, levels.data(), gap));
+        applied_levels += kLevels;
+    }
+    state.SetItemsProcessed(applied_levels);
+    state.SetLabel("levels/sec, the book alone");
+}
+BENCHMARK(BM_BookUpdateAcrossSymbols)
+    ->Arg(1)->Arg(64)->Arg(4000)
+    ->Unit(benchmark::kNanosecond)
+    ->MinTime(2.0);
+
+// ── BM_FirstWriteToANewBook ───────────────────────────────────────────────────
+//
+// What a book's memory costs where it is made: the first write to a symbol makes its book, and in
+// the arena one such write in forty-odd opens a region of 2 MiB, which the kernel then backs on its
+// first touch - zeroing a huge page, and with THP's defrag at `madvise`, compacting memory to find
+// one if it must. That write is the one to look at, not the mean: every iteration here is the first
+// write to a new symbol, timed alone, and the percentiles and the worst are reported beside the mean.
+static void BM_FirstWriteToANewBook(benchmark::State& state) {
+    constexpr uint16_t kLevels = 20;
+    TempDir tmp;
+    ob::Engine engine(tmp.path.string(), /*flush_interval_ns=*/1'000'000'000ULL);
+    engine.set_book_huge_pages(book_memory() != BookMemory::Heap);
+    engine.open();
+
+    ob::DeltaUpdate du{};
+    std::vector<ob::Level> levels;
+    make_delta(du, levels, 0, 0, kLevels);
+    du.sequence_number = 0;
+    uint64_t ts = 1'700'000'000'000'000'000ULL;
+    std::vector<double> took;
+    took.reserve(static_cast<size_t>(state.max_iterations));
+    size_t n = 0;
+    for (auto _ : state) {
+        const std::string s = "NEW" + std::to_string(n++);
+        std::memset(du.symbol, 0, sizeof(du.symbol));
+        std::memcpy(du.symbol, s.data(), s.size());
+        du.timestamp_ns = ++ts;
+        const auto t0 = std::chrono::steady_clock::now();
+        benchmark::DoNotOptimize(engine.apply_delta(du, levels.data()));
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        took.push_back(ns);
+        state.SetIterationTime(ns / 1e9);
+    }
+    engine.close();
+    std::sort(took.begin(), took.end());
+    state.counters["p50_us"] = took[took.size() / 2] / 1000;
+    state.counters["p99_us"] = took[took.size() * 99 / 100] / 1000;
+    state.counters["max_us"] = took.back() / 1000;
+    state.SetLabel("the first write to each of N new symbols");
+}
+BENCHMARK(BM_FirstWriteToANewBook)
+    ->UseManualTime()
+    ->Iterations(4000)
+    ->Unit(benchmark::kMicrosecond);
 
 // ── BM_FormatQueryResponse ───────────────────────────────────────────────────
 //

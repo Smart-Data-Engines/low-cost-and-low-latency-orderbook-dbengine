@@ -296,13 +296,12 @@ Limits of this first version:
 
 ## Tuning that is real for this engine
 
-Three of the knobs people expect are **not** tuning for this engine, and saying so is more useful
+Two of the knobs people expect are **not** tuning for this engine, and saying so is more useful
 than listing them:
 
 | Knob | Why it is not here |
 |---|---|
 | `LimitMEMLOCK` | The engine locks no memory. No `mlock`, no `MAP_LOCKED`, no `MAP_HUGETLB` anywhere in the sources — checked, not assumed. Raising the limit would raise it for nothing, and in a unit file it reads as knowledge about the engine's requirements. |
-| Huge pages | `MADV_HUGEPAGE` does not appear in the engine. What transparent huge pages do to the mmap'd segment reads is a property of your kernel's defaults, not of a setting we expose, and **we have not measured it** — so there is no number here to justify changing it. |
 | `MemoryMax`, `CPUQuota` | An engine tuned for particular hardware and then capped below it is a contradiction. If the host is shared, the cap belongs to whatever else is on it. If a CPU cap is there anyway — a container runtime's, a parent slice's — the node reads it, and its startup line says so: `machine: 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs (…)` (#156). |
 
 What does matter:
@@ -358,6 +357,51 @@ sudo sysctl --system
 
 `1` rather than `0`: zero disables swap for the cgroup entirely, which turns memory pressure into
 the OOM killer choosing a victim, and the victim is often the largest process — this one.
+
+### Huge pages for the books
+
+A node holds one book per symbol, 48 KB, and a write to the top of a book touches four of its 4 KiB
+pages and its header a fifth. With thousands of symbols that is more pages than a core's TLB maps,
+so a write to a book written a while ago walks the page table for each of them. Since #51 the books
+are made in regions of 2 MiB, aligned to 2 MiB, which the kernel is asked to back with transparent
+huge pages (`madvise(MADV_HUGEPAGE)`): 43 books to a region, and one TLB entry for all of them.
+`--book-huge-pages off` makes each book on the heap, as before.
+
+What it changes, measured in Release with `bench_engine`, the way of making books rotated in one
+binary, the WAL and segments on tmpfs:
+
+| A write of twenty levels | 4 000 books | 1 or 64 books |
+|---|---|---|
+| to the book alone, EPYC 9R45 (x86), median of 12 | 22.1% faster | within the noise |
+| to the book alone, Graviton (ARM), median of 20 processes | 16.0% faster | within the noise |
+| to the book alone, i3-7100U (a shared laptop), median of 15 processes | 7.0% faster, the processes' spreads overlapping | within the noise |
+| through the whole engine, x86 and ARM, median of 12 | 1.5% and 4.7% faster | within the noise |
+
+Through the whole engine the gain is small beside what the rest of a write costs, and within reach of
+the benchmark's own spread: an earlier session of the same benchmark, on the branch before its
+last change, gave 5.5% and 5.3%.
+
+The cost is in the first write to a new symbol, which makes its book. About one in 43 opens a region,
+and the kernel zeroes a 2 MiB page for it. Of 4 000 new symbols, the first write took 85-92 µs at p99
+on the x86 host and 36-53 µs on the ARM host, against 15-16 µs and 27-30 µs with the books on the
+heap. Its median fell, from 9.0-9.7 µs to 2.2-2.3 µs and from 10.2-10.4 µs to 3.0-3.2 µs, because a
+book on the heap is twelve page faults of its own.
+
+- **What the kernel must allow:** `/sys/kernel/mm/transparent_hugepage/enabled` at `madvise` or
+  `always`. At `never` the advice does nothing, and a write to a book alone measured up to 1% slower
+  than on the heap at 4 000 books.
+- **Fragmented memory:** with THP's `defrag` at `madvise`, as on every machine measured here, the
+  fault that opens a region may compact memory to find a huge page (`compact_stall` in
+  `/proc/vmstat`); none of our runs moved that count. `defer` makes such a fault take small pages at
+  once and leaves the collapse to khugepaged.
+- **What the node got:** `ob_book_arena_regions` counts the regions, and `AnonHugePages` in
+  `/proc/<pid>/smaps_rollup` says how much of the process is on huge pages. Each region is an `INFO`
+  line, and a refused advice a `WARN`.
+- **Not covered:** the rest of the heap - the pending rows, the stores being flushed. With glibc's
+  `glibc.malloc.hugetlb=1` the whole heap goes on huge pages: through the engine at 4 000 books that
+  measured 5.8% faster on the x86 host, where the books alone gave 1.5%, and 3.7% on the ARM host,
+  where they gave 4.7%. It is every allocation of the process, decided by an environment variable,
+  so the engine does not set it.
 
 ### Memory kept after reading a segment
 

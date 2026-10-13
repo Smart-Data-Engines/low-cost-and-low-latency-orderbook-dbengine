@@ -254,6 +254,9 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_segment_merge_refused",
                                  "Segments refused as already indexed (a flush race; should stay 0)"));
     gauges_.push_back(make_gauge("ob_symbol_count",    "Number of tracked symbols"));
+    // #51: the books are made in 2 MiB regions asked to be huge pages, unless --book-huge-pages off.
+    gauges_.push_back(make_gauge("ob_book_arena_regions",
+                                 "Regions of 2 MiB the books are made in (0 with --book-huge-pages off)"));
     gauges_.push_back(make_gauge("ob_current_epoch",   "Current failover epoch"));
     // #215: a replica whose store was replaced to follow a stream holds part of it until its
     // primary says the catch-up ended, and does not stand for election meanwhile.

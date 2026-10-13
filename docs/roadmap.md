@@ -1619,9 +1619,47 @@ glibc maps an allocation afresh and unmaps it on free - not measured here.
 - Per-socket allocation, pinned io threads, `--cpu-affinity` configuration
 - Effort: M | Impact: Tail latency on multi-socket servers, which is where clients run
 
-### 51. Huge pages
+### 51. Huge pages ✅
 - `MADV_HUGEPAGE` / explicit hugetlb for mmap segments and SoA buffers
 - Effort: S | Impact: TLB pressure at large working sets
+
+**Done for the books** (spec `smart-data-engine-workspace/specs/huge-pages/`,
+`evidence/2026-10-13-huge-pages/`). The segments are not mmap'd - a read is `read()` into buffers
+kept between reads (#49 step 2) - so what was left of this item is the books. A book is 48 KB, and a
+write to the top of one side touches four of its 4 KiB pages and its header a fifth. Every benchmark
+here wrote one book, whose pages never leave the TLB, so what thousands cost was not measured until
+two benchmarks wrote to N books in a fixed pseudo-random order.
+
+- **Measured first.** With glibc's `glibc.malloc.hugetlb=1`, the whole heap on huge pages, a write
+  to one of 4 000 books was 22.9% faster at the median on an EPYC 9R45 and 20.0% on the i3-7100U,
+  and no different at 1 or 64. The EPYC's counters put 0.908 page walks on each level written
+  through the engine at 4 000 books, 37% of them in the book's code (`insert_level`, `apply_delta`),
+  and 0.365 with huge pages.
+- **Built.** The books are made in 2 MiB regions, aligned to 2 MiB and advised `MADV_HUGEPAGE`, 43
+  to a region, by a slab of one size with a free list (`BookArena`) behind `std::allocate_shared`.
+  Its allocator holds the arena, so a book a reader holds keeps its memory. `--book-huge-pages off`
+  makes books on the heap as before, and `ob_book_arena_regions` counts the regions.
+- **What it gives,** measured on the code merged (the branch at `bf553a0`, whose sources the merge
+  carries unchanged; only these notes came after), the way of making books rotated in one binary: a write to one of 4 000 books alone is 22.1% faster on the x86 host (median of 12,
+  ranges apart) and 16.0% on the ARM host (median of 20 processes); through the whole engine 1.5%
+  and 4.7%, within reach of that benchmark's spread between sessions (an earlier one gave 5.5% and
+  5.3%); at 1 and 64 books within the noise. On the i3-7100U, which other sessions share, 15
+  processes a mode gave the book alone a median 7.0% faster with the processes' spreads overlapping:
+  the spec asked for ranges apart on all three machines, and the i3 does not meet it. The same arena on 4 KiB pages was up to 1% slower than
+  the heap: the gain is the huge page's, not the slab's.
+- **What it costs.** One first write to a new symbol in 43 opens a region, and the kernel zeroes a
+  huge page for it: 85-92 µs at p99 on the x86 host and 36-53 µs on the ARM host, against 15-16 and
+  27-30 µs on the heap. The median first write fell from about 10 µs to 2-3 µs, because a book on
+  the heap is twelve page faults of its own. No compaction stalled in any run.
+- **The ARM host spreads independently of the TLB.** The same write to one book measured about 140,
+  150 or 200 M levels/s in different processes, in every mode, with the repetitions of one process
+  agreeing. No low bits of a virtual address measured explain it; most likely it is where the
+  physical pages fall in a 64 KB 4-way L1, whose ways are 16 KB. Hence 20 processes a mode there.
+- **Not done.** The rest of the heap - the pending rows and the stores the flush writes. With all of
+  it on huge pages a write through the engine measured 5.8% faster on the x86 host, where the books
+  alone gave 1.5%, and 3.7% on the ARM host, where they gave 4.7%. And a layout of `SoASide` whose top
+  fits on one page would need fewer pages without huge ones, but touches the seqlock's readers and
+  the SIMD aggregation.
 
 ### 52. Shared-memory transport for local clients
 - Zero-copy ring buffer for co-located processes, bypassing TCP entirely
