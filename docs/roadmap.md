@@ -1159,6 +1159,28 @@ flag rather than a file.
   five-minute tutorial that ends with a real query
 - Effort: M | Impact: Reduces evaluation friction; the docs currently require reading the repo
 
+**Built; publishing waits for the owner** (spec `smart-data-engine-workspace/specs/docs-site/`).
+`mkdocs.yml` renders `docs/` as it is: no page is a copy, and `docs-integrity` builds it with
+`--strict`. A link to a page or an anchor that is not there fails the build, so does a page left out
+of the navigation, and so does a link out of `docs/` to a file the repository does not have
+(`scripts/mkdocs_hooks.py` points the ones that are there at GitHub). Three pages are new:
+- the start page, which links to the README's measured figures rather than repeat them;
+- `docs/tutorial.md`, from the v0.1.0 packages to a `SELECT` over `nc` and from Python;
+- `docs/protocol.md`: the banner, commands, the framing of every answer, pushed rows, pipelining,
+  `QUIT`, compression and TLS.
+
+Every exchange the two pages show, and the tutorial's Python, is replayed against the server in the
+integration battery (`tests/integration/test_docs_transcripts.py`). A page that drifts from the
+server is a red test: a changed answer, a missing empty line, a changed output and a page that lost
+its markers each fail it. The README's own `nc` example had drifted that way, with `OK` answers
+missing the empty line that ends them and a timestamp no server writes. It is corrected, and it
+points at the two pages.
+
+What is left is the owner's: turning on GitHub Pages (Settings → Pages → GitHub Actions). After
+that, a workflow that deploys the site on every merge, in a pull request of its own. Until then
+the site is what `mkdocs serve` shows. The tutorial installs the client from the release's wheel
+until v0.1.0 is on PyPI.
+
 ### 41. Client libraries: Rust and Go
 - Thin bindings over the existing C API, published to crates.io and as a Go module
 - Effort: M | Impact: Widens the audience beyond C++ and Python shops

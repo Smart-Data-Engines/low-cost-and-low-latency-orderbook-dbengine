@@ -263,24 +263,32 @@ ob> quit
 ./build/ob_tcp_server --port 5555 --data-dir /tmp/ob_data
 ```
 
-Connect with any TCP client:
+Connect with any TCP client. Every `OK` answer ends with an empty line:
 
 ```bash
 $ nc localhost 5555
 OK ob_tcp_server v0.1.0
+
 PING
 PONG
-INSERT BTC-USD BINANCE bid 6500000 150 3
+INSERT BTC-USD BINANCE bid 6500000 150 3 1700000000000000000
 OK
+
 FLUSH
 OK
+
 SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999
 OK
 timestamp_ns	price	quantity	order_count	side	level	sequence_number
-1700000000000	6500000	150	3	0	0	1
+1700000000000000000	6500000	150	3	0	0	1
 
 QUIT
 ```
+
+The last field of `INSERT` is the time of the update in nanoseconds; leave it out and the node
+stamps arrival time. The [tutorial](docs/tutorial.md) goes from a release to this in five minutes,
+and the [wire protocol](docs/protocol.md) is what a client has to know to read the answers. The
+exchanges on both pages are replayed against the server in CI.
 
 ### Use from Python
 
@@ -429,6 +437,8 @@ docs/                  Documentation
 
 See the [docs/](docs/) directory:
 
+- [Tutorial](docs/tutorial.md) - from a release to a query in five minutes
+- [Wire protocol](docs/protocol.md) - commands, the framing of every answer, pushed rows, pipelining
 - [Architecture Overview](docs/architecture.md)
 - [CLI Reference](docs/cli.md)
 - [Query Language](docs/query-language.md)
