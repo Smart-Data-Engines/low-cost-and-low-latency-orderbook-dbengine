@@ -11,6 +11,11 @@ here as `#N`.
 
 ### Added
 
+- Rolling windows: `GROUP BY TIME_BUCKET(1m) ROLLING 15m` answers every bucket with the aggregates
+  of the fifteen minutes that end with it - the rows' and the series' of the book alike, each what a
+  bucket as wide as the window would answer (#44, step 3). The first windows reach back before the
+  range, the ceiling counts the buckets they reach back to, and the window slides in constant time a
+  bucket. This completes #44.
 - A documentation site, built from `docs/` by MkDocs with `--strict` in CI, and not yet published
   (#40). It brings a five-minute tutorial from the release packages to a query, and a wire protocol
   reference. Every exchange the two show is replayed against the server in the integration battery.

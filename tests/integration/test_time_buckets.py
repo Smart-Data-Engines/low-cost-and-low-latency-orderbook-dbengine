@@ -276,3 +276,49 @@ def test_a_series_refuses_what_it_cannot_read(cluster, book):
         answer = send_command(port, sql).strip()
         assert answer.startswith("ERR") and says in answer, (sql, answer)
 
+
+
+# ── Step 3: rolling windows ───────────────────────────────────────────────────
+
+def test_a_rolling_window_is_the_clients_own_aggregation_over_it(primary_client, written):
+    """`ROLLING 5s` at one-second buckets: each bucket answers the five seconds that end with it,
+    the first ones reaching before the range the query names."""
+    symbol, rows = written
+    lo, hi = BASE + 5 * SEC, BASE + 30 * SEC - 1
+    buckets = primary_client.query_buckets(
+        f"SELECT COUNT(*), FIRST(price), LAST(price), SUM(quantity), VWAP(price) FROM '{symbol}'.'EX' "
+        f"WHERE timestamp >= {lo} AND timestamp <= {hi} GROUP BY TIME_BUCKET(1s) ROLLING 5s")
+    assert [b.start_ns for b in buckets] == [lo + i * SEC for i in range(25)], "every bucket of the range"
+    for b in buckets:
+        inside = sorted((r for r in rows if b.start_ns + SEC - 5 * SEC <= r[0] < b.start_ns + SEC),
+                        key=lambda r: r[0])
+        assert b.values["COUNT(*)"].value == len(inside), b.start_ns
+        if not inside:
+            assert b.values["FIRST(price)"].value is None
+            continue
+        assert b.values["FIRST(price)"].value == inside[0][1]
+        assert b.values["LAST(price)"].value == inside[-1][1]
+        q = sum(r[2] for r in inside)
+        assert b.values["SUM(quantity)"].value == q
+        vwap = b.values["VWAP(price)"].value
+        assert vwap == (None if q == 0 else sum(r[1] * r[2] for r in inside) * 1_000_000 // q), b.start_ns
+
+
+def test_a_rolling_series_is_the_series_of_a_bucket_as_wide_as_the_window(primary_client, book):
+    """`ROLLING 4s` at one-second buckets: a window that starts on a multiple of four seconds is the
+    four-second bucket the client computes from the level-0 rows - requirement 9.4, over the wire."""
+    rows = primary_client.query(f"SELECT * FROM '{book}'.'EX' WHERE level = 0")
+    want = series_by_client(rows, 4 * SEC)
+    asked = [f"{fn}({series})" for series in ("bid", "mid") for fn in ("OPEN", "HIGH", "LOW", "CLOSE", "TWAP")]
+    buckets = primary_client.query_buckets(
+        f"SELECT {', '.join(asked)} FROM '{book}'.'EX' GROUP BY TIME_BUCKET(1s) ROLLING 4s")
+    lo = min(r.timestamp_ns for r in rows)
+    compared = 0
+    for b in buckets:
+        window_start = b.start_ns + SEC - 4 * SEC
+        if window_start % (4 * SEC) or window_start < lo:
+            continue
+        for name in asked:
+            assert b.values[name].value == want[window_start][name], (b.start_ns, name, b.values[name])
+        compared += 1
+    assert compared >= 9, f"only {compared} windows compared - the oracle checked almost nothing"

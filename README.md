@@ -196,6 +196,10 @@ in the harness installs anything, and a containerised competitor would measure t
 - **SQL-like query language** with time-range filters and aggregations. A `SELECT` answers the
   columns it names, in the order it names them, and the server decodes only the columns needed
   to answer it — including a column a predicate reads and the answer does not carry
+- **Time buckets and rolling windows** — `GROUP BY TIME_BUCKET(1m)` answers bars of the stored
+  rows (`FIRST`, `MIN`, `MAX`, `LAST`, `VWAP`, ...) and of the book itself (`OPEN`, `HIGH`, `LOW`,
+  `CLOSE`, `TWAP` of the bid, the ask, the mid or the spread), and `ROLLING 15m` the same over the
+  window that ends with each bucket ([query language](docs/query-language.md#time-buckets))
 - **The live book, on the wire** — `BOOK <symbol> <exchange> [depth]` returns the current levels of
   both sides from the structure the engine updates in place, under one seqlock read, bids first and
   each side in its own order. Distinct from `SELECT`, which reads history and answers with every
