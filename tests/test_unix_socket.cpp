@@ -200,6 +200,15 @@ std::unique_ptr<Wire> to_port(uint16_t port) {
 
 bool greeted(const std::string& greeting) { return greeting.rfind("OK ob_tcp_server v", 0) == 0; }
 
+/// Whether a connection to the port is accepted at all.
+bool to_port_answers(uint16_t port) {
+    std::string why;
+    const int fd = ob::net::dial("127.0.0.1", port, 500, false, why, "test");
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
+
 /// The client's half of `AUTH`; the server's last answer.
 std::string authenticate(Wire& w, const std::string& identity, const std::string& secret) {
     const std::string challenge = w.ask("AUTH");
@@ -319,12 +328,18 @@ TEST(UnixSocketServer, TlsOnThePortLeavesTheSocketPlain) {
     config.tls_key_file  = key;
     Running server(config);
 
-    // Through the socket: no handshake, the banner and a PING in plain text.
+    // Through the socket: no handshake, the banner and a PING in plain text - on the loop that
+    // accepted the connection, and on the one the next is handed to.
     auto local = through(config.unix_socket);
     ASSERT_TRUE(local);
     const std::string banner = local->greeting();
     ASSERT_TRUE(greeted(banner)) << banner;
     EXPECT_EQ(local->ask("PING"), "PONG\n");
+    auto handed = through(config.unix_socket);
+    ASSERT_TRUE(handed);
+    const std::string second = handed->greeting();
+    ASSERT_TRUE(greeted(second)) << second;
+    EXPECT_EQ(handed->ask("PING"), "PONG\n");
 
     // Through the port, the same bytes are the start of a handshake that fails: no banner, no PONG.
     auto remote = to_port(config.port);
@@ -334,6 +349,7 @@ TEST(UnixSocketServer, TlsOnThePortLeavesTheSocketPlain) {
     EXPECT_FALSE(greeted(over_tcp)) << over_tcp;
 
     local.reset();
+    handed.reset();
     remote.reset();
     server.stop();
 }
@@ -373,6 +389,39 @@ TEST(UnixSocketServer, OneSessionLimitForBothTransports) {
 
     local.reset();
     server.stop();
+}
+
+TEST(UnixSocketServer, ADrainClosesTheSocketWithThePort) {
+    // Requirement 3.4. A session left open holds the drain, so the socket's refusal is seen while
+    // the server is still running: an open listener would answer "server shutting down" instead,
+    // and after run() returns the file is gone, which is a different error.
+    Dir dir;
+    auto config             = config_in(dir, port_at(90));
+    config.drain_timeout_ms = 10000;
+    Running server(config);
+    auto held = through(config.unix_socket);
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(greeted(held->greeting()));
+
+    std::thread stopper([&] { server.stop(); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::string why;
+    bool refused = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int fd = ob::net::dial_unix(config.unix_socket, 200, false, why);
+        if (fd < 0 && why == std::strerror(ECONNREFUSED)) {
+            refused = true;
+            break;
+        }
+        if (fd >= 0) ::close(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(refused) << "the socket took connections while the server drained; last: " << why;
+    EXPECT_TRUE(exists(config.unix_socket)) << "the drain was over before the socket refused";
+    EXPECT_FALSE(to_port_answers(config.port)) << "the port is still open in the drain";
+
+    held.reset();   // the drain ends with the last session
+    stopper.join();
 }
 
 TEST(UnixSocketServer, TheFileTakesItsModeAndGoesWithTheServer) {
