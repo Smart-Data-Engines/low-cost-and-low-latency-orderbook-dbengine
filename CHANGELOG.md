@@ -11,6 +11,14 @@ here as `#N`.
 
 ### Added
 
+- A certificate is replaced without a restart (#238). `SIGHUP` - `systemctl reload`, through the
+  unit's new `ExecReload` - reads the TLS certificate, key and CA again from the paths the node
+  started with, for every surface at once. New connections get the new certificate and open ones
+  finish on theirs. Files the start would refuse are refused, and then every surface keeps the
+  certificate it had and the node goes on. `ob_tls_reloads_total`, `ob_tls_reload_failures_total`
+  and `ob_tls_certificate_not_after_seconds` follow it. Two alerts come with them,
+  `OrderbookCertificateExpiring` two weeks before the end and `OrderbookTlsReloadFailed`, and a
+  dashboard row ("Replacing a certificate" in `docs/operations.md`).
 - The decoded columns a node holds between queries (#220) are held in an arena of 2 MiB regions
   (#223): a column evicted gives its memory back to the next, and the regions of the larger columns
   are advised for transparent huge pages. A query's first read of a large segment measured 0.38 to
@@ -43,6 +51,9 @@ here as `#N`.
 
 ### Changed
 
+- `SIGHUP` does not stop the server (#238). Nothing handled it, so its default action ended the
+  process. A node without TLS now logs that there is nothing to reload and goes on, and `SIGTERM` is
+  the signal that stops a node.
 - A narrow column of three, five, six or seven bytes a value decodes up to six times faster: each
   value is put together in a register, where a `memcpy` into a zeroed 64-bit value went through a
   stack slot no load could be forwarded from (#223). Decoding binance-top20's seven columns went from
@@ -60,6 +71,8 @@ here as `#N`.
 
 ### Fixed
 
+- The man page said nothing on the wire is encrypted, which stopped being true with #30. It names the
+  three TLS surfaces now, and the signals the server takes (#238).
 - The Python client finds and cuts an answer in bytes, and decodes it after. It cut by the length
   of the decoded text encoded again, so a byte that is not UTF-8 took two bytes of the next answer
   of a pipelined batch with it. Bytes that begin no answer are refused at once by name, where they

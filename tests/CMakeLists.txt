@@ -1194,6 +1194,12 @@ target_compile_definitions(test_tls_node_link
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# The certificate read again without a restart (#238): handshakes over a socket pair on each side of
+# a reload, and the refusals that leave the certificate in force.
+ob_add_tcp_test(test_tls_reload
+    test_tls_reload.cpp
+)
+
 # The C++ client's TLS path against a real handshake, plus the name check that turns chain
 # verification into peer verification.
 add_executable(test_tls_client test_tls_client.cpp)

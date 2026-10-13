@@ -58,9 +58,10 @@ struct ReplicationConfig {
     /// TLS for accepted replica connections (#30 part three, series D). Null = plaintext.
     ///
     /// A `node_server` context: it presents this node's certificate and **requires** one from the
-    /// replica, so there is no flag here saying whether to verify. Built once at startup, so a
-    /// certificate that does not load stops the process rather than every handshake.
-    std::shared_ptr<TlsContext> tls_server;
+    /// replica, so there is no flag here saying whether to verify. Built at startup, so a
+    /// certificate that does not load stops the process rather than every handshake, and taken
+    /// from the surface at each accept, so a reload (#238) reaches the next replica to connect.
+    std::shared_ptr<TlsSurface> tls_server;
 };
 
 struct ReplicationClientConfig {
@@ -77,8 +78,9 @@ struct ReplicationClientConfig {
     /// A `node_client` context. The name this side requires is `primary_host` as given, pinned
     /// through `tls_expect_host()`: an address needs an `IP:` SAN in the primary's certificate and a
     /// name a `DNS:` one. `connect_to_primary()` resolves a name since #236, and the check stays on
-    /// the name rather than on the address it resolved to.
-    std::shared_ptr<TlsContext> tls_client;
+    /// the name rather than on the address it resolved to. Taken from the surface at each
+    /// connection, so a reload (#238) reaches the next one.
+    std::shared_ptr<TlsSurface> tls_client;
 
     // Snapshot bootstrap configuration
     size_t      snapshot_chunk_size{262144};     // --snapshot-chunk-size (default 256 KB)

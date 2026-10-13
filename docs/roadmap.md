@@ -2677,6 +2677,69 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 238. A renewed certificate needed a restart of every node ✅ **P3**
+
+**One of the known gaps until now.** The certificate, key and CA of the three TLS surfaces were read
+once, at the start, and the caveats said: certificate rotation needs a restart, one node at a time.
+A certificate from ACME lives 90 days, and each renewal was a restart of the whole cluster, node by
+node. Spec: `smart-data-engine-workspace/specs/tls-reload/`.
+
+**Done.** `SIGHUP` reads the three files again from the paths the node started with, and
+`systemctl reload` sends it, through the unit's new `ExecReload`:
+- each surface holds its context in a `TlsSurface`, and the four places that open a connection take
+  the one in force when they do. An accepted client, an accepted replica, a replica dialling its
+  primary and a mesh link alike. A connection already open finishes on the context its `SSL` holds;
+- `build_tls_contexts()` is the start's checks, throwing. The start exits on the refusal, and a
+  reload logs it and keeps every context in force. Every surface or none: a CA bundle the node links
+  refuse is refused for the client port too, which reads no CA;
+- INFO with the new certificate's subject and end of validity, ERROR with the refusal, which names
+  the file. `ob_tls_reloads_total`, `ob_tls_reload_failures_total` and
+  `ob_tls_certificate_not_after_seconds` follow it, with `OrderbookCertificateExpiring` (two weeks
+  before) and `OrderbookTlsReloadFailed` in the shipped rules and a row on the dashboard;
+- `SIGHUP` is blocked in every thread but the one that handles it, `ob-signals`. The kernel runs a
+  process's handler on any thread that does not block the signal. On a thread in `epoll_wait`, or in
+  a `recv` on a socket with a receive timeout, that call then fails with EINTR whatever
+  `SA_RESTART` says. The replica's stream reader counts that failure as a disconnect. That was
+  harmless while every signal the server handled ended it;
+- a node without TLS logs that there is nothing to reload. Until now `SIGHUP` had no handler, and its
+  default action ended the server: a change of behaviour, in the CHANGELOG.
+
+The man page still said nothing on the wire was encrypted, which stopped being true with #30. It
+names the three surfaces now, and the signals.
+
+**Tests.** `test_tls_reload.cpp`, seven, over a socket pair:
+- a connection opened before a reload finishes its handshake on certificate A, and the one after is
+  shown B;
+- three refused renewals leave every surface on A and count three failures: half a renewal, a key
+  others may read, no certificate;
+- a broken CA bundle keeps even the client port on A.
+
+`test_tls_reload.py`, six, against live nodes:
+- the client port and the replication link before and after a reload, and the connection opened
+  before still served;
+- a refused renewal: the node up, still on A, the failure counted;
+- a replica that dials its restarted primary with the certificate it reloaded;
+- a mesh node whose restarted peer logs its renewed identity;
+- a node without TLS through two `SIGHUP`s;
+- `/proc` showing `SIGHUP` open in one thread of the node, `ob-signals`.
+
+**Mutations: 23, each killed** - thirteen by the unit tests, eight by the live module and two by the
+alert check:
+- a surface whose swap does nothing, a refusal that falls through to the swap, the node links built
+  in a `try` that swallows their refusal, each of the five surfaces left out of the swap;
+- the gauge not set at the start, or not after a reload, or always 0; the failure not counted; the
+  branch for a node without TLS gone; the end of validity read as its start;
+- each of the four use sites holding on to the context of its first connection (a `static`), which
+  only the live tests see;
+- the handler not installed, the block not made, the monitor not reloading;
+- the expiry alert without its `> 0`, the refusal alert at `> 1`.
+
+Two controls survived: a log line no test reads reworded, its new text checked in the binary, and an
+alert's summary reworded.
+
+- Effort: S | Impact: a renewal no longer restarts a cluster node by node; a certificate about to
+  expire pages two weeks ahead
+
 ### 237. The Python client cut an answer by the length of its text encoded again, and waited out its timeout on bytes no answer begins with ✅ **P3**
 
 **Found by the C++ SDK port, findings 35 and 36.** Both are in `_recv_plain_response()`, which
@@ -14955,7 +15018,8 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   verify the chain *and* the name; on the node links verification is mutual and cannot be configured
   otherwise. Three things are still worth a reviewer's notice. **Every one of those flags defaults
   to off**, so a cluster that nobody configured is plaintext on all three surfaces and says so only
-  in its startup log. **Certificate rotation needs a restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
+  in its startup log. **`--tls-peer-names` is read only at the start**: a certificate is replaced
+  with `SIGHUP` since #238, but narrowing who may join is a restart. And **`--tls-peer-names` empty means chain-only verification**,
   which under a company-wide CA means any host it signs may join the cluster — the list is the
   mechanism that narrows that, and the startup log names which mode is in force.
   *(This bullet used to say the replication link and the mesh were plaintext. That was true until

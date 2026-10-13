@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <stdexcept>
 #include <charconv>
 #include <limits>
@@ -46,38 +47,57 @@
 
 namespace ob {
 
-// ── execute_command ───────────────────────────────────────────────────────────
+// ── TLS and secrets, loaded at the start ──────────────────────────────────────
 
-/// Commands a session may run before it has authenticated.
-///
-/// AUTH is how it authenticates. PING is here so that a load balancer's health check needs no
-/// credentials and reveals nothing about the data. QUIT is here because refusing a client's request
-/// to leave would be absurd, and because a client that cannot leave holds a session slot.
-LoadedTlsContexts load_tls_or_exit(const ServerConfig& config) {
+namespace {
+
+/// `epoch` as `2027-01-11T09:30:00Z`, for a log line an operator compares with a calendar.
+std::string utc_timestamp(int64_t epoch) {
+    const time_t t = static_cast<time_t>(epoch);
+    struct tm tm {};
+    char buf[32];
+    if (::gmtime_r(&t, &tm) == nullptr ||
+        std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm) == 0) {
+        return std::to_string(epoch);
+    }
+    return buf;
+}
+
+/// The surface's context, for reading what it presents; the client port first, because every
+/// surface presents the certificate in `--tls-cert-file`.
+std::shared_ptr<const TlsContext> any_context(const LoadedTlsContexts& tls) {
+    for (const auto* surface : {&tls.client_port, &tls.replication_server, &tls.replication_client,
+                                &tls.mesh_server, &tls.mesh_client}) {
+        if (*surface) return (*surface)->current();
+    }
+    return nullptr;
+}
+
+/// "subject /CN=node1, valid until 2027-01-11T09:30:00Z": what an operator checks after a renewal.
+std::string describe_certificate(const TlsContext& ctx) {
+    const auto not_after = ctx.certificate_not_after();
+    return "subject " + ctx.certificate_subject() + ", valid until " +
+           (not_after ? utc_timestamp(*not_after) : std::string("(unknown)"));
+}
+
+/// A surface holding `ctx`, for the start and for a reload to build alike.
+std::shared_ptr<TlsSurface> surface_of(TlsContext ctx) {
+    return std::make_shared<TlsSurface>(std::make_shared<const TlsContext>(std::move(ctx)));
+}
+
+} // namespace
+
+LoadedTlsContexts build_tls_contexts(const ServerConfig& config) {
     LoadedTlsContexts out;
     const bool any_node_link = config.tls_replication || config.tls_multi_master;
     const bool any_surface   = config.tls_client || any_node_link;
-
-    if (!any_surface) {
-        if (!config.tls_cert_file.empty() || !config.tls_key_file.empty() ||
-            !config.tls_ca_file.empty()   || !config.tls_peer_names.empty()) {
-            // A warning here and a *refusal* in the clients, deliberately, because the two have
-            // different innocent explanations. On a server this is a staged rollout: the paths go
-            // into ob.conf on every node first and the surface flags follow, which is the right way
-            // to do it. A client call has no such story - `tls_ca_file` without `tls` is one
-            // expression written by someone who believes the connection is encrypted.
-            OB_LOG_WARN("tls", "TLS files or peer names were given but no --tls-* surface is "
-                               "enabled, so this node listens and dials in plaintext");
-        }
-        return out;
-    }
+    if (!any_surface) return out;
 
     if (config.tls_cert_file.empty() || config.tls_key_file.empty()) {
         // Refused rather than falling back: a `--tls-*` flag that quietly meant plaintext is the
         // worst possible outcome of this feature.
-        std::fprintf(stderr, "Error: --tls-client, --tls-replication and --tls-multi-master each "
-                             "need both --tls-cert-file and --tls-key-file\n");
-        std::exit(1);
+        throw std::runtime_error("--tls-client, --tls-replication and --tls-multi-master each need "
+                                 "both --tls-cert-file and --tls-key-file");
     }
 
     if (any_node_link && config.tls_ca_file.empty()) {
@@ -86,51 +106,116 @@ LoadedTlsContexts load_tls_or_exit(const ServerConfig& config) {
         // ends each believing they are talking to the cluster - and reads as protection. There is no
         // fallback to the system trust store either: that would mean every public CA may introduce a
         // replica.
-        std::fprintf(stderr,
-                     "Error: --tls-replication and --tls-multi-master need --tls-ca-file. A node "
-                     "link verifies its peer's certificate in both directions; without a trust "
-                     "anchor it would encrypt without authenticating, which leaves the relay "
-                     "described in SECURITY.md open.\n");
+        throw std::runtime_error(
+            "--tls-replication and --tls-multi-master need --tls-ca-file. A node link verifies its "
+            "peer's certificate in both directions; without a trust anchor it would encrypt without "
+            "authenticating, which leaves the relay described in SECURITY.md open.");
+    }
+
+    if (config.tls_client) {
+        out.client_port = surface_of(TlsContext::server(config.tls_cert_file, config.tls_key_file));
+    }
+    if (config.tls_replication) {
+        out.replication_server = surface_of(TlsContext::node_server(
+            config.tls_cert_file, config.tls_key_file, config.tls_ca_file, config.tls_peer_names));
+        out.replication_client = surface_of(TlsContext::node_client(
+            config.tls_cert_file, config.tls_key_file, config.tls_ca_file, config.tls_peer_names));
+    }
+    if (config.tls_multi_master) {
+        out.mesh_server = surface_of(TlsContext::node_server(
+            config.tls_cert_file, config.tls_key_file, config.tls_ca_file, config.tls_peer_names));
+        out.mesh_client = surface_of(TlsContext::node_client(
+            config.tls_cert_file, config.tls_key_file, config.tls_ca_file, config.tls_peer_names));
+    }
+    return out;
+}
+
+LoadedTlsContexts load_tls_or_exit(const ServerConfig& config) {
+    const bool any_node_link = config.tls_replication || config.tls_multi_master;
+    const bool any_surface   = config.tls_client || any_node_link;
+
+    if (!any_surface &&
+        (!config.tls_cert_file.empty() || !config.tls_key_file.empty() ||
+         !config.tls_ca_file.empty()   || !config.tls_peer_names.empty())) {
+        // A warning here and a *refusal* in the clients, deliberately, because the two have
+        // different innocent explanations. On a server this is a staged rollout: the paths go
+        // into ob.conf on every node first and the surface flags follow, which is the right way
+        // to do it. A client call has no such story - `tls_ca_file` without `tls` is one
+        // expression written by someone who believes the connection is encrypted.
+        OB_LOG_WARN("tls", "TLS files or peer names were given but no --tls-* surface is "
+                           "enabled, so this node listens and dials in plaintext");
+    }
+
+    LoadedTlsContexts out;
+    try {
+        out = build_tls_contexts(config);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Error: %s\n", e.what());
         std::exit(1);
     }
+    if (!any_surface) return out;
 
     if (!config.tls_peer_names.empty() && !any_node_link) {
         OB_LOG_WARN("tls", "--tls-peer-names constrains which peers may connect to a node link, and "
                            "no node-link surface is enabled");
     }
-
-    try {
-        if (config.tls_client) {
-            out.client_port = std::make_shared<TlsContext>(
-                TlsContext::server(config.tls_cert_file, config.tls_key_file));
-        }
-        if (config.tls_replication) {
-            out.replication_server = std::make_shared<TlsContext>(
-                TlsContext::node_server(config.tls_cert_file, config.tls_key_file,
-                                        config.tls_ca_file, config.tls_peer_names));
-            out.replication_client = std::make_shared<TlsContext>(
-                TlsContext::node_client(config.tls_cert_file, config.tls_key_file,
-                                        config.tls_ca_file, config.tls_peer_names));
-            OB_LOG_INFO("tls", "replication link: TLS 1.3, mutual certificate verification");
-        } else {
-            OB_LOG_INFO("tls", "replication link: plaintext");
-        }
-        if (config.tls_multi_master) {
-            out.mesh_server = std::make_shared<TlsContext>(
-                TlsContext::node_server(config.tls_cert_file, config.tls_key_file,
-                                        config.tls_ca_file, config.tls_peer_names));
-            out.mesh_client = std::make_shared<TlsContext>(
-                TlsContext::node_client(config.tls_cert_file, config.tls_key_file,
-                                        config.tls_ca_file, config.tls_peer_names));
-            OB_LOG_INFO("tls", "multi-master mesh: TLS 1.3, mutual certificate verification");
-        } else {
-            OB_LOG_INFO("tls", "multi-master mesh: plaintext");
-        }
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "Error: %s\n", e.what());
-        std::exit(1);
+    OB_LOG_INFO("tls", "replication link: %s",
+                config.tls_replication ? "TLS 1.3, mutual certificate verification" : "plaintext");
+    OB_LOG_INFO("tls", "multi-master mesh: %s",
+                config.tls_multi_master ? "TLS 1.3, mutual certificate verification" : "plaintext");
+    if (const auto ctx = any_context(out)) {
+        OB_LOG_INFO("tls", "certificate in force: %s, from %s", describe_certificate(*ctx).c_str(),
+                    config.tls_cert_file.c_str());
     }
     return out;
+}
+
+TlsReload reload_tls_contexts(const ServerConfig& config, const LoadedTlsContexts& in_force,
+                              MetricsRegistry* registry) {
+    if (!any_context(in_force)) {
+        OB_LOG_INFO("tls", "reload asked for, and no --tls-* surface is enabled: nothing to reload");
+        return TlsReload::NothingToReload;
+    }
+    OB_LOG_INFO("tls", "reloading TLS: certificate %s, key %s, CA %s", config.tls_cert_file.c_str(),
+                config.tls_key_file.c_str(),
+                config.tls_ca_file.empty() ? "(none)" : config.tls_ca_file.c_str());
+
+    // Every context first, and only then any surface: one refused file and none of them changes,
+    // so a node never presents the old certificate on one surface and the new on another.
+    LoadedTlsContexts fresh;
+    try {
+        fresh = build_tls_contexts(config);
+    } catch (const std::exception& e) {
+        // The refusal names the file and why, never its contents (the factories' messages).
+        OB_LOG_ERROR("tls", "TLS reload refused, every surface keeps the certificate it had: %s",
+                     e.what());
+        if (registry) registry->increment_counter("ob_tls_reload_failures_total");
+        return TlsReload::Refused;
+    }
+
+    for (const auto& [now, next] : {std::pair{&in_force.client_port, &fresh.client_port},
+                                    std::pair{&in_force.replication_server, &fresh.replication_server},
+                                    std::pair{&in_force.replication_client, &fresh.replication_client},
+                                    std::pair{&in_force.mesh_server, &fresh.mesh_server},
+                                    std::pair{&in_force.mesh_client, &fresh.mesh_client}}) {
+        if (*now && *next) (*now)->replace((*next)->current());
+    }
+
+    const auto ctx = any_context(in_force);
+    OB_LOG_INFO("tls", "TLS reloaded, new connections present %s; connections already open keep "
+                       "the certificate they were opened with", describe_certificate(*ctx).c_str());
+    if (registry) {
+        registry->increment_counter("ob_tls_reloads_total");
+        registry->set_gauge("ob_tls_certificate_not_after_seconds",
+                            tls_certificate_not_after(in_force));
+    }
+    return TlsReload::Reloaded;
+}
+
+int64_t tls_certificate_not_after(const LoadedTlsContexts& tls) {
+    const auto ctx = any_context(tls);
+    if (!ctx) return 0;
+    return ctx->certificate_not_after().value_or(0);
 }
 
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
@@ -191,6 +276,8 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
     return out;
 }
 
+// ── execute_command ───────────────────────────────────────────────────────────
+
 bool serialised_across_reactors(CommandType t) {
     switch (t) {
     case CommandType::FAILOVER:
@@ -227,6 +314,11 @@ bool serialised_across_reactors(CommandType t) {
     return true;
 }
 
+/// Commands a session may run before it has authenticated.
+///
+/// AUTH is how it authenticates. PING is here so that a load balancer's health check needs no
+/// credentials and reveals nothing about the data. QUIT is here because refusing a client's request
+/// to leave would be absurd, and because a client that cannot leave holds a session slot.
 bool allowed_before_authentication(CommandType t) {
     switch (t) {
     case CommandType::AUTH:
@@ -1212,11 +1304,12 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"snapshot-chunk-size", {"<N>", "Bytes per snapshot transfer chunk"}},
         {"snapshot-staging-dir", {"<DIR>", "Where an incoming snapshot is staged before install"}},
         {"tls-ca-file", {"<PATH>", "Trust anchor (PEM) for verifying peer certificates on node "
-                                   "links; required by --tls-replication and --tls-multi-master"}},
+                                   "links; required by --tls-replication and --tls-multi-master; "
+                                   "read again on SIGHUP"}},
         {"tls-cert-file", {"<PATH>", "This node's certificate chain (PEM), used on every TLS "
-                                     "surface and in both roles"}},
+                                     "surface and in both roles; read again on SIGHUP"}},
         {"tls-client", {"", "TLS on the client port; needs --tls-cert-file and --tls-key-file"}},
-        {"tls-key-file", {"<PATH>", "This node's private key (PEM); mode 600"}},
+        {"tls-key-file", {"<PATH>", "This node's private key (PEM); mode 600; read again on SIGHUP"}},
         {"tls-multi-master", {"", "TLS with mutual certificate verification on the multi-master "
                                   "mesh; needs --tls-ca-file"}},
         {"tls-peer-names", {"<NAMES>", "Comma-separated identities an accepted peer's certificate "
@@ -2193,6 +2286,11 @@ TcpServer::TcpServer(ServerConfig config)
                                        },
                                        config_.wal_rotate_bytes,
                                        config_.wal_dir);
+
+    // When the certificate in force stops being valid, for the alert that warns before it does
+    // (#238); 0 without TLS. Each reload sets it again.
+    engine_->registry().set_gauge("ob_tls_certificate_not_after_seconds",
+                                  tls_certificate_not_after(tls_));
 }
 
 TcpServer::~TcpServer() {
@@ -2557,7 +2655,7 @@ void Reactor::adopt(int fd, uint64_t conn_id) {
         // completes, which is what send_response() on a handshaking session does - the bytes sit in
         // send_buf_ and SSL_write is not reached until tls_handshaking_ clears.
         try {
-            s->enable_tls(tls_.client_port->wrap(fd, /*server_side=*/true));
+            s->enable_tls(tls_.client_port->current()->wrap(fd, /*server_side=*/true));
             OB_LOG_DEBUG("tls", "handshake started: fd=%d", fd);
         } catch (const std::exception& e) {
             OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s", fd, e.what());
@@ -3323,6 +3421,13 @@ DrainVerdict drain_verdict(std::chrono::steady_clock::time_point drain_started,
         std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_started).count();
     if (waited >= static_cast<long long>(drain_timeout_ms)) return DrainVerdict::DeadlineReached;
     return DrainVerdict::KeepWaiting;
+}
+
+TlsReload TcpServer::reload_tls() {
+    // Nothing here is the loops': the surfaces swap under their own mutex, the configuration is
+    // read-only once constructed, and the registry is atomics. `engine_` is set in the constructor
+    // and reset in the destructor, and `ob_tcp_server` joins the thread calling this before either.
+    return reload_tls_contexts(config_, tls_, &engine_->registry());
 }
 
 void TcpServer::shutdown() {

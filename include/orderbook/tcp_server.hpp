@@ -356,26 +356,68 @@ struct LoadedSecrets {
 /// belongs in the log rather than only in a document nobody reads at three in the morning.
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config);
 
-/// The TLS contexts a node runs with. A null member means that surface and role is plaintext.
+/// The TLS surfaces a node runs with, each holding the context in force. A null member means that
+/// surface and role is plaintext.
 ///
-/// Four instances and two shapes: the client port needs a server context that asks nothing of the
+/// Five surfaces and two shapes: the client port needs a server context that asks nothing of the
 /// caller, and each node link needs one of each role. Replication and the mesh share the shapes but
 /// not the instances, so a future difference between the two surfaces has somewhere to live.
+///
+/// Which members are null is decided once, by the `--tls-*` flags at the start. A reload (#238)
+/// changes the context inside a surface, never whether there is one.
 struct LoadedTlsContexts {
-    std::shared_ptr<TlsContext> client_port;      ///< --tls-client
-    std::shared_ptr<TlsContext> replication_server;
-    std::shared_ptr<TlsContext> replication_client;
-    std::shared_ptr<TlsContext> mesh_server;
-    std::shared_ptr<TlsContext> mesh_client;
+    std::shared_ptr<TlsSurface> client_port;      ///< --tls-client
+    std::shared_ptr<TlsSurface> replication_server;
+    std::shared_ptr<TlsSurface> replication_client;
+    std::shared_ptr<TlsSurface> mesh_server;
+    std::shared_ptr<TlsSurface> mesh_client;
 };
 
-/// Build every configured TLS context, or print a refusal and exit.
+/// Build every configured TLS context from the files the configuration names, or throw
+/// `std::runtime_error` saying what was refused.
 ///
 /// Refuses a `--tls-*` surface without a certificate and key rather than listening in plaintext,
-/// refuses a **node link** without `--tls-ca-file` rather than encrypting without authenticating the
-/// peer, and warns when a certificate or a peer-name list is configured with no surface enabled - a
-/// certificate that protects nothing looks exactly like one that does.
+/// and a **node link** without `--tls-ca-file` rather than encrypting without authenticating the
+/// peer. What is refused about the files themselves - unreadable, not a regular file, a key others
+/// may read, a key that does not match its certificate - is the `TlsContext` factories' refusal, so
+/// a reload refuses exactly what a start does. Logs nothing: the start and the reload each say what
+/// their outcome means.
+LoadedTlsContexts build_tls_contexts(const ServerConfig& config);
+
+/// `build_tls_contexts()`, or print its refusal and exit 1: a node does not start on a certificate
+/// it cannot use.
+///
+/// Also logs each surface's state and the certificate in force at INFO, and warns when a
+/// certificate or a peer-name list is configured with no surface enabled - a certificate that
+/// protects nothing looks exactly like one that does.
 LoadedTlsContexts load_tls_or_exit(const ServerConfig& config);
+
+/// What `reload_tls_contexts()` did.
+enum class TlsReload {
+    Reloaded,          ///< every surface holds a context built from the files just read
+    Refused,           ///< the files were refused, and every surface holds what it held before
+    NothingToReload,   ///< no `--tls-*` surface is enabled
+};
+
+/// Read the certificate, key and CA again from the paths in `config` and put the new contexts into
+/// the surfaces of `in_force`: all of them, or - when anything is refused - none (#238).
+///
+/// `config` is the one `in_force` was built from. A connection opened from here on, accepted or
+/// dialled, uses the new context; one already open finishes on the context it was opened with,
+/// which its `SSL` holds. A refusal leaves the node serving with the certificate it had, so a bad
+/// replacement cannot stop a node that was running.
+///
+/// Logs the outcome - INFO with the new certificate's subject and end of validity, ERROR with the
+/// refusal, which names the file and never its contents - and, with a registry, counts it:
+/// `ob_tls_reloads_total`, `ob_tls_reload_failures_total`, and
+/// `ob_tls_certificate_not_after_seconds` after a reload.
+TlsReload reload_tls_contexts(const ServerConfig& config, const LoadedTlsContexts& in_force,
+                              MetricsRegistry* registry);
+
+/// When the certificate `tls` presents stops being valid, in seconds since the epoch, for
+/// `ob_tls_certificate_not_after_seconds`; 0 for a node without TLS. Every surface presents the
+/// same certificate, the one in `--tls-cert-file`.
+int64_t tls_certificate_not_after(const LoadedTlsContexts& tls);
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
 
@@ -460,6 +502,11 @@ public:
 
     /// Signal the server to stop (thread-safe, called from signal handler).
     void shutdown();
+
+    /// Read the TLS certificate, key and CA again, for the connections after this one
+    /// (`reload_tls_contexts()`, #238). Thread-safe: `ob_tcp_server` calls it from the thread that
+    /// watches for SIGHUP while `run()` serves.
+    TlsReload reload_tls();
 
 private:
     ServerConfig             config_;

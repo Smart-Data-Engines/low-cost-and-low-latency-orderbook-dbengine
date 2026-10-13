@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -102,12 +105,41 @@ public:
 
     ssl_ctx_st* raw() const { return ctx_; }
 
+    /// The subject of the certificate this context presents, on one line (`/CN=.../O=...`), or ""
+    /// for one that presents none (`client()`). For a log line: sanitised.
+    std::string certificate_subject() const;
+    /// When that certificate stops being valid, in seconds since the epoch; nullopt for none.
+    std::optional<int64_t> certificate_not_after() const;
+
 private:
     explicit TlsContext(ssl_ctx_st* ctx) : ctx_(ctx) {}
     ssl_ctx_st* ctx_{nullptr};
     /// Shared with every channel this context opens, so the list is not copied per connection.
     /// Null on a context that accepts nothing (`client()`, `node_client()`).
     std::shared_ptr<const std::vector<std::string>> peer_names_;
+};
+
+/// One TLS surface's context as it stands now (#238). An accept or a dial takes current() when it
+/// opens a connection, and a reload puts a new context in with replace() for the connections after
+/// it. A connection keeps the context it was opened with - its `SSL` holds the `SSL_CTX` - so a
+/// replace touches no session in progress, a handshake under way included.
+class TlsSurface {
+public:
+    explicit TlsSurface(std::shared_ptr<const TlsContext> ctx) : ctx_(std::move(ctx)) {}
+
+    std::shared_ptr<const TlsContext> current() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return ctx_;
+    }
+
+    void replace(std::shared_ptr<const TlsContext> ctx) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        ctx_.swap(ctx);
+    }
+
+private:
+    mutable std::mutex mtx_;
+    std::shared_ptr<const TlsContext> ctx_;
 };
 
 /// Bind a client `SSL` to the name it expects, before the handshake. False on a name OpenSSL

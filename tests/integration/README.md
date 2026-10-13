@@ -74,6 +74,7 @@ tests/integration/
 ├── test_auth.py                    # Challenge-response on all three surfaces
 ├── test_tls.py                     # TLS on the client port, chain *and* name
 ├── test_tls_cluster.py             # TLS on the node links, mutual by construction
+├── test_tls_reload.py              # SIGHUP reads the certificate again, on every surface
 ├── test_subscriptions.py           # SUBSCRIBE / PUSH / UNSUBSCRIBE
 ├── test_aggregations.py            # Aggregates over the wire, including refusals
 ├── test_compression.py             # LZ4 compression negotiation and data integrity

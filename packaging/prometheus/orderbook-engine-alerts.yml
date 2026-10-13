@@ -183,6 +183,31 @@ groups:
             backup with room - change it to the schedule. A node that never took one is not paged.
             docs/operations.md, "Backing up and restoring a node".
 
+  - name: orderbook-engine-tls
+    rules:
+      - alert: OrderbookCertificateExpiring
+        expr: max by (instance) (ob_tls_certificate_not_after_seconds) > 0 and max by (instance) (ob_tls_certificate_not_after_seconds) - time() < 14 * 86400
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: the TLS certificate in force expires within 14 days"
+          description: >-
+            The certificate this node presents - the one read at the start or at the last reload
+            it took - ends within two weeks, or has ended. Renew it, replace the files and send the
+            node SIGHUP (systemctl reload). A node without TLS exports 0 and is not paged.
+            docs/operations.md, "Replacing a certificate".
+      - alert: OrderbookTlsReloadFailed
+        expr: sum by (instance) (increase(ob_tls_reload_failures_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a TLS reload was refused"
+          description: >-
+            The node read its certificate, key and CA again and refused them, so it still presents
+            the certificate it had. The ERROR line in its log names the file and the reason: a key
+            that does not match the certificate, a key others may read, a file it cannot read.
+            docs/operations.md, "Replacing a certificate".
+
   - name: orderbook-engine-clients
     rules:
       - alert: OrderbookAuthFailures

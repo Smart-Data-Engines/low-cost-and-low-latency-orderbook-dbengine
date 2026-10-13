@@ -1361,6 +1361,94 @@
           }
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "TLS",
+      "id": 37,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Time left on the TLS certificate",
+      "id": 38,
+      "description": "Seconds until the certificate this node presents expires: the one read at the start, or at the last reload it took. SIGHUP (systemctl reload) reads a renewed one; OrderbookCertificateExpiring fires at 14 days. No line: no TLS surface is enabled.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 87
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (instance) (ob_tls_certificate_not_after_seconds{job=~\"$job\", instance=~\"$instance\"} > 0) - time()",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "TLS reloads and refusals",
+      "id": 39,
+      "description": "Reloads in the last hour that put a new certificate in force, and those the node refused. A refusal leaves the certificate it had; the ERROR line in the node's log names the file and the reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 87
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (increase(ob_tls_reloads_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "legendFormat": "reloaded {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instance) (increase(ob_tls_reload_failures_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "legendFormat": "refused {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
     }
   ]
 }

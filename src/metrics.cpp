@@ -124,6 +124,12 @@ MetricsRegistry::MetricsRegistry() {
                                      "Held columns decoded on the heap: no slot under the arena's cap (#223)"));
     counters_.push_back(make_counter("ob_backup_failures_total",
                                      "Backups that failed, and left nothing that looks like one"));
+    // The certificate read again on SIGHUP (#238). A failure leaves the certificate in force, which
+    // goes on serving until it expires: the count and the gauge below are what an alert reads.
+    counters_.push_back(make_counter("ob_tls_reloads_total",
+                                     "TLS reloads that put new contexts in force (#238)"));
+    counters_.push_back(make_counter("ob_tls_reload_failures_total",
+                                     "TLS reloads refused, each leaving the certificate in force (#238)"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.
@@ -265,6 +271,9 @@ MetricsRegistry::MetricsRegistry() {
     // #51: the books are made in 2 MiB regions asked to be huge pages, unless --book-huge-pages off.
     gauges_.push_back(make_gauge("ob_book_arena_regions",
                                  "Regions of 2 MiB the books are made in (0 with --book-huge-pages off)"));
+    gauges_.push_back(make_gauge("ob_tls_certificate_not_after_seconds",
+                                 "When the TLS certificate in force expires, Unix time; 0 without "
+                                 "TLS (#238)"));
     gauges_.push_back(make_gauge("ob_current_epoch",   "Current failover epoch"));
     // #215: a replica whose store was replaced to follow a stream holds part of it until its
     // primary says the catch-up ended, and does not stand for election meanwhile.
