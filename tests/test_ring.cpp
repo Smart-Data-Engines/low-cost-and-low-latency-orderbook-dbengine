@@ -144,11 +144,13 @@ TEST(Ring, TwoThreadsPassTenMillionBytesInOrder) {
         std::mt19937 rng(7);
         std::vector<char> chunk(4096);
         uint64_t sent = 0;
-        while (sent < kTotal) {
+        // A reader that found a wrong byte stops reading, and a writer waiting for room it will
+        // never make would hold the join forever: the test fails rather than hangs.
+        while (sent < kTotal && !bad) {
             const size_t n = std::min<uint64_t>(kTotal - sent, 1 + rng() % chunk.size());
             for (size_t i = 0; i < n; ++i) chunk[i] = byte_at(sent + i);
             size_t done = 0;
-            while (done < n) {
+            while (done < n && !bad) {
                 done += w.write(chunk.data() + done, n - done);
                 w.publish();
             }
