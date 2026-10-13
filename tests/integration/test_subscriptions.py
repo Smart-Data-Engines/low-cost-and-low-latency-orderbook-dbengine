@@ -338,7 +338,7 @@ def test_a_command_still_works_while_rows_are_being_pushed(cluster) -> None:
 # hold yet, and the push of that update was the one the client dropped as already in the book.
 #
 # This holds the recipe end to end. Through a node, a write landing inside a book's read is rare:
-# master's server passed it too, with no book of 4 171 behind its number. The race is found in
+# master's server passed it too, with no book of 4 065 behind its number. The race is found in
 # process, by `QueryBook.ABookHoldsEveryUpdateUpToTheSequenceNumberItReports`.
 
 @pytest.mark.subscriptions

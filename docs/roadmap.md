@@ -2742,8 +2742,8 @@ And two that the recipe rests on just the same, the second of which no test reac
 - `test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss` holds the recipe end to
   end. On a live node, under a writer in batches, every update above the first book's number has to
   arrive as a push, and every book has to show its own update. Master's server passes it too: no book
-  of 4 171 was behind its number. Through a node a write rarely lands inside a book's read, and the
-  race is found in process.
+  of 4 065 was behind its number, nor of 18 575 with the writes one at a time. Through a node a write
+  rarely lands inside a book's read, and the race is found in process.
 - `test_a_pushed_row_names_its_side_as_every_other_row_does`, against a scripted server: a bid, an
   ask, and a push whose side is neither, dropped.
 
