@@ -3442,7 +3442,10 @@ packing:
 A seal now weighs a runs candidate as larger by 50% times its runs per value, at most 90%, so it takes
 one only where it is that much smaller. Weighed offline against every segment's candidates, that is
 the choice of an oracle charging each byte against its measured decode, and binance-top20's long runs
-pay almost nothing. The merge was charged too and gained nothing. A merged column decodes at ZSTD's
+pay almost nothing. On 10 October a seal weighing decoding against bytes was estimated above not to
+pay - each per cent of decoding about a per cent of bytes. That estimate weighed whole columns, and
+came before #259 made the narrow packing, which is what the runs are traded for here, several times
+faster to decode. The merge was charged too and gained nothing. A merged column decodes at ZSTD's
 pace, and the charge moved its choices among candidates no faster: from blocks to ZSTD in two
 segments, because ZSTD's margin is over LZ4's best and LZ4's best had been runs. It chooses as before.
 
