@@ -419,6 +419,30 @@ TEST(ColumnCodec, ADecodeIntoWritesNothingForABlockWhoseHeaderOrPayloadFails) {
     EXPECT_EQ(into, column) << "the control: the whole block decodes";
 }
 
+TEST(ColumnCodec, EveryNarrowWidthGivesItsValuesBack) {
+    // #223: each width from one byte to eight is loaded its own way. Every one is written with its
+    // highest value, its top bit alone, small values and values just under the highest.
+    for (unsigned w = 1; w <= 8; ++w) {
+        const uint64_t top = w == 8 ? kMax : (uint64_t{1} << (8 * w)) - 1;
+        std::vector<uint64_t> column;
+        for (size_t i = 0; i < 4000; ++i) {
+            switch (i % 4) {
+            case 0:  column.push_back(top); break;
+            case 1:  column.push_back(i % 251); break;
+            case 2:  column.push_back(top - i % 200); break;
+            default: column.push_back(uint64_t{1} << (8 * w - 1)); break;
+            }
+        }
+        std::string block;
+        encode_as(column, Encoding{Transform::kNone, Packing::kNarrow, Compressor::kNone}, 3, block);
+        ASSERT_EQ(block.size() / column.size(), w) << "the control: the column is " << w << " bytes a value";
+        std::vector<uint64_t> back;
+        std::string why;
+        ASSERT_TRUE(decode(bytes(block), column.size(), back, &why)) << w << ": " << why;
+        EXPECT_EQ(back, column) << w << " bytes a value";
+    }
+}
+
 TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {
     // A thread keeps one ZSTD context of each kind while it lives and frees them when it ends: a
     // migration's threads and an embedding application's come and go. Under the sanitizers job's

@@ -43,6 +43,10 @@ here as `#N`.
 
 ### Changed
 
+- A narrow column of three, five, six or seven bytes a value decodes up to six times faster: each
+  value is put together in a register, where a `memcpy` into a zeroed 64-bit value went through a
+  stack slot no load could be forwarded from (#223). Decoding binance-top20's seven columns went from
+  6.95 to 2.42 ns a row on the EPYC host and from 6.83 to 3.10 on ARM.
 - A port with no bind flag listens on IPv6 as well: `::`, both families on one socket, where it was
   `0.0.0.0` (#236). On a host whose firewall covers IPv4 alone, such a port is now reachable over
   IPv6. `--bind 0.0.0.0`, and the same in `--replication-bind`, `--mm-bind` and `--metrics-bind`,

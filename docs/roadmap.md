@@ -3237,6 +3237,21 @@ in. Advising every class for huge pages took ARM's faults 197 times down, and ma
 recording's first query slower: a 70 KB column opened a 2 MiB region zeroed whole. What is left of
 #223 is the decoders on the recordings, #49's.
 
+**The narrow decoder, profiled the same day, waited on its own stack** (`evidence/2026-10-13-narrow-decode/`).
+`perf` on the EPYC host put the decode of the recordings' quantities and prices - narrow columns,
+three and five bytes a value, behind LZ4 - in `narrow_inverse<uint64_t, 3>` and `<…, 5>`, and LZ4's
+decompression under 1%. GCC compiled each value's `memcpy` of three bytes into a zeroed `uint64_t` as
+three stores into a stack slot and a load of all eight, which no store can forward: 98% of the
+function's samples sat on the instruction after that load. A value is now put together from loads
+of its own sizes, in a register. Every column's decode, the seal's choices, median of three rounds:
+binance-top20's quantities from 5.22 to 0.86 ns a value on x86 and from 4.40 to 0.74 on ARM; all
+seven columns from 6.95 to 2.42 ns a row and from 6.83 to 3.10 - format 2 reads them in 3.26 - and
+binance-diff's from 11.78 to 8.88 and from 11.22 to 8.85, where format 2 reads them in 3.60. On a
+node, cold: binance-top20's first query took 0.71 (x86) and 0.69 (ARM) of master's time and its
+narrow window 0.63 and 0.72; binance-diff's queries and the synthetic set's, whose columns are one
+and two bytes wide, stayed within master's ranges. What is left on binance-diff is its runs, behind
+delta and LZ4.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 
