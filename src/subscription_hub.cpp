@@ -188,7 +188,7 @@ std::vector<int> SubscriptionHub::drain(SessionManager& sessions,
     // first row into an empty queue and every overflow set the flag before the eventfd is written,
     // and the drain that moved the last bytes cleared it before moving them. A loop that polls -
     // `boost`, and the rings of #52 - comes here on every pass, and this is what keeps that pass to
-    // one load rather than a read() and a lock (measured: the read alone was 5% of a polling loop's
+    // one load rather than a read() and a lock (measured: the read alone was 6% of a polling loop's
     // cycles on the Graviton). A row whose wake() lands after this load is delivered on the next
     // pass.
     if (!wake_pending_.load(std::memory_order_acquire)) return {};

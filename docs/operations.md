@@ -2502,21 +2502,29 @@ cc.rings.enabled = true;   // after AUTH, where the node asks for it
 ```
 
 What a command cost through each, pinned, in the default profile (`boost`, whose loops poll for a
-moment after each event) and with a client that polls for its answer, the median of seven rounds of
-50 000 (the roadmap, #52, has the series):
+moment after each event), with a client that polls for its answer and sends the next command once it
+has one, the median of seven rounds of 50 000 (the roadmap, #52, has the series):
 
 | p50 | EPYC 9R45, TCP | socket | rings | Graviton, TCP | socket | rings |
 |---|---|---|---|---|---|---|
-| `PING` | 2.96 us | 1.59 us | **0.51 us** | 4.66 us | 2.83 us | **0.92 us** |
-| `BOOK`, ten levels | 3.99 us | 2.67 us | 1.51 us | 6.36 us | 4.53 us | 2.33 us |
-| `MINSERT`, twenty levels | 5.78 us | 3.98 us | 2.84 us | 8.17 us | 5.82 us | 3.75 us |
+| `PING` | 2.96 us | 1.59 us | **0.47 us** | 4.68 us | 2.81 us | **0.93 us** |
+| `BOOK`, ten levels | 3.99 us | 2.66 us | 1.38 us | 6.31 us | 4.56 us | 2.38 us |
+| `MINSERT`, twenty levels | 5.80 us | 3.96 us | 2.73 us | 8.18 us | 5.83 us | 3.79 us |
 
+- **A command that finds the node asleep pays for waking it.** The loop polls for 10 us after an
+  event in `boost` and then sleeps; in `eco` it sleeps at once. After a 50 us pause a `PING` cost
+  1.99 us through rings on the EPYC, 2.69 through the socket and 4.26 through TCP. After 500 us,
+  with the host's idle CPUs asleep deeper, it cost 6.10, 6.79 and 8.48. On the Graviton both pauses
+  cost 3.16-3.23 us through rings. A client whose commands come more than 10 us apart gets these
+  figures rather than the table's: the rings stay the cheapest, by less.
 - **The client polls before it sleeps.** A node answers a `PING` through rings in well under a
   microsecond, so a client that sleeps on its bell at once is caught going to sleep and pays the
-  whole wake-up: 3.50 us a `PING` on the EPYC, more than the socket's 2.00, against 0.51 for one
-  that polled 5 us first. `ClientConfig::rings.spin_us` is 20 by default; 0 sleeps at once.
-- **The node polls in `boost`.** In `eco` its loop sleeps between events, every command rings its
-  bell, and the rings keep less: 2.19 us a `PING` on the EPYC with a polling client.
+  whole wake-up: 3.44 us a `PING` on the EPYC, more than the socket's 1.99 for a client blocked in
+  `recv()`, against 0.47 for one that polled 5 us first. `ClientConfig::rings.spin_us` is 20 by
+  default; 0 sleeps at once.
+- **In `eco`,** a client that sends its next command at once can reach the loop before it sleeps:
+  0.80 us a `PING` on the EPYC and 1.56 on the Graviton through rings. After any pause it pays the
+  wake-up above.
 - **Memory:** `--ring-bytes` (1 MiB by default) a direction, so 2 MiB a session plus a page.
   `ob_ring_bytes` is what the sessions in rings hold, `ob_ring_sessions_total` counts the moves, and
   `ob_ring_bells_total` the answers that had to wake a sleeping client.

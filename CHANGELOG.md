@@ -17,9 +17,10 @@ here as `#N`.
   socket carried - with a bell rung only for a side that sleeps. The C++ client moves with
   `ClientConfig::rings` and polls its answer 20 us before it sleeps; `--rings off` and
   `--ring-bytes` (1 MiB a direction) bound it; `ob_ring_sessions_total`, `ob_ring_bytes` and
-  `ob_ring_bells_total` count it. Pinned, `boost`, a polling client: a `PING` in 0.51 us on an EPYC
-  9R45 and 0.92 us on a Graviton, against 2.96 and 4.66 through TCP; a one-level `INSERT` in 1.33
-  and 2.02 us.
+  `ob_ring_bells_total` count it. Pinned, `boost`, a client that polls and sends back to back: a
+  `PING` in 0.47 us on an EPYC 9R45 and 0.93 us on a Graviton, against 2.96 and 4.68 through TCP;
+  a one-level `INSERT` in 1.33 and 2.03 us. A command that finds the node asleep, after a pause,
+  pays for waking it: 1.99-6.10 us (EPYC) and 3.16-3.23 us (Graviton) a `PING` through rings.
 
 - A Unix socket beside the port, for clients on the node's host (#52, step 1). `--unix-socket <path>`
   serves the same protocol, `AUTH` and `--max-sessions` without TCP, and `--unix-socket-mode` (0660)
@@ -73,8 +74,9 @@ here as `#N`.
 ### Changed
 
 - A pass of the client loop that nothing woke no longer reads the subscription hub's eventfd or
-  takes its lock (#52): the polling loops of `boost` were paying both on every pass, and every
-  transport's round trip is 0.1-0.3 us shorter for it.
+  takes its lock (#52): the polling loops of `boost` were paying both on every pass, and a round trip
+  through TCP or the Unix socket is 0.08-0.15 us shorter for it on an EPYC 9R45 and 0.17-0.34 us on
+  a Graviton.
 - A seal no longer writes a column as runs a value or two long to save a few percent (#223): a runs
   candidate is weighed as larger by half its runs per value, and taken only where it is that much
   smaller. binance-diff's columns, as sealed, decode in 5.55-5.57 ns a row where they took 7.09-7.15

@@ -4289,6 +4289,25 @@ Learned the hard way. Check here before debugging.
      path and bind its own socket there while the server runs; an unconditional `unlink()` at stop
      removes that one. `run()` keeps the device and inode `lstat()` gave after `bind()` and removes
      the file only while they match (#52).
+588. **On x86 a sequentially consistent store is an `XCHG` on the line the other side polls.** The
+     rings' wake-up rule needs a store then a load on each side with nothing reordered between. A
+     release store, a seq_cst fence and a relaxed load do it with a plain `MOV` and a `LOCK OR` on
+     the thread's own stack; seq_cst stores and loads do it with an `XCHG` on the shared line. A
+     profile on the Graviton put 15% of a polling loop's cycles in the fences' `DMB`s, and the
+     switch to seq_cst operations took those cycles without shortening the round trip there. On
+     the EPYC it lengthened a `PING`, a ten-level `BOOK` and a one-level `INSERT` by 40-130 ns at
+     p50. A profile's cycles are not the round trip, so the change was measured both ways, and the
+     rings kept the fences (#52).
+589. **A probe that links the code under test is part of the measurement.** `command_latency` links
+     the rings, so a series of a new build measured with its own probe changes both ends of the
+     round trip. The first build of #52 took 0.45 µs a `PING` with its probe, and 0.68 µs with the
+     next build's probe. Each figure was right, but neither said which side moved it.
+     `rings_2x2.py` in the evidence runs each server with each probe, in one session.
+590. **A race that threads hit once in a long while, one thread can stage every time.** A mutant whose
+     reader slept without looking at the ring again survived the threaded wake-up test. That test
+     only loses a byte when the writer publishes in the instant between the reader's empty read and
+     its flag, and then publishes nothing more for two seconds. Called in that order from one
+     thread, the steps lose it every time (`AReaderAboutToSleepLooksAgain`, #52).
 
 ## Current state and open problems
 
