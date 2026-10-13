@@ -447,6 +447,16 @@ target_link_libraries(orderbook_shard_coordinator PUBLIC orderbook_shard_map ord
 add_library(orderbook_net STATIC src/net.cpp src/ring.cpp)
 target_link_libraries(orderbook_net PUBLIC orderbook_core orderbook_logger)
 
+# The rings' wake-up rule (#52) is a Dekker pair through two seq_cst fences, which GCC's -Wtsan, fatal
+# under -Werror, refuses the way it refuses the SoA buffer's. Unlike that seqlock, no byte the rings
+# carry is ordered by a fence: the bytes are ordered by the release and acquire of the two counters,
+# which TSan does model, and the fences order only the sleep flags, atomics TSan would not call a race
+# either way. So the file stays instrumented and only the diagnostic goes. What TSan cannot check is
+# the wake-up rule itself, and the ring tests do. GCC only: an unknown -Wno-* is a diagnostic in clang.
+if(OB_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(src/ring.cpp PROPERTIES COMPILE_OPTIONS "-Wno-tsan")
+endif()
+
 # ── Metrics HTTP server compiled library ───────────────────────────────────────
 add_library(orderbook_metrics_server STATIC src/metrics_server.cpp)
 target_link_libraries(orderbook_metrics_server PUBLIC orderbook_metrics orderbook_logger orderbook_net)
