@@ -52,7 +52,7 @@ struct Encoding {
     bool operator==(const Encoding&) const = default;
 };
 
-/// The charge a seal and a merge put on a runs candidate, `EncodeOptions::runs_charge_pct` (#223).
+/// The charge a seal puts on a runs candidate, `EncodeOptions::runs_charge_pct` (#223).
 inline constexpr unsigned kRunsChargePct = 50;
 
 struct EncodeOptions {

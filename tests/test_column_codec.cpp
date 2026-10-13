@@ -213,30 +213,35 @@ std::vector<uint64_t> short_runs(size_t n, unsigned repeat_per_mille, uint64_t s
 
 TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
     // The rule, held exactly (#223): no candidate weighs less than the chosen one, a runs candidate
-    // weighed as larger by its charge - for every charge, the default's included, on columns of runs
-    // short and long and on the edge columns.
+    // weighed as larger by its charge - for every charge, the default's included, with ZSTD and as a
+    // seal searches, on columns of runs short and long and on the edge columns.
     std::vector<std::vector<uint64_t>> columns = edge_columns();
     for (unsigned repeat : {0u, 300u, 600u, 900u}) columns.push_back(short_runs(5'000, repeat, repeat + 1));
     std::vector<uint64_t> long_runs;
     for (uint64_t i = 0; i < 5'000; ++i) long_runs.push_back(1'000 + (i / 23) * 7 % 101);
     columns.push_back(long_runs);
-    for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u, std::numeric_limits<unsigned>::max()}) {
-        EncodeOptions options;
-        options.runs_charge_pct = pct;
-        for (const auto& column : columns) {
-            SCOPED_TRACE(::testing::Message() << "charge " << pct << "%, " << column.size() << " values");
-            const RunsPerTransform r = runs_of(column);
-            std::string chosen;
-            const Choice c = encode(column, options, chosen);
-            std::vector<uint64_t> back;
-            std::string why;
-            ASSERT_TRUE(decode(bytes(chosen), column.size(), back, &why)) << c.encoding.name() << ": " << why;
-            ASSERT_EQ(back, column);
-            const double mine = weighed(c.encoding, chosen.size(), r, pct);
-            for (const Encoding& e : every_candidate()) {
-                std::string other;
-                encode_as(column, e, options.zstd_level, other);
-                EXPECT_LE(mine, weighed(e, other.size(), r, pct)) << c.encoding.name() << " chosen over " << e.name();
+    for (const int zstd_level : {3, 0}) {   // with ZSTD, and as a seal searches, without it
+        for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u, std::numeric_limits<unsigned>::max()}) {
+            EncodeOptions options;
+            options.zstd_level = zstd_level;
+            options.runs_charge_pct = pct;
+            for (const auto& column : columns) {
+                SCOPED_TRACE(::testing::Message() << "ZSTD " << zstd_level << ", charge " << pct << "%, "
+                                                  << column.size() << " values");
+                const RunsPerTransform r = runs_of(column);
+                std::string chosen;
+                const Choice c = encode(column, options, chosen);
+                std::vector<uint64_t> back;
+                std::string why;
+                ASSERT_TRUE(decode(bytes(chosen), column.size(), back, &why)) << c.encoding.name() << ": " << why;
+                ASSERT_EQ(back, column);
+                const double mine = weighed(c.encoding, chosen.size(), r, pct);
+                for (const Encoding& e : every_candidate()) {
+                    if (zstd_level == 0 && e.compressor == Compressor::kZstd) continue;
+                    std::string other;
+                    encode_as(column, e, zstd_level, other);
+                    EXPECT_LE(mine, weighed(e, other.size(), r, pct)) << c.encoding.name() << " chosen over " << e.name();
+                }
             }
         }
     }

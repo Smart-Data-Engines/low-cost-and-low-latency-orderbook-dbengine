@@ -439,13 +439,18 @@ public:
         /// searches.
         uint32_t search_every{16};
 
-        /// A seal's: what queries read most, so nothing that decodes as slowly as ZSTD.
+        /// A seal's: what queries read most, so nothing that decodes as slowly as ZSTD, and a runs
+        /// candidate charged for its runs (#223).
         static SegmentFormat seal() { return SegmentFormat{}; }
         /// A merge's: what stays, so ZSTD(3) where it saves 10% over LZ4, and every segment searched.
+        /// Nothing is charged for runs: a merged column decodes at ZSTD's pace, and the charge moved
+        /// its choices among candidates no faster than the ones they replaced - from blocks to ZSTD,
+        /// where the runs under LZ4 it took out had kept ZSTD from its margin (#223).
         static SegmentFormat merge() {
             SegmentFormat f;
             f.search.zstd_level = 3;
             f.search.zstd_margin_pct = 10;
+            f.search.runs_charge_pct = 0;
             f.search_every = 1;
             return f;
         }
