@@ -33,6 +33,12 @@ Group=orderbook
 StateDirectory=orderbook
 StateDirectoryMode=0750
 
+# /run/orderbook, for `unix-socket` in ob.conf (#52): created on every start with the same ownership,
+# writable under ProtectSystem=strict, removed at stop. A client on this host reaches the socket as a
+# member of the orderbook group - the directory lets the group in, the socket's mode lets it connect.
+RuntimeDirectory=orderbook
+RuntimeDirectoryMode=0750
+
 # File descriptors, with the arithmetic rather than a round number: one per client session
 # (max-sessions, 64 by default and raised in production), one per replication peer, one per
 # multi-master peer, the listening sockets, the metrics socket, the WAL file, and one per open

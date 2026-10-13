@@ -2445,6 +2445,41 @@ TLS and authentication are for different things and you want both: TLS establish
 `AUTH` establishes who is on it. Neither substitutes for the other, and a client with credentials
 against a TLS-only node still gets `ERR unauthenticated`.
 
+### Clients on the node's own host: the Unix socket
+
+`--unix-socket /run/orderbook/ob.sock` makes the node listen on a Unix stream socket as well as its
+port (#52). It serves the same protocol, with the same sessions, `AUTH` and `--max-sessions`; what it
+leaves out is TCP, which is most of a round trip between two processes of one host (the figures are
+in the roadmap, #52).
+
+- **Who may connect is decided by the file.** The socket gets `--unix-socket-mode` (0660 by default)
+  before it takes a connection. The packaged unit creates `/run/orderbook` for it, open to the
+  `orderbook` group, so a client's user joins that group. With `--auth-secret-file` the socket asks
+  for `AUTH` as the port does.
+- **It is not encrypted.** `--tls-client` covers the port; a session through the socket is plain
+  text whatever that flag says, because its bytes do not leave the host's kernel. The startup log
+  says so: `listening on unix socket /run/orderbook/ob.sock (mode 0660), not encrypted: the file's
+  permissions decide who may connect`.
+- **Each connection is logged with the process at its other end**, from `SO_PEERCRED`, where a TCP
+  one has an address: `Reactor 0 adopted fd=19 conn_id=1 from unix pid=2449093 uid=1000 gid=1000`.
+  `ob_unix_connections_total` counts them; `ob_active_sessions` counts the sessions of both
+  transports.
+- **The file is the node's.** At the start a socket nobody listens on - what a node killed with
+  SIGKILL leaves - is replaced, with `removed a stale unix socket at ...` in the log. A socket
+  somebody listens on, or a path that is not a socket, stops the start, and a file that is not a
+  socket is left as it is. A drain closes the socket with the port, and the node removes the file
+  when it stops, unless another process has bound that path since.
+
+The clients:
+
+```python
+eng = OrderbookEngine(unix_socket="/run/orderbook/ob.sock", auth=("grafana", secret))
+```
+
+For the C++ client it is `ClientConfig::unix_socket`, and for backups from cron
+`ob_backup --unix-socket /run/orderbook/ob.sock`. A client asked for TLS through the socket is refused
+before it connects, and a pool or the shard router dials every node at its address.
+
 ### The metrics endpoint
 
 No authentication, deliberately — a Prometheus scraper cannot perform a challenge-response, and a
