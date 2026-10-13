@@ -22,7 +22,8 @@ from conftest import cpp_client_binary_path, free_port, patience, server_binary_
 
 pytestmark = pytest.mark.smoke
 
-SUBCOMMANDS = ("ping", "insert_query", "minsert", "query_agg", "query_buckets", "query_named")
+SUBCOMMANDS = ("ping", "insert_query", "minsert", "query_agg", "query_buckets", "query_named",
+               "large_select")
 
 
 @pytest.fixture(scope="module")
@@ -99,16 +100,21 @@ def run_harness(harness: Path, node: Node, name: str, env: dict[str, str]) -> su
 def test_every_subcommand_runs_through_rings(harness, workdir, spin_us):
     # A node a transport: the subcommands write fixed symbols and check exact answers, so a second
     # run on the same node would read the first one's rows.
-    for label, env in (("socket", {}), ("rings", {"OB_RINGS": "1", "OB_RING_SPIN_US": spin_us})):
+    # Rings of 64 KiB, so large_select's answer is several rings long and the node waits for room.
+    elapsed = {}
+    for label, env in (("socket", {}), ("rings", {"OB_RINGS": "1", "OB_RING_SPIN_US": spin_us,
+                                                  "OB_RING_BYTES": "65536"})):
         node_dir = workdir / label
         node_dir.mkdir()
         node = Node(node_dir)
         try:
+            started = time.monotonic()
             for name in SUBCOMMANDS:
                 run = run_harness(harness, node, name, {"OB_UNIX_SOCKET": str(node.sock), **env})
                 assert run.returncode == 0, f"{name} through the {label}:\n{run.stdout}\n{run.stderr}"
                 assert '"status":"pass"' in run.stdout, f"{name} through the {label}: {run.stdout}"
-            moved = node.log().count("moved to rings of 1048576 bytes a direction")
+            elapsed[label] = time.monotonic() - started
+            moved = node.log().count("moved to rings of 65536 bytes a direction")
             expected = len(SUBCOMMANDS) if label == "rings" else 0
             assert moved == expected, f"{moved} sessions moved through the {label}, not {expected}"
             assert node.metric("ob_ring_sessions_total") == expected
@@ -123,6 +129,9 @@ def test_every_subcommand_runs_through_rings(harness, workdir, spin_us):
         finally:
             node.stop()
         assert node.proc.returncode == 0, node.log()[-3000:]
+    # A client that did not ring a node asleep would be served only at the node's 100 ms timeout:
+    # every command a tenth of a second, where through the socket they take microseconds.
+    assert elapsed["rings"] < elapsed["socket"] * 5 + 2.0, elapsed
 
 
 def test_a_node_with_rings_off_keeps_sessions_on_the_socket(harness, workdir):

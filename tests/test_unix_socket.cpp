@@ -888,3 +888,26 @@ TEST(RingsServer, ClosingTheSocketEndsTheSessionInRings) {
     EXPECT_TRUE(greeted(greeting)) << "the session in rings outlived its socket: " << greeting;
     server.stop();
 }
+
+TEST(RingsServer, ABurstLargerThanTheCommandRingIsTakenAsTheNodeReadsIt) {
+    // 20 000 PINGs in one write through a ring of 64 KiB: the client fills it, waits for room on its
+    // bell, and the node rings it as it reads. The answers pile up in the node's queue meanwhile, and
+    // go out once the client reads them.
+    Dir dir;
+    const auto config = ring_config(dir, port_at(180), false);
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w, 65536);
+    ASSERT_TRUE(r.ok()) << r.error();
+    std::string burst;
+    for (int i = 0; i < 20000; ++i) burst += "PING\n";
+    ASSERT_TRUE(r.send_raw(burst)) << "the client was never given room";
+    for (int i = 0; i < 20000; ++i) {
+        const std::string a = r.answer();
+        ASSERT_EQ(a, "PONG\n") << "answer " << i;
+    }
+    w.reset();
+    server.stop();
+}

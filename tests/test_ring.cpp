@@ -73,6 +73,15 @@ TEST(Ring, TheClientSeesWhatTheServerMadeAndNothingElse) {
     EXPECT_FALSE(not_rings.valid());
     EXPECT_NE(why.find("not rings"), std::string::npos) << why;
 
+    // The right size and version and no magic: the magic is checked on its own.
+    const int forged = ::memfd_create("forged-rings", MFD_CLOEXEC);
+    ASSERT_GE(forged, 0);
+    ASSERT_EQ(::ftruncate(forged, static_cast<off_t>(Layout::total(kMinBytes))), 0);
+    const Block fake{0, kVersion, 0, kMinBytes};
+    ASSERT_EQ(::pwrite(forged, &fake, sizeof(fake), 0), static_cast<ssize_t>(sizeof(fake)));
+    Mapping forged_rings = Mapping::attach(forged, kMinBytes, why);
+    EXPECT_FALSE(forged_rings.valid()) << "memory without the magic was taken for rings";
+
     Mapping client = Mapping::attach(::dup(server.fd()), kMinBytes, why);
     ASSERT_TRUE(client.valid()) << why;
 }
