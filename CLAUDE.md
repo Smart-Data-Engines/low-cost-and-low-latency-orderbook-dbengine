@@ -4265,6 +4265,12 @@ Learned the hard way. Check here before debugging.
      forbid. `Engine::subscribe()` takes the write lock once after registering instead (#239), which
      puts every write on one side of the call for one lock on a rare path. No test can open that
      window, so a static test holds the lock where it is.
+583. **Charging one group of candidates moves the bar another group is measured against.** The codec
+     takes ZSTD only where it is 10% smaller than LZ4's best. Charging runs for their runs made LZ4's
+     best a larger candidate, so ZSTD passed its margin where it had not: two segments of
+     binance-diff's merged quantities went from blocks, 0.51 ns a value, to ZSTD, 1.95-2.49 (#223).
+     Each margin was right alone. A change to how one group is weighed is measured on every policy
+     that compares against that group - here the merge, which charges nothing now.
 
 ## Current state and open problems
 

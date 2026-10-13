@@ -9,7 +9,7 @@
 // blocks on random quantities, ZSTD on a book's snapshots, whose levels repeat from one to the
 // next - so every column of every segment is written in the smallest of the candidates below that
 // its options try: five without compression, and runs and narrow of each transform under LZ4 and
-// under ZSTD.
+// under ZSTD. A seal charges a runs candidate for its runs (`runs_charge_pct`, #223).
 //
 // A candidate is a transform, a packing and, or not, LZ4 or ZSTD over the packed bytes:
 //

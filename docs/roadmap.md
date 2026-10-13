@@ -3429,8 +3429,33 @@ The seal's choices, median of three rounds, ns a value on x86 and on ARM:
 On a node, cold, binance-diff's first query took 0.89 (x86) and 0.92 (ARM) of master's time: 1.17 and
 1.28 of format 2's, where master's took 1.31 and 1.39. The other queries of the three datasets stayed
 within master's ranges, which six more rounds showed to be bimodal by memory state, on master as on
-the branch. What is left on binance-diff: 7.1 ns a row against format 2's 3.7, of which the prices
-and quantities, narrow behind LZ4, are 3.1 and the three columns of runs 3.7.
+the branch. Runs a value or two long were what that left.
+
+**The seal's choice, measured next, took runs a value or two long for saving a few percent**
+(`evidence/2026-10-13-runs-charged/`). It wrote each column in its smallest candidate. On binance-diff
+the smallest was often such runs, which decode two to four times slower than the next smallest
+packing:
+- the prices of one segment as delta runs under LZ4 at 1.45 bytes a value and 3.27 ns, where narrow
+  under LZ4 was 1.56 bytes and 0.93 ns;
+- the quantities of the same segment at 2.07 bytes and 3.07 ns, against 2.10 and 0.65.
+
+A seal now weighs a runs candidate as larger by 50% times its runs per value, at most 90%, so it takes
+one only where it is that much smaller. Weighed offline against every segment's candidates, that is
+the choice of an oracle charging each byte against its measured decode, and binance-top20's long runs
+pay almost nothing. The merge was charged too and gained nothing. A merged column decodes at ZSTD's
+pace, and the charge moved its choices among candidates no faster: from blocks to ZSTD in two
+segments, because ZSTD's margin is over LZ4's best and LZ4's best had been runs. It chooses as before.
+
+The seal's choices, all seven columns, ns a row on x86 and on ARM:
+- binance-diff from 7.09 - 7.15 to 5.55 - 5.57 and from 7.04 - 7.13 to 5.61 - 5.64, for 1.1% more
+  bytes. Its prices went from 1.66 to 0.95 ns a value on x86, its quantities from 1.38 to 0.88 and its
+  levels from 1.30 to 0.96;
+- binance-top20 as on master.
+
+On a node, cold, binance-diff's first query took 0.98 (x86) and 0.94 (ARM) of master's time; its other
+queries and binance-top20's stayed within master's ranges, and the synthetic set writes the same files
+in both builds. What is left on binance-diff: 5.6 ns a row against format 2's 3.7, of which the three
+columns of runs - the timestamps, the levels and the sequence numbers - are 3.3.
 
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's

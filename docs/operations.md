@@ -1979,6 +1979,9 @@ A segment written in format 3 holds its seven columns in one file, `columns.v3`,
 - a packing: Simple8b, runs of equal values, fixed-width blocks, or each value in the bytes it needs;
 - and LZ4 or ZSTD over the packed bytes where that is smaller.
 
+A seal weighs runs as larger by half their runs per value, in percent: runs a value or two long
+decode several times slower than any other packing, for the few percent they save (#223).
+
 Each column carries a CRC32C, checked whenever the column is read. Format 2 wrote the timestamp, the
 order count, the side and the level raw, and the price as one 64-bit word a row.
 
