@@ -8,6 +8,7 @@
 // close(): stop flush thread + final flush + flush_segment + WAL flush.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/timed_lock.hpp"
 #include "orderbook/wall_clock.hpp"
 #include "orderbook/thread_boundary.hpp"
@@ -3021,17 +3022,17 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
         // `promote_to_primary()` deleting the position rather than from a check of its own: with no
         // position saved there is no identity to match, and no match means start over.
 
-        // Parse host:port from address.
-        auto colon = new_primary_address.rfind(':');
-        if (colon != std::string::npos) {
-            ReplicationClientConfig cfg = repl_client_config_;
-            cfg.primary_host = new_primary_address.substr(0, colon);
-            cfg.primary_port = static_cast<uint16_t>(
-                std::stoi(new_primary_address.substr(colon + 1)));
+        // Parse host:port from address; an IPv6 host is in brackets.
+        ReplicationClientConfig cfg = repl_client_config_;
+        if (net::split_host_port(new_primary_address, cfg.primary_host, cfg.primary_port) &&
+            cfg.primary_port != 0) {
             repl_client_ = std::make_unique<ReplicationClient>(cfg, *this);
             lock.unlock();
             repl_client_->start();
             lock.lock();
+        } else {
+            OB_LOG_WARN("engine", "the new primary's address '%s' is not host:port; not following it",
+                        new_primary_address.c_str());
         }
     }
 

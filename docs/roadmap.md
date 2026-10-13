@@ -2593,6 +2593,64 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 236. The engine listened and dialled on IPv4 alone ✅ **P3**
+
+**Found by the C++ SDK port's finding 28**: the Python client could not reach `[::1]`. The client was
+the visible part of it. Every socket the engine opened was IPv4:
+- the client, replication, mesh and metrics listeners: `socket(AF_INET)`, `INADDR_ANY`, and
+  `inet_pton(AF_INET)` for a bind address;
+- a replica's connection to its primary, a mesh dial and the C++ client: `inet_pton(AF_INET)`, or
+  `getaddrinfo` with `AF_INET`;
+- every `host:port` split at its last colon, which an IPv6 literal is full of.
+
+On a network reached over IPv6 alone a node listened where nothing could reach it, and dialled
+nothing.
+
+**Fixed** (spec `smart-data-engine-workspace/specs/ipv6-everywhere/`). One module, `ob::net`, opens
+every listener and every connection, and splits and joins every address:
+- a listener with no bind flag is `::` with `IPV6_V6ONLY` off, so it takes both families. A host
+  without IPv6 gets IPv4 and says so;
+- an IPv4 or IPv6 literal binds its own family alone: `0.0.0.0` is every IPv4 interface, `::` every
+  IPv6 one;
+- a dial tries every address `getaddrinfo(AF_UNSPEC)` gives, each within its timeout, and turns
+  Nagle off on what it returns - the one place (#140) every dialled connection gets it now;
+- an IPv6 host is in brackets wherever a port follows it (`[::1]:9090`), and an IPv4 client of a
+  dual-stack port is logged, and shown in `STATUS`, as itself.
+
+The Python client dials with `socket.create_connection()`, reads brackets in `hosts=[...]` and
+writes them wherever a port follows a host. That includes the address it matches against a shard
+map's, and written without them a refresh of the map would have replaced the connection to an IPv6
+shard every time.
+
+**The default changed with it.** A port with no bind flag listened on `0.0.0.0`, and now listens on
+IPv6 too. A host whose firewall covers IPv4 alone exposes it on IPv6 after the upgrade, so the
+CHANGELOG and `docs/upgrading.md` say how to keep a port on IPv4 (`0.0.0.0` in its bind flag).
+
+Two more changes rode along:
+- A replica's connection to its primary was a blocking `connect()`, which waits out the kernel's SYN
+  retries - minutes - for an address that drops packets. It is bounded now, 5 s an address, in a
+  loop that retries on its own anyway.
+- The TLS name check took a host in brackets as a DNS name: `--primary-host [::1]` or a C++ client
+  given `[::1]` refused a certificate for `IP:::1`. It takes the address inside them now; the check
+  still refuses a certificate for another address in both spellings.
+
+`tests/test_net.cpp` holds the module: addresses of each form, listeners on `::`, `::1`, `0.0.0.0`
+and `127.0.0.1`, both families on one port and one family on each of the others, a name's every
+address, and Nagle off on a dialled connection. `test_tls_client.cpp` holds the bracketed check
+both ways. `test_ipv6.py` holds a node on `::1`:
+- the Python and C++ clients, given the address with and without brackets;
+- a node with no bind answering both families;
+- a replica following its primary, which `STATUS` names `[::1]:<port>`;
+- an IPv4 replica of a dual-stack port, named by its IPv4 address;
+- a mesh pair that finds each other through an etcd on `[::1]`;
+- a pool that keeps its connection to a shard at `[::1]:<port>` across a refresh of the map.
+
+Against a server and clients built before this item, five of those six fail. The sixth, the IPv4
+replica, passes on both: it is the control.
+
+- Effort: M | Impact: on a network reached over IPv6 alone a node could be reached by nothing and
+  could reach no primary or peer
+
 ### 235. The live book does not come back with the node: a start rebuilds it from the WAL's tail alone **P1**
 
 **Found with #233, writing #43's example.** Measured on v0.1.0, on one node:

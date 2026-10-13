@@ -3,7 +3,7 @@
 //         pool routing, health-check, failover.
 
 #include "orderbook/client.hpp"
-#include "orderbook/socket_options.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
@@ -94,53 +94,23 @@ Result<void> OrderbookClient::connect() {
 
     if (fd_ != -1) disconnect();
 
-    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd_ < 0)
-        return Result<void>::err(OB_ERR_IO, "socket() failed");
-
-    // TCP_NODELAY immediately, through the one definition that explains why (#140).
-    set_tcp_nodelay(fd_, "client");
-
-    // Non-blocking for connect timeout
-    int flags = ::fcntl(fd_, F_GETFL, 0);
-    ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(config_.port);
-    if (::inet_pton(AF_INET, config_.host.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd_); fd_ = -1;
-        return Result<void>::err(OB_ERR_IO, "invalid host address");
+    // The server's address of either family, or a name and every address of it in turn, each within
+    // the connect timeout (ob::net::dial()); the socket comes back blocking, as reads expect, and
+    // with Nagle off (#140).
+    std::string why;
+    fd_ = net::dial(config_.host, config_.port,
+                    static_cast<uint32_t>(config_.connect_timeout_sec * 1000),
+                    /*leave_nonblocking=*/false, why, "client");
+    if (fd_ < 0) {
+        fd_ = -1;
+        // The words this client has always answered with, which its callers read.
+        const char* what = why.find("deadline") != std::string::npos  ? "connect timeout"
+                         : why.find("resolve") != std::string::npos   ? "invalid host address"
+                                                                      : "connection refused";
+        OB_LOG_DEBUG("client", "connect to %s failed: %s",
+                     net::join_host_port(config_.host, config_.port).c_str(), why.c_str());
+        return Result<void>::err(OB_ERR_IO, what);
     }
-
-    int rc = ::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (rc < 0 && errno != EINPROGRESS) {
-        ::close(fd_); fd_ = -1;
-        return Result<void>::err(OB_ERR_IO, "connection refused");
-    }
-
-    if (rc < 0) {
-        // EINPROGRESS — poll for completion
-        pollfd pfd{};
-        pfd.fd     = fd_;
-        pfd.events = POLLOUT;
-        int timeout_ms = static_cast<int>(config_.connect_timeout_sec * 1000);
-        int pr = ::poll(&pfd, 1, timeout_ms);
-        if (pr <= 0) {
-            ::close(fd_); fd_ = -1;
-            return Result<void>::err(OB_ERR_IO, "connect timeout");
-        }
-        int so_err = 0;
-        socklen_t len = sizeof(so_err);
-        ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_err, &len);
-        if (so_err != 0) {
-            ::close(fd_); fd_ = -1;
-            return Result<void>::err(OB_ERR_IO, "connection refused");
-        }
-    }
-
-    // Restore blocking mode
-    ::fcntl(fd_, F_SETFL, flags);
 
     // SO_RCVTIMEO for read timeout
     {
@@ -1351,14 +1321,8 @@ OrderbookPool::OrderbookPool(PoolConfig config)
     // Parse host list and create a client for each host
     for (const auto& host_str : config_.hosts) {
         NodeState ns;
-        auto colon = host_str.rfind(':');
-        if (colon != std::string::npos) {
-            ns.host = host_str.substr(0, colon);
-            auto port_sv = std::string_view(host_str).substr(colon + 1);
-            uint16_t port_val = 9090;
-            std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port_val);
-            ns.port = port_val;
-        } else {
+        // "host:port", an IPv6 host in brackets; a host alone is on 9090.
+        if (!net::split_host_port(host_str, ns.host, ns.port)) {
             ns.host = host_str;
             ns.port = 9090;
         }

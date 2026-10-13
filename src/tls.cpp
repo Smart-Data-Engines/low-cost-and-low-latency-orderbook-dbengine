@@ -313,8 +313,15 @@ std::shared_ptr<ssl_st> TlsContext::wrap(int fd, bool server_side) const {
     return std::shared_ptr<ssl_st>(ssl, [](SSL* s) { if (s) SSL_free(s); });
 }
 
-bool tls_expect_host(ssl_st* ssl, const std::string& host) {
+bool tls_expect_host(ssl_st* ssl, const std::string& dialled) {
     X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+
+    // The address without the brackets an IPv6 literal may be written in: `set1_ip_asc` refuses
+    // "[::1]", and the name branch below would then require a DNS entry spelled with brackets, which
+    // no certificate has - a correct certificate refused.
+    const std::string host = dialled.size() >= 2 && dialled.front() == '[' && dialled.back() == ']'
+                                 ? dialled.substr(1, dialled.size() - 2)
+                                 : dialled;
 
     // Try the address form first, because it is the one that tells them apart: `set1_ip_asc`
     // parses a literal and answers 0 for anything else, so the failure *is* the detection. A

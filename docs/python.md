@@ -494,6 +494,8 @@ engine = OrderbookEngine(
     hosts=["10.0.0.1:5555", "10.0.0.2:5555", "10.0.0.3:5555"],
     timeout=10.0,
 )
+# IPv6 hosts in brackets, as in any address with a port: hosts=["[fd00::1]:5555", ...].
+# A single node takes a bare IPv6 address: OrderbookEngine(host="::1", port=5555).
 
 # Writes are automatically distributed across all MM nodes (round-robin)
 engine.insert("BTC-USD", "BINANCE", "bid",

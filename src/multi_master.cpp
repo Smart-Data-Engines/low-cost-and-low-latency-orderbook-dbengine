@@ -8,6 +8,7 @@
 #include "orderbook/socket_options.hpp"
 #include "orderbook/level_payload.hpp"
 #include "orderbook/multi_master.hpp"
+#include "orderbook/net.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
@@ -54,19 +55,9 @@ bool set_nonblocking(int fd) {
     return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-/// Parse "host:port" into components.
+/// Parse "host:port" into components; an IPv6 host is in brackets ("[::1]:6001").
 bool parse_address(const std::string& addr, std::string& host, uint16_t& port) {
-    auto colon = addr.rfind(':');
-    if (colon == std::string::npos) return false;
-    host = addr.substr(0, colon);
-    try {
-        unsigned long p = std::stoul(addr.substr(colon + 1));
-        if (p > 65535) return false;
-        port = static_cast<uint16_t>(p);
-    } catch (...) {
-        return false;
-    }
-    return true;
+    return net::split_host_port(addr, host, port);
 }
 
 /// Open a connection to `address`, on a socket that is non-blocking from the start, giving up after
@@ -89,83 +80,10 @@ int dial_address(const std::string& address, uint32_t timeout_ms, std::string& w
         return -1;
     }
 
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        // A name rather than a literal. This resolution also used to happen under the mutex.
-        struct addrinfo hints{}, *res = nullptr;
-        hints.ai_family   = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
-            why = "the host name does not resolve";
-            return -1;
-        }
-        addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
-        ::freeaddrinfo(res);
-    }
-
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        why = std::strerror(errno);
-        return -1;
-    }
-    if (!set_nonblocking(fd)) {
-        why = "the socket could not be put in non-blocking mode";
-        ::close(fd);
-        return -1;
-    }
-
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
-        return fd;  // loopback usually completes in the call
-    }
-    if (errno != EINPROGRESS) {
-        why = std::strerror(errno);
-        ::close(fd);
-        return -1;
-    }
-
-    // Wait for the handshake to finish, or for the deadline. The loop is here for EINTR: a signal
-    // arriving mid-dial is not a peer that failed, and treating it as one would cost an attempt.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    for (;;) {
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now()).count();
-        if (left <= 0) {
-            why = "no answer within the connect deadline";
-            ::close(fd);
-            return -1;
-        }
-        struct pollfd pfd{};
-        pfd.fd     = fd;
-        pfd.events = POLLOUT;
-        const int ready = ::poll(&pfd, 1, static_cast<int>(left));
-        if (ready > 0) break;
-        if (ready == 0) {
-            why = "no answer within the connect deadline";
-            ::close(fd);
-            return -1;
-        }
-        if (errno != EINTR) {
-            why = std::strerror(errno);
-            ::close(fd);
-            return -1;
-        }
-    }
-
-    int err = 0;
-    socklen_t len = sizeof(err);
-    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
-        why = std::strerror(errno);
-        ::close(fd);
-        return -1;
-    }
-    if (err != 0) {
-        why = std::strerror(err);
-        ::close(fd);
-        return -1;
-    }
-    return fd;
+    // Every address of the host, in getaddrinfo()'s order and of either family, each bounded by the
+    // deadline; the socket comes back non-blocking, as the io loop takes it, and with Nagle off
+    // (ob::net::dial(), #140).
+    return net::dial(host, port, timeout_ms, /*leave_nonblocking=*/true, why, "mm");
 }
 
 } // anonymous namespace
@@ -310,52 +228,26 @@ void MultiMasterManager::start() {
         }
     }
 
-    // Bind listen socket.
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
-        OB_LOG_ERROR("mm", "socket() failed: %s", std::strerror(errno));
-        throw std::runtime_error("socket() failed");
-    }
-
-    int opt = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    set_nonblocking(listen_fd_);
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(config_.replication_port);
-    // On every interface unless --mm-bind names one (#203). The server refuses an address that does
-    // not parse before it gets here; this only says so if something else built the config, and goes
-    // on the way a failed bind does - without a listening socket, still dialling its peers.
-    const bool address_ok = config_.bind_address.empty() ||
-        ::inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) == 1;
-    if (address_ok) {
+    // The mesh port's listener: every interface of both families unless --mm-bind names one
+    // (#203). The server refuses an address that does not parse before it gets here; this only says
+    // so if something else built the config, and goes on the way a failed bind does - without a
+    // listening socket, still dialling its peers.
+    if (!net::valid_bind(config_.bind_address)) {
+        OB_LOG_ERROR("mm", "invalid --mm-bind address '%s'; the mesh port is not opened",
+                     config_.bind_address.c_str());
+        listen_fd_ = -1;
+    } else {
         OB_LOG_INFO("mm", "mesh port %u listens on %s",
                     static_cast<unsigned>(config_.replication_port),
                     config_.bind_address.empty() ? "every interface" : config_.bind_address.c_str());
-    }
-
-    if (!address_ok) {
-        OB_LOG_ERROR("mm", "invalid --mm-bind address '%s'; the mesh port is not opened",
-                     config_.bind_address.c_str());
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    } else if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr),
-               sizeof(addr)) < 0) {
-        OB_LOG_ERROR("mm", "bind() failed on port %u: %s",
-                     config_.replication_port, std::strerror(errno));
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-        // Don't throw — allow tests to work without binding
-        OB_LOG_WARN("mm", "Continuing without listen socket (port bind failed)");
-    } else {
-        if (::listen(listen_fd_, 16) < 0) {
-            OB_LOG_ERROR("mm", "listen() failed: %s", std::strerror(errno));
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        std::string listen_error;
+        listen_fd_ = net::listen_on(config_.bind_address, config_.replication_port, 16, SOCK_NONBLOCK,
+                                    listen_error);
+        if (listen_fd_ < 0) {
+            OB_LOG_ERROR("mm", "%s", listen_error.c_str());
+            // Don't throw - allow tests to work without binding.
+            OB_LOG_WARN("mm", "Continuing without listen socket (port bind failed)");
         } else {
-            // Add listen_fd to epoll.
             struct epoll_event ev{};
             ev.events = EPOLLIN;
             ev.data.u64 = kMeshEventListen;
@@ -369,7 +261,7 @@ void MultiMasterManager::start() {
     if (!config_.coordinator_config.endpoints.empty()) {
         // The host peers reach this node by, not 127.0.0.1: each node of a mesh across hosts dialled
         // its own port (#195).
-        std::string repl_addr = config_.advertise_host + ":" + std::to_string(config_.replication_port);
+        std::string repl_addr = net::join_host_port(config_.advertise_host, config_.replication_port);
         peer_registry_ = std::make_unique<PeerRegistry>(
             config_.coordinator_config, config_.node_id, repl_addr, engine_.registry(),
             config_.shard_id);
@@ -807,7 +699,7 @@ void MultiMasterManager::io_loop() {
                 if (ev_key == kMeshEventListen) {
                     // ── Accept new connections (level-triggered EPOLLIN) ──────────
                     while (true) {
-                        struct sockaddr_in peer_addr{};
+                        sockaddr_storage peer_addr{};
                         socklen_t addr_len = sizeof(peer_addr);
                         int client_fd = ::accept(listen_fd_,
                                                  reinterpret_cast<struct sockaddr*>(&peer_addr),
@@ -854,8 +746,9 @@ void MultiMasterManager::io_loop() {
                         ev.data.u64 = pending.conn_id;
                         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
 
-                        OB_LOG_INFO("mm", "Accepted peer connection fd=%d as connection %llu",
-                                    client_fd, static_cast<unsigned long long>(pending.conn_id));
+                        OB_LOG_INFO("mm", "Accepted peer connection fd=%d from %s as connection %llu",
+                                    client_fd, net::address_of(peer_addr, addr_len).c_str(),
+                                    static_cast<unsigned long long>(pending.conn_id));
 
                         // TLS before a byte is queued. What follows is queued rather than written: the
                         // drain returns early while the handshake runs, so these frames go out with the
@@ -1293,8 +1186,6 @@ void MultiMasterManager::finish_dial(uint16_t node_id, int fd, const std::string
         ::close(fd);
         return;
     }
-
-    set_tcp_nodelay(fd, "mm");
 
     peer.fd             = fd;
     peer.conn_id        = next_conn_id_++;
@@ -2902,7 +2793,7 @@ void MultiMasterManager::handle_catchup_request(PeerConnection& peer,
 }
 
 std::string MultiMasterManager::own_address() const {
-    return config_.advertise_host + ":" + std::to_string(config_.replication_port);
+    return net::join_host_port(config_.advertise_host, config_.replication_port);
 }
 
 void MultiMasterManager::handle_topology_change(

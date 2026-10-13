@@ -418,7 +418,7 @@ add_library(orderbook_multi_master STATIC src/multi_master.cpp src/mm_snapshot.c
 # which CMake repeats on the link line. Undeclared, it linked only while some earlier library on the
 # line happened to pull the engine's objects in first - and #196's coordinator, linking the client,
 # moved that earlier library, and every test linking the coordinator lost `Engine::install_snapshot`.
-target_link_libraries(orderbook_multi_master PUBLIC orderbook_mm_framing orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger orderbook_engine orderbook_wal)
+target_link_libraries(orderbook_multi_master PUBLIC orderbook_mm_framing orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger orderbook_engine orderbook_wal orderbook_net)
 
 # ── Shard map compiled library ─────────────────────────────────────────────────
 add_library(orderbook_shard_map STATIC src/shard_map.cpp)
@@ -434,7 +434,7 @@ add_library(orderbook_shard_router STATIC src/shard_router.cpp)
 # drift `log_episode.hpp` exists to prevent. `orderbook_metrics` depends only on
 # `orderbook_core` and `orderbook_logger`, both of which this library already links, so the
 # dependency graph does not grow.
-target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderbook_coordinator orderbook_logger orderbook_metrics)
+target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderbook_coordinator orderbook_logger orderbook_metrics orderbook_net)
 
 # ── Shard coordinator compiled library ──────────────────────────────────────────
 # The migration's connection to the shard a symbol moves to (#196) is a client's, in a translation
@@ -442,9 +442,13 @@ target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderboo
 add_library(orderbook_shard_coordinator STATIC src/shard_coordinator.cpp src/symbol_mover.cpp)
 target_link_libraries(orderbook_shard_coordinator PUBLIC orderbook_shard_map orderbook_coordinator orderbook_engine orderbook_logger orderbook_client)
 
+# ── Sockets and addresses (IPv4 and IPv6), for every listener and dialler ───────
+add_library(orderbook_net STATIC src/net.cpp)
+target_link_libraries(orderbook_net PUBLIC orderbook_core orderbook_logger)
+
 # ── Metrics HTTP server compiled library ───────────────────────────────────────
 add_library(orderbook_metrics_server STATIC src/metrics_server.cpp)
-target_link_libraries(orderbook_metrics_server PUBLIC orderbook_metrics orderbook_logger)
+target_link_libraries(orderbook_metrics_server PUBLIC orderbook_metrics orderbook_logger orderbook_net)
 
 # ── Aggregation engine compiled library ────────────────────────────────────────
 add_library(orderbook_agg STATIC src/aggregation.cpp)
@@ -465,7 +469,7 @@ target_link_libraries(orderbook_admission PUBLIC orderbook_core)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/engine_compaction.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission orderbook_net)
 
 # ── Backup and restore (#34) ──────────────────────────────────────────────────
 # The server's BACKUP and the offline ob_restore: engine-side, and nothing of the client, whose
@@ -557,14 +561,14 @@ add_library(orderbook_tcp_server_lib STATIC
     src/session.cpp
     src/subscription_hub.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_backup orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls orderbook_machine)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_backup orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls orderbook_machine orderbook_net)
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
 # `orderbook_metrics` for the reason given above `orderbook_shard_router`: the pool's
 # health-check loop is guarded by the same header the server's loops use, and it passes a
 # null registry.
-target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics orderbook_query_columns)
+target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics orderbook_query_columns orderbook_net)
 
 option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
 if(OB_CLIENT_LZ4)

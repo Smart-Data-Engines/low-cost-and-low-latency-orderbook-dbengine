@@ -52,11 +52,12 @@ inline constexpr const char* kDefaultProfile = "boost";
 
 struct ServerConfig {
     uint16_t    port{9090};
-    /// --bind, --replication-bind, --mm-bind: the IPv4 address the client port, the replication
-    /// port and the multi-master port listen on (#203). Empty means every interface, which is what
-    /// all three did before the flags existed - so a deployment that wanted the client port on
-    /// loopback, with TLS and authentication on it or not, needed a firewall rule. Checked as it is
-    /// parsed: an address that does not parse is a refusal to start, not a listener on 0.0.0.0.
+    /// --bind, --replication-bind, --mm-bind: the IPv4 or IPv6 address the client port, the
+    /// replication port and the multi-master port listen on (#203, #236). Empty means every
+    /// interface of both families - so a deployment that wanted the client port on loopback, with
+    /// TLS and authentication on it or not, needed a firewall rule before the flags existed. Checked
+    /// as it is parsed: an address that does not parse is a refusal to start, not a listener on
+    /// every interface.
     std::string bind;
     std::string replication_bind;
     std::string mm_bind;

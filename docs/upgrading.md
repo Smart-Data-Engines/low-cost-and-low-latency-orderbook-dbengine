@@ -70,6 +70,15 @@ of `docs/operations.md` named for a particular change say where an older build t
 one reads a newer directory differently ("Going back to a build before part 2b of #165",
 "Downgrading a mesh node across #189").
 
+## Listeners after v0.1.0
+
+A port with no bind flag listens on IPv6 as well as IPv4 in this version: `::`, both families on one
+socket, where v0.1.0 listened on `0.0.0.0` (#236). A host whose firewall covers IPv4 alone -
+iptables rules and no ip6tables ones, say - exposes such a port on IPv6 once the node is upgraded.
+Either extend the firewall to IPv6 first, or keep the port where it was with `0.0.0.0` in its bind
+flag: `bind`, `replication-bind`, `mm-bind`, `metrics-bind`. Clients, replicas and peers that reach a
+node over IPv4 notice nothing.
+
 ## When a change breaks a row
 
 A change to what a node writes or sends that makes a row fail here is not merged by relaxing the

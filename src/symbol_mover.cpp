@@ -2,6 +2,7 @@
 // a translation unit of its own.
 
 #include "orderbook/symbol_mover.hpp"
+#include "orderbook/net.hpp"
 
 #include "orderbook/client.hpp"
 #include "orderbook/logger.hpp"
@@ -20,17 +21,13 @@ struct TargetConnection::Impl {
 
 namespace {
 
-/// "host:port" into a client's configuration; false when it is not that.
+/// "host:port" into a client's configuration, an IPv6 host in brackets; false when it is not that.
 bool parse_address(const std::string& address, ClientConfig& config) {
-    const size_t colon = address.rfind(':');
-    if (colon == std::string::npos || colon == 0 || colon + 1 == address.size()) return false;
-    unsigned port = 0;
-    const char* first = address.data() + colon + 1;
-    const char* last = address.data() + address.size();
-    const auto [end, ec] = std::from_chars(first, last, port);
-    if (ec != std::errc{} || end != last || port == 0 || port > 65535) return false;
-    config.host = address.substr(0, colon);
-    config.port = static_cast<uint16_t>(port);
+    std::string host;
+    uint16_t port = 0;
+    if (!net::split_host_port(address, host, port) || host.empty() || port == 0) return false;
+    config.host = host;
+    config.port = port;
     return true;
 }
 

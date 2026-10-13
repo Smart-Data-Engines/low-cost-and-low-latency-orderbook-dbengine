@@ -153,9 +153,9 @@ TEST(SocketOptions, ABadDescriptorIsLoggedRatherThanFatal) {
 
 TEST(SocketOptionsStatic, EverySocketSetsItOrSaysWhyNot) {
     // Counted per site rather than per file. A per-file rule is satisfied by either of two
-    // sockets, so `src/replication.cpp` — which accepts a replica and dials a primary — would
-    // keep passing after losing one of its two calls: the rule would cover less than it reads as
-    // covering, which is the failure mode this repository files most often.
+    // sockets, so `src/tcp_server.cpp` — which accepts a client to serve and, while draining, one
+    // to refuse — would keep passing after losing either: the rule would cover less than it reads
+    // as covering, which is the failure mode this repository files most often.
     size_t files_with_sockets = 0, files_setting = 0, files_exempting = 0;
     std::vector<std::string> short_of;
 

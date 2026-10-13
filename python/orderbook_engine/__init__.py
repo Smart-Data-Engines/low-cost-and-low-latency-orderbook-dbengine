@@ -392,6 +392,32 @@ def _build_tls_context(tls: bool, tls_ca_file: Optional[str],
     return ctx
 
 
+def _join_host_port(host: str, port: int) -> str:
+    """The other direction: an IPv6 host in brackets ("[::1]:5555"), any other host as it is - the
+    form a node publishes its address in, and the one a shard map names it by."""
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    return f"[{bare}]:{port}" if ":" in bare else f"{bare}:{port}"
+
+
+def _split_host_port(address: str, default_port: int) -> Tuple[str, int]:
+    """"host:port" into its halves, an IPv6 host in brackets ("[::1]:5555"). A host alone is on
+    `default_port`, and so is an IPv6 literal alone, with or without its brackets."""
+    if address.startswith("["):
+        close = address.find("]")
+        if close < 0:
+            raise ValueError(f"an address opens '[' and does not close it: {address!r}")
+        host, rest = address[1:close], address[close + 1:]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError(f"an address has {rest!r} after its ']', not ':port': {address!r}")
+        return host, int(rest[1:])
+    if address.count(":") == 1:
+        host, port = address.rsplit(":", 1)
+        return host, int(port)
+    return address, default_port
+
+
 class _TcpBackend:
     """Communicates with ob_tcp_server over a TCP socket."""
 
@@ -399,7 +425,8 @@ class _TcpBackend:
                  compress: bool = False,
                  auth: Optional[Tuple[str, str]] = None,
                  tls_ctx: Optional["ssl.SSLContext"] = None):
-        self._host = host
+        # An IPv6 literal may come in the brackets of an address; the socket takes it bare.
+        self._host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
         self._port = port
         # A ready context, not the three arguments that build one: the refusals belong at the
         # engine's constructor, outside the pool's except-Exception, and building one per backend
@@ -459,8 +486,8 @@ class _TcpBackend:
                     self._abandon("", quietly=True)
                     if isinstance(e, (OrderbookError, OSError)):
                         raise OrderbookError(
-                            -1, f"the connection to {self._host}:{self._port} was closed while "
-                                f"this call was in flight") from e
+                            -1, f"the connection to {_join_host_port(self._host, self._port)} was "
+                                f"closed while this call was in flight") from e
                     raise
                 self._abandon(f"an exchange ({label}) did not finish: {str(e) or type(e).__name__}",
                               quietly=opening)
@@ -469,7 +496,7 @@ class _TcpBackend:
     def _check_open(self) -> None:
         if self._sock is not None:
             return
-        where = f"{self._host}:{self._port}"
+        where = _join_host_port(self._host, self._port)
         if self._closed_because is None:
             raise OrderbookError(-1, f"the connection to {where} is closed")
         raise OrderbookError(
@@ -504,13 +531,11 @@ class _TcpBackend:
         self._buf = b""
 
     def _connect(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Every address of the host, of either family, in the resolver's order - an IPv6 literal,
+        # an IPv4 one or a name - each within the timeout. It was AF_INET alone, so `[::1]` failed
+        # here with "Address family for hostname not supported" (finding 28 of the C++ SDK port).
+        sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
         sock.settimeout(self._timeout)
-        try:
-            sock.connect((self._host, self._port))
-        except BaseException:
-            sock.close()
-            raise
         if self._tls_ctx is not None:
             # Before the banner: the banner is the server's first application bytes and it sends
             # them once the handshake finishes, so a read here would consume a TLS record as text.
@@ -526,7 +551,7 @@ class _TcpBackend:
                 # "wrong version number" here almost always means the port is not running with
                 # --tls-client: the plaintext banner arrives where a ServerHello was expected.
                 raise OrderbookTlsError(
-                    f"TLS handshake with {self._host}:{self._port} failed: {e}") from e
+                    f"TLS handshake with {_join_host_port(self._host, self._port)} failed: {e}") from e
             except OSError:
                 sock.close()
                 raise
@@ -1286,12 +1311,7 @@ class _ClientPool:
 
         # Parse hosts into _NodeState objects.
         for h in hosts:
-            if ":" in h:
-                host, port_str = h.rsplit(":", 1)
-                port = int(port_str)
-            else:
-                host = h
-                port = 5555
+            host, port = _split_host_port(h, 5555)
             self._nodes.append(_NodeState(host=host, port=port))
 
         # Initial discovery.
@@ -1309,7 +1329,7 @@ class _ClientPool:
         self._health_thread.start()
 
     def _node_key(self, node: _NodeState) -> str:
-        return f"{node.host}:{node.port}"
+        return _join_host_port(node.host, node.port)
 
     def _connect_all(self):
         """Connect to all nodes that aren't already connected."""
@@ -1564,11 +1584,7 @@ class _ClientPool:
         address = shard_info.get("address", "")
         if not address:
             return None
-        if ":" in address:
-            host, port_str = address.rsplit(":", 1)
-            port = int(port_str)
-        else:
-            host, port = address, 5555
+        host, port = _split_host_port(address, 5555)
         try:
             backend = _TcpBackend(host, port, self._timeout, compress=self._compress,
                                   auth=self._auth, tls_ctx=self._tls_ctx)
@@ -1594,7 +1610,9 @@ class _ClientPool:
             connections = {}
             for sid, backend in self._routing.connections.items():
                 info = shards.get(sid)
-                where = f"{backend._host}:{backend._port}"
+                # As the node publishes it, an IPv6 host in brackets: written without them the
+                # comparison never held for one, and every refresh replaced the connection.
+                where = _join_host_port(backend._host, backend._port)
                 if info is None or self._shard_connection_closed(backend) or \
                         info.get("address", "") not in (where, backend._host):
                     retired.append(backend)
