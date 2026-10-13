@@ -878,11 +878,12 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     // any other packing, and on binance-diff's prices and quantities they were chosen for saving a
     // few percent. The charge follows the runs per value, so long runs pay almost nothing.
     size_t run_count[2] = {0, 0};
-    const uint64_t charge_pct = std::min(options.runs_charge_pct, 1000u);
     const auto weigh = [&](size_t bytes, int t, bool is_runs) -> uint64_t {
         const size_t n = streams[t].values.size();
-        if (!is_runs || charge_pct == 0 || n == 0) return bytes;
-        const uint64_t per_mille = std::min<uint64_t>(900, 10 * charge_pct * run_count[t] / n);
+        if (!is_runs || options.runs_charge_pct == 0 || n == 0) return bytes;
+        // Runs a thousand values first, so that no charge and no column can overflow the product.
+        const uint64_t runs_per_mille = uint64_t{1000} * run_count[t] / n;
+        const uint64_t per_mille = std::min<uint64_t>(900, options.runs_charge_pct * runs_per_mille / 100);
         return static_cast<uint64_t>(bytes) * 1000 / (1000 - per_mille);
     };
     const auto offer = [](Best& best, const Best& candidate) {

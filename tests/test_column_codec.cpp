@@ -173,8 +173,8 @@ double weighed(const Encoding& e, size_t bytes, const RunsPerTransform& r, unsig
     const size_t runs = e.transform == Transform::kDelta ? r.delta_runs : r.for_runs;
     const size_t values = e.transform == Transform::kDelta ? r.delta_values : r.for_values;
     if (values == 0) return static_cast<double>(bytes);
-    const double per_mille = std::min(900.0, std::floor(10.0 * pct * static_cast<double>(runs) /
-                                                        static_cast<double>(values)));
+    const double runs_per_mille = std::floor(1000.0 * static_cast<double>(runs) / static_cast<double>(values));
+    const double per_mille = std::min(900.0, std::floor(pct * runs_per_mille / 100.0));
     return std::floor(static_cast<double>(bytes) * 1000.0 / (1000.0 - per_mille));
 }
 
@@ -220,7 +220,7 @@ TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
     std::vector<uint64_t> long_runs;
     for (uint64_t i = 0; i < 5'000; ++i) long_runs.push_back(1'000 + (i / 23) * 7 % 101);
     columns.push_back(long_runs);
-    for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u}) {
+    for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u, std::numeric_limits<unsigned>::max()}) {
         EncodeOptions options;
         options.runs_charge_pct = pct;
         for (const auto& column : columns) {
