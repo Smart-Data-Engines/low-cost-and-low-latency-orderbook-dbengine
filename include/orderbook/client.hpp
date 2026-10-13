@@ -31,6 +31,17 @@ class ShardRouter;
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Client configuration for a single TCP connection.
+/// Rings in shared memory for a client on the node's host (#52, step 2).
+struct RingOptions {
+    /// Move the session to rings after connecting and authenticating. Needs `unix_socket`.
+    bool     enabled = false;
+    /// Each direction's size; 0 takes the server's (`--ring-bytes`).
+    uint64_t bytes = 0;
+    /// How long a read polls the answer ring before it sleeps on its bell, in microseconds. Polling
+    /// keeps a round trip off the scheduler, at the cost of the core it polls on; 0 sleeps at once.
+    uint32_t spin_us = 0;
+};
+
 struct ClientConfig {
     std::string host = "127.0.0.1";
     uint16_t    port = 9090;
@@ -40,6 +51,10 @@ struct ClientConfig {
     /// whatever the server's TLS - the file's permissions decide who may connect - so `tls` with a
     /// path is refused. A pool and the shard router dial every node at its address.
     std::string unix_socket;
+
+    /// Move the session to rings in shared memory once connected (#52, step 2): needs
+    /// `unix_socket`, not `tls` and not `compress`. A pool and the shard router never set it.
+    RingOptions rings;
 
     double      connect_timeout_sec = 5.0;
     double      read_timeout_sec    = 10.0;
@@ -180,6 +195,10 @@ public:
     explicit OrderbookClient(ClientConfig config = {});
     ~OrderbookClient();
 
+    /// The rings of a session moved to them (#52, step 2). Opaque: defined in client.cpp, so this
+    /// header does not carry the ring's.
+    struct Rings;
+
     // Move-only semantics
     OrderbookClient(OrderbookClient&& other) noexcept;
     OrderbookClient& operator=(OrderbookClient&& other) noexcept;
@@ -314,6 +333,9 @@ private:
     // which is a startup cost nobody measures against a shared-mutable-state problem nobody wants.
     std::unique_ptr<TlsContext>  tls_ctx_;
     std::shared_ptr<ssl_st>      ssl_;
+
+    std::unique_ptr<Rings>       rings_;   ///< null on the socket (#52, step 2)
+    Result<void>                 move_to_rings();
 
     // Communication. Both route through TLS when ssl_ is set; nothing above this line knows.
     Result<void>             send_all(size_t len);

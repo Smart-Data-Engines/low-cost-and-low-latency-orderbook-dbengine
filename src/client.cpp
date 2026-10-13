@@ -4,6 +4,7 @@
 
 #include "orderbook/client.hpp"
 #include "orderbook/net.hpp"
+#include "orderbook/ring.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
@@ -17,9 +18,37 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <poll.h>
 #include <sys/socket.h>
 
 namespace ob {
+
+/// A session moved to rings (#52, step 2): commands into one, answers out of the other, and the two
+/// bells. Owns all of them; the mapping closes its memfd.
+struct OrderbookClient::Rings {
+    ring::Mapping mapping;
+    ring::Writer  commands;   ///< to the server
+    ring::Reader  answers;    ///< from the server
+    int           server_bell{-1};
+    int           client_bell{-1};
+    ~Rings() {
+        if (server_bell >= 0) ::close(server_bell);
+        if (client_bell >= 0) ::close(client_bell);
+    }
+};
+
+namespace {
+
+/// Everything of `p`, through the command ring: what fits now, and the rest once the server has
+/// read enough to make room - waited for on the client's bell, within `timeout_ms`.
+Result<void> send_through_rings(OrderbookClient::Rings& r, const char* p, size_t len, int timeout_ms);
+
+/// Bytes from the answer ring, like `recv()`: >0, 0 when the server has closed the socket the
+/// session is kept under, -1 with `why`. Polls for `spin_us` before it sleeps on its bell.
+ssize_t read_from_rings(OrderbookClient::Rings& r, int sock, char* buf, size_t len, std::string* why,
+                        uint32_t spin_us, int timeout_ms);
+
+}  // namespace
 
 // ── 3.1  Constructor / Destructor / Move ──────────────────────────────────────
 
@@ -41,6 +70,7 @@ OrderbookClient::OrderbookClient(OrderbookClient&& other) noexcept
     , recv_buf_(std::move(other.recv_buf_))
     , sock_buf_(std::move(other.sock_buf_))
     , compressed_(other.compressed_)
+    , rings_(std::move(other.rings_))
 {
     other.fd_ = -1;
 }
@@ -54,6 +84,7 @@ OrderbookClient& OrderbookClient::operator=(OrderbookClient&& other) noexcept {
         recv_buf_   = std::move(other.recv_buf_);
         sock_buf_   = std::move(other.sock_buf_);
         compressed_ = other.compressed_;
+        rings_      = std::move(other.rings_);
         other.fd_   = -1;
     }
     return *this;
@@ -65,6 +96,15 @@ Result<void> OrderbookClient::connect() {
     // Refuse a configuration whose parts contradict each other, before opening anything. Both of
     // these describe a caller who believes the connection is protected in a way it is not, and the
     // useful moment to say so is now rather than after the first row has crossed the wire.
+    if (config_.rings.enabled && config_.unix_socket.empty()) {
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 "rings without unix_socket: a session moves to rings through the "
+                                 "node's Unix socket");
+    }
+    if (config_.rings.enabled && config_.compress) {
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 "rings with compress: a compressed session cannot move to rings");
+    }
     if (config_.tls && !config_.unix_socket.empty()) {
         return Result<void>::err(OB_ERR_INVALID_ARG,
                                  "tls with unix_socket: the server's unix socket has no TLS, and "
@@ -174,6 +214,15 @@ Result<void> OrderbookClient::connect() {
         }
     }
 
+    // Rings, once the session is authenticated: RINGS is refused before AUTH where AUTH is asked.
+    if (config_.rings.enabled) {
+        auto rr = move_to_rings();
+        if (!rr) {
+            close_transport();
+            return rr;
+        }
+    }
+
     // Optional LZ4 compression negotiation
     if (config_.compress) {
         auto cr = negotiate_compression();
@@ -193,7 +242,9 @@ void OrderbookClient::disconnect() {
     if (fd_ == -1) return;  // no-op on inactive connection
     // Best-effort QUIT — ignore errors
     static constexpr char quit[] = "QUIT\n";
-    if (ssl_) {
+    if (rings_) {
+        (void)send_through_rings(*rings_, quit, sizeof(quit) - 1, 0);
+    } else if (ssl_) {
         std::string why;
         (void)tls_blocking_write_all(ssl_.get(), quit, sizeof(quit) - 1, &why);
     } else {
@@ -203,6 +254,7 @@ void OrderbookClient::disconnect() {
 }
 
 void OrderbookClient::close_transport() {
+    rings_.reset();
     if (ssl_) {
         // close_notify before the descriptor goes, so the server's read reports a clean close
         // rather than a truncation it has to log as one. The SSL object is freed by its deleter.
@@ -273,6 +325,10 @@ bool OrderbookClient::connected() const {
 
 Result<void> OrderbookClient::send_all(size_t len) {
     const char* ptr = send_buf_.data();
+    if (rings_) {
+        return send_through_rings(*rings_, ptr, len,
+                                  static_cast<int>(config_.read_timeout_sec * 1000));
+    }
     if (ssl_) {
         std::string why;
         const int w = tls_blocking_write_all(ssl_.get(), ptr, len, &why);
@@ -294,6 +350,10 @@ Result<void> OrderbookClient::send_all(size_t len) {
 }
 
 ssize_t OrderbookClient::read_some(char* buf, size_t len, std::string* why) {
+    if (rings_) {
+        return read_from_rings(*rings_, fd_, buf, len, why, config_.rings.spin_us,
+                               static_cast<int>(config_.read_timeout_sec * 1000));
+    }
     if (ssl_) {
         // >0 / 0 / -1 already, and `why` distinguishes the two closes and the timeout, which the
         // plaintext branch below has to reconstruct from errno.
@@ -311,6 +371,119 @@ ssize_t OrderbookClient::read_some(char* buf, size_t len, std::string* why) {
         return -1;
     }
 }
+
+Result<void> OrderbookClient::move_to_rings() {
+    const std::string line = config_.rings.bytes != 0
+                                 ? "RINGS " + std::to_string(config_.rings.bytes) + "\n"
+                                 : std::string("RINGS\n");
+    send_buf_.assign(line);
+    if (auto sr = send_all(send_buf_.size()); !sr) return sr;
+
+    // The answer comes with the rings' descriptors, so it is read with them, not by recv_response().
+    std::string answer;
+    std::string why;
+    std::vector<int> fds;
+    if (!net::recv_with_fds(fd_, 4096, 3, static_cast<uint32_t>(config_.read_timeout_sec * 1000),
+                            answer, fds, why)) {
+        return Result<void>::err(OB_ERR_IO, "moving to rings: " + why);
+    }
+    const std::string_view prefix = "OK RINGS ";
+    if (answer.rfind(prefix, 0) != 0 || fds.size() != 3) {
+        for (const int fd : fds) ::close(fd);
+        return Result<void>::err(OB_ERR_IO, "the server would not move the session to rings: " +
+                                                answer.substr(0, answer.find('\n')));
+    }
+    uint64_t bytes = 0;
+    const char* first = answer.data() + prefix.size();
+    const auto [end, ec] = std::from_chars(first, answer.data() + answer.size(), bytes);
+    if (ec != std::errc{} || end == first) {
+        for (const int fd : fds) ::close(fd);
+        return Result<void>::err(OB_ERR_IO, "a rings answer without a size: " + answer);
+    }
+    auto r          = std::make_unique<Rings>();
+    r->server_bell  = fds[1];
+    r->client_bell  = fds[2];
+    r->mapping      = ring::Mapping::attach(fds[0], bytes, why);
+    if (!r->mapping.valid()) return Result<void>::err(OB_ERR_IO, "the rings' memory: " + why);
+    r->commands = ring::Writer(r->mapping.to_server(), r->mapping.to_server_data(), bytes);
+    r->answers  = ring::Reader(r->mapping.to_client(), r->mapping.to_client_data(), bytes);
+    rings_      = std::move(r);
+    OB_LOG_DEBUG("client", "fd=%d: moved to rings of %llu bytes a direction", fd_,
+                 static_cast<unsigned long long>(bytes));
+    return Result<void>::ok();
+}
+
+namespace {
+
+int ms_until(std::chrono::steady_clock::time_point deadline) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    return static_cast<int>(std::max<int64_t>(0, left.count()));
+}
+
+Result<void> send_through_rings(OrderbookClient::Rings& r, const char* p, size_t len, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    size_t done = 0;
+    while (done < len) {
+        const size_t n = r.commands.write(p + done, len - done);
+        done += n;
+        if (r.commands.broken()) {
+            return Result<void>::err(OB_ERR_IO, "the server left the command ring in a state it never had");
+        }
+        if (n > 0) {
+            if (r.commands.publish()) ring::ring_bell(r.server_bell);
+            continue;
+        }
+        // Full: the server rings when it has read enough to make room.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Result<void>::err(OB_ERR_IO, "no room in the command ring within the timeout");
+        }
+        if (!r.commands.prepare_to_wait_for_room()) continue;
+        pollfd pfd{r.client_bell, POLLIN, 0};
+        (void)::poll(&pfd, 1, ms_until(deadline));
+        ring::drain_bell(r.client_bell);
+        r.commands.done_waiting_for_room();
+    }
+    return Result<void>::ok();
+}
+
+ssize_t read_from_rings(OrderbookClient::Rings& r, int sock, char* buf, size_t len, std::string* why,
+                        uint32_t spin_us, int timeout_ms) {
+    const auto start    = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(timeout_ms);
+    const auto spin_end = start + std::chrono::microseconds(spin_us);
+    for (;;) {
+        const size_t n = r.answers.read(buf, len);
+        if (n > 0) {
+            // The room just made may be what a server with a full answer ring waits for.
+            if (r.answers.producer_waiting()) ring::ring_bell(r.server_bell);
+            return static_cast<ssize_t>(n);
+        }
+        if (r.answers.broken()) {
+            if (why != nullptr) *why = "the server left the answer ring in a state it never had";
+            return -1;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < spin_end) continue;
+        if (now >= deadline) {
+            if (why != nullptr) *why = "recv timed out";
+            return -1;
+        }
+        if (!r.answers.prepare_to_sleep()) continue;
+        // The bell, and the socket the session is kept under: it carries nothing after the move,
+        // so anything there is the server closing the session.
+        pollfd pfds[2] = {{r.client_bell, POLLIN, 0}, {sock, POLLIN, 0}};
+        const int ready = ::poll(pfds, 2, ms_until(deadline));
+        ring::drain_bell(r.client_bell);
+        r.answers.woke();
+        if (ready > 0 && pfds[1].revents != 0 && r.answers.available() == 0) {
+            char c = 0;
+            if (::recv(sock, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0) return 0;
+        }
+    }
+}
+
+}  // namespace
 
 Result<std::string_view> OrderbookClient::recv_response() {
     sock_buf_.clear();
@@ -1356,6 +1529,7 @@ OrderbookPool::OrderbookPool(PoolConfig config)
         cc.host                = ns.host;
         cc.port                = ns.port;
         cc.unix_socket         = {};   // every node is dialled at its address (#52)
+        cc.rings               = {};   // and so is not on this host's socket
         cc.connect_timeout_sec = config_.connect_timeout_sec;
         cc.read_timeout_sec    = config_.read_timeout_sec;
         cc.compress            = config_.compress;

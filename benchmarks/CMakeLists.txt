@@ -53,6 +53,8 @@ target_link_libraries(wire_load PRIVATE orderbook_client)
 # and reports `BOOK` against a `PING` baseline in the same round, which is what makes the table in
 # the roadmap re-measurable with a command.
 add_executable(command_latency command_latency.cpp)
+# The rings of #52's step 2: the probe moves its session to them with OB_RINGS=1.
+target_link_libraries(command_latency PRIVATE orderbook_net)
 
 # ── Pipelined ingest, K connections, the server's CPU per thread (#146) ──────
 #

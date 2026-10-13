@@ -154,6 +154,7 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
         cc.read_timeout_sec    = config_.read_timeout_sec;
         cc.compress            = config_.compress;
         cc.unix_socket         = {};   // every node is dialled at its address (#52)
+        cc.rings               = {};   // and so is not on this host's socket
         copy_client_access(config_, cc);
 
         // "host:port", an IPv6 host in brackets; a host alone is on 9090.
@@ -202,6 +203,7 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
             cc.read_timeout_sec    = config_.read_timeout_sec;
             cc.compress            = config_.compress;
             cc.unix_socket         = {};   // every node is dialled at its address (#52)
+            cc.rings               = {};   // and so is not on this host's socket
             copy_client_access(config_, cc);
 
             // "host:port", an IPv6 host in brackets; a host alone is on 9090.
