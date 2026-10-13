@@ -224,6 +224,33 @@ std::unique_ptr<Wire> to_port(uint16_t port) {
 
 bool greeted(const std::string& greeting) { return greeting.rfind("OK ob_tcp_server v", 0) == 0; }
 
+/// One counter from the node's `/metrics` on `port`, or -1 when it cannot be read.
+long long metric(uint16_t port, const std::string& name) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    std::string text;
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+        const std::string get = "GET /metrics HTTP/1.0\r\n\r\n";
+        if (::send(fd, get.data(), get.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(get.size())) {
+            char buf[65536];
+            for (ssize_t n; (n = ::recv(fd, buf, sizeof(buf), 0)) > 0;) text.append(buf, static_cast<size_t>(n));
+        }
+    }
+    ::close(fd);
+    // `name{labels} value`, or `name value`: the value follows the first space after the name.
+    for (size_t at = text.find("\n" + name); at != std::string::npos; at = text.find("\n" + name, at + 1)) {
+        const char next = text[at + 1 + name.size()];
+        if (next != '{' && next != ' ') continue;   // a longer name that starts with this one
+        const size_t space = text.find(' ', at + 1);
+        return space == std::string::npos ? -1 : std::atoll(text.c_str() + space + 1);
+    }
+    return -1;
+}
+
 /// A session moved to rings (#52, step 2), speaking the protocol through them the way the C++
 /// client does: commands into one ring, answers out of the other, and a bell rung only for a side
 /// that sleeps.
@@ -266,6 +293,8 @@ public:
     int server_bell() const { return server_bell_; }
     /// How many times a command found the node asleep and rang it.
     uint64_t bells_rung() const { return bells_rung_; }
+    /// How many times a full command ring put this client to sleep until the node made room.
+    uint64_t room_waits() const { return room_waits_; }
 
     bool send_raw(const std::string& bytes) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -280,6 +309,7 @@ public:
             if (n > 0) continue;
             if (std::chrono::steady_clock::now() > deadline) return false;
             if (commands_.prepare_to_wait_for_room()) {
+                ++room_waits_;
                 // Long enough that a bell the node never rang shows as a failure, not as a pause.
                 pollfd p{client_bell_, POLLIN, 0};
                 if (::poll(&p, 1, 2000) == 0) return false;
@@ -340,6 +370,7 @@ public:
 private:
     int                socket_fd_;
     uint64_t           bells_rung_{0};
+    uint64_t           room_waits_{0};
     bool               ok_{false};
     std::string        error_;
     std::string        answer_;
@@ -923,21 +954,35 @@ TEST(RingsServer, ClosingTheSocketEndsTheSessionInRings) {
 }
 
 TEST(RingsServer, ABurstLargerThanTheCommandRingIsTakenAsTheNodeReadsIt) {
-    // 20 000 PINGs in one write through a ring of 64 KiB: the client fills it, waits for room on its
+    // 60 000 PINGs in one write through a ring of 64 KiB: the client fills it, waits for room on its
     // bell, and the node rings it as it reads. The answers pile up in the node's queue meanwhile, and
-    // go out once the client reads them.
+    // go out once the client reads them. The node reads a whole ring at a time, so the burst is
+    // several rings long, and it starts once the node has gone to sleep: a node still awake from the
+    // move could take the first ring before the client finds it full.
     Dir dir;
-    const auto config = ring_config(dir, ring_port_at(80), false);
+    auto config         = ring_config(dir, ring_port_at(80), false);
+    config.metrics_port = ring_port_at(81);
     Running server(config);
     auto w = through(config.unix_socket);
     ASSERT_TRUE(w);
     ASSERT_TRUE(greeted(w->greeting()));
     RingWire r(*w, 65536);
     ASSERT_TRUE(r.ok()) << r.error();
+    // No round trip first: its answer would ring the client, and the count below is of room alone.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::string burst;
-    for (int i = 0; i < 20000; ++i) burst += "PING\n";
+    for (int i = 0; i < 60000; ++i) burst += "PING\n";
     ASSERT_TRUE(r.send_raw(burst)) << "the client was never given room";
-    for (int i = 0; i < 20000; ++i) {
+    ASSERT_GE(r.room_waits(), 1u) << "the client never waited for room, so nothing here tests it";
+    // The client has not slept on an answer yet, so every bell so far was for room, and each one
+    // counts in `ob_ring_bells_total` as an answer's bell does. The loop publishes once a pass.
+    long long bells = 0;
+    for (int i = 0; i < 100 && bells < 1; ++i) {
+        bells = metric(config.metrics_port, "ob_ring_bells_total");
+        if (bells < 1) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_GE(bells, 1) << "the bells rung for room are not in ob_ring_bells_total";
+    for (int i = 0; i < 60000; ++i) {
         const std::string a = r.answer();
         ASSERT_EQ(a, "PONG\n") << "answer " << i;
     }
