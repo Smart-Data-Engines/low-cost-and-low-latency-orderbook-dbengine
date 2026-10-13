@@ -186,7 +186,8 @@ in the harness installs anything, and a containerised competitor would measure t
 - **SoA (Struct-of-Arrays) buffer** with seqlock for lock-free concurrent reads
 - **Write-Ahead Log (WAL)** with CRC32C checksums and crash recovery
 - **Columnar segments on disk** — time-partitioned, every column of a segment in one checksummed
-  file, each in whichever of its candidate encodings is smallest for it (segment format 3, #219);
+  file, each in whichever of its candidate encodings is smallest for it, a seal charging runs for
+  their runs (segment format 3, #219, #223);
   written whole when a symbol has enough rows or its oldest are ten seconds old, and merged in the
   background into segments of up to 262 144 rows, so their number follows the data rather than
   uptime

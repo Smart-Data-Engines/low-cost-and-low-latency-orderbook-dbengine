@@ -1218,6 +1218,65 @@ TEST(ColumnarStoreFormat, TheMergesFormatTakesZstdWhereItSavesItsMargin) {
     EXPECT_EQ(rows[3999].quantity, 100'000 + 19 * 7'919 % 5'003);
 }
 
+TEST(ColumnarStoreFormat, ASealChargesRunsForTheirRunsAndAMergeKeepsTheSmallest) {
+    // A column of runs a value or two long - each quantity repeated with probability 0.43 - is
+    // smallest as runs, and decodes several times slower that way (#223). The seal's format charges
+    // runs for their runs and writes it otherwise; the same store told to charge nothing writes
+    // runs, which is what says the column tests something. The merge's format charges nothing and
+    // writes the smallest, runs.
+    constexpr uint8_t kPackingMask = 0x18;
+    constexpr uint8_t kRunsPacking = 0x08;
+    const auto fill = [](ob::ColumnarStore& store) {
+        uint64_t x = 7;
+        const auto next = [&x] {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            return x >> 33;
+        };
+        for (uint64_t i = 0; i < 10'000;) {
+            const uint64_t qty = 1 + (next() & ((uint64_t{1} << 20) - 1));
+            for (int k = next() % 1000 < 430 ? 2 : 1; k > 0 && i < 10'000; --k, ++i) {
+                store.append(make_row(1'000'000'000ULL + i * 1'000ULL, 6'000'000'000LL, qty));
+            }
+        }
+    };
+    {
+        const auto format = ob::ColumnarStore::SegmentFormat::seal();
+        EXPECT_EQ(format.search.runs_charge_pct, ob::column_codec::kRunsChargePct);
+        TempDir charged_dir("format_runs_charged");
+        ob::ColumnarStore charged(charged_dir.str());
+        charged.set_segment_format(format);
+        fill(charged);
+        const auto meta = charged.flush_segment();
+        ASSERT_TRUE(meta.has_value());
+        const auto encodings = block_encodings(meta->dir_path);
+        ASSERT_EQ(encodings.size(), 7u);
+        EXPECT_NE(encodings[kQuantityColumn] & kPackingMask, kRunsPacking) << "the quantities were written as runs";
+        const auto rows = scan_all(charged);
+        ASSERT_EQ(rows.size(), 10'000u);
+
+        auto by_size = format;
+        by_size.search.runs_charge_pct = 0;
+        TempDir free_dir("format_runs_free");
+        ob::ColumnarStore free(free_dir.str());
+        free.set_segment_format(by_size);
+        fill(free);
+        const auto free_meta = free.flush_segment();
+        ASSERT_TRUE(free_meta.has_value());
+        EXPECT_EQ(block_encodings(free_meta->dir_path)[kQuantityColumn] & kPackingMask, kRunsPacking)
+            << "by size alone the quantities are not runs, so this column tests nothing";
+    }
+    const auto merge = ob::ColumnarStore::SegmentFormat::merge();
+    EXPECT_EQ(merge.search.runs_charge_pct, 0u);
+    TempDir merged_dir("format_runs_merged");
+    ob::ColumnarStore merged(merged_dir.str());
+    merged.set_segment_format(merge);
+    fill(merged);
+    const auto merged_meta = merged.flush_segment();
+    ASSERT_TRUE(merged_meta.has_value());
+    EXPECT_EQ(block_encodings(merged_meta->dir_path)[kQuantityColumn] & kPackingMask, kRunsPacking)
+        << "the merge's format did not write the smallest";
+}
+
 TEST(ColumnarStoreReadBuffers, AFormat3ReadsDecodingScratchIsCountedInWhatThePoolKeeps) {
     // The decoder's own buffers - here the quantities unpacked from fixed-width blocks before their
     // inverse - belong to the read's pooled set, so the budget bounds them as it bounds the columns.

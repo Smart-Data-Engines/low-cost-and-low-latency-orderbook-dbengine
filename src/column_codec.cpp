@@ -161,7 +161,8 @@ void transform_delta(std::span<const uint64_t> v, Stream& s) {
     }
 }
 
-void pack_runs(const std::vector<uint64_t>& v, std::string& out) {
+/// Returns how many runs it packed.
+size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
     thread_local std::vector<uint64_t> values, lengths;
     values.clear();
     lengths.clear();
@@ -178,8 +179,10 @@ void pack_runs(const std::vector<uint64_t>& v, std::string& out) {
     put_varint(out, value_words.size());
     put_u64_words(out, value_words);
     put_u64_words(out, length_words);
+    const size_t runs = values.size();
     keep_small(values);
     keep_small(lengths);
+    return runs;
 }
 
 unsigned block_width(const uint64_t* v, size_t n) {
@@ -868,6 +871,23 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
         What what{What::kS8b};
         Compressor compressor{Compressor::kNone};
         size_t bytes{std::numeric_limits<size_t>::max()};
+        uint64_t weighed{std::numeric_limits<uint64_t>::max()};   ///< the bytes, a runs one charged
+    };
+    // A runs candidate is weighed as if it were larger by its charge (#223): a run's decode is a step
+    // its length decides, so where runs are a value or two long they decode several times slower than
+    // any other packing, and on binance-diff's prices and quantities they were chosen for saving a
+    // few percent. The charge follows the runs per value, so long runs pay almost nothing.
+    size_t run_count[2] = {0, 0};
+    const auto weigh = [&](size_t bytes, int t, bool is_runs) -> uint64_t {
+        const size_t n = streams[t].values.size();
+        if (!is_runs || options.runs_charge_pct == 0 || n == 0) return bytes;
+        // Runs a thousand values first, so that no charge and no column can overflow the product.
+        const uint64_t runs_per_mille = uint64_t{1000} * run_count[t] / n;
+        const uint64_t per_mille = std::min<uint64_t>(900, options.runs_charge_pct * runs_per_mille / 100);
+        return static_cast<uint64_t>(bytes) * 1000 / (1000 - per_mille);
+    };
+    const auto offer = [](Best& best, const Best& candidate) {
+        if (candidate.weighed < best.weighed) best = candidate;
     };
     Best light, lz4, zstd;
     for (int t = 0; t < 2; ++t) {
@@ -875,15 +895,15 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
         s8b[t].clear();
         put_u64_words(s8b[t], encode_simple8b(s.values).words);
         runs[t].clear();
-        pack_runs(s.values, runs[t]);
+        run_count[t] = pack_runs(s.values, runs[t]);
         const size_t b_s8b = header_bytes(s, Packing::kSimple8b, Compressor::kNone, 0) + s8b[t].size();
         const size_t b_runs = header_bytes(s, Packing::kRuns, Compressor::kNone, 0) + runs[t].size();
-        if (b_s8b < light.bytes) light = Best{t, What::kS8b, Compressor::kNone, b_s8b};
-        if (b_runs < light.bytes) light = Best{t, What::kRuns, Compressor::kNone, b_runs};
+        offer(light, Best{t, What::kS8b, Compressor::kNone, b_s8b, weigh(b_s8b, t, false)});
+        offer(light, Best{t, What::kRuns, Compressor::kNone, b_runs, weigh(b_runs, t, true)});
         if (t == 0) {
             const size_t b_blocks =
                 header_bytes(s, Packing::kBlocks, Compressor::kNone, 0) + blocks_bytes(s.values);
-            if (b_blocks < light.bytes) light = Best{t, What::kBlocks, Compressor::kNone, b_blocks};
+            offer(light, Best{t, What::kBlocks, Compressor::kNone, b_blocks, weigh(b_blocks, t, false)});
         }
     }
     const bool try_lz4 = options.lz4;
@@ -906,27 +926,25 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
                 if (!compress(compressor, *payloads[k], options.zstd_level, z)) continue;
                 const Packing packing = k == 0 ? Packing::kRuns : Packing::kNarrow;
                 const size_t bytes = header_bytes(s, packing, compressor, payloads[k]->size()) + z.size();
-                if (bytes < best_here.bytes) {
-                    best_here = Best{t, k == 0 ? What::kCompressedRuns : What::kCompressedNarrow,
-                                     compressor, bytes};
-                }
+                offer(best_here, Best{t, k == 0 ? What::kCompressedRuns : What::kCompressedNarrow,
+                                      compressor, bytes, weigh(bytes, t, k == 0)});
             }
         }
     }
-    // The smallest, with two margins: a compressed candidate has to be smaller than the smallest
-    // uncompressed one by `compressed_margin_pct`, and a ZSTD one than the smallest LZ4 one by
+    // The smallest as weighed, with two margins: a compressed candidate has to be smaller than the
+    // uncompressed one by `compressed_margin_pct`, and a ZSTD one than the LZ4 one by
     // `zstd_margin_pct` - both cost a decompression, ZSTD's several times LZ4's.
-    const auto smaller_by = [](size_t bytes, size_t than, unsigned pct) {
-        return 100 * static_cast<uint64_t>(bytes) <
-               static_cast<uint64_t>(100 - std::min(pct, 100u)) * than;
+    const auto smaller_by = [](uint64_t weighed, uint64_t than, unsigned pct) {
+        return 100 * weighed < static_cast<uint64_t>(100 - std::min(pct, 100u)) * than;
     };
     Best best = light;
-    if (try_lz4 && lz4.bytes < best.bytes && smaller_by(lz4.bytes, light.bytes, options.compressed_margin_pct)) {
+    if (try_lz4 && lz4.weighed < best.weighed &&
+        smaller_by(lz4.weighed, light.weighed, options.compressed_margin_pct)) {
         best = lz4;
     }
-    if (try_zstd && zstd.bytes < best.bytes &&
-        smaller_by(zstd.bytes, light.bytes, options.compressed_margin_pct) &&
-        (!try_lz4 || smaller_by(zstd.bytes, lz4.bytes, options.zstd_margin_pct))) {
+    if (try_zstd && zstd.weighed < best.weighed &&
+        smaller_by(zstd.weighed, light.weighed, options.compressed_margin_pct) &&
+        (!try_lz4 || smaller_by(zstd.weighed, lz4.weighed, options.zstd_margin_pct))) {
         best = zstd;
     }
 

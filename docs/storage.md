@@ -59,8 +59,10 @@ A block says how it is encoded and how many values it holds, and is decoded only
 segment's row count. Each column is in whichever of its candidate encodings is smallest for it:
 less the column's minimum or less the value before it, divided by what the values share; packed in
 Simple8b, as runs of equal values, in fixed-width blocks of 128, or each value in the bytes it
-needs; and under LZ4 at a seal, or ZSTD at a merge where that saves 10% over LZ4. The layout,
-byte by byte, is in `include/orderbook/column_codec.hpp` and in the spec,
+needs; and under LZ4 at a seal, or ZSTD at a merge where that saves 10% over LZ4. A seal weighs
+runs as larger by half their runs per value, in percent: runs a value or two long decode several
+times slower than any other packing, for the few percent they save (#223). The layout, byte by byte,
+is in `include/orderbook/column_codec.hpp` and in the spec,
 `smart-data-engine-workspace/specs/segment-format-v3/design.md`.
 
 Format 2, which a node writes with `segment-format = 2` and every node reads:

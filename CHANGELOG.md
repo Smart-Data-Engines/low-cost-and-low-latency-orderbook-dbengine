@@ -51,6 +51,11 @@ here as `#N`.
 
 ### Changed
 
+- A seal no longer writes a column as runs a value or two long to save a few percent (#223): a runs
+  candidate is weighed as larger by half its runs per value, and taken only where it is that much
+  smaller. binance-diff's columns, as sealed, decode in 5.55-5.57 ns a row where they took 7.09-7.15
+  on the EPYC host, and in 5.61-5.64 where 7.04-7.13 on ARM, for 1.1% more bytes; binance-top20's,
+  whose runs are long, as before. A merge chooses as it did.
 - A column of short runs decodes faster (#223): where its runs average two to eight values, a run of
   up to eight is written whole, with nothing branching on its length, and a 16-bit column's in one
   vector. On a recording of an order book's changes, its levels, sequence numbers and timestamps

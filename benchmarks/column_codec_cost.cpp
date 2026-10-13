@@ -134,8 +134,8 @@ std::vector<cc::Encoding> candidates() {
     return out;
 }
 
-/// The engine's two policies (engine.hpp): a seal's, LZ4 or nothing, and a merge's, ZSTD at 3
-/// where it saves 10% over LZ4.
+/// The engine's two policies (columnar_store.hpp): a seal's, LZ4 or nothing, a runs candidate
+/// charged for its runs, and a merge's, ZSTD at 3 where it saves 10% over LZ4 and nothing charged.
 struct Policy {
     const char* name;
     cc::EncodeOptions options;
@@ -148,9 +148,11 @@ std::vector<Policy> policies() {
     merge.lz4 = true;
     merge.zstd_level = 3;
     merge.zstd_margin_pct = 10;
+    merge.runs_charge_pct = 0;
     cc::EncodeOptions smallest;
     smallest.lz4 = true;
     smallest.zstd_level = 3;
+    smallest.runs_charge_pct = 0;
     return {{"seal", seal}, {"merge", merge}, {"smallest", smallest}};
 }
 
