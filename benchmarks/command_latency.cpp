@@ -37,6 +37,11 @@
 // blocks pays for its own wake-up, and on a host whose idle CPUs sleep deeply that is part of every
 // figure, more of a short round trip than of a long one (#52).
 //
+// `OB_GAP_US=<n>` waits n microseconds between two round trips, outside the timed part, watching
+// the clock so the probe itself stays awake. Back to back, the next command can reach a node whose
+// loop is still polling after the last one; after a gap the loop has gone to sleep - once its spin
+// is over in `boost`, at once in `eco` - and the figure is a command that has to wake it (#52).
+//
 // One JSON object on stdout: percentiles of the round trip, the server's CPU for the timed loop
 // (read from /proc/<server-pid>/stat), and the size of one answer in bytes and in lines - the
 // second so a driver can check the answer is the shape it asked for, not only that it arrived.
@@ -212,6 +217,8 @@ int main(int argc, char** argv) {
     // does; 0 sleeps at once. Ignored with OB_SPIN=1, which never sleeps.
     const char* spin_us_env = std::getenv("OB_SPIN_US");
     const long spin_us = spin_us_env != nullptr ? std::strtol(spin_us_env, nullptr, 10) : 0;
+    const char* gap_env = std::getenv("OB_GAP_US");
+    const long gap_us = gap_env != nullptr ? std::strtol(gap_env, nullptr, 10) : 0;
     // One round trip. Returns false on a transport failure; an ERR answer is reported through
     // `answer` and refused by the caller, because timing an error is how this probe lied once.
     // The answer is complete: one line for PING and errors, a blank line ending anything else.
@@ -288,6 +295,10 @@ int main(int argc, char** argv) {
     const double cpu_before = process_cpu_seconds(server_pid);
     const auto wall0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iterations; ++i) {
+        if (gap_us > 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(gap_us);
+            while (std::chrono::steady_clock::now() < until) {}
+        }
         const auto t0 = std::chrono::steady_clock::now();
         if (!round_trip()) { std::fprintf(stderr, "round trip %d failed\n", i); return 1; }
         const auto t1 = std::chrono::steady_clock::now();
@@ -304,14 +315,14 @@ int main(int argc, char** argv) {
     // tick touches one round trip in hundreds, and p99 does not see it (#180).
     // The transport too, so a figure carries what it travelled on rather than leaving it to the
     // file it was saved in (#52).
-    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"spin_us\": %ld, \"iterations\": %d, "
+    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"spin_us\": %ld, \"gap_us\": %ld, \"iterations\": %d, "
                 "\"p50_ns\": %lld, \"p99_ns\": %lld, "
                 "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
                 "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu, "
                 "\"split_answers\": %zu}\n",
                 json_label.c_str(),
                 use_rings ? "rings" : (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
-                spin ? "true" : "false", spin_us,
+                spin ? "true" : "false", spin_us, gap_us,
                 iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
                 ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),
