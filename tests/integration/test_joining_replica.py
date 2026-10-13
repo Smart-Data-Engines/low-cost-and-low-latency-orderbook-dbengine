@@ -136,6 +136,11 @@ def test_a_primary_lost_while_its_replica_joins_loses_no_write():
         status = send_command(replica.tcp_port, "STATUS")
         assert "joining: stream=" in status, status
         assert os.path.exists(os.path.join(replica.data_dir, "repl_joining.txt"))
+        # The wait the failover fixtures make before handing a cluster on sees this window too: in
+        # PR #250's TSan run a test killed the primary 0.4 s into a join that no role check showed.
+        with pytest.raises(RuntimeError) as waited:
+            cluster.wait_until_no_node_is_joining(timeout=1.0)
+        assert "joining: stream=" in str(waited.value), waited.value
 
         # The node that holds the stream returns and takes the role; the replica finishes joining.
         cluster.restart_node(primary.index)
@@ -148,6 +153,7 @@ def test_a_primary_lost_while_its_replica_joins_loses_no_write():
         assert wait_for(lambda: not os.path.exists(os.path.join(replica.data_dir, "repl_joining.txt")),
                         within=patience(30)), "the replica caught up and is still recorded as joining"
         assert "joining:" not in send_command(replica.tcp_port, "STATUS")
+        cluster.wait_until_no_node_is_joining(timeout=10.0)
         assert role_of(replica.tcp_port).upper().startswith("REPLICA")
     finally:
         cluster.shutdown()

@@ -318,6 +318,27 @@ def send_command(port: int, command: str, timeout: float = 10.0) -> str:
         return buffered.decode(errors="replace")
 
 
+def full_status(port: int, timeout: float = 5.0) -> str:
+    """STATUS, read to the empty line that ends it - not to its first newline, where `send_command()`
+    stops: a line near the end of a long answer is not in that first read for certain."""
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        banner = b""
+        while b"\n\n" not in banner:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ClosedWithoutReply(f"node on port {port} closed before its banner")
+            banner += chunk
+        sock.sendall(b"STATUS\n")
+        answer = banner.split(b"\n\n", 1)[1]
+        while not answer.endswith(b"\n\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            answer += chunk
+        return answer.decode(errors="replace")
+
+
 def role_of(port: int, timeout: float = 5.0) -> str:
     """The node's own answer to ROLE, or why it did not give one.
 
@@ -1262,6 +1283,37 @@ class ClusterManager:
             f"Cluster not converged after {timeout}s. Roles: {roles}"
         )
 
+    def wait_until_no_node_is_joining(self, timeout: float = 45.0) -> None:
+        """Poll STATUS until no node reports a `joining:` line.
+
+        Since #215 a replica joining a stream does not stand for election, and a role check cannot
+        see that it is joining: ROLE says REPLICA from the moment it demotes. A test that kills the
+        primary inside that window sees no failover - by design - and fails at the wrong code. The
+        failover tests leave exactly that window behind them: a node demoted with no position that
+        names the new primary's stream discards and replays from zero, and in PR #250's TSan run the
+        next test killed the primary 0.4 s into that join and waited 40 s for a promotion that was
+        refused 50 times.
+        """
+        deadline = time.monotonic() + patience(timeout)
+        joining: dict = {}
+        while True:
+            joining = {}
+            for node in self.nodes:
+                try:
+                    status = full_status(node.tcp_port)
+                except Exception as exc:  # noqa: BLE001 - a node that cannot answer is not done
+                    joining[node.node_id] = f"no STATUS: {exc}"
+                    continue
+                line = next((ln for ln in status.splitlines() if ln.startswith("joining:")), None)
+                if line is not None:
+                    joining[node.node_id] = line
+            if not joining or time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+        if joining:
+            raise RuntimeError(f"after {patience(timeout):.0f}s a node is still joining, or does not "
+                               f"answer STATUS: {joining}")
+
     # ── Restart / kill (for failover tests) ───────────────────────
 
     def restart_node(self, node_index: int) -> None:
@@ -1877,6 +1929,9 @@ def healthy_cluster(failover_cluster: ClusterManager) -> Generator[ClusterManage
     cluster makes the next test's red point at the wrong code.
     """
     cluster = failover_cluster
+    # Before the test as well as after it: the first test of a module gets the cluster as `start()`
+    # left it, and a replica may still be joining it.
+    cluster.wait_until_no_node_is_joining()
     yield cluster
 
     # Before the repair, not after: restarting reuses the data directory. These modules kill nodes
@@ -1910,6 +1965,8 @@ def healthy_cluster(failover_cluster: ClusterManager) -> Generator[ClusterManage
             f"cluster not restored after the test: expected exactly one primary, "
             f"roles={roles}"
         )
+    # One primary is not yet a cluster that can fail over: a replica still joining will not stand.
+    cluster.wait_until_no_node_is_joining()
 
     # Last, so the cluster is whole first: a death report that leaves the next module a broken
     # cluster turns one finding into a page of unrelated red.
