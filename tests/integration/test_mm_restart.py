@@ -37,7 +37,7 @@ import urllib.request
 import pytest
 
 from conftest import ClusterManager, node_log_since, node_log_size, patience
-from orderbook_engine import BookUpdate, OrderbookEngine
+from orderbook_engine import BookUpdate, OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.multi_master
 
@@ -79,10 +79,20 @@ def write(node, first_ts: int, per_symbol: int) -> None:
 
 
 def rows(node) -> int:
+    """The rows `node` holds of SYMBOLS. A symbol it has no row of yet counts as none: the mesh
+    delivers a write to the other nodes in milliseconds, and wait_for() can poll before it arrives -
+    which a battery under load did, and which raised instead of polling again."""
     client = client_for(node)
     try:
         client.flush()
-        return sum(len(client.query_all(sym, EXCHANGE)) for sym in SYMBOLS)
+        total = 0
+        for sym in SYMBOLS:
+            try:
+                total += len(client.query_all(sym, EXCHANGE))
+            except OrderbookError as e:
+                if "OB_ERR_NOT_FOUND" not in str(e):
+                    raise
+        return total
     finally:
         client.close()
 
@@ -162,6 +172,7 @@ def held_after_missing_writes(mesh, returning: int, just_after_a_tick: bool = Fa
     killed with every node's rows written down, 200 rows a symbol were written to node 0
     meanwhile, and it was restarted."""
     writer = mesh.nodes[0]
+    assert rows(mesh.nodes[returning]) == 0, "a symbol the node has no row of yet counts as none"
     write(writer, BASE_TS, 10)
     assert wait_for(mesh.nodes[returning], 100, 30) == 100, (
         "the premise: the mesh holds the first rows")
