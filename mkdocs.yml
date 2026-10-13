@@ -1,0 +1,54 @@
+# The documentation site (#40): the files in docs/, rendered. Nothing here is a copy - a page is
+# its file in docs/, and `mkdocs build --strict` in CI refuses a broken link, a page missing from
+# the navigation and every other warning. Build it with:
+#   pip install -r scripts/requirements-docs.txt && mkdocs build --strict
+site_name: Orderbook DB Engine
+site_description: A database engine for Level 2 order book data - native, measured, open source.
+repo_url: https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine
+repo_name: Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine
+edit_uri: edit/master/docs/
+docs_dir: docs
+site_dir: site
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+hooks:
+  - scripts/mkdocs_hooks.py
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Start: index.md
+  - Tutorial: tutorial.md
+  - Architecture: architecture.md
+  - Wire protocol: protocol.md
+  - Query language: query-language.md
+  - Python client: python.md
+  - C API: c-api.md
+  - Server and flags: cli.md
+  - Operations: operations.md
+  - Storage: storage.md
+  - Upgrading: upgrading.md
+  - Releasing: releasing.md
+  - Roadmap: roadmap.md
+  - Repository security: github-security.md

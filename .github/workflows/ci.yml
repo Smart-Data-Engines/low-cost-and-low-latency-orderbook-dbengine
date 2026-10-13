@@ -19,7 +19,7 @@ jobs:
   docs-integrity:
     name: docs-integrity
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -75,6 +75,18 @@ jobs:
           "$PROMTOOL" check rules packaging/prometheus/orderbook-engine-alerts.yml
           python3 scripts/check_dashboards.py
           python3 scripts/check_alert_rules.py
+
+      - name: The documentation site builds, with no broken link and no warning
+        # docs/ rendered by MkDocs (#40), with `strict: true` in mkdocs.yml. Each of these fails the
+        # build: a link to a page or an anchor that is not there, a page left out of the navigation,
+        # and a link out of docs/ to a file the repository does not have (scripts/mkdocs_hooks.py).
+        # What the pages show a server answering is checked against one, in the integration battery
+        # (tests/integration/test_docs_transcripts.py). The versions are pinned: MkDocs 2.0 removes
+        # the hooks this build uses.
+        run: |
+          python3 -m venv .venv-docs
+          .venv-docs/bin/pip install -q -r scripts/requirements-docs.txt
+          .venv-docs/bin/mkdocs build --strict
 
   build-and-test:
     name: build-and-test

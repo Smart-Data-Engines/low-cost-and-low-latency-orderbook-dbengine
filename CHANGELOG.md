@@ -11,6 +11,9 @@ here as `#N`.
 
 ### Added
 
+- A documentation site, built from `docs/` by MkDocs with `--strict` in CI, and not yet published
+  (#40). It brings a five-minute tutorial from the release packages to a query, and a wire protocol
+  reference. Every exchange the two show is replayed against the server in the integration battery.
 - IPv6, on every listener and every connection (#236). A listener with no bind flag takes both
   families; `--bind`, `--replication-bind`, `--mm-bind` and `--metrics-bind` take an IPv6 address;
   a replica, a mesh peer and both clients dial a name, an IPv4 or an IPv6 address, every address of

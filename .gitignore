@@ -80,3 +80,6 @@ venv/
 # manifest in every results file carries the SHA-256 — so the identity is committed and the bytes
 # are not.
 benchmarks/comparative/results/dataset-*.csv
+
+# The documentation site, built by `mkdocs build` (#40)
+/site/
