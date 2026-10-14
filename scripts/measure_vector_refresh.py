@@ -51,6 +51,33 @@ import measure_mesh_catchup as M  # noqa: E402
 
 BASE_TS = 1_700_000_000_000_000_000
 
+# What a round costs the device, beside what it delivered (#190 step 9): the bytes the server wrote,
+# and the ticks, seals and merges it ran, over the ingest alone.
+COSTS = ("ob_flush_ticks_total", "ob_seals_total", "ob_compactions_total", "ob_compaction_rows_total")
+
+
+def written_bytes(pid: int) -> int:
+    """`write_bytes` of /proc/<pid>/io: what the process sent towards the storage layer."""
+    with open(f"/proc/{pid}/io") as f:
+        for line in f:
+            if line.startswith("write_bytes:"):
+                return int(line.split()[1])
+    raise RuntimeError(f"no write_bytes in /proc/{pid}/io")
+
+
+def counters(metrics_port: int) -> dict:
+    """The COSTS counters from a node's /metrics, each summed over its label sets (pitfall 66)."""
+    import urllib.request
+    text = urllib.request.urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=10).read().decode()
+    out = {k: 0 for k in COSTS}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in out:
+            out[name] += int(float(line.rsplit(" ", 1)[1]))
+    return out
+
 
 def prefill(port: int, symbols: int, batch: int = 256) -> None:
     """One single-level MINSERT for each of `symbols` symbols, pipelined."""
@@ -154,6 +181,8 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             before = os.path.getsize(writer.log)
             result = probe_run(writer, symbols, args)
         else:
+            bytes_before = written_bytes(writer.proc.pid)
+            costs_before = counters(writer.ports[1])
             out = subprocess.run([probe, str(writer.tcp), str(writer.proc.pid),
                                   str(args.connections), str(args.batches), str(args.levels),
                                   str(args.batch)], capture_output=True, text=True, timeout=900)
@@ -161,6 +190,10 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
                 result = json.loads(out.stdout.strip().splitlines()[-1])
             else:
                 result = {"failed": (out.stderr.strip().splitlines() or ["?"])[-1][:160]}
+            result["written_mb"] = round((written_bytes(writer.proc.pid) - bytes_before) / 1e6, 1)
+            costs_after = counters(writer.ports[1])
+            for k in COSTS:
+                result[k.replace("ob_", "").replace("_total", "")] = costs_after[k] - costs_before[k]
         result["label"] = label
         with open(writer.log, "rb") as f:
             f.seek(before)
@@ -219,7 +252,7 @@ def main() -> int:
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
             "server_cores", "probe_n", "probe_p50_ms", "probe_p99_ms", "probe_p999_ms",
             "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "budget_waits",
-            "refused",
+            "refused", "written_mb", "flush_ticks", "seals", "compactions", "compaction_rows",
             "peer_drops", "failed")
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):
