@@ -4308,6 +4308,20 @@ Learned the hard way. Check here before debugging.
      only loses a byte when the writer publishes in the instant between the reader's empty read and
      its flag, and then publishes nothing more for two seconds. Called in that order from one
      thread, the steps lose it every time (`AReaderAboutToSleepLooksAgain`, #52).
+591. **A check that keys members by name reads a live member of one class for a dead one's.** Sixty
+     of the 507 member names in `include/orderbook/` are declared in more than one header, and
+     `tests/test_field_usage.cpp` counted a read of any `registry_` for all seven classes declaring
+     one, so it missed `AntiEntropyManager`'s, set and never read, which clang 21's
+     `-Wunused-private-field` found (#240). Keyed by header, it missed it again: it placed a file by
+     its name, and `src/engine_compaction.cpp` defines the engine's members under a name no header
+     has. The mutation that put the member back is what said so. A fix to a check is tried on the
+     case that made it.
+592. **`add_compile_options()` above `FetchContent_MakeAvailable()` builds the dependencies with our
+     `-Werror`.** Pitfall 62 the other way round: googletest's own `gtest-all.cc` was compiled with our
+     flags, and clang 21's `-Wcharacter-conversion` in `gtest-printers.h` stopped the build. All 133
+     test files include that header and compiled clean, because googletest declares its include
+     directories `SYSTEM` to the code that uses them, and its own sources are not that code.
+     google/benchmark adds a `-Werror` of its own unless `BENCHMARK_ENABLE_WERROR` is off.
 
 ## Current state and open problems
 

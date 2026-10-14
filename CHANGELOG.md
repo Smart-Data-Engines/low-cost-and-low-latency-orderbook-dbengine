@@ -107,6 +107,11 @@ here as `#N`.
 
 ### Fixed
 
+- The tree builds with clang 21 (#240). It failed on a member nothing read,
+  `AntiEntropyManager::registry_`, which is gone, and in googletest's own sources, which the
+  warnings-as-errors meant for our code no longer reach. The test that looks for a member written and
+  never read keyed members by name, so a live one in another class hid a dead one. It keys them by
+  the header that declares them now, and found a second, `MultiMasterManager::hlc_`, gone too.
 - A client resuming a subscription from a book, as documented, could lose updates (#239). The
   documentation said to take the book, then subscribe, and drop the pushes at or below the book's
   sequence number. That order loses what is written between the two: with a writer running, 48 of 50
