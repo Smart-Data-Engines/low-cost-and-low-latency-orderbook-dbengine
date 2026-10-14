@@ -147,11 +147,18 @@ TEST(WalBudget, AWriterPastTheBudgetWaitsForASyncAndGoesOnOnceItIsDone) {
     }
     EXPECT_TRUE(engine.wal_sync_running_for().has_value())
         << "a refusal now would not know a sync was running";
-    // The writer asked for the sync it is waiting for, and waits while it is held.
-    const uint64_t held_at = written.load();
+    // The sync was asked for at half the budget and is held: the writer goes on to the whole of the
+    // budget and stops there, waiting for the sync it cannot have. Read once it stops moving.
+    uint64_t held_at = written.load();
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(milliseconds(300));
+        const uint64_t now = written.load();
+        if (now == held_at) break;
+        held_at = now;
+    }
+    EXPECT_LT(held_at, kPastTheBudget) << "the writer wrote everything while the sync was held";
     std::this_thread::sleep_for(milliseconds(300));
     EXPECT_EQ(written.load(), held_at) << "the writer went on while the sync it waits for was held";
-    EXPECT_LT(held_at, kPastTheBudget);
     EXPECT_GE(budget_waits(engine), 1u);
 
     release();
@@ -159,6 +166,27 @@ TEST(WalBudget, AWriterPastTheBudgetWaitsForASyncAndGoesOnOnceItIsDone) {
     EXPECT_EQ(written.load(), kPastTheBudget);
     EXPECT_EQ(refused.load(), 0) << "a write held for a 300 ms sync was refused";
     engine.while_syncing_wal_for_test({});
+    engine.close();
+}
+
+TEST(WalBudget, PastHalfTheBudgetASyncIsAskedForBeforeAnyWriterWaits) {
+    // 100 deltas are about 2.5 MB: past half the 4 MiB budget and short of all of it, so nothing
+    // has to wait - and with the flush an hour away, a tick can only be the one the writer asked
+    // for at half the budget, so that its sync runs while the writer fills the rest.
+    TempDir dir("ob_wal_budget_half_");
+    ob::Engine engine(dir.path, kAnHour, ob::FsyncPolicy::INTERVAL);
+    engine.open();
+    for (uint64_t i = 0; i < 100; ++i) ASSERT_EQ(write(engine, i), ob::OB_OK);
+    std::optional<uint64_t> ticks;
+    for (int i = 0; i < 50; ++i) {
+        ticks = counter_value(engine.registry().serialize(), "ob_flush_ticks_total");
+        if (ticks.value_or(0) > 0) break;
+        std::this_thread::sleep_for(milliseconds(100));
+    }
+    ASSERT_TRUE(ticks.has_value()) << "ob_flush_ticks_total is not in the exposition";
+    EXPECT_GE(*ticks, 1u) << "past half the budget no sync was asked for, so it would come only "
+                             "once a writer had stopped at the whole of it";
+    EXPECT_EQ(budget_waits(engine), 0u);
     engine.close();
 }
 
