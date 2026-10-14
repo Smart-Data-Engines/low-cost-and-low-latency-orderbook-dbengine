@@ -929,7 +929,7 @@ integration test holds the names against what a running node serves.
   measured. Before it, the writers filled the pending queue's million rows - about 34 MB of WAL at
   ten levels a record - before admission knew the device's rate, and the sync that followed was the
   writers' wait: 4.9 s at 7 MB/s, and refused writes at 5 MB/s. A wait begins with
-  `A writer is waiting for the WAL to reach the device: <MB> is unsynced, against a budget of <MB>`
+  `A writer is waiting for the WAL to reach the device: <MiB> is unsynced, against a budget of <MiB>`
   and ends with `The WAL waiting for a sync is within its budget again; <n> write(s) waited for a
   sync.` Under `every` each write syncs itself and under `none` nothing does, so the budget does not
   bind there and the gauge is 0.
