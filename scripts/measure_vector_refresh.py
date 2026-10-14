@@ -65,6 +65,12 @@ def written_bytes(pid: int) -> int:
     raise RuntimeError(f"no write_bytes in /proc/{pid}/io")
 
 
+def device_stat(device: str) -> tuple[int, int]:
+    """Sectors written and milliseconds busy, from /sys/block/<device>/stat (fields 7 and 10)."""
+    fields = open(f"/sys/block/{device}/stat").read().split()
+    return int(fields[6]), int(fields[9])
+
+
 def counters(metrics_port: int) -> dict:
     """The COSTS counters from a node's /metrics, each summed over its label sets (pitfall 66)."""
     import urllib.request
@@ -183,6 +189,8 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
         else:
             bytes_before = written_bytes(writer.proc.pid)
             costs_before = counters(writer.ports[1])
+            dev_before = device_stat(args.block_device) if args.block_device else None
+            began = time.monotonic()
             out = subprocess.run([probe, str(writer.tcp), str(writer.proc.pid),
                                   str(args.connections), str(args.batches), str(args.levels),
                                   str(args.batch)], capture_output=True, text=True, timeout=900)
@@ -191,6 +199,14 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             else:
                 result = {"failed": (out.stderr.strip().splitlines() or ["?"])[-1][:160]}
             result["written_mb"] = round((written_bytes(writer.proc.pid) - bytes_before) / 1e6, 1)
+            if dev_before:
+                # What reached the device, the journal and every other writer on it included, and
+                # the share of the ingest it was busy - a device below its cap and not busy is one
+                # the engine left idle.
+                sectors, busy_ms = device_stat(args.block_device)
+                elapsed = time.monotonic() - began
+                result["device_mb"] = round((sectors - dev_before[0]) * 512 / 1e6, 1)
+                result["device_busy_pct"] = round(100.0 * (busy_ms - dev_before[1]) / 1000 / elapsed, 1)
             costs_after = counters(writer.ports[1])
             for k in COSTS:
                 result[k.replace("ob_", "").replace("_total", "")] = costs_after[k] - costs_before[k]
@@ -247,12 +263,15 @@ def main() -> int:
                     help="1 measures the refresh alone: no peer, so no broadcast and no resend")
     ap.add_argument("--refresh-log", metavar="LABEL")
     ap.add_argument("--root", default=os.path.join(os.getcwd(), "vector-refresh-runs"))
+    ap.add_argument("--block-device", metavar="NAME",
+                    help="also record what reached /sys/block/NAME and how busy it was")
     args = ap.parse_args()
     servers = [s.split("=", 1) for s in args.server]
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
             "server_cores", "probe_n", "probe_p50_ms", "probe_p99_ms", "probe_p999_ms",
             "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "budget_waits",
-            "refused", "written_mb", "flush_ticks", "seals", "compactions", "compaction_rows",
+            "refused", "written_mb", "device_mb", "device_busy_pct", "flush_ticks", "seals",
+            "compactions", "compaction_rows",
             "peer_drops", "failed")
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):
