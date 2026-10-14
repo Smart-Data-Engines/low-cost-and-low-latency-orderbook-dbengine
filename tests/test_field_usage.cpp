@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 namespace {
 
 // ── One line of source, two questions ────────────────────────────────────────
@@ -217,18 +219,18 @@ std::vector<std::string> read_lines(const std::filesystem::path& p) {
     return out;
 }
 
-std::vector<std::filesystem::path> sources_under(const std::string& rel, const char* ext) {
+std::vector<std::filesystem::path> sources_under(const std::filesystem::path& root,
+                                                 const std::string& rel, const char* ext) {
     std::vector<std::filesystem::path> out;
-    const std::filesystem::path root = std::filesystem::path(OB_SOURCE_DIR) / rel;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root / rel)) {
         if (entry.is_regular_file() && entry.path().extension() == ext) out.push_back(entry.path());
     }
     std::sort(out.begin(), out.end());
     return out;
 }
 
-std::string short_path(const std::filesystem::path& p) {
-    return std::filesystem::relative(p, std::filesystem::path(OB_SOURCE_DIR)).string();
+std::string short_path(const std::filesystem::path& root, const std::filesystem::path& p) {
+    return std::filesystem::relative(p, root).string();
 }
 
 struct Field {
@@ -237,40 +239,162 @@ struct Field {
     std::vector<std::string> reads;
 };
 
-std::map<std::string, Field> survey() {
+/// The class or struct this header line begins to define, or empty: `class Engine {`,
+/// `struct FlushState final : Base`, `class alignas(64) Ring` with its brace on the next line. Not a
+/// forward declaration (`class Engine;`), an `enum class`, a template parameter (`template <class
+/// T>`) or a variable of a struct type (`struct stat st;`).
+std::string class_declared_by(const std::string& line) {
+    const std::string c = code_of(line);
+    for (const char* key : {"class", "struct"}) {
+        const std::string k = key;
+        for (std::size_t at = c.find(k); at != std::string::npos; at = c.find(k, at + 1)) {
+            if ((at > 0 && ident_char(c[at - 1])) || at + k.size() >= c.size() ||
+                c[at + k.size()] != ' ') {
+                continue;
+            }
+            const std::string before = c.substr(0, at);
+            const std::size_t last = before.find_last_not_of(" \t");
+            if (last != std::string::npos && last >= 3 && before.compare(last - 3, 4, "enum") == 0) {
+                continue;
+            }
+            std::size_t i = at + k.size();
+            while (i < c.size()) {   // `alignas(64)` and `[[nodiscard]]` before the name
+                while (i < c.size() && c[i] == ' ') ++i;
+                if (c.compare(i, 8, "alignas(") == 0) {
+                    i = c.find(')', i);
+                    if (i == std::string::npos) return {};
+                    ++i;
+                } else if (c.compare(i, 2, "[[") == 0) {
+                    i = c.find("]]", i);
+                    if (i == std::string::npos) return {};
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            std::size_t end = i;
+            while (end < c.size() && ident_char(c[end])) ++end;
+            if (end == i) continue;
+            std::size_t next = end;
+            while (next < c.size() && c[next] == ' ') ++next;
+            const bool defines = next >= c.size() || c[next] == '{' ||
+                                 (c[next] == ':' && c.compare(next, 2, "::") != 0) ||
+                                 c.compare(next, 5, "final") == 0;
+            if (defines) return c.substr(i, end - i);
+        }
+    }
+    return {};
+}
+
+/// The class whose member this source line begins to define, or empty: `void Engine::seal(`,
+/// `Engine::Engine(`, `Engine::~Engine(`, `std::string Engine::FlushState::name(` (`FlushState`).
+/// A definition starts in the first column in this tree, and a call or a body is indented, which is
+/// what keeps `Engine::wall_clock_ns()` in a function body from counting.
+std::string class_defined_by(const std::string& line) {
+    if (line.empty() || !(std::isalpha(static_cast<unsigned char>(line[0])) || line[0] == '_')) {
+        return {};
+    }
+    const std::string c = code_of(line);
+    for (std::size_t at = c.find("::"); at != std::string::npos; at = c.find("::", at + 2)) {
+        std::size_t member = at + 2;
+        if (member < c.size() && c[member] == '~') ++member;
+        std::size_t end = member;
+        while (end < c.size() && ident_char(c[end])) ++end;
+        if (end == member) continue;
+        std::size_t paren = end;
+        while (paren < c.size() && c[paren] == ' ') ++paren;
+        if (paren >= c.size() || c[paren] != '(') continue;
+        std::size_t begin = at;
+        while (begin > 0 && ident_char(c[begin - 1])) --begin;
+        if (begin == at) continue;
+        return c.substr(begin, at - begin);
+    }
+    return {};
+}
+
+/// A field's key: its name and the header that declares it, `name@stem`.
+std::string field_key(const std::string& name, const std::string& stem) { return name + "@" + stem; }
+
+/// Which declarations of `name` an occurrence at `at` in `code` can belong to: `own` holds the
+/// stems of the headers whose classes the file defines members of, and `declared_in` those of the
+/// headers declaring a member of that name.
+///
+/// Keyed by the name alone, the survey took each of the sixty names (of 507) declared in more than
+/// one header for one field, so a dead member stayed invisible beside a live one of the same name in
+/// another class: `AntiEntropyManager::registry_` was written once and read nowhere, because six
+/// other classes read a `registry_` of their own - and clang 21's -Wunused-private-field was what
+/// found it (#240). A bare name belongs to the classes whose members the file defines; another
+/// object's member (`x.name_`, `p->name_`) can be of any class, and so can a bare name in a file that
+/// defines no member of a class declaring it. What the rule cannot place it credits to **every**
+/// declaration, so its mistakes are members reported as read, as before. Placing a file by its own
+/// name was one: `src/engine_compaction.cpp` defines the engine's members under another name, and
+/// its reads of the engine's `registry_` kept the dead one alive - the mutation table said so.
+std::set<std::string> owners_of(const std::string& code, std::size_t at,
+                                const std::set<std::string>& own,
+                                const std::set<std::string>& declared_in) {
+    const bool through_an_object =
+        (at >= 1 && code[at - 1] == '.') || (at >= 2 && code[at - 2] == '-' && code[at - 1] == '>');
+    if (through_an_object) return declared_in;
+    std::set<std::string> placed;
+    for (const auto& stem : own) {
+        if (declared_in.count(stem)) placed.insert(stem);
+    }
+    return placed.empty() ? declared_in : placed;
+}
+
+std::map<std::string, Field> survey(const std::filesystem::path& root) {
     std::map<std::string, Field> fields;
-    const auto headers = sources_under("include/orderbook", ".hpp");
+    std::map<std::string, std::set<std::string>> declared_in;   // name -> header stems
+    std::map<std::string, std::string> header_of_class;          // class -> header stem
+    const auto headers = sources_under(root, "include/orderbook", ".hpp");
 
     for (const auto& h : headers) {
         int n = 0;
+        const std::string stem = h.stem().string();
         for (const auto& line : read_lines(h)) {
             ++n;
+            const std::string cls = class_declared_by(line);
+            if (!cls.empty()) header_of_class.emplace(cls, stem);
             const std::string name = declared_name(line);
             if (!name.empty()) {
-                fields[name].declared_at.push_back(short_path(h) + ":" + std::to_string(n));
+                fields[field_key(name, stem)].declared_at.push_back(short_path(root, h) + ":" +
+                                                                    std::to_string(n));
+                declared_in[name].insert(stem);
             }
         }
     }
 
-    std::vector<std::filesystem::path> all = sources_under("src", ".cpp");
+    std::vector<std::filesystem::path> all = sources_under(root, "src", ".cpp");
     all.insert(all.end(), headers.begin(), headers.end());
 
     for (const auto& f : all) {
+        const auto lines = read_lines(f);
+        // The headers whose classes this file defines members of: a header's own, and for a
+        // source file every class it has a `Class::member(` definition of.
+        std::set<std::string> own;
+        if (f.extension() == ".hpp") own.insert(f.stem().string());
+        for (const auto& line : lines) {
+            const auto it = header_of_class.find(class_defined_by(line));
+            if (it != header_of_class.end()) own.insert(it->second);
+        }
         int n = 0;
-        for (const auto& line : read_lines(f)) {
+        for (const auto& line : lines) {
             ++n;
-            const std::string where = short_path(f) + ":" + std::to_string(n);
-            for (const auto& [name, at] : trailing_underscore_names(code_of(line))) {
-                (void)at;
-                auto it = fields.find(name);
-                if (it == fields.end()) continue;
-                // Skipped by **recorded site**, not by asking the rule again: a line the rule
-                // misreads as a declaration would otherwise vanish from both columns, which is how
-                // a read gets deleted rather than merely misfiled.
-                const auto& decls = it->second.declared_at;
-                if (std::find(decls.begin(), decls.end(), where) != decls.end()) continue;
-                if (pure_write(line, name)) it->second.writes.push_back(where);
-                else                        it->second.reads.push_back(where);
+            const std::string where = short_path(root, f) + ":" + std::to_string(n);
+            const std::string code = code_of(line);
+            for (const auto& [name, at] : trailing_underscore_names(code)) {
+                const auto decl = declared_in.find(name);
+                if (decl == declared_in.end()) continue;
+                const bool write = pure_write(line, name);
+                for (const auto& owner : owners_of(code, at, own, decl->second)) {
+                    Field& field = fields[field_key(name, owner)];
+                    // Skipped by **recorded site**, not by asking the rule again: a line the rule
+                    // misreads as a declaration would otherwise vanish from both columns, which is
+                    // how a read gets deleted rather than merely misfiled.
+                    const auto& decls = field.declared_at;
+                    if (std::find(decls.begin(), decls.end(), where) != decls.end()) continue;
+                    (write ? field.writes : field.reads).push_back(where);
+                }
             }
         }
     }
@@ -333,6 +457,96 @@ TEST(FieldUsage, TheRulesAreTriedOnTheCasesTheyGotWrong) {
     EXPECT_FALSE(pure_write("    registry_.set_gauge(\"ob_current_epoch\", 1);", "registry_"))
         << "handing a member to a method is a use, and only a named mutator is a write";
     EXPECT_FALSE(pure_write("    std::lock_guard<std::mutex> lk(mtx_);", "mtx_"));
+
+    // Which declaration an occurrence belongs to, when a name is declared in more than one header.
+    const std::set<std::string> both = {"anti_entropy", "metrics_server"};
+    const std::string bare = "    : config_(config), engine_(engine), registry_(registry) {";
+    EXPECT_EQ(owners_of(bare, bare.find("registry_"), {"anti_entropy"}, both),
+              std::set<std::string>{"anti_entropy"})
+        << "a bare name in a file defining a class's members is that class's member - which is "
+           "what lets a dead member be seen beside a live one of the same name";
+    const std::string arrow = "    server->registry_.set_gauge(name, 1);";
+    EXPECT_EQ(owners_of(arrow, arrow.find("registry_"), {"anti_entropy"}, both), both)
+        << "another object's member can be of any class, so it is read for every declaration";
+    const std::string dot = "    other.registry_ = r;";
+    EXPECT_EQ(owners_of(dot, dot.find("registry_"), {"anti_entropy"}, both), both);
+    EXPECT_EQ(owners_of(bare, bare.find("registry_"), {"tcp_server"}, both), both)
+        << "a bare name in a file that defines no member of a class declaring it cannot be placed";
+    EXPECT_EQ(owners_of(bare, bare.find("registry_"), {"anti_entropy", "tcp_server"}, both),
+              std::set<std::string>{"anti_entropy"});
+
+    // Which class a line defines a member of, and which class a header line declares.
+    EXPECT_EQ(class_defined_by("void Engine::note_store_for_compaction() {"), "Engine");
+    EXPECT_EQ(class_defined_by("std::shared_ptr<const void> Engine::pin_segment_files() {"), "Engine")
+        << "the return type's own `::` is not the definition";
+    EXPECT_EQ(class_defined_by("AntiEntropyManager::~AntiEntropyManager() {"), "AntiEntropyManager");
+    EXPECT_EQ(class_defined_by("std::string Engine::FlushState::name() const {"), "FlushState");
+    EXPECT_EQ(class_defined_by("    const auto now = Engine::wall_clock_ns();"), "")
+        << "a call in a body is indented, and a definition is not";
+    EXPECT_EQ(class_defined_by("static_assert(sizeof(ob::Level) == 24);"), "");
+    EXPECT_EQ(class_declared_by("class MultiMasterManager {"), "MultiMasterManager");
+    EXPECT_EQ(class_declared_by("    struct FlushState final : Base {"), "FlushState");
+    EXPECT_EQ(class_declared_by("struct alignas(64) RingHeader"), "RingHeader");
+    EXPECT_EQ(class_declared_by("template <class T> struct Holder {"), "Holder");
+    EXPECT_EQ(class_declared_by("class Engine;"), "") << "a forward declaration defines nothing";
+    EXPECT_EQ(class_declared_by("enum class NodeRole : uint8_t {"), "");
+    EXPECT_EQ(class_declared_by("    struct stat st;"), "");
+}
+
+TEST(FieldUsage, AnOccurrenceIsCreditedToTheClassesItCanBelongTo) {
+    // The placement rule over a tree built for it, so what it decides does not depend on the shape
+    // the engine's tree has today. `x_` and `z_` are members of both Alpha and Beta, and `w_` of
+    // Alpha alone. Alpha writes its `x_` and reads it nowhere; Beta reads its own in its own file and
+    // in a file named after no header, as `src/engine_compaction.cpp` defines the engine's members.
+    // `z_` is read only through an object, which can be of either class, and `w_` only in a member
+    // definition the rule cannot read.
+    struct Tree {
+        std::filesystem::path root = std::filesystem::temp_directory_path() /
+                                     ("field_usage_" + std::to_string(::getpid()));
+        Tree() { std::filesystem::remove_all(root); }
+        ~Tree() {
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+        void file(const std::string& rel, const std::string& text) const {
+            std::filesystem::create_directories((root / rel).parent_path());
+            std::ofstream(root / rel) << text;
+        }
+    } tree;
+    tree.file("include/orderbook/alpha.hpp",
+              "class Alpha {\npublic:\n    Alpha();\n    int w() const;\nprivate:\n"
+              "    int x_;\n    int z_;\n    int w_;\n};\n");
+    tree.file("include/orderbook/beta.hpp",
+              "class Beta {\npublic:\n    Beta();\n    int x() const;\n    void touch();\nprivate:\n"
+              "    int x_;\n    int z_;\n};\n");
+    tree.file("src/alpha.cpp", "Alpha::Alpha()\n    : x_(0), z_(0), w_(0) {}\n");
+    tree.file("src/beta.cpp", "Beta::Beta()\n    : x_(0), z_(0) {}\n\nint Beta::x() const {\n"
+                              "    return x_;\n}\n");
+    tree.file("src/beta_more.cpp", "void Beta::touch() {\n    use(x_);\n}\n");
+    tree.file("src/gamma.cpp", "int peek(const Beta* b) {\n    return b->z_;\n}\n");
+    tree.file("src/odd.cpp", "namespace detail {\n    int Alpha::w() const { return w_; }\n}\n");
+
+    const auto fields = survey(tree.root);
+    auto reads = [&](const std::string& key) {
+        const auto it = fields.find(key);
+        return it == fields.end() ? std::vector<std::string>{} : it->second.reads;
+    };
+    auto has = [](const std::vector<std::string>& v, const std::string& site) {
+        return std::find(v.begin(), v.end(), site) != v.end();
+    };
+    ASSERT_EQ(fields.count("x_@alpha"), 1u) << "the tree was not surveyed";
+    EXPECT_EQ(fields.at("x_@alpha").writes, std::vector<std::string>{"src/alpha.cpp:2"});
+    EXPECT_TRUE(reads("x_@alpha").empty())
+        << "Beta's reads of its own x_ are not Alpha's - the shape that kept "
+           "AntiEntropyManager::registry_ looking alive (#240)";
+    EXPECT_TRUE(has(reads("x_@beta"), "src/beta.cpp:5"));
+    EXPECT_TRUE(has(reads("x_@beta"), "src/beta_more.cpp:2"))
+        << "a file defining Beta's members is Beta's whatever it is called";
+    EXPECT_TRUE(has(reads("z_@alpha"), "src/gamma.cpp:2") && has(reads("z_@beta"), "src/gamma.cpp:2"))
+        << "a member reached through an object is read for every class declaring it";
+    EXPECT_TRUE(has(reads("w_@alpha"), "src/odd.cpp:2"))
+        << "an occurrence the rule cannot place is read for every class declaring it, so the "
+           "rule's mistakes are members reported as read, never members reported as dead";
 }
 
 TEST(FieldUsage, EveryMemberShapedNameInAHeaderIsEnumerated) {
@@ -341,7 +555,7 @@ TEST(FieldUsage, EveryMemberShapedNameInAHeaderIsEnumerated) {
     // can quietly shrink is not a test - so the refined enumeration is checked against a
     // deliberately cruder one that cannot be narrowed by accident.
     std::set<std::string> crude;
-    for (const auto& h : sources_under("include/orderbook", ".hpp")) {
+    for (const auto& h : sources_under(OB_SOURCE_DIR, "include/orderbook", ".hpp")) {
         for (const auto& line : read_lines(h)) {
             const std::string c = code_of(line);
             for (const auto& [name, at] : trailing_underscore_names(c)) {
@@ -358,10 +572,13 @@ TEST(FieldUsage, EveryMemberShapedNameInAHeaderIsEnumerated) {
         }
     }
 
-    const auto fields = survey();
+    std::set<std::string> enumerated;
+    for (const auto& [key, field] : survey(OB_SOURCE_DIR)) {
+        enumerated.insert(key.substr(0, key.find('@')));
+    }
     std::vector<std::string> missing;
     for (const auto& name : crude) {
-        if (fields.find(name) == fields.end()) missing.push_back(name);
+        if (enumerated.count(name) == 0) missing.push_back(name);
     }
 
     ASSERT_GE(crude.size(), 200u)
@@ -375,14 +592,15 @@ TEST(FieldUsage, EveryMemberShapedNameInAHeaderIsEnumerated) {
 }
 
 TEST(FieldUsage, NoMemberIsWrittenAndNeverRead) {
-    const auto fields = survey();
+    const auto fields = survey(OB_SOURCE_DIR);
 
     std::ostringstream findings;
     std::size_t count = 0;
-    for (const auto& [name, field] : fields) {
+    for (const auto& [key, field] : fields) {
         if (field.writes.empty() || !field.reads.empty()) continue;
         ++count;
-        findings << "\n  " << name << "\n      declared at " << field.declared_at.front();
+        findings << "\n  " << key.substr(0, key.find('@')) << "\n      declared at "
+                 << field.declared_at.front();
         for (const auto& w : field.writes) findings << "\n      written at  " << w;
     }
 

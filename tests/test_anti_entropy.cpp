@@ -9,7 +9,6 @@
 
 #include "orderbook/anti_entropy.hpp"
 #include "orderbook/engine.hpp"
-#include "orderbook/peer_registry.hpp"
 
 #include <gtest/gtest.h>
 
@@ -39,20 +38,15 @@ struct TempDir {
     TempDir& operator=(const TempDir&) = delete;
 };
 
-/// A manager with a real engine (it publishes metrics through it) and a registry it never uses,
-/// because in this design the peers come from the injected pass, not from etcd.
+/// A manager with a real engine, which it publishes metrics through. The peers come from the
+/// injected pass, not from etcd, so there is no peer registry: the manager held one it never used
+/// until clang 21 said so (#240).
 struct Fixture {
     TempDir dir{"anti_entropy_"};
     ob::Engine engine{dir.path, 3'600'000'000'000ULL, ob::FsyncPolicy::EVERY};
-    // The registry is constructed but never contacted: in this design the peers come from the
-    // injected pass, not from etcd. It stays in the constructor signature because the manager
-    // still owns the reference.
-    ob::MetricsRegistry metrics;
-    ob::PeerRegistry registry{ob::CoordinatorConfig{}, /*local_node_id=*/1, "127.0.0.1:1",
-                              metrics};
     ob::AntiEntropyManager manager;
 
-    Fixture() : manager(ob::AntiEntropyConfig{3600}, engine, registry) { engine.open(); }
+    Fixture() : manager(ob::AntiEntropyConfig{3600}, engine) { engine.open(); }
     ~Fixture() { engine.close(); }
 };
 

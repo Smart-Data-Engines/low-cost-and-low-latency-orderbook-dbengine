@@ -43,22 +43,6 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERS
         "clang ${CMAKE_CXX_COMPILER_VERSION} is older than this engine needs: clang 15 or newer, or GCC 12.")
 endif()
 
-# ── Compiler warnings ──────────────────────────────────────────────────────────
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12")
-    add_compile_options(-Wall -Wextra -Werror)
-    # GCC 12 - the floor above - misreads libstdc++'s own inline code at -O2: 12.3, Ubuntu 22.04's,
-    # reports -Wrestrict on assigning a string literal to a std::string, and 12.3 and 12.4 report
-    # -Wmaybe-uninitialized on copying a std::optional's value after has_value(). A Release build
-    # with GCC 12 - what the README's Build section and the packages use - failed on both (#221).
-    # Under GCC 12 the two stay warnings without failing the build; under GCC 13 and later, which
-    # report neither on the same code, and under clang, every warning still fails it.
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
-        add_compile_options(-Wno-error=restrict -Wno-error=maybe-uninitialized)
-    endif()
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
-    add_compile_options(-Wall -Wextra -Werror)
-endif()
-
 # ── SIMD options ───────────────────────────────────────────────────────────────
 option(OB_ENABLE_AVX2   "Enable AVX2 SIMD optimizations"   OFF)
 option(OB_ENABLE_AVX512 "Enable AVX-512 SIMD optimizations" OFF)
@@ -106,6 +90,10 @@ if(OB_BUILD_TESTS)
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_DOWNLOAD_DEPENDENCIES ON CACHE BOOL "" FORCE)
+    # Its own -Werror, on unless turned off - for "Release candidates", in the option's words. Its
+    # sources compile clean under clang 21; the next compiler's first warning in them would stop
+    # this build the way googletest's did (#240), in a file that is not ours to fix.
+    set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(benchmark)
 
     # RapidCheck
@@ -130,6 +118,29 @@ FetchContent_Declare(
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 set(JSON_Install OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
+
+# ── Compiler warnings ──────────────────────────────────────────────────────────
+#
+# After the dependencies, for the reason the instrumented builds below are: `add_compile_options()`
+# reaches every target created after it, and our warnings-as-errors are about our code. Before them,
+# googletest's own sources were compiled with -Werror, and clang 21 stopped the build in
+# `gtest-all.cc` on a -Wcharacter-conversion in `gtest-printers.h`, a file we do not maintain (#240).
+# Our tests include that header and compiled clean, because googletest declares its include
+# directories SYSTEM; its own sources do not get that.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12")
+    add_compile_options(-Wall -Wextra -Werror)
+    # GCC 12 - the floor above - misreads libstdc++'s own inline code at -O2: 12.3, Ubuntu 22.04's,
+    # reports -Wrestrict on assigning a string literal to a std::string, and 12.3 and 12.4 report
+    # -Wmaybe-uninitialized on copying a std::optional's value after has_value(). A Release build
+    # with GCC 12 - what the README's Build section and the packages use - failed on both (#221).
+    # Under GCC 12 the two stay warnings without failing the build; under GCC 13 and later, which
+    # report neither on the same code, and under clang, every warning still fails it.
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
+        add_compile_options(-Wno-error=restrict -Wno-error=maybe-uninitialized)
+    endif()
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
+    add_compile_options(-Wall -Wextra -Werror)
+endif()
 
 # ── Instrumented builds: sanitizers and coverage ──────────────────────────────
 #

@@ -37,10 +37,8 @@ uint64_t max_records_behind(const std::vector<VectorGap>& peer_lacks,
     return worst;
 }
 
-AntiEntropyManager::AntiEntropyManager(AntiEntropyConfig config,
-                                       Engine& engine,
-                                       PeerRegistry& registry)
-    : config_(config), engine_(engine), registry_(registry) {
+AntiEntropyManager::AntiEntropyManager(AntiEntropyConfig config, Engine& engine)
+    : config_(config), engine_(engine) {
     OB_LOG_DEBUG("anti_entropy", "AntiEntropyManager created: interval=%us",
                  config_.interval_seconds);
 }
@@ -109,7 +107,6 @@ void AntiEntropyManager::loop() {
     // One reconciliation pass is the unit, and an abandoned one costs an interval: the next pass
     // compares the same version vectors again. Without this the thread ends and divergence between
     // masters is never repaired - the mechanism #57 exists for - while every node keeps serving.
-    // `registry_` here is the *peer* registry; the metrics one comes through the engine.
     LoopGuard guard{"anti_entropy", "a reconciliation pass", &engine_.registry()};
 
     while (running_.load(std::memory_order_relaxed)) {

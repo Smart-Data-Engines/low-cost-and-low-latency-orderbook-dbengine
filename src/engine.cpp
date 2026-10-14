@@ -404,7 +404,7 @@ void Engine::open() {
 
         hlc_ = std::make_unique<HybridLogicalClock>(mm_config_.node_id);
         wal_.set_origin_node_id(mm_config_.node_id);
-        mm_mgr_ = std::make_unique<MultiMasterManager>(mm_config_, *this, wal_, *hlc_);
+        mm_mgr_ = std::make_unique<MultiMasterManager>(mm_config_, *this, wal_);
         node_role_.store(NodeRole::MULTI_MASTER, std::memory_order_release);
 
         // Multi-master nodes always accept writes — reset read-only flag

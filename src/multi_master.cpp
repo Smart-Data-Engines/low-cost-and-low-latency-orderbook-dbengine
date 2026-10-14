@@ -163,12 +163,10 @@ static uint64_t now_ms() {
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
-MultiMasterManager::MultiMasterManager(MultiMasterConfig config, Engine& engine,
-                                       WALWriter& wal, HybridLogicalClock& hlc)
+MultiMasterManager::MultiMasterManager(MultiMasterConfig config, Engine& engine, WALWriter& wal)
     : config_(std::move(config))
     , engine_(engine)
     , wal_(wal)
-    , hlc_(hlc)
     // The worker's only job when it finishes is to make io_loop() come back and look.
     , snapshot_builder_([this] { wake_io_loop(); }) {
     conflict_resolver_ = std::make_unique<ConflictResolver>();
@@ -281,7 +279,7 @@ void MultiMasterManager::start() {
     if (peer_registry_) {
         AntiEntropyConfig ae_config{};
         ae_config.interval_seconds = config_.anti_entropy_interval_sec;
-        anti_entropy_ = std::make_unique<AntiEntropyManager>(ae_config, engine_, *peer_registry_);
+        anti_entropy_ = std::make_unique<AntiEntropyManager>(ae_config, engine_);
         // The work itself, injected rather than reached for: this object owns the manager, so a
         // reference back would be a cycle, and a function makes a pass testable with a fake.
         anti_entropy_->set_reconciler([this] { return reconcile_with_peers(); });

@@ -18,7 +18,6 @@
 // cluster, no etcd and no ports.
 
 #include "orderbook/hlc.hpp"
-#include "orderbook/peer_registry.hpp"
 #include "orderbook/version_vector.hpp"
 
 #include <functional>
@@ -104,8 +103,7 @@ using ReconcileFn = std::function<ReconcileReport()>;
 
 class AntiEntropyManager {
 public:
-    explicit AntiEntropyManager(AntiEntropyConfig config, Engine& engine,
-                                PeerRegistry& registry);
+    explicit AntiEntropyManager(AntiEntropyConfig config, Engine& engine);
     ~AntiEntropyManager();
 
     AntiEntropyManager(const AntiEntropyManager&) = delete;
@@ -135,7 +133,6 @@ public:
 private:
     AntiEntropyConfig config_;
     Engine& engine_;
-    PeerRegistry& registry_;
 
     std::thread thread_;
     std::atomic<bool> running_{false};
