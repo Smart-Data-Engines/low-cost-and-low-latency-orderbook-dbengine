@@ -1184,8 +1184,9 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             // journal, which a data directory's segments keep busy - unless the WAL has one of its own.
             const bool hint = wal_beside_data && wal >= kSlowLockMs;
             OB_LOG_WARN("engine", "A batch of %zu write(s) waited %.1f ms for the engine lock and "
-                                  "held it %.1f ms - %.1f ms of it waiting for room in the pending "
-                                  "queue, %.1f ms in the WAL append%s",
+                                  "held it %.1f ms - %.1f ms of it waiting for room (in the pending "
+                                  "queue, or for the WAL to reach the device), %.1f ms in the WAL "
+                                  "append%s",
                         writes, waited, total, room, wal,
                         hint ? "; a WAL on a filesystem of its own (--wal-dir) does not wait for "
                                "the data directory's journal"

@@ -166,9 +166,13 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             f.seek(before)
             text = f.read().decode(errors="replace")
         # What the writer said while the ingest ran: a write waiting for room in the pending queue,
-        # one refused because no room came, and a peer dropped for not draining its send buffer.
+        # or - since #190 step 9 - for the WAL to reach the device, one refused because no room
+        # came, and a peer dropped for not draining its send buffer. A refusal is counted by the
+        # clause both of its lines share: step 9 gave a refusal during a WAL sync a line of its own,
+        # and counting the old line alone would have read every such refusal as none.
         result["queue_waits"] = text.count("is waiting for room in the pending queue")
-        result["refused"] = text.count("did not free room in 5 s")
+        result["budget_waits"] = text.count("is waiting for the WAL to reach the device")
+        result["refused"] = text.count("so this write is refused rather than accepted")
         result["peer_drops"] = text.count("is not draining")
         if log_level == "DEBUG":
             took = [(int(m.group(1)), int(m.group(2))) for m in re.finditer(
@@ -214,7 +218,8 @@ def main() -> int:
     servers = [s.split("=", 1) for s in args.server]
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
             "server_cores", "probe_n", "probe_p50_ms", "probe_p99_ms", "probe_p999_ms",
-            "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "refused",
+            "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "budget_waits",
+            "refused",
             "peer_drops", "failed")
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):

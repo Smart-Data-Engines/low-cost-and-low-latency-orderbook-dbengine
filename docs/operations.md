@@ -446,7 +446,7 @@ tenth of a second late or more: 0.13 - 0.31 s in four runs of six, measured on a
 symbols (i3-7100U, ext4 over LUKS, #186). The node says so:
 
 ```
-A batch of 1 write(s) waited 0.0 ms for the engine lock and held it 305.4 ms - 0.0 ms of it waiting for room in the pending queue, 305.4 ms in the WAL append; a WAL on a filesystem of its own (--wal-dir) does not wait for the data directory's journal
+A batch of 1 write(s) waited 0.0 ms for the engine lock and held it 305.4 ms - 0.0 ms of it waiting for room (in the pending queue, or for the WAL to reach the device), 305.4 ms in the WAL append; a WAL on a filesystem of its own (--wal-dir) does not wait for the data directory's journal
 ```
 
 `--wal-dir <DIR>` (`wal-dir` in the configuration file) puts the WAL files and `wal_identity` there;
