@@ -3330,9 +3330,9 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
         if (wal_budget_wait_.begin()) {
             OB_LOG_WARN("engine",
                         "A writer is waiting for the WAL to reach the device: %.1f MB is unsynced, "
-                        "against a budget of %.1f MB - what one sync may write, set from how long "
-                        "the last ones took. The flush has been asked to run now; the write is "
-                        "refused if no room comes within %lld s.",
+                        "against a budget of %.1f MB - about a second of the device's writing, by "
+                        "the syncs measured so far, and 4 MiB before the first. The flush has been "
+                        "asked to run now; the write is refused if no room comes within %lld s.",
                         static_cast<double>(unsynced()) / 1e6,
                         static_cast<double>(sync_budget_.bytes()) / 1e6,
                         static_cast<long long>(kBackpressureDeadline.count()));
@@ -3690,7 +3690,7 @@ std::string Engine::room_refusal_reason(
 }
 
 void Engine::note_sync_for_budget(uint64_t bytes, std::chrono::steady_clock::duration took) {
-    // Under every policy: only `interval` lets the budget bind (`await_pending_room()`), and the
+    // Whatever the policy: only `interval` lets the budget bind (`await_pending_room()`), and the
     // gauge says 0 under the others, so what a sync tells it there is read by nothing.
     const uint64_t before = sync_budget_.bytes();
     if (sync_budget_.on_sync(bytes, took) != SyncBudget::Change::None) {
