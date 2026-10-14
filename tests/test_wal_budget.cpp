@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -108,10 +109,36 @@ TEST(WalBudget, AWriterPastTheBudgetWaitsForASyncAndGoesOnOnceItIsDone) {
     std::atomic<int> refused{0};
     std::thread writer([&] {
         for (uint64_t i = 0; i < kPastTheBudget; ++i) {
-            if (write(engine, i) != ob::OB_OK) refused.fetch_add(1);
+            // Stopped at the first refusal: a writer that can never get room would otherwise be
+            // refused once every five seconds for the rest of its writes.
+            if (write(engine, i) != ob::OB_OK) {
+                refused.fetch_add(1);
+                break;
+            }
             written.fetch_add(1);
         }
     });
+    const std::function<void()> release = [&] {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            released = true;
+        }
+        cv.notify_all();
+    };
+    // Let go of the sync, join the writer and take the hook out on every way out of this test, an
+    // assertion that returns early included: a joinable thread destroyed is std::terminate, which
+    // ends the whole binary rather than this test, and a hook left in would be called by the
+    // engine's close() after what it refers to is gone.
+    struct Joined {
+        std::thread& t;
+        const std::function<void()>& let_go;
+        ob::Engine& e;
+        ~Joined() {
+            let_go();
+            if (t.joinable()) t.join();
+            e.while_syncing_wal_for_test({});
+        }
+    } joined{writer, release, engine};
 
     {
         std::unique_lock<std::mutex> lock(m);
@@ -127,11 +154,7 @@ TEST(WalBudget, AWriterPastTheBudgetWaitsForASyncAndGoesOnOnceItIsDone) {
     EXPECT_LT(held_at, kPastTheBudget);
     EXPECT_GE(budget_waits(engine), 1u);
 
-    {
-        std::lock_guard<std::mutex> lock(m);
-        released = true;
-    }
-    cv.notify_all();
+    release();
     writer.join();
     EXPECT_EQ(written.load(), kPastTheBudget);
     EXPECT_EQ(refused.load(), 0) << "a write held for a 300 ms sync was refused";
