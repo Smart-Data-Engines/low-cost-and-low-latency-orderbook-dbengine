@@ -170,6 +170,9 @@ MetricsRegistry::MetricsRegistry() {
                                      "writes that waited for room in the pending queue"));
     counters_.push_back(make_counter("ob_writer_backpressure_refusals_total",
                                      "writes refused because the pending queue never freed room"));
+    counters_.push_back(make_counter("ob_writer_wal_budget_waits_total",
+                                     "writes that waited for a WAL sync because the WAL waiting for "
+                                     "one had reached its budget (#190)"));
     // Admission (#190 step 5): batches paced at the rate the device takes, and how long in all.
     counters_.push_back(make_counter("ob_writer_admission_delays_total",
                                      "Batches of writes that waited for admission at the device's rate"));
@@ -262,6 +265,9 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_writer_admission_rate",
                                  "Rows a second writes are admitted at while the device is behind; "
                                  "0 while admission is off (#190)"));
+    gauges_.push_back(make_gauge("ob_wal_sync_budget_bytes",
+                                 "Bytes of WAL that may wait for a sync before a writer waits for "
+                                 "one; 0 when the fsync policy is not interval (#190)"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
     gauges_.push_back(make_gauge("ob_decoded_columns_bytes",

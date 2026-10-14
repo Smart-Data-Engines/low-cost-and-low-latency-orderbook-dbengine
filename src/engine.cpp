@@ -3283,9 +3283,17 @@ void Engine::request_flush() {
 }
 
 bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
-    const auto room = [this]() {
-        return queued_rows() < MAX_PENDING_ROWS ||
-               stop_flush_.load(std::memory_order_relaxed);
+    // Room is two things (#190 step 9): space in the pending queue, and - under `interval` - WAL
+    // waiting for a sync within what one sync may write. The second is what bounds a writer's wait
+    // on a device slower than the writes: the queue alone let a million rows' WAL, 34 MB, wait for
+    // one sync, and at 5 MB/s that sync outlasted the deadline. `every` syncs each run on the
+    // writer's own thread and `none` never syncs, so under those there is no sync to wait for.
+    const bool budgeted = fsync_policy_ == FsyncPolicy::INTERVAL;
+    const auto unsynced = [this]() { return wal_.bytes_appended() - wal_.bytes_synced(); };
+    const auto queue_has_room = [this]() { return queued_rows() < MAX_PENDING_ROWS; };
+    const auto wal_has_room = [&]() { return !budgeted || unsynced() < sync_budget_.bytes(); };
+    const auto room = [&]() {
+        return (queue_has_room() && wal_has_room()) || stop_flush_.load(std::memory_order_relaxed);
     };
     if (room()) {
         // The episode has to be closed here as well as after a wait, because the writer that
@@ -3298,30 +3306,51 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
             OB_LOG_INFO("engine", "The pending queue has room again; %llu write(s) waited for it.",
                         static_cast<unsigned long long>(waited));
         }
+        if (const uint64_t waited = wal_budget_wait_.end()) {
+            OB_LOG_INFO("engine", "The WAL waiting for a sync is within its budget again; %llu "
+                                  "write(s) waited for a sync.",
+                        static_cast<unsigned long long>(waited));
+        }
         return true;
     }
 
     request_flush();
-    registry_.increment_counter("ob_writer_backpressure_waits_total");
-    if (backpressure_.begin()) {
-        OB_LOG_WARN("engine",
-                    "A writer is waiting for room in the pending queue (%zu rows). The flush has "
-                    "been asked to run now rather than at the next interval; the write is refused "
-                    "if it does not free room within %lld s.",
-                    queued_rows(),
-                    static_cast<long long>(kBackpressureDeadline.count()));
+    if (!queue_has_room()) {
+        registry_.increment_counter("ob_writer_backpressure_waits_total");
+        if (backpressure_.begin()) {
+            OB_LOG_WARN("engine",
+                        "A writer is waiting for room in the pending queue (%zu rows). The flush has "
+                        "been asked to run now rather than at the next interval; the write is refused "
+                        "if it does not free room within %lld s.",
+                        queued_rows(),
+                        static_cast<long long>(kBackpressureDeadline.count()));
+        }
+    } else {
+        registry_.increment_counter("ob_writer_wal_budget_waits_total");
+        if (wal_budget_wait_.begin()) {
+            OB_LOG_WARN("engine",
+                        "A writer is waiting for the WAL to reach the device: %.1f MB is unsynced, "
+                        "against a budget of %.1f MB - what one sync may write, set from how long "
+                        "the last ones took. The flush has been asked to run now; the write is "
+                        "refused if no room comes within %lld s.",
+                        static_cast<double>(unsynced()) / 1e6,
+                        static_cast<double>(sync_budget_.bytes()) / 1e6,
+                        static_cast<long long>(kBackpressureDeadline.count()));
+        }
     }
 
     const bool got_room = pending_cv_.wait_for(lock, kBackpressureDeadline, room);
 
     if (!got_room) {
         registry_.increment_counter("ob_writer_backpressure_refusals_total");
-        OB_LOG_ERROR("engine",
-                     "The pending queue did not free room in %lld s, so this write is refused "
-                     "rather than accepted. The flush cannot make progress - a full disk or a "
-                     "failing fsync is the usual reason, and ob_flush_errors_total and "
-                     "ob_wal_fsync_errors_total say which.",
-                     static_cast<long long>(kBackpressureDeadline.count()));
+        const auto sync_began = wal_sync_started_.load(std::memory_order_relaxed);
+        std::optional<std::chrono::steady_clock::duration> sync_running_for;
+        if (sync_began != std::chrono::steady_clock::time_point{}) {
+            sync_running_for = std::chrono::steady_clock::now() - sync_began;
+        }
+        OB_LOG_ERROR("engine", "%s",
+                     room_refusal_reason(sync_running_for,
+                                         wal_sync_bytes_.load(std::memory_order_relaxed)).c_str());
         return false;
     }
     // Deliberately not closed here: the waiter that gets room is still inside the episode, and
@@ -3617,6 +3646,9 @@ void Engine::flush_tick() {
                 break;
         }
         registry_.set_gauge("ob_writer_admission_rate", static_cast<int64_t>(admission_.rate()));
+        registry_.set_gauge("ob_wal_sync_budget_bytes",
+                            fsync_policy_ == FsyncPolicy::INTERVAL
+                                ? static_cast<int64_t>(sync_budget_.bytes()) : 0);
 
         // And said at WARN when a tick takes a second (#186): writers at the ceiling wait for the room
         // a tick frees in the pending queue - up to 3.4 s, measured, with every section this tick
@@ -3631,6 +3663,47 @@ void Engine::flush_tick() {
         }
 }
 
+
+std::string Engine::room_refusal_reason(
+    std::optional<std::chrono::steady_clock::duration> sync_running_for, uint64_t sync_bytes) {
+    char line[512];
+    if (sync_running_for) {
+        // Not "cannot make progress": the flush is syncing, at the device's rate. That sentence was
+        // the one printed for every refusal at 5 MB/s, where nothing had failed (#190 step 9).
+        std::snprintf(line, sizeof(line),
+                      "No room came in %lld s, so this write is refused rather than accepted. The "
+                      "flush's WAL sync has run for %.0f ms, writing back %.1f MB: the device takes "
+                      "the WAL slower than the writes arrive, and ob_wal_sync_budget_bytes is what a "
+                      "sync may now have to write.",
+                      static_cast<long long>(kBackpressureDeadline.count()),
+                      std::chrono::duration<double, std::milli>(*sync_running_for).count(),
+                      static_cast<double>(sync_bytes) / 1e6);
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "The pending queue did not free room in %lld s, so this write is refused "
+                      "rather than accepted. The flush cannot make progress - a full disk or a "
+                      "failing fsync is the usual reason, and ob_flush_errors_total and "
+                      "ob_wal_fsync_errors_total say which.",
+                      static_cast<long long>(kBackpressureDeadline.count()));
+    }
+    return line;
+}
+
+void Engine::note_sync_for_budget(uint64_t bytes, std::chrono::steady_clock::duration took) {
+    // Under every policy: only `interval` lets the budget bind (`await_pending_room()`), and the
+    // gauge says 0 under the others, so what a sync tells it there is read by nothing.
+    const uint64_t before = sync_budget_.bytes();
+    if (sync_budget_.on_sync(bytes, took) != SyncBudget::Change::None) {
+        const uint64_t after = sync_budget_.bytes();
+        OB_LOG_DEBUG("engine", "WAL sync budget %llu -> %llu byte(s) after a sync of %llu byte(s) in "
+                               "%.1f ms",
+                     static_cast<unsigned long long>(before), static_cast<unsigned long long>(after),
+                     static_cast<unsigned long long>(bytes),
+                     std::chrono::duration<double, std::milli>(took).count());
+    }
+    // No wake-up here: the drain that follows every caller's sync wakes the writers, a chunk at a
+    // time, and one more would be a mechanism no test could tell from its absence.
+}
 
 Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const char* failure,
                                                        WalPosition& covered,
@@ -3653,6 +3726,7 @@ Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const 
         }
         batch = pending_rows_.take_all();
         detached_rows_.store(batch.rows(), std::memory_order_relaxed);
+        wal_sync_bytes_.store(ticket.bytes() - wal_.bytes_synced(), std::memory_order_relaxed);
         if (under_the_lock) under_the_lock();
         if (!ticket.owed()) {
             // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
@@ -3663,11 +3737,18 @@ Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const 
             note_wal_synced();
         }
     }
+    // In flight from here, for a refusal to say so (#190 step 9) - the test hook included, since a
+    // test holds the sync there.
+    if (ticket.owed()) wal_sync_started_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
     if (while_syncing_wal_for_test_) while_syncing_wal_for_test_();
     if (ticket.owed()) {
+        // The sync alone is what the budget measures: the device's time for these bytes.
+        const auto sync_began = std::chrono::steady_clock::now();
         const int sync_err = wal_.perform_sync(ticket);
+        const auto sync_took = std::chrono::steady_clock::now() - sync_began;
+        wal_sync_started_.store({}, std::memory_order_relaxed);
         TimedLock timed(mtx_, settling.c_str());
-        wal_.complete_sync(ticket, sync_err);
+        const uint64_t covered_bytes = wal_.complete_sync(ticket, sync_err);
         if (sync_err != 0) {
             detached_rows_.store(0, std::memory_order_relaxed);
             pending_rows_.put_back_front(std::move(batch));
@@ -3676,6 +3757,7 @@ Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const 
         // The floor follows the checkpoint this sync covered (#160): it was appended before this
         // ticket's position, and no checkpoint is appended while the caller holds `flush_mtx_`.
         note_wal_synced();
+        note_sync_for_budget(covered_bytes, sync_took);
     }
     covered = ticket.position();
     return batch;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "orderbook/admission.hpp"
+#include "orderbook/sync_budget.hpp"
 #include "orderbook/aggregation.hpp"
 #include "orderbook/chunked_queue.hpp"
 #include "orderbook/columnar_store.hpp"
@@ -309,6 +310,13 @@ public:
 
     /// The admission controller, for a test to show it a tick without a slow device.
     AdmissionController& admission_for_test() { return admission_; }
+    SyncBudget& sync_budget_for_test() { return sync_budget_; }
+
+    /// The line a write refused for want of room is logged with: with a WAL sync running, that the
+    /// device is slower than the writes; without one, that the flush cannot make progress (#190
+    /// step 9). A function of its inputs so that a test can read it without a five-second wait.
+    static std::string room_refusal_reason(
+        std::optional<std::chrono::steady_clock::duration> sync_running_for, uint64_t sync_bytes);
 
     /// Keep every segment's files where they are for as long as the returned handle lives (#165 part
     /// 2b): while one is held, the tick neither merges segments nor sweeps retention. A snapshot
@@ -875,6 +883,26 @@ private:
     /// Writes admitted at the rate the device takes (#190 step 5). Its interval is the flush
     /// interval, declared above and so initialised before this.
     AdmissionController admission_{AdmissionController::for_interval(std::chrono::nanoseconds(flush_interval_ns_))};
+
+    /// How much WAL may wait for a sync before a writer waits for one (#190 step 9): the backlog a
+    /// sync has to write, bounded before admission knows the device's rate. Binds under
+    /// `--fsync-policy interval` only.
+    SyncBudget sync_budget_{SyncBudget::Config{}};
+
+    /// Loud once when writers begin waiting for the WAL budget, once when they stop. Guarded by
+    /// `mtx_`, as `backpressure_` is.
+    LogEpisode wal_budget_wait_;
+
+    /// When the WAL sync in flight began - `time_point{}` while none is - and how many bytes it
+    /// writes back. Read by a refusal, which otherwise blamed a full disk or a failing `fsync` for a
+    /// device that was syncing at its own rate (#190 step 9).
+    std::atomic<std::chrono::steady_clock::time_point> wal_sync_started_{};
+    std::atomic<uint64_t> wal_sync_bytes_{0};
+
+    /// After a WAL sync that newly covered `bytes` in `took`: what it tells the budget, said on
+    /// DEBUG and in `ob_wal_sync_budget_bytes`, and a wake-up for the writers waiting for it.
+    /// Caller holds `mtx_`.
+    void note_sync_for_budget(uint64_t bytes, std::chrono::steady_clock::duration took);
 
     /// A symbol's segments whose end falls in one period: what a merge may take from.
     struct CompactionKey {

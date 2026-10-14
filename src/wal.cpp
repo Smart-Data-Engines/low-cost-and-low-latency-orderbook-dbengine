@@ -399,6 +399,7 @@ WALWriter::RunResult WALWriter::write_run(const uint8_t* data, std::span<const s
             run.sync_errno = err;
         } else {
             pending_sync_ = 0;
+            (void)note_synced_up_to(bytes_appended());
         }
     }
 
@@ -855,7 +856,10 @@ bool WALWriter::flush() {
             // flush loop there is nothing left to do.
             return false;
         }
-        if (leaving_ok) pending_sync_ = 0;
+        if (leaving_ok) {
+            pending_sync_ = 0;
+            (void)note_synced_up_to(bytes_appended());
+        }
     }
     return leaving_ok;
 }
@@ -873,6 +877,7 @@ WALWriter::SyncTicket& WALWriter::SyncTicket::operator=(SyncTicket&& other) noex
         fd_       = other.fd_;
         leaving_  = std::move(other.leaving_);
         records_  = other.records_;
+        bytes_    = other.bytes_;
         position_ = other.position_;
         other.fd_      = -1;
         other.leaving_.clear();
@@ -901,6 +906,7 @@ std::pair<WALWriter::SyncTicket, int> WALWriter::prepare_sync() {
     SyncTicket ticket;
     ticket.owner_    = this;
     ticket.position_ = current_position();
+    ticket.bytes_    = bytes_appended();
     // The files a rotation left go with the ticket under every policy: they were synced at the
     // rotation until stage 5 of #151, and the ticket is where that moved.
     ticket.leaving_ = std::move(leaving_fds_);
@@ -923,7 +929,10 @@ std::pair<WALWriter::SyncTicket, int> WALWriter::prepare_sync() {
         ticket.leaving_.clear();
         const int leaving_err = sync_and_close_leaving("the flush tick");
         const int err = fsync_or_record("the flush tick");
-        if (err == 0 && leaving_err == 0) pending_sync_ = 0;
+        if (err == 0 && leaving_err == 0) {
+            pending_sync_ = 0;
+            (void)note_synced_up_to(bytes_appended());
+        }
         return {std::move(ticket), err != 0 ? err : leaving_err};
     }
     ticket.fd_      = dup_fd;
@@ -950,12 +959,17 @@ int WALWriter::perform_sync(SyncTicket& ticket) {
     return first_err;
 }
 
-void WALWriter::complete_sync(const SyncTicket& ticket, int err) {
+uint64_t WALWriter::complete_sync(const SyncTicket& ticket, int err) {
     // A failure leaves the records owed, for the reason `flush()` gives. On success only the
     // records the ticket counted are paid: those written while the sync ran are after its position
-    // and are owed the next one.
-    if (err != 0) return;
+    // and are owed the next one - and so are their bytes.
+    if (err != 0) return 0;
     pending_sync_ -= std::min(pending_sync_, ticket.records_);
+    const uint64_t covered = note_synced_up_to(ticket.bytes_);
+    OB_LOG_DEBUG("wal", "sync covered %llu byte(s) up to file %u offset %u",
+                 static_cast<unsigned long long>(covered), ticket.position_.file_index,
+                 ticket.position_.offset);
+    return covered;
 }
 
 size_t WALWriter::truncate_before(uint32_t before_index) {

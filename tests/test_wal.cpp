@@ -1614,6 +1614,104 @@ TEST(WalSyncTicket, AFailedSyncLeavesItsRecordsOwed) {
     EXPECT_EQ(writer.pending_sync_count(), 0u) << "the control: success pays what the ticket covered";
 }
 
+// ── #190 step 9: the bytes a sync has to write ─────────────────────────────────
+
+TEST(WalSyncBytes, WhatIsAppendedIsCountedAndATicketCoversWhatCameBeforeIt) {
+    TempDir tmp("bytes_cover");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    const uint64_t appended0 = writer.bytes_appended();
+    const ob::WalPosition p0 = writer.current_position();
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    const ob::WalPosition p1 = writer.current_position();
+    ASSERT_EQ(p1.file_index, p0.file_index);
+    EXPECT_EQ(writer.bytes_appended() - appended0, p1.offset - p0.offset)
+        << "every byte the position moved by is a byte the next sync has to write";
+
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    ASSERT_TRUE(ticket.owed());
+    EXPECT_EQ(ticket.bytes(), writer.bytes_appended());
+    const uint64_t synced_before = writer.bytes_synced();
+
+    // Written while the sync would run: after the ticket, so still to be written after it.
+    for (uint64_t s = 4; s <= 5; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    const int performed = writer.perform_sync(ticket);
+    ASSERT_EQ(performed, 0);
+    EXPECT_EQ(writer.complete_sync(ticket, performed), ticket.bytes() - synced_before)
+        << "a completed sync reports the bytes it newly covered";
+    EXPECT_EQ(writer.bytes_synced(), ticket.bytes());
+    EXPECT_EQ(writer.bytes_appended() - writer.bytes_synced(),
+              writer.current_position().offset - p1.offset)
+        << "the two records written during the sync are still to be synced";
+}
+
+TEST(WalSyncBytes, AFailedSyncLeavesItsBytesUnsynced) {
+    TempDir tmp("bytes_fail");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    const uint64_t synced_before = writer.bytes_synced();
+    EXPECT_EQ(writer.complete_sync(ticket, EIO), 0u);
+    EXPECT_EQ(writer.bytes_synced(), synced_before) << "a failed sync was counted as one that wrote";
+    EXPECT_GT(writer.complete_sync(ticket, 0), 0u) << "the control: success covers the ticket";
+}
+
+TEST(WalSyncBytes, AFlushCoversEveryByteAppended) {
+    TempDir tmp("bytes_flush");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_GT(writer.bytes_appended(), writer.bytes_synced());
+    ASSERT_TRUE(writer.flush());
+    EXPECT_EQ(writer.bytes_synced(), writer.bytes_appended());
+}
+
+TEST(WalSyncBytes, UnderEveryEachWriteSyncsItsOwnBytes) {
+    TempDir tmp("bytes_every");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::EVERY);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+        EXPECT_EQ(writer.bytes_synced(), writer.bytes_appended()) << "after write " << s;
+    }
+}
+
+TEST(WalSyncBytes, TheFilesARotationLeftAreInTheBytesTheTicketCovers) {
+    // A rotation leaves its file for the next ticket to sync (stage 5 of #151), so the bytes the
+    // ticket covers are both files' - one count across them.
+    TempDir tmp("bytes_rotate");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 512, ob::FsyncPolicy::INTERVAL);
+    const uint32_t first_file = writer.current_position().file_index;
+    for (uint64_t s = 1; s <= 20; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_GT(writer.current_position().file_index, first_file)
+        << "nothing rotated, so nothing is tested";
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    ASSERT_EQ(writer.perform_sync(ticket), 0);
+    (void)writer.complete_sync(ticket, 0);
+    EXPECT_EQ(writer.bytes_synced(), writer.bytes_appended());
+}
+
 TEST(WalSyncStatic, ADroppedTicketReachesTheWriterOnlyThroughTheFailureCount) {
     // `SyncTicket::settle()` runs from the ticket's destructor, which may be on any thread and
     // without the writer's lock: it syncs the files a rotation left, through the owner's
