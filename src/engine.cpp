@@ -3303,6 +3303,15 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
     const auto room = [&]() {
         return (queue_has_room() && wal_has_room()) || stop_flush_.load(std::memory_order_relaxed);
     };
+    // The sync a writer will need is asked for at half the budget, so that it runs while the writer
+    // fills the other half. Asked for only once the budget is reached, the sync and the writing took
+    // turns - the device idle while the writer wrote, the writer idle while the device synced - and
+    // a device slower than the writes took 7-9% fewer of them than with the queue alone, on the
+    // m9g.xlarge at 7 and 10 MB/s. Once per request: the flag says one is outstanding.
+    if (budgeted && unsynced() >= sync_budget_.bytes() / 2 &&
+        !flush_now_.load(std::memory_order_relaxed)) {
+        request_flush();
+    }
     if (room()) {
         // The episode has to be closed here as well as after a wait, because the writer that
         // ends it is usually one that never waited: the flush drains the queue, and the next
