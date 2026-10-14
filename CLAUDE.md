@@ -4322,6 +4322,18 @@ Learned the hard way. Check here before debugging.
      test files include that header and compiled clean, because googletest declares its include
      directories `SYSTEM` to the code that uses them, and its own sources are not that code.
      google/benchmark adds a `-Werror` of its own unless `BENCHMARK_ENABLE_WERROR` is off.
+593. **A harness that counts an event by the line one build writes reads another build's event as
+     none.** `measure_vector_refresh.py` counted refusals as `did not free room in 5 s`, and #190's
+     step 9 gives a refusal during a WAL sync a line of its own - so on the one device where the
+     step could refuse, an ABAB run would have reported it refusing nothing. Count by the clause
+     both lines share (`so this write is refused rather than accepted`), and when a change rewords a
+     line, grep the scripts as well as the tests for the old words.
+594. **When a new limit binds before an old one, the old one's tests pass through the new path.**
+     Under `--fsync-policy interval` the WAL budget (4 MiB to begin with) stops a writer long before
+     the pending queue's million rows, so `PendingBackpressure`'s tests went on finishing - by the
+     budget's wait and its request for a tick - and exercised the queue's ceiling not at all. One of
+     them noticed only because it counted the queue's waits. They run under `none` now, where the
+     budget does not bind; a test of a limit has to say which limit it reaches.
 
 ## Current state and open problems
 
