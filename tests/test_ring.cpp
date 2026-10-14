@@ -226,7 +226,16 @@ TEST(Ring, AFullWriterIsWokenWhenTheReaderMakesRoom) {
     ASSERT_GE(bell, 0);
     constexpr uint64_t kTotal = 4 * kMinBytes;
     int lost = 0, waited = 0;
+    // The reader begins once the writer has said it waits for room, so that the wait this test is
+    // about happens at least once. Begun at once, a reader faster than the writer - ThreadSanitizer's
+    // on a CI runner, in #240's run - kept the ring from filling, and the test failed on its own
+    // precondition having exercised nothing. Bounded, so that a writer that never waits fails the
+    // assertion below rather than hanging the reader.
+    std::atomic<bool> writer_waits{false};
     std::thread consumer([&] {
+        for (int i = 0; i < 20'000 && !writer_waits.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
         Reader r = pair.server_reader();
         std::vector<char> out(kMinBytes / 3);
         uint64_t got = 0;
@@ -246,6 +255,7 @@ TEST(Ring, AFullWriterIsWokenWhenTheReaderMakesRoom) {
         sent += n;
         if (n > 0 || !w.prepare_to_wait_for_room()) continue;
         ++waited;
+        writer_waits.store(true);
         pollfd p{bell, POLLIN, 0};
         if (::poll(&p, 1, 2000) == 0) ++lost;
         drain_bell(bell);

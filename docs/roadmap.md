@@ -2858,6 +2858,12 @@ as a definition.
 CI still builds with GCC 12 and 13 and clang 18, so the next compiler's first warning will again be
 met on a machine that upgraded, not by a check.
 
+**Found by this item's CI, in #52's tests:** `Ring.AFullWriterIsWokenWhenTheReaderMakesRoom` failed
+under ThreadSanitizer on its own precondition - "the writer never waited" - having exercised
+nothing. Its reader began at once, and a reader faster than the writer kept the ring from filling;
+pitfall 133's shape. The reader begins now once the writer has said it waits for room, so the wait
+the test is about happens in every run.
+
 - Effort: S | Impact: the tree builds with the newest clang, and the check for a member nothing reads
   sees one beside a live member of the same name
 
