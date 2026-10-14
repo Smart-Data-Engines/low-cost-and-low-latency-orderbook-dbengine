@@ -859,8 +859,9 @@ Two files ship with the engine (#35):
 |---|---|---|---|
 | `OrderbookCheckpointsFrozen` | critical | a sync failed; no checkpoint claims anything since, and WAL retention has stopped | "When an fsync fails" |
 | `OrderbookSyncErrors` | critical | the device refused a WAL or segment sync | "When an fsync fails" |
-| `OrderbookWritesRefused` | critical | writes answered with an error: the pending queue freed no room in 5 s | below, `ob_pending_rows` |
+| `OrderbookWritesRefused` | critical | writes answered with an error: no room came in 5 s, in the pending queue or for the WAL | below, `ob_pending_rows` |
 | `OrderbookWritersWaiting` | warning | for ten minutes some writes waited for the flush: ingest near the device's ceiling | "The WAL on a filesystem of its own" |
+| `OrderbookWritersWaitingForTheWal` | warning | for ten minutes some writes waited for a WAL sync: the ingest is faster than the device takes the WAL | below, `ob_wal_sync_budget_bytes` |
 | `OrderbookFlushErrors`, `OrderbookLoopErrors` | warning | a flush tick, or an iteration of a background loop, threw and the next one runs | "When a subsystem's loop keeps failing" |
 | `OrderbookReplicaDisconnected` | warning | fewer replicas connected than an hour ago | "When a replica falls behind" |
 | `OrderbookReplicationLagHigh` | warning | the slowest replica more than 64 MiB of WAL behind for five minutes | "When a replica falls behind" |

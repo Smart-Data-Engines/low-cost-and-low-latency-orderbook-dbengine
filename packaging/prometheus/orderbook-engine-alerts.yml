@@ -34,12 +34,13 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.instance }}: writes refused - the pending queue freed no room in 5 s"
+          summary: "{{ $labels.instance }}: writes refused - no room came in 5 s"
           description: >-
-            The flush did not drain the pending queue for five seconds: a device slower than the
-            ingest, a full disk, or a failing sync. Clients were answered with an error, not OK.
-            Look at the flush tick lines in the log for the phase that grew. docs/operations.md,
-            "What the metrics say when something is wrong".
+            For five seconds the pending queue did not drain, or the WAL did not reach the
+            device: a device slower than the ingest, a full disk, or a failing sync. Clients were
+            answered with an error, not OK. The refusal's log line says which, and the flush tick
+            lines the phase that grew. docs/operations.md, "What the metrics say when something is
+            wrong".
       - alert: OrderbookWritersWaiting
         expr: sum by (instance) (rate(ob_writer_backpressure_waits_total[5m])) > 0
         for: 10m
@@ -51,6 +52,19 @@ groups:
             For ten minutes some writes waited for the flush: sustained ingest near the device's
             write ceiling. A WAL on a device of its own (--wal-dir) takes the WAL's syncs off the
             data directory's journal. docs/operations.md, "The WAL on a filesystem of its own".
+      - alert: OrderbookWritersWaitingForTheWal
+        expr: sum by (instance) (rate(ob_writer_wal_budget_waits_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: writers keep waiting for the WAL to reach the device"
+          description: >-
+            For ten minutes some writes waited for a WAL sync, because the WAL waiting for one had
+            reached about a second of the device's writing (ob_wal_sync_budget_bytes): the ingest
+            is faster than the device takes the WAL. A WAL on a device of its own (--wal-dir) does
+            not share it with the segments. docs/operations.md, "What the metrics say when
+            something is wrong".
       - alert: OrderbookFlushErrors
         expr: sum by (instance) (increase(ob_flush_errors_total[5m])) > 0
         labels:
