@@ -3338,10 +3338,11 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
             OB_LOG_WARN("engine",
                         "A writer is waiting for the WAL to reach the device: %.1f MB is unsynced, "
                         "against a budget of %.1f MB - about a second of the device's writing, by "
-                        "the syncs measured so far, and 4 MiB before the first. The flush has been "
-                        "asked to run now; the write is refused if no room comes within %lld s.",
+                        "the syncs measured so far, and %.1f MB before the first. The flush has "
+                        "been asked to run now; the write is refused if no room comes within %lld s.",
                         static_cast<double>(unsynced()) / 1e6,
                         static_cast<double>(sync_budget_.bytes()) / 1e6,
+                        static_cast<double>(SyncBudget::Config{}.initial_bytes) / 1e6,
                         static_cast<long long>(kBackpressureDeadline.count()));
         }
     }
