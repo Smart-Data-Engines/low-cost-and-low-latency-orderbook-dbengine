@@ -896,7 +896,9 @@ integration test holds the names against what a running node serves.
   wait, and `ob_writer_backpressure_refusals_total` each write refused after five seconds without
   room. Waits are not an error — a writer faster than a flush cycle meets the ceiling once a cycle,
   which one pipelining connection on an m9g.xlarge does at 6.6 M levels a second — and refusals
-  are: the flush cannot make progress.
+  are. The refusal's line says which: that the flush cannot make progress, or that its WAL sync has
+  run for so many milliseconds, writing back so many megabytes - a device slower than the writes
+  (#190, step 9).
 - `ob_writer_admission_rate`, `ob_writer_admission_delays_total`,
   `ob_writer_admission_delay_us_total` — **writes faster than the device** (#190). A flush tick
   that took twice its interval or longer - or its WAL sync alone, which says so before the tick's
@@ -917,6 +919,19 @@ integration test holds the names against what a running node serves.
   Without it, a device slower than the ingest stops every writer at the full pending queue for as
   long as a tick takes and refuses the writes past five seconds: measured with the volume's writes
   capped at 30 MB/s, every round refused. `--write-admission off` restores that behaviour.
+- `ob_wal_sync_budget_bytes`, `ob_writer_wal_budget_waits_total` — **how much WAL may wait for a
+  sync** (#190, step 9). Under `--fsync-policy interval` a writer also waits, before it writes,
+  while the WAL written since the last completed sync is at the budget, and asks for the flush at
+  once; the counter counts those waits, apart from the waits for room in the queue. The gauge is the
+  budget, set by the syncs themselves: 4 MiB before the first, doubled after a quick sync that used
+  at least half of it, and after a slow one what the device writes in a second at the rate that sync
+  measured. Before it, the writers filled the pending queue's million rows - about 34 MB of WAL at
+  ten levels a record - before admission knew the device's rate, and the sync that followed was the
+  writers' wait: 4.9 s at 7 MB/s, and refused writes at 5 MB/s. A wait begins with
+  `A writer is waiting for the WAL to reach the device: <MB> is unsynced, against a budget of <MB>`
+  and ends with `The WAL waiting for a sync is within its budget again; <n> write(s) waited for a
+  sync.` Under `every` each write syncs itself and under `none` nothing does, so the budget does not
+  bind there and the gauge is 0.
 - `ob_unsealed_rows` — rows drained, readable, and waiting in memory for their store's seal (#165
   part 2a): a store is sealed at 65 536 rows or when its oldest are ten seconds old, and every store
   together is held under four million rows. These are the rows a crash replays from the WAL, and
