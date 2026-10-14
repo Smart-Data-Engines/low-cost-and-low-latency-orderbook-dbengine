@@ -49,6 +49,7 @@ inline constexpr uint16_t kPortsStartReadsWalOnce   = 21200;  ///< test_start_re
 inline constexpr uint16_t kPortsMmVectorChanges     = 21300;  ///< test_mm_vector_changes.cpp
 inline constexpr uint16_t kPortsHandoverStream      = 21400;  ///< test_handover_stream.cpp
 inline constexpr uint16_t kPortsUnixSocket          = 21500;  ///< test_unix_socket.cpp
+inline constexpr uint16_t kPortsRings               = 21600;  ///< test_unix_socket.cpp, the rings (#52)
 
 /// Every block above, so a test can check them all rather than the ones somebody remembered.
 inline constexpr uint16_t kAllPortBlocks[] = {
@@ -56,7 +57,7 @@ inline constexpr uint16_t kAllPortBlocks[] = {
     kPortsMmDedup,     kPortsMmStats,             kPortsMmPendingPeers, kPortsMmWireClock,
     kPortsWriteBatch,  kPortsMmRestartOrigins,    kPortsMmPerOriginNumbering,
     kPortsMmLegacyNumbering, kPortsStartReadsWalOnce, kPortsMmVectorChanges,
-    kPortsHandoverStream, kPortsUnixSocket,
+    kPortsHandoverStream, kPortsUnixSocket, kPortsRings,
 };
 
 /// How many ports one block owns.

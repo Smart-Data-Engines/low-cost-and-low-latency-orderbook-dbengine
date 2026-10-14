@@ -275,6 +275,31 @@ and replay it.
 A failed attempt closes the connection, which is also the rate limit: one attempt per connection,
 and connections are bounded by `--max-sessions`.
 
+### RINGS
+
+Only through the node's Unix socket (`--unix-socket`), after `AUTH` where it is required, and only
+with `--rings on` (the default). Moves the session to a pair of rings in shared memory (#52):
+
+```
+C: RINGS [bytes]
+S: OK RINGS 1048576          (with three descriptors: the memory and two bells)
+S:
+```
+
+`bytes` is each direction's size, a power of two up to `--ring-bytes`; without it the node's. The
+socket carries nothing afterwards and closing it ends the session. The memory layout and the rule
+for waking are in [the wire protocol](protocol.md#rings-in-shared-memory); the C++ client does all
+of it with `ClientConfig::rings`.
+
+| Response | Means |
+|----------|-------|
+| `OK RINGS <bytes>` | the session is in rings; the answer arrived with their descriptors |
+| `ERR rings: only a session through the node's Unix socket can move to rings` | a TCP session |
+| `ERR rings: switched off on this node (--rings off)` | the node refuses every move |
+| `ERR rings: <n> bytes a direction; ...` | a size the node does not take |
+| `ERR rings: nothing may follow RINGS before its answer` | bytes after `RINGS` on the socket; the session is closed |
+| `ERR rings: earlier answers are still being sent; ...` | ask again once they are read |
+
 ## Large responses and slow clients
 
 A response is queued per session and written as the socket accepts it, so a result set larger than the
@@ -614,6 +639,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--read-only` | — (boolean) | Refuse writes regardless of role |
 | `--replication-compress` | — (boolean) | Compress the replication stream with LZ4 |
 | `--replication-port` | `<PORT>` | Port replicas connect to on this node |
+| `--rings` | `on\|off` | Whether a session through `--unix-socket` may move to a pair of rings in shared memory with `RINGS` (default: `on`, #52): the same protocol, without a system call a round trip when the node polls. Refused for TCP and TLS sessions, and before `AUTH` where it is required |
+| `--ring-bytes` | `<BYTES>` | The size of each direction of a session's rings: a power of two from 65536 to 67108864 (default: 1048576). A client may ask for less, never more |
 | `--replication-bind` | `<ADDR>` | IPv4 or IPv6 address the replication port listens on (default: every interface, both families) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
 | `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |

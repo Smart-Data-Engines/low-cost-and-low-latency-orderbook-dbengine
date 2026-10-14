@@ -11,6 +11,7 @@
 #include "orderbook/shard_coordinator.hpp"
 #include "orderbook/session.hpp"
 #include "orderbook/tls.hpp"
+#include "orderbook/ring.hpp"
 #include "orderbook/subscription_hub.hpp"
 
 #include <chrono>
@@ -146,6 +147,10 @@ struct ServerConfig {
     /// host (#52). Empty: none. Not encrypted - the file's mode decides who may connect.
     std::string unix_socket;
     uint32_t    unix_socket_mode{0660};           // --unix-socket-mode, octal
+    /// --rings: whether a session through the Unix socket may move to a pair of rings in shared
+    /// memory (#52, step 2); --ring-bytes: each direction's size, a power of two.
+    bool        rings{true};
+    uint64_t    ring_bytes{ring::kDefaultBytes};
     std::string backup_dir;                       // empty: BACKUP is refused (#34)
 
     /// Background flush interval. Shorter means less unflushed data at any moment and

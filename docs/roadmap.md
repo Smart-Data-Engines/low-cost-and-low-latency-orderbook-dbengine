@@ -1661,7 +1661,7 @@ two benchmarks wrote to N books in a fixed pseudo-random order.
   fits on one page would need fewer pages without huge ones, but touches the seqlock's readers and
   the SIMD aggregation.
 
-### 52. Shared-memory transport for local clients
+### 52. Shared-memory transport for local clients ✅
 - Zero-copy ring buffer for co-located processes, bypassing TCP entirely
 - Effort: L | Impact: Sub-microsecond local writes; a genuine HFT differentiator
 
@@ -1732,8 +1732,66 @@ and the median ratio of the branch's to master's was 0.997. The cells furthest o
 are in the most bimodal series, `eco` on the EPYC with a polling client.
 
 Twenty mutants of the server, the socket and the clients, each killed by a named test; the
-control, the socket's backlog at 127, survives. What is left of the item is step 2: rings in shared
-memory for a client on the node's host, set up through this socket.
+control, the socket's backlog at 127, survives.
+
+**Step 2 closes the item: rings in shared memory, set up through that socket** (spec
+`specs/shared-memory-rings/` in the workspace). `RINGS` on the socket answers with three descriptors -
+a memfd sealed against shrinking and growing, and two eventfds - and from there commands go into one
+single-producer ring and answers and pushed rows come out of the other, the same bytes the socket
+would carry. A side that polls is never rung: a producer rings the consumer's bell only when the
+consumer said it sleeps, a Dekker pair with a sequentially consistent fence on each side (pitfalls
+582 and 588). Each side checks the other's counters against its own. The C++ client moves with
+`ClientConfig::rings`, the Python client stays on the socket. Not zero-copy: each side copies its
+bytes in and out, a few nanoseconds at these sizes.
+
+Through each, on the same hosts as step 1, pinned, `boost`, a client that polls for its answer and
+sends the next command once it has one, the median of seven rounds of 50 000
+(`evidence/2026-10-13-shared-memory-rings/`; `INSERT` from a run of its own, also seven rounds):
+
+| p50 | EPYC 9R45, TCP | socket | rings | Graviton, TCP | socket | rings |
+|---|---|---|---|---|---|---|
+| `PING` | 2.96 µs | 1.59 µs | **0.47 µs** | 4.68 µs | 2.81 µs | **0.93 µs** |
+| `BOOK`, ten levels | 3.99 µs | 2.66 µs | 1.38 µs | 6.31 µs | 4.56 µs | 2.38 µs |
+| `MINSERT`, twenty levels | 5.80 µs | 3.96 µs | 2.73 µs | 8.18 µs | 5.83 µs | 3.79 µs |
+| `INSERT`, one level | 3.83 µs | 2.40 µs | 1.33 µs | 5.92 µs | 4.09 µs | 2.03 µs |
+
+`PING`'s p99 is 0.51 µs (EPYC) and 1.04 µs (Graviton). The impact line's sub-microsecond write is not
+met: one level takes 1.33 µs through rings on the EPYC, of which the transport is under half a
+microsecond, and what is left is the write path.
+
+- **A command that finds the node asleep pays for waking it.** `boost` polls for 10 µs after each
+  event and then sleeps; `eco` sleeps at once. After a 50 µs pause a `PING` took 1.99 µs through
+  rings on the EPYC, 2.69 through the socket and 4.26 through TCP. After 500 µs, when the EPYC's
+  idle CPUs sleep deeper, it took 6.10, 6.79 and 8.48. On the Graviton, whose CPUs idle in WFI
+  alone, both pauses cost the same: 3.16-3.23 µs, 4.50-4.67 and 6.47-6.53. Back to back in `eco`, a
+  client that answers fast enough reaches the loop before it sleeps: 0.80 µs (EPYC) and 1.56
+  (Graviton) through rings.
+- **A client that sleeps at once loses it.** The node answers a `PING` in under a microsecond, so a
+  client that sleeps on its bell straight after sending is caught going to sleep: 3.44 µs on the
+  EPYC, more than the socket's 1.99 for a client blocked in `recv()`. Polling 5 µs first gave
+  0.47. `ClientConfig::rings.spin_us` is 20 by default.
+- **A profile on the Graviton made the polling pass cheaper for every transport.** The first build
+  took 0.91-1.38 µs a `PING` through rings there, each round near one end or the other. Its loop
+  spent a fifth of its cycles in `get_session()`'s lock, 15% in the two functions holding the
+  rings' fences and 6% in the subscription hub's `read()`, all on every pass. The loop now keeps its
+  sessions in rings by pointer, and the hub returns at once from a pass nothing woke. Against the
+  first build, the same probe alternating: on the Graviton a `PING` through rings 1.36 → 0.94 µs and
+  its p99 1.48 → 1.05; on the EPYC the p99 0.75 → 0.51 and `BOOK` 1.61 → 1.37, while the `PING`'s
+  p50 went 0.45 → 0.47; TCP and the socket 0.08-0.15 µs faster on the EPYC and 0.17-0.34 on the
+  Graviton.
+- **The fences stayed.** Sequentially consistent stores and loads in their place took the profile's
+  cycles and did not shorten the round trip on the Graviton. On the EPYC, where such a store is an
+  `XCHG` on the line the other side polls, they lengthened a `PING`, a `BOOK` and an `INSERT` by
+  40-130 ns. Each server was measured with each probe in one session, because the probe links the
+  rings too (pitfalls 588 and 589).
+- **The rest of the engine is the code master runs:** 40 of the 51 object files both Release builds
+  made have byte-identical `.text` on both hosts, the write path among them. Of the eleven that
+  differ, nine have sources that changed: the server, the session, the parser, the hub, the
+  sockets, the client, the shard router, the metrics and the probe. The other two build a
+  `ServerConfig` or a `ClientConfig`, each with a new field. Through TCP the branch's median sat
+  within the range of master `2665d00` or below it in all 48 cells (p50 and p99, both clients,
+  profiles and hosts), below it in 41, with a median ratio of 0.974: the hub's cheaper pass is
+  every transport's.
 
 ### 53. Kernel-bypass experiment
 - AF_XDP or DPDK prototype measured against the io_uring path, published as an engineering write-up

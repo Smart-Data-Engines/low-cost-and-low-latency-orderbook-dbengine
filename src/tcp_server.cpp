@@ -307,6 +307,7 @@ bool serialised_across_reactors(CommandType t) {
     case CommandType::SUBSCRIBE:
     case CommandType::UNSUBSCRIBE:
     case CommandType::AUTH:
+    case CommandType::RINGS:
     case CommandType::UNKNOWN:
         return false;
     }
@@ -341,6 +342,7 @@ bool allowed_before_authentication(CommandType t) {
     case CommandType::MIGRATE:
     case CommandType::ADOPT:
     case CommandType::BACKUP:
+    case CommandType::RINGS:
     case CommandType::MM_PEERS:
     case CommandType::MM_CONFLICTS:
     case CommandType::SUBSCRIBE:
@@ -699,6 +701,28 @@ std::string execute_command(const Command& cmd,
     }
 
     switch (cmd.type) {
+
+    case CommandType::RINGS: {
+        // Whether this session may move to rings, and of what size (#52, step 2). The loop does the
+        // moving, because the answer carries the rings' descriptors, and takes the size from here.
+        if (!session.local()) {
+            return format_error("rings: only a session through the node's Unix socket can move to rings");
+        }
+        if (session.ring_limit() == 0) {
+            return format_error("rings: switched off on this node (--rings off)");
+        }
+        if (session.in_rings()) return format_error("rings: this session is in rings already");
+        if (session.is_compressed()) {
+            return format_error("rings: a compressed session cannot move to rings");
+        }
+        const uint64_t bytes = cmd.ring_bytes != 0 ? cmd.ring_bytes : session.ring_limit();
+        if (!ring::valid_capacity(bytes) || bytes > session.ring_limit()) {
+            return format_error("rings: " + std::to_string(bytes) + " bytes a direction; this node takes "
+                                "a power of two from " + std::to_string(ring::kMinBytes) + " to " +
+                                std::to_string(session.ring_limit()));
+        }
+        return "OK RINGS " + std::to_string(bytes) + "\n\n";
+    }
 
     case CommandType::COMPRESS: {
         if (session.commands_executed() > 0) {
@@ -1203,6 +1227,8 @@ const std::vector<std::string>& known_flags() {
         "replication-bind",
         "replication-compress",
         "replication-port",
+        "ring-bytes",
+        "rings",
         "shard-id",
         "shard-vnodes",
         "snapshot-chunk-size",
@@ -1302,6 +1328,10 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"read-only", {"", "Refuse writes regardless of role"}},
         {"replication-compress", {"", "Compress the replication stream with LZ4"}},
         {"replication-port", {"<PORT>", "Port replicas connect to on this node"}},
+        {"rings", {"on|off", "Whether a session through --unix-socket may move to a pair of rings in "
+                             "shared memory (default: on; #52)"}},
+        {"ring-bytes", {"<BYTES>", "Each direction of a session's rings: a power of two from 65536 to "
+                                   "67108864 (default: 1048576)"}},
         {"shard-id", {"<N>", "This node's shard, when sharding by symbol"}},
         {"shard-vnodes", {"<N>", "Virtual nodes per shard in the consistent hash ring"}},
         {"snapshot-chunk-size", {"<N>", "Bytes per snapshot transfer chunk"}},
@@ -1695,6 +1725,24 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                 std::exit(1);
             }
             config.unix_socket = val;
+        } else if (arg == "--rings") {
+            const std::string val{cursor.value()};
+            if (val == "on") {
+                config.rings = true;
+            } else if (val == "off") {
+                config.rings = false;
+            } else {
+                std::fprintf(stderr, "Error: --rings expects on or off, got '%s'\n", val.c_str());
+                std::exit(1);
+            }
+        } else if (arg == "--ring-bytes") {
+            const uint64_t bytes = cursor.value_as<uint64_t>();
+            if (!ring::valid_capacity(bytes)) {
+                std::fprintf(stderr, "Error: --ring-bytes expects a power of two from %zu to %zu, got %llu\n",
+                             ring::kMinBytes, ring::kMaxBytes, static_cast<unsigned long long>(bytes));
+                std::exit(1);
+            }
+            config.ring_bytes = bytes;
         } else if (arg == "--unix-socket-mode") {
             const std::string val{cursor.value()};
             uint32_t mode = 0;
@@ -2152,6 +2200,8 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("read-only", c.read_only ? "true" : "false");
     line("replication-compress", c.replication_compress ? "true" : "false");
     line("replication-port", std::to_string(c.replication_port));
+    line("rings", c.rings ? "on" : "off");
+    line("ring-bytes", std::to_string(c.ring_bytes));
     line("shard-id", c.shard_id);
     line("shard-vnodes", std::to_string(c.shard_vnodes));
     line("snapshot-chunk-size", std::to_string(c.snapshot_chunk_size));
@@ -2432,6 +2482,14 @@ private:
     void arm_epollout(int fd);
     void disarm_epollout(int fd);
 
+    /// Move a session through the Unix socket to rings in shared memory: the memory, two bells, and
+    /// the answer with their descriptors on the socket (#52, step 2). False: the session is to close.
+    bool move_to_rings(int fd, Session& s, uint64_t bytes, const std::string& answer);
+
+    /// The output of a session in rings, which has no EPOLLOUT to arm: what fits goes now, and the
+    /// client rings when it frees room for the rest.
+    void serve_ring_output(Session& s);
+
     const int                index_;
     const ServerConfig&      config_;
     std::vector<Reactor*>*   reactors_;
@@ -2459,6 +2517,17 @@ private:
         bool     local;
     };
     std::vector<HandedOff>   handoff_;   ///< under handoff_mtx_
+
+    /// Sessions in rings (#52, step 2): each one's bell, which epoll reports, to the socket the
+    /// session is kept under, and the sessions themselves, for the loop to poll.
+    std::unordered_map<int, int> ring_bells_;
+    /// With the session itself, so a pass that polls them takes no lock: `get_session()` locks, and
+    /// it was a fifth of a polling loop's cycles on the Graviton. Removed in `close_session()`, the
+    /// one place a session goes.
+    std::vector<std::pair<int, Session*>> ring_sessions_;
+    /// Bells the sessions in rings have rung for their clients since the loop last published them
+    /// as `ob_ring_bells_total`: each session adds to it as it rings (`Session::enable_rings()`).
+    uint64_t ring_bells_unpublished_{0};
 
     /// Where the next accepted connection goes. Only the accepting reactor reads it.
     size_t                   next_reactor_{0};
@@ -2624,6 +2693,15 @@ void Reactor::close_session(int fd, const char* reason) {
     // have to tolerate that instead of the invariant holding.
     if (Session* s = sessions_.get_session(fd)) {
         hub_.remove_connection(*engine_, fd, s->conn_id());
+        if (s->in_rings()) {
+            const int bell = s->server_bell();
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, bell, nullptr);
+            ring_bells_.erase(bell);
+            ring_sessions_.erase(std::remove_if(ring_sessions_.begin(), ring_sessions_.end(),
+                                                [fd](const auto& r) { return r.first == fd; }),
+                                 ring_sessions_.end());
+            engine_->registry().increment_gauge("ob_ring_bytes", -static_cast<int64_t>(s->ring_bytes()));
+        }
     }
     sessions_.remove_session(fd);
     stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
@@ -2632,6 +2710,12 @@ void Reactor::close_session(int fd, const char* reason) {
 
 void Reactor::arm_epollout(int fd) {
     if (epoll_fd_ < 0 || fd < 0) return;
+    if (!ring_sessions_.empty()) {
+        if (Session* s = sessions_.get_session(fd); s != nullptr && s->in_rings()) {
+            serve_ring_output(*s);
+            return;
+        }
+    }
 
     struct epoll_event ev{};
     ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
@@ -2640,6 +2724,62 @@ void Reactor::arm_epollout(int fd) {
         OB_LOG_WARN("tcp_server", "arm_epollout failed: fd=%d errno=%s",
                     fd, std::strerror(errno));
     }
+}
+
+bool Reactor::move_to_rings(int fd, Session& s, uint64_t bytes, const std::string& answer) {
+    std::string why;
+    ring::Mapping mapping = ring::Mapping::create(bytes, why);
+    if (!mapping.valid()) {
+        OB_LOG_WARN("tcp_server", "Reactor %d: fd=%d cannot move to rings: %s", index_, fd, why.c_str());
+        return false;
+    }
+    const int server_bell = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    const int client_bell = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    const auto give_up = [&](const std::string& what) {
+        OB_LOG_WARN("tcp_server", "Reactor %d: fd=%d cannot move to rings: %s", index_, fd, what.c_str());
+        if (server_bell >= 0) ::close(server_bell);
+        if (client_bell >= 0) ::close(client_bell);
+        return false;
+    };
+    if (server_bell < 0 || client_bell < 0) return give_up(std::string("eventfd(): ") + std::strerror(errno));
+    // In the epoll set before the client holds anything: a command it sends the moment it maps the
+    // rings rings a bell somebody listens to.
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN;
+    ev.data.fd = server_bell;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_bell, &ev) < 0) {
+        return give_up(std::string("epoll_ctl() of the bell: ") + std::strerror(errno));
+    }
+    // The answer and the three descriptors in one message, so the client has the rings with the OK.
+    const int fds[3] = {mapping.fd(), server_bell, client_bell};
+    if (!net::send_with_fds(fd, answer, fds, 3, why)) {
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, server_bell, nullptr);
+        return give_up("sending the answer: " + why);
+    }
+    const size_t mapped = mapping.bytes();
+    s.enable_rings(std::move(mapping), server_bell, client_bell, ring_bells_unpublished_);
+    ring_bells_[server_bell] = fd;
+    ring_sessions_.emplace_back(fd, &s);
+    engine_->registry().increment_counter("ob_ring_sessions_total");
+    engine_->registry().increment_gauge("ob_ring_bytes", static_cast<int64_t>(mapped));
+    OB_LOG_INFO("tcp_server", "Reactor %d: fd=%d conn_id=%llu moved to rings of %llu bytes a direction, "
+                "from %s", index_, fd, static_cast<unsigned long long>(s.conn_id()),
+                static_cast<unsigned long long>(bytes), peer_address(fd).c_str());
+    return true;
+}
+
+void Reactor::serve_ring_output(Session& s) {
+    // Bounded: a client that frees room as fast as this fills it is served through its bell, not
+    // by this loop holding the reactor.
+    for (int round = 0; round < 4; ++round) {
+        if (!s.flush_output()) return;   // the caller sees ring_broken()
+        if (!s.has_pending_output()) {
+            s.ring_room_wait_done();
+            return;
+        }
+        if (s.ring_wait_for_room()) return;   // the client rings when it frees room
+    }
+    ring::ring_bell(s.server_bell());
 }
 
 void Reactor::hand_off(int fd, uint64_t conn_id, bool local) {
@@ -2703,6 +2843,7 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
     }
 
     Session* s = sessions_.get_session(fd);
+    if (s) s->set_local(local, config_.rings ? config_.ring_bytes : 0);
     if (s && tls_.client_port && !local) {
         // Wrap before anything is written: the banner is application data and must not precede
         // the handshake. It is queued here and goes out with the first flush after the handshake
@@ -2824,6 +2965,9 @@ void Reactor::publish_gauge(const char* name, int64_t now, int64_t& published) {
 
 void Reactor::disarm_epollout(int fd) {
     if (epoll_fd_ < 0 || fd < 0) return;
+    if (!ring_sessions_.empty()) {
+        if (Session* s = sessions_.get_session(fd); s != nullptr && s->in_rings()) return;
+    }
 
     // Back to read-only interest. Leaving EPOLLOUT armed on an edge-triggered fd
     // makes epoll_wait return immediately whenever the socket is writable, which is
@@ -2837,6 +2981,10 @@ void Reactor::disarm_epollout(int fd) {
     }
 }
 
+/// Marks an event the loop made itself for a session in rings it polled (#52, step 2). EPOLLMSG is
+/// defined and never reported, so no event from the kernel carries it.
+constexpr uint32_t kRingPolled = EPOLLMSG;
+
 // At column zero on purpose, like every loop in src/: the scan in `tests/test_thread_boundaries.cpp`
 // finds a loop by that signature and has to classify it (#131).
 void Reactor::run_loop() {
@@ -2844,7 +2992,30 @@ void Reactor::run_loop() {
     while (running_.load(std::memory_order_relaxed)) {
         const int wait_ms = io_wait_ms(last_event_at_, config_.io_spin_us, 100,
                                        std::chrono::steady_clock::now());
-        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, wait_ms);
+        // Sessions in rings (#52, step 2) are polled while the loop polls; before it sleeps, each
+        // client is told to ring. A ring that filled in between keeps this one pass awake: the wait
+        // is still the decision above, and the pass does not sleep it.
+        const bool rings_told = wait_ms != 0 && !ring_sessions_.empty();
+        bool ring_filled = false;
+        if (rings_told) {
+            for (const auto& [sfd, rs] : ring_sessions_) {
+                if (!rs->ring_prepare_to_sleep()) ring_filled = true;
+            }
+        }
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, ring_filled ? 0 : wait_ms);
+        if (rings_told) {
+            for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();
+        }
+        if (nfds >= 0 && !ring_sessions_.empty()) {
+            for (const auto& [sfd, rs] : ring_sessions_) {
+                if (nfds >= MAX_EVENTS) break;   // the rest is polled on the next pass
+                if (rs->ring_input_waiting()) {
+                    events_[nfds].events  = EPOLLIN | EPOLLOUT | kRingPolled;
+                    events_[nfds].data.fd = sfd;
+                    ++nfds;
+                }
+            }
+        }
         if (nfds > 0) last_event_at_ = std::chrono::steady_clock::now();
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -2894,6 +3065,12 @@ void Reactor::run_loop() {
         publish_gauge("ob_session_pending_bytes",
                       static_cast<int64_t>(sessions_.total_pending_output_bytes()),
                       published_session_pending_bytes_);
+        // Counted as they were rung and published once a pass, so a pass that rang nothing neither
+        // walks the sessions in rings nor writes to any of them.
+        if (ring_bells_unpublished_ != 0) {
+            engine_->registry().increment_counter("ob_ring_bells_total", ring_bells_unpublished_);
+            ring_bells_unpublished_ = 0;
+        }
 
         // One event is the unit a failure costs, not the reactor: an exception while serving one
         // closes that session, is counted, and the loop goes on with the rest of the batch. The
@@ -2909,15 +3086,48 @@ void Reactor::run_loop() {
                     continue;
                 }
 
+                // Sessions in rings (#52, step 2): a bell, or a ring the loop polled, stands for the
+                // session's socket being readable and writable at once. The socket itself carries
+                // nothing after the move, so an event there is the session's end.
+                uint32_t ev = events_[i].events;
+                if ((ev & kRingPolled) != 0) {
+                    ev = EPOLLIN | EPOLLOUT;
+                } else if (!ring_bells_.empty()) {
+                    if (const auto bell = ring_bells_.find(fd); bell != ring_bells_.end()) {
+                        ring::drain_bell(fd);
+                        fd = bell->second;
+                        ev = EPOLLIN | EPOLLOUT;
+                    } else if (Session* rs = sessions_.get_session(fd); rs != nullptr && rs->in_rings()) {
+                        char c = 0;
+                        const ssize_t peeked = ::recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                        if (peeked == 0) {
+                            close_session(fd, "peer closed");
+                        } else if (peeked > 0) {
+                            close_session(fd, "bytes on the socket of a session in rings");
+                        }
+                        continue;
+                    }
+                }
+
                 if (fd == listen_fd_ || fd == unix_listen_fd_) {
                     accept_from(fd, fd == unix_listen_fd_);
                 } else {
                     // Writable first: a session with queued output is waiting on this,
                     // and draining it may be the only thing that lets the client send
                     // its next command.
-                    if (events_[i].events & EPOLLOUT) {
+                    if (ev & EPOLLOUT) {
                         Session* session = sessions_.get_session(fd);
-                        if (session) {
+                        if (session && session->in_rings()) {
+                            serve_ring_output(*session);
+                            if (session->ring_broken()) {
+                                close_session(fd, "a ring the client left in a state it never had");
+                                continue;
+                            }
+                            if (!session->has_pending_output() && session->close_requested()) {
+                                close_session(fd, "quit after flush");
+                                continue;
+                            }
+                        } else if (session) {
                             // A handshake that wanted to write is why this event arrived.
                             if (session->tls_handshaking()) {
                                 if (!session->continue_tls_handshake()) {
@@ -2947,7 +3157,7 @@ void Reactor::run_loop() {
                         }
                     }
 
-                    if (!(events_[i].events & EPOLLIN)) continue;
+                    if (!(ev & EPOLLIN)) continue;
 
                     {
                         // A handshake in progress consumes this event and nothing else: not one byte
@@ -3049,6 +3259,10 @@ void Reactor::run_loop() {
                             const char* close_after_flush = nullptr;
                             bool        quit              = false;
                             bool        queue_refused     = false;
+                            // RINGS as the read's last command (#52, step 2): its size and its
+                            // answer, for after the flush.
+                            uint64_t    rings_bytes       = 0;
+                            std::string rings_answer;
 
                             // One answer into the session's buffer. False: the session is to
                             // close, because a client that has stopped reading cannot be sent
@@ -3129,6 +3343,24 @@ void Reactor::run_loop() {
                                     break;
                                 }
 
+                                if (cmd.type == CommandType::RINGS &&
+                                    response.rfind("OK RINGS", 0) == 0) {
+                                    // Answered with the rings' descriptors on the socket, so not
+                                    // queued (#52, step 2): the move happens after this read's one
+                                    // flush, once everything before it has gone out on the socket.
+                                    // Nothing may come after it there.
+                                    if (&line != &lines.back() || session->unparsed_bytes() > 0) {
+                                        (void)session->queue_response(format_error(
+                                            "rings: nothing may follow RINGS before its answer"));
+                                        close_after_flush = "bytes after RINGS";
+                                        break;
+                                    }
+                                    rings_bytes  = cmd.ring_bytes != 0 ? cmd.ring_bytes
+                                                                       : session->ring_limit();
+                                    rings_answer = std::move(response);
+                                    break;
+                                }
+
                                 if (!enqueue(response)) {
                                     queue_refused = true;
                                     break;
@@ -3162,6 +3394,23 @@ void Reactor::run_loop() {
                             if (close_after_flush) {
                                 close_session(fd, close_after_flush);
                                 goto next_event;
+                            }
+
+                            if (rings_bytes != 0) {
+                                // Everything before RINGS has gone out on the socket, unless the
+                                // socket would not take it all: then the move waits for a RINGS
+                                // asked again, and the answers come first.
+                                if (session->has_pending_output()) {
+                                    if (!session->queue_response(format_error(
+                                            "rings: earlier answers are still being sent; ask again "
+                                            "once they are read"))) {
+                                        close_session(fd, "send failed");
+                                        goto next_event;
+                                    }
+                                } else if (!move_to_rings(fd, *session, rings_bytes, rings_answer)) {
+                                    close_session(fd, "moving to rings failed");
+                                    goto next_event;
+                                }
                             }
 
                             if (quit) {

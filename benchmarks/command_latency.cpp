@@ -29,13 +29,25 @@
 // `OB_UNIX_SOCKET=<path>` measures the node's Unix socket (`--unix-socket`, #52) instead of its
 // port, which is then not used: the round trip of a client on the node's own host.
 //
+// `OB_RINGS=1`, beside `OB_UNIX_SOCKET`, moves the session to rings in shared memory (`RINGS`, #52
+// step 2) and times the round trip through them; with `OB_SPIN=1` the probe polls the answer ring,
+// without it it sleeps on its bell.
+//
 // `OB_SPIN=1` makes the probe poll for its answer rather than sleep in `recv()`: a client that
 // blocks pays for its own wake-up, and on a host whose idle CPUs sleep deeply that is part of every
 // figure, more of a short round trip than of a long one (#52).
 //
+// `OB_GAP_US=<n>` waits n microseconds between two round trips, outside the timed part, watching
+// the clock so the probe itself stays awake. Back to back, the next command can reach a node whose
+// loop is still polling after the last one; after a gap the loop has gone to sleep - once its spin
+// is over in `boost`, at once in `eco` - and the figure is a command that has to wake it (#52).
+//
 // One JSON object on stdout: percentiles of the round trip, the server's CPU for the timed loop
 // (read from /proc/<server-pid>/stat), and the size of one answer in bytes and in lines - the
 // second so a driver can check the answer is the shape it asked for, not only that it arrived.
+
+#include "orderbook/net.hpp"
+#include "orderbook/ring.hpp"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -49,6 +61,7 @@
 #include <netinet/tcp.h>
 #include <sstream>
 #include <string>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -156,6 +169,42 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Rings (#52, step 2): asked for on the socket, then every round trip goes through them.
+    const char* rings_env = std::getenv("OB_RINGS");
+    const bool use_rings = rings_env != nullptr && std::string(rings_env) == "1";
+    ob::ring::Mapping rings;
+    ob::ring::Writer  commands;
+    ob::ring::Reader  answers;
+    int server_bell = -1, client_bell = -1;
+    if (use_rings) {
+        if (unix_path == nullptr || *unix_path == '\0') {
+            std::fprintf(stderr, "OB_RINGS needs OB_UNIX_SOCKET\n");
+            return 2;
+        }
+        static constexpr char ask[] = "RINGS\n";
+        if (::send(fd, ask, sizeof(ask) - 1, MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(ask) - 1)) {
+            std::perror("send");
+            return 1;
+        }
+        std::string granted, why;
+        std::vector<int> fds;
+        if (!ob::net::recv_with_fds(fd, 4096, 3, 5000, granted, fds, why) ||
+            granted.rfind("OK RINGS ", 0) != 0 || fds.size() != 3) {
+            std::fprintf(stderr, "RINGS refused: %s%s\n", granted.c_str(), why.c_str());
+            return 1;
+        }
+        const uint64_t size = std::strtoull(granted.c_str() + 9, nullptr, 10);
+        server_bell = fds[1];
+        client_bell = fds[2];
+        rings = ob::ring::Mapping::attach(fds[0], size, why);
+        if (!rings.valid()) {
+            std::fprintf(stderr, "the rings' memory: %s\n", why.c_str());
+            return 1;
+        }
+        commands = ob::ring::Writer(rings.to_server(), rings.to_server_data(), size);
+        answers  = ob::ring::Reader(rings.to_client(), rings.to_client_data(), size);
+    }
+
     std::string answer;
     size_t answer_bytes = 0;
     size_t answer_lines = 0;
@@ -164,9 +213,54 @@ int main(int argc, char** argv) {
     size_t reads = 0;
     const char* spin_env = std::getenv("OB_SPIN");
     const bool spin = spin_env != nullptr && std::string(spin_env) == "1";
+    // Through rings, poll this long before sleeping on the bell, as `ClientConfig::rings.spin_us`
+    // does; 0 sleeps at once. Ignored with OB_SPIN=1, which never sleeps.
+    const char* spin_us_env = std::getenv("OB_SPIN_US");
+    const long spin_us = spin_us_env != nullptr ? std::strtol(spin_us_env, nullptr, 10) : 0;
+    const char* gap_env = std::getenv("OB_GAP_US");
+    const long gap_us = gap_env != nullptr ? std::strtol(gap_env, nullptr, 10) : 0;
     // One round trip. Returns false on a transport failure; an ERR answer is reported through
     // `answer` and refused by the caller, because timing an error is how this probe lied once.
+    // The answer is complete: one line for PING and errors, a blank line ending anything else.
+    const auto complete = [&]() {
+        const bool whole_line = answer.find('\n') != std::string::npos;
+        if (whole_line && (one_line || answer.rfind("ERR", 0) == 0)) return true;
+        return answer.size() >= 2 && answer.compare(answer.size() - 2, 2, "\n\n") == 0;
+    };
+    const auto ring_trip = [&]() -> bool {
+        size_t done = 0;
+        while (done < command.size()) {
+            const size_t n = commands.write(command.data() + done, command.size() - done);
+            done += n;
+            if (commands.broken()) return false;
+            if (n > 0 && commands.publish()) ob::ring::ring_bell(server_bell);
+        }
+        answer.clear();
+        reads = 0;
+        const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+        for (;;) {
+            const size_t got = answers.read(buf, sizeof(buf));
+            if (got > 0) {
+                ++reads;
+                answer.append(buf, got);
+                if (answers.producer_waiting()) ob::ring::ring_bell(server_bell);
+                if (complete()) break;
+                continue;
+            }
+            if (answers.broken()) return false;
+            if (spin || std::chrono::steady_clock::now() < spin_end) continue;
+            if (!answers.prepare_to_sleep()) continue;
+            pollfd p{client_bell, POLLIN, 0};
+            if (::poll(&p, 1, 5000) == 0) return false;
+            ob::ring::drain_bell(client_bell);
+            answers.woke();
+        }
+        answer_bytes = answer.size();
+        answer_lines = static_cast<size_t>(std::count(answer.begin(), answer.end(), '\n'));
+        return true;
+    };
     const auto round_trip = [&]() -> bool {
+        if (use_rings) return ring_trip();
         const auto sent = ::send(fd, command.data(), command.size(), MSG_NOSIGNAL);
         if (sent != static_cast<ssize_t>(command.size())) return false;
         answer.clear();
@@ -201,6 +295,10 @@ int main(int argc, char** argv) {
     const double cpu_before = process_cpu_seconds(server_pid);
     const auto wall0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iterations; ++i) {
+        if (gap_us > 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(gap_us);
+            while (std::chrono::steady_clock::now() < until) {}
+        }
         const auto t0 = std::chrono::steady_clock::now();
         if (!round_trip()) { std::fprintf(stderr, "round trip %d failed\n", i); return 1; }
         const auto t1 = std::chrono::steady_clock::now();
@@ -217,13 +315,14 @@ int main(int argc, char** argv) {
     // tick touches one round trip in hundreds, and p99 does not see it (#180).
     // The transport too, so a figure carries what it travelled on rather than leaving it to the
     // file it was saved in (#52).
-    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"iterations\": %d, "
+    std::printf("{\"command\": \"%s\", \"transport\": \"%s\", \"spin\": %s, \"spin_us\": %ld, \"gap_us\": %ld, \"iterations\": %d, "
                 "\"p50_ns\": %lld, \"p99_ns\": %lld, "
                 "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
                 "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu, "
                 "\"split_answers\": %zu}\n",
-                json_label.c_str(), (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
-                spin ? "true" : "false",
+                json_label.c_str(),
+                use_rings ? "rings" : (unix_path != nullptr && *unix_path != '\0') ? "unix" : "tcp",
+                spin ? "true" : "false", spin_us, gap_us,
                 iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
                 ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),

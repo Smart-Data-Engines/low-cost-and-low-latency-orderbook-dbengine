@@ -184,6 +184,15 @@ void SubscriptionHub::enqueue(uint64_t subscription_id, const QueryResult& row) 
 
 std::vector<int> SubscriptionHub::drain(SessionManager& sessions,
                                         const std::function<void(int)>& arm_epollout) {
+    // Nothing woke the hub since the last drain: no queue has a row or an overflow, because the
+    // first row into an empty queue and every overflow set the flag before the eventfd is written,
+    // and the drain that moved the last bytes cleared it before moving them. A loop that polls -
+    // `boost`, and the rings of #52 - comes here on every pass, and this is what keeps that pass to
+    // one load rather than a read() and a lock (measured: the read alone was 6% of a polling loop's
+    // cycles on the Graviton). A row whose wake() lands after this load is delivered on the next
+    // pass.
+    if (!wake_pending_.load(std::memory_order_acquire)) return {};
+
     // Drain the eventfd and clear the flag *before* moving any bytes. The other order loses the
     // wake-up for a row enqueued between the two.
     if (wakeup_fd_ >= 0) {

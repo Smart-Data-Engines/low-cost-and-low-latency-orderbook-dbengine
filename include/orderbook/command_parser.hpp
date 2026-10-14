@@ -33,6 +33,7 @@ enum class CommandType {
     AUTH,
     BOOK,
     BACKUP,
+    RINGS,
     UNKNOWN
 };
 
@@ -107,6 +108,7 @@ struct Command {
     std::string adopt_source_shard;   // the moving symbol's shard, for ADOPT BEGIN
     bool        backup_status{false}; // BACKUP STATUS rather than BACKUP (#34)
     size_t      mm_conflicts_limit{100}; // for MM_CONFLICTS
+    uint64_t    ring_bytes{0};           // for RINGS: 0 asks for the server's size (#52)
 
     /// The whole SUBSCRIBE line, handed to the query engine unparsed.
     ///

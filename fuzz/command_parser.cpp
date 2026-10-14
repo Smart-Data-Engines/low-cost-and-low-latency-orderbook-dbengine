@@ -79,6 +79,11 @@ bool same_meaning(const ob::Command& a, const ob::Command& b) {
         const auto& y = b.book_args;
         return x.symbol == y.symbol && x.exchange == y.exchange && x.depth == y.depth;
     }
+    case ob::CommandType::RINGS:
+        // The size included: an omitted one means the node's own, so a formatter that dropped it
+        // would turn a request for 64 KiB rings into one for the node's megabyte, and both texts
+        // would still parse (#52).
+        return a.ring_bytes == b.ring_bytes;
     // Commands whose whole content is their name.
     case ob::CommandType::FLUSH:
     case ob::CommandType::PING:

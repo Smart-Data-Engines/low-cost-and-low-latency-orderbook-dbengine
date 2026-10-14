@@ -2488,6 +2488,53 @@ For the C++ client it is `ClientConfig::unix_socket`, and for backups from cron
 `ob_backup --unix-socket /run/orderbook/ob.sock`. A client asked for TLS through the socket is refused
 before it connects, and a pool or the shard router dials every node at its address.
 
+### Rings in shared memory
+
+A session through the socket can move its bytes to a pair of rings in shared memory (`RINGS`, #52
+step 2): commands into one ring, answers and pushed rows out of the other, and no system call a round
+trip while both ends poll. The protocol is the same byte for byte; how the move works is on the
+[wire protocol](protocol.md#rings-in-shared-memory) page.
+
+```cpp
+ob::ClientConfig cc;
+cc.unix_socket   = "/run/orderbook/ob.sock";
+cc.rings.enabled = true;   // after AUTH, where the node asks for it
+```
+
+What a command cost through each, pinned, in the default profile (`boost`, whose loops poll for a
+moment after each event), with a client that polls for its answer and sends the next command once it
+has one, the median of seven rounds of 50 000 (the roadmap, #52, has the series):
+
+| p50 | EPYC 9R45, TCP | socket | rings | Graviton, TCP | socket | rings |
+|---|---|---|---|---|---|---|
+| `PING` | 2.96 us | 1.59 us | **0.47 us** | 4.68 us | 2.81 us | **0.93 us** |
+| `BOOK`, ten levels | 3.99 us | 2.66 us | 1.38 us | 6.31 us | 4.56 us | 2.38 us |
+| `MINSERT`, twenty levels | 5.80 us | 3.96 us | 2.73 us | 8.18 us | 5.83 us | 3.79 us |
+
+- **A command that finds the node asleep pays for waking it.** The loop polls for 10 us after an
+  event in `boost` and then sleeps; in `eco` it sleeps at once. After a 50 us pause a `PING` cost
+  1.99 us through rings on the EPYC, 2.69 through the socket and 4.26 through TCP. After 500 us,
+  with the host's idle CPUs asleep deeper, it cost 6.10, 6.79 and 8.48. On the Graviton both pauses
+  cost 3.16-3.23 us through rings. A client whose commands come more than 10 us apart gets these
+  figures rather than the table's: the rings stay the cheapest, by less.
+- **The client polls before it sleeps.** A node answers a `PING` through rings in well under a
+  microsecond, so a client that sleeps on its bell at once is caught going to sleep and pays the
+  whole wake-up: 3.44 us a `PING` on the EPYC, more than the socket's 1.99 for a client blocked in
+  `recv()`, against 0.47 for one that polled 5 us first. `ClientConfig::rings.spin_us` is 20 by
+  default; 0 sleeps at once.
+- **In `eco`,** a client that sends its next command at once can reach the loop before it sleeps:
+  0.80 us a `PING` on the EPYC and 1.56 on the Graviton through rings. After any pause it pays the
+  wake-up above.
+- **Memory:** `--ring-bytes` (1 MiB by default) a direction, so 2 MiB a session plus a page.
+  `ob_ring_bytes` is what the sessions in rings hold, `ob_ring_sessions_total` counts the moves, and
+  `ob_ring_bells_total` the times the node woke a sleeping client, for an answer or for room in its
+  command ring.
+- **Who may:** a session through the socket, after `AUTH` where it is required. TCP, TLS and
+  compressed sessions are refused, and `--rings off` refuses every one. The memory is shared with
+  the process at the other end of the socket alone, through descriptors passed on it, and sealed
+  against shrinking; a client that leaves a ring in a state the node never wrote has its session
+  closed.
+
 ### The metrics endpoint
 
 No authentication, deliberately — a Prometheus scraper cannot perform a challenge-response, and a

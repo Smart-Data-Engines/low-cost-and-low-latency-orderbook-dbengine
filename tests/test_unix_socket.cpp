@@ -10,6 +10,7 @@
 
 #include "orderbook/auth.hpp"
 #include "orderbook/net.hpp"
+#include "orderbook/ring.hpp"
 #include "orderbook/tcp_server.hpp"
 #include "test_ports.hpp"
 
@@ -17,11 +18,13 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -35,6 +38,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -67,6 +71,11 @@ struct Dir {
 /// counted.
 uint16_t port_at(uint16_t offset) {
     return static_cast<uint16_t>(ob::test::kPortsUnixSocket + offset);
+}
+
+/// The rings' tests have a block of their own: with the socket's they would not fit in one.
+uint16_t ring_port_at(uint16_t offset) {
+    return static_cast<uint16_t>(ob::test::kPortsRings + offset);
 }
 
 /// A server listening on `port` and on `dir`'s socket, two loops so connections are handed off as
@@ -139,6 +148,8 @@ public:
     Wire(const Wire&) = delete;
     Wire& operator=(const Wire&) = delete;
 
+    int fd() const { return fd_; }
+
     /// What the server sends first: the banner, or a refusal.
     std::string greeting() { return answer(); }
 
@@ -196,18 +207,180 @@ std::unique_ptr<Wire> through(const std::string& path) {
     }
 }
 
-/// A connection to the port, which listens by the time the socket does: the port is bound first.
+/// A connection to the port, once the server listens there.
 std::unique_ptr<Wire> to_port(uint16_t port) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     std::string why;
-    const int fd = ob::net::dial("127.0.0.1", port, 1000, false, why, "test");
-    if (fd < 0) {
-        ADD_FAILURE() << "no connection to port " << port << ": " << why;
-        return nullptr;
+    for (;;) {
+        const int fd = ob::net::dial("127.0.0.1", port, 1000, false, why, "test");
+        if (fd >= 0) return std::make_unique<Wire>(fd);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            ADD_FAILURE() << "no connection to port " << port << ": " << why;
+            return nullptr;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    return std::make_unique<Wire>(fd);
 }
 
 bool greeted(const std::string& greeting) { return greeting.rfind("OK ob_tcp_server v", 0) == 0; }
+
+/// One counter from the node's `/metrics` on `port`, or -1 when it cannot be read.
+long long metric(uint16_t port, const std::string& name) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    std::string text;
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+        const std::string get = "GET /metrics HTTP/1.0\r\n\r\n";
+        if (::send(fd, get.data(), get.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(get.size())) {
+            char buf[65536];
+            for (ssize_t n; (n = ::recv(fd, buf, sizeof(buf), 0)) > 0;) text.append(buf, static_cast<size_t>(n));
+        }
+    }
+    ::close(fd);
+    // `name{labels} value`, or `name value`: the value follows the first space after the name.
+    for (size_t at = text.find("\n" + name); at != std::string::npos; at = text.find("\n" + name, at + 1)) {
+        const char next = text[at + 1 + name.size()];
+        if (next != '{' && next != ' ') continue;   // a longer name that starts with this one
+        const size_t space = text.find(' ', at + 1);
+        return space == std::string::npos ? -1 : std::atoll(text.c_str() + space + 1);
+    }
+    return -1;
+}
+
+/// A session moved to rings (#52, step 2), speaking the protocol through them the way the C++
+/// client does: commands into one ring, answers out of the other, and a bell rung only for a side
+/// that sleeps.
+class RingWire {
+public:
+    /// Sends `RINGS` on the socket of `w` and takes the answer with its three descriptors.
+    RingWire(Wire& w, uint64_t bytes = 0) : socket_fd_(w.fd()) {
+        const std::string line = bytes != 0 ? "RINGS " + std::to_string(bytes) + "\n" : "RINGS\n";
+        if (!w.send_raw(line)) {
+            error_ = "the RINGS line was not sent";
+            return;
+        }
+        std::vector<int> fds;
+        if (!ob::net::recv_with_fds(socket_fd_, 4096, 3, 5000, answer_, fds, error_)) return;
+        if (answer_.rfind("OK RINGS ", 0) != 0 || fds.size() != 3) {
+            for (const int fd : fds) ::close(fd);
+            error_ = "answer '" + answer_ + "' with " + std::to_string(fds.size()) + " descriptor(s)";
+            return;
+        }
+        const uint64_t size = std::stoull(answer_.substr(9));
+        server_bell_ = fds[1];
+        client_bell_ = fds[2];
+        mapping_ = ob::ring::Mapping::attach(fds[0], size, error_);
+        if (!mapping_.valid()) return;
+        commands_ = ob::ring::Writer(mapping_.to_server(), mapping_.to_server_data(), size);
+        answers_  = ob::ring::Reader(mapping_.to_client(), mapping_.to_client_data(), size);
+        ok_ = true;
+    }
+    ~RingWire() {
+        if (server_bell_ >= 0) ::close(server_bell_);
+        if (client_bell_ >= 0) ::close(client_bell_);
+    }
+    RingWire(const RingWire&) = delete;
+    RingWire& operator=(const RingWire&) = delete;
+
+    bool ok() const { return ok_; }
+    const std::string& error() const { return error_; }
+    const std::string& rings_answer() const { return answer_; }
+    ob::ring::Mapping& mapping() { return mapping_; }
+    int server_bell() const { return server_bell_; }
+    /// How many times a command found the node asleep and rang it.
+    uint64_t bells_rung() const { return bells_rung_; }
+    /// How many times a full command ring put this client to sleep until the node made room.
+    uint64_t room_waits() const { return room_waits_; }
+
+    bool send_raw(const std::string& bytes) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        size_t done = 0;
+        while (done < bytes.size()) {
+            const size_t n = commands_.write(bytes.data() + done, bytes.size() - done);
+            done += n;
+            if (commands_.publish()) {
+                ob::ring::ring_bell(server_bell_);
+                ++bells_rung_;
+            }
+            if (n > 0) continue;
+            if (std::chrono::steady_clock::now() > deadline) return false;
+            if (commands_.prepare_to_wait_for_room()) {
+                ++room_waits_;
+                // Long enough that a bell the node never rang shows as a failure, not as a pause.
+                pollfd p{client_bell_, POLLIN, 0};
+                if (::poll(&p, 1, 2000) == 0) return false;
+                ob::ring::drain_bell(client_bell_);
+                commands_.done_waiting_for_room();
+            }
+        }
+        return true;
+    }
+
+    std::string ask(const std::string& line) { return send_raw(line + "\n") ? answer() : "(send failed)"; }
+
+    /// One answer, framed as `Wire::answer()` frames one; sleeps on its bell between bytes.
+    std::string answer() {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (;;) {
+            const bool ok  = buf_.rfind("OK", 0) == 0;
+            const auto end = ok ? buf_.find("\n\n") : buf_.find('\n');
+            if (end != std::string::npos) {
+                const size_t len = end + (ok ? 2 : 1);
+                std::string out  = buf_.substr(0, len);
+                buf_.erase(0, len);
+                return out;
+            }
+            char tmp[16384];
+            const size_t n = answers_.read(tmp, sizeof(tmp));
+            if (n > 0) {
+                buf_.append(tmp, n);
+                if (answers_.producer_waiting()) ob::ring::ring_bell(server_bell_);
+                continue;
+            }
+            if (answers_.broken()) return "(the server left the answer ring broken)";
+            if (std::chrono::steady_clock::now() > deadline) {
+                return "(timed out with " + std::to_string(buf_.size()) + " bytes)";
+            }
+            if (answers_.prepare_to_sleep()) {
+                // Two seconds asleep with the node's answer due is a bell it never rang: said as
+                // such, rather than covered by a poll that wakes anyway.
+                pollfd p{client_bell_, POLLIN, 0};
+                if (::poll(&p, 1, 2000) == 0) {
+                    return "(no bell within 2 s, " + std::to_string(answers_.available()) +
+                           " bytes in the ring)";
+                }
+                ob::ring::drain_bell(client_bell_);
+                answers_.woke();
+            }
+        }
+    }
+
+    /// Whether the server has closed the socket the session is kept under, within `ms`.
+    bool socket_closed_within(int ms) {
+        pollfd p{socket_fd_, POLLIN, 0};
+        if (::poll(&p, 1, ms) <= 0) return false;
+        char c = 0;
+        return ::recv(socket_fd_, &c, 1, MSG_DONTWAIT) == 0;
+    }
+
+private:
+    int                socket_fd_;
+    uint64_t           bells_rung_{0};
+    uint64_t           room_waits_{0};
+    bool               ok_{false};
+    std::string        error_;
+    std::string        answer_;
+    std::string        buf_;
+    ob::ring::Mapping  mapping_;
+    ob::ring::Writer   commands_;
+    ob::ring::Reader   answers_;
+    int                server_bell_{-1};
+    int                client_bell_{-1};
+};
 
 /// Whether a connection to the port is accepted at all.
 bool to_port_answers(uint16_t port) {
@@ -530,6 +703,289 @@ TEST(UnixSocketServer, WhatAKilledServerLeftIsReplaced) {
     ASSERT_TRUE(w);
     ASSERT_TRUE(greeted(w->greeting()));
     EXPECT_EQ(w->ask("PING"), "PONG\n");
+    w.reset();
+    server.stop();
+}
+
+// ── Rings in shared memory (#52, step 2) ────────────────────────────────────────────────────────────
+
+namespace {
+
+/// The rings' tests run each twice: with a loop that sleeps between events, so every command rings
+/// its bell, and with one that polls, as `boost` does, so none needs to.
+ob::ServerConfig ring_config(const Dir& dir, uint16_t port, bool polling) {
+    auto c = config_in(dir, port);
+    c.io_spin_us = polling ? 50 : 0;
+    return c;
+}
+
+void the_protocol_goes_through_rings(uint16_t port, bool polling) {
+    Dir dir;
+    const auto config = ring_config(dir, port, polling);
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w);
+    ASSERT_TRUE(r.ok()) << r.error();
+    EXPECT_EQ(r.rings_answer(), "OK RINGS 1048576\n\n");
+
+    EXPECT_EQ(r.ask("PING"), "PONG\n");
+    EXPECT_EQ(r.ask("INSERT RING EX bid 10000 5"), "OK\n\n");
+    EXPECT_EQ(r.ask("INSERT RING EX ask 10100 7"), "OK\n\n");
+    const std::string book = r.ask("BOOK RING EX 5");
+    EXPECT_EQ(book.rfind("OK", 0), 0u) << book;
+    EXPECT_NE(book.find("10100"), std::string::npos) << book;
+    // Pipelined, and again after a pause long enough for the loop to have gone to sleep.
+    ASSERT_TRUE(r.send_raw("PING\nBOOK RING EX 5\n"));
+    EXPECT_EQ(r.answer(), "PONG\n");
+    EXPECT_EQ(r.answer(), book);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    // A loop that went to sleep is woken by the command, not by its own 100 ms timeout.
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(r.ask("PING"), "PONG\n");
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(50))
+        << "the PING waited for the loop's timeout rather than waking it";
+
+    // The socket the session is kept under carries nothing more, and the session is still there.
+    EXPECT_FALSE(r.socket_closed_within(50));
+    w.reset();   // its end is the session's end
+    server.stop();
+}
+
+}  // namespace
+
+TEST(RingsServer, TheProtocolGoesThroughRingsToALoopThatSleeps) {
+    the_protocol_goes_through_rings(ring_port_at(0), false);
+}
+
+TEST(RingsServer, TheProtocolGoesThroughRingsToALoopThatPolls) {
+    the_protocol_goes_through_rings(ring_port_at(10), true);
+}
+
+TEST(RingsServer, ALoopThatPollsFindsACommandNobodyRang) {
+    // A client rings only a loop that said it sleeps, so a loop that polls has to find each command
+    // itself. The test above cannot tell: its client sleeps until each answer, and waking it takes
+    // longer than the loop's spin, so every command there finds the loop asleep and rings. Here the
+    // spin outlasts the test, the loop never sleeps, and no command may ring.
+    Dir dir;
+    auto config       = ring_config(dir, ring_port_at(90), true);
+    config.io_spin_us = 30'000'000;
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w);
+    ASSERT_TRUE(r.ok()) << r.error();
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_EQ(r.ask("PING"), "PONG\n") << "command " << i;
+    }
+    EXPECT_EQ(r.bells_rung(), 0u) << "the loop slept, so the commands were not found by polling";
+    w.reset();
+    server.stop();
+}
+
+TEST(RingsServer, OnlyASessionThroughTheSocketMovesAndOnlyWhenAsked) {
+    Dir dir;
+    const std::string secret(40, 's');
+    const std::string secrets = dir.at("clients.secret");
+    {
+        std::ofstream out(secrets);
+        out << "ops " << secret << "\n";
+    }
+    ASSERT_EQ(::chmod(secrets.c_str(), 0600), 0);
+    auto config             = config_in(dir, ring_port_at(20));
+    config.auth_secret_file = secrets;
+    config.ring_bytes       = 65536 * 4;
+    Running server(config);
+
+    auto remote = to_port(config.port);
+    ASSERT_TRUE(remote);
+    ASSERT_TRUE(greeted(remote->greeting()));
+    ASSERT_EQ(authenticate(*remote, "ops", secret).rfind("OK AUTH", 0), 0u);
+    EXPECT_EQ(remote->ask("RINGS"),
+              "ERR rings: only a session through the node's Unix socket can move to rings\n");
+
+    auto local = through(config.unix_socket);
+    ASSERT_TRUE(local);
+    ASSERT_TRUE(greeted(local->greeting()));
+    EXPECT_EQ(local->ask("RINGS"), "ERR unauthenticated\n");
+    ASSERT_EQ(authenticate(*local, "ops", secret).rfind("OK AUTH", 0), 0u);
+    EXPECT_EQ(local->ask("RINGS 100000").rfind("ERR rings: 100000 bytes a direction", 0), 0u);
+    EXPECT_EQ(local->ask("RINGS 524288").rfind("ERR rings: 524288 bytes a direction", 0), 0u)
+        << "more than --ring-bytes was granted";
+    EXPECT_EQ(local->ask("PING"), "PONG\n") << "a refused RINGS ended the session";
+
+    // Nothing may follow RINGS on the socket before its answer.
+    ASSERT_TRUE(local->send_raw("RINGS\nPING\n"));
+    EXPECT_EQ(local->answer(), "ERR rings: nothing may follow RINGS before its answer\n");
+
+    auto granted = through(config.unix_socket);
+    ASSERT_TRUE(granted);
+    ASSERT_TRUE(greeted(granted->greeting()));
+    ASSERT_EQ(authenticate(*granted, "ops", secret).rfind("OK AUTH", 0), 0u);
+    RingWire r(*granted, 65536);
+    ASSERT_TRUE(r.ok()) << r.error();
+    EXPECT_EQ(r.rings_answer(), "OK RINGS 65536\n\n");
+    EXPECT_EQ(r.ask("RINGS"), "ERR rings: this session is in rings already\n");
+
+    remote.reset();
+    local.reset();
+    granted.reset();
+    server.stop();
+}
+
+TEST(RingsServer, ASwitchedOffNodeRefusesToMove) {
+    Dir dir;
+    auto config  = config_in(dir, ring_port_at(30));
+    config.rings = false;
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    EXPECT_EQ(w->ask("RINGS"), "ERR rings: switched off on this node (--rings off)\n");
+    w.reset();
+    server.stop();
+}
+
+TEST(RingsServer, PushesComeThroughTheRing) {
+    Dir dir;
+    const auto config = ring_config(dir, ring_port_at(40), false);
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w);
+    ASSERT_TRUE(r.ok()) << r.error();
+    const std::string subscribed = r.ask("SUBSCRIBE * FROM 'PUSHED'.'EX'");
+    ASSERT_EQ(subscribed.rfind("OK", 0), 0u) << subscribed;
+
+    auto writer = to_port(config.port);
+    ASSERT_TRUE(writer);
+    ASSERT_TRUE(greeted(writer->greeting()));
+    EXPECT_EQ(writer->ask("INSERT PUSHED EX bid 4200 3"), "OK\n\n");
+    const std::string push = r.answer();
+    EXPECT_EQ(push.rfind("PUSH ", 0), 0u) << push;
+    EXPECT_NE(push.find("4200"), std::string::npos) << push;
+
+    writer.reset();
+    w.reset();
+    server.stop();
+}
+
+TEST(RingsServer, AnAnswerLargerThanTheRingWaitsForTheReader) {
+    // 64 KiB a direction and an answer over twice that: the loop fills the ring, says it waits for
+    // room, and the client's reads ring it back.
+    Dir dir;
+    const auto config = ring_config(dir, ring_port_at(50), false);
+    Running server(config);
+    auto writer = to_port(config.port);
+    ASSERT_TRUE(writer);
+    ASSERT_TRUE(greeted(writer->greeting()));
+    std::string minsert = "MINSERT BIG EX bid 1000\n";
+    for (int i = 0; i < 1000; ++i) minsert += std::to_string(100000 - i) + " " + std::to_string(i + 1) + " 1\n";
+    for (int round = 0; round < 4; ++round) {
+        ASSERT_TRUE(writer->send_raw(minsert));
+        ASSERT_EQ(writer->answer(), "OK\n\n");
+    }
+    ASSERT_EQ(writer->ask("FLUSH"), "OK\n\n");
+
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w, 65536);
+    ASSERT_TRUE(r.ok()) << r.error();
+    ASSERT_TRUE(r.send_raw("SELECT * FROM 'BIG'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999\n"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));   // the loop fills the ring first
+    const std::string rows = r.answer();
+    ASSERT_EQ(rows.rfind("OK", 0), 0u) << rows.substr(0, 200);
+    EXPECT_GT(rows.size(), 2u * 65536) << "the answer was not more than twice the ring";
+    EXPECT_EQ(static_cast<size_t>(std::count(rows.begin(), rows.end(), '\n')), 4000u + 3)
+        << "rows went missing on the way through the ring";
+
+    writer.reset();
+    w.reset();
+    server.stop();
+}
+
+TEST(RingsServer, ACounterTheClientCouldNotHaveLeftEndsTheSession) {
+    Dir dir;
+    const auto config = ring_config(dir, ring_port_at(60), false);
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w);
+    ASSERT_TRUE(r.ok()) << r.error();
+    EXPECT_EQ(r.ask("PING"), "PONG\n");
+    // More commands published than the ring holds.
+    r.mapping().to_server()->tail.store(r.mapping().capacity() * 4, std::memory_order_release);
+    ob::ring::ring_bell(r.server_bell());
+    EXPECT_TRUE(r.socket_closed_within(5000)) << "the session went on after its ring was broken";
+    w.reset();
+    server.stop();
+}
+
+TEST(RingsServer, ClosingTheSocketEndsTheSessionInRings) {
+    // One session a node: the place the session in rings held is given back when its socket closes.
+    Dir dir;
+    auto config         = ring_config(dir, ring_port_at(70), false);
+    config.max_sessions = 1;
+    Running server(config);
+    {
+        auto w = through(config.unix_socket);
+        ASSERT_TRUE(w);
+        ASSERT_TRUE(greeted(w->greeting()));
+        RingWire r(*w);
+        ASSERT_TRUE(r.ok()) << r.error();
+        EXPECT_EQ(r.ask("PING"), "PONG\n");
+    }   // the socket closes here, and the rings with the session
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::string greeting;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto again = through(config.unix_socket);
+        ASSERT_TRUE(again);
+        greeting = again->greeting();
+        if (greeted(greeting)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(greeted(greeting)) << "the session in rings outlived its socket: " << greeting;
+    server.stop();
+}
+
+TEST(RingsServer, ABurstLargerThanTheCommandRingIsTakenAsTheNodeReadsIt) {
+    // 60 000 PINGs in one write through a ring of 64 KiB: the client fills it, waits for room on its
+    // bell, and the node rings it as it reads. The answers pile up in the node's queue meanwhile, and
+    // go out once the client reads them. The node reads a whole ring at a time, so the burst is
+    // several rings long, and it starts once the node has gone to sleep: a node still awake from the
+    // move could take the first ring before the client finds it full.
+    Dir dir;
+    auto config         = ring_config(dir, ring_port_at(80), false);
+    config.metrics_port = ring_port_at(81);
+    Running server(config);
+    auto w = through(config.unix_socket);
+    ASSERT_TRUE(w);
+    ASSERT_TRUE(greeted(w->greeting()));
+    RingWire r(*w, 65536);
+    ASSERT_TRUE(r.ok()) << r.error();
+    // No round trip first: its answer would ring the client, and the count below is of room alone.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::string burst;
+    for (int i = 0; i < 60000; ++i) burst += "PING\n";
+    ASSERT_TRUE(r.send_raw(burst)) << "the client was never given room";
+    ASSERT_GE(r.room_waits(), 1u) << "the client never waited for room, so nothing here tests it";
+    // The client has not slept on an answer yet, so every bell so far was for room, and each one
+    // counts in `ob_ring_bells_total` as an answer's bell does. The loop publishes once a pass.
+    long long bells = 0;
+    for (int i = 0; i < 100 && bells < 1; ++i) {
+        bells = metric(config.metrics_port, "ob_ring_bells_total");
+        if (bells < 1) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_GE(bells, 1) << "the bells rung for room are not in ob_ring_bells_total";
+    for (int i = 0; i < 60000; ++i) {
+        const std::string a = r.answer();
+        ASSERT_EQ(a, "PONG\n") << "answer " << i;
+    }
     w.reset();
     server.stop();
 }

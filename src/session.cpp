@@ -164,6 +164,7 @@ void Session::enable_tls(std::shared_ptr<ssl_st> ssl) {
     ssl_             = std::move(ssl);
     tls_handshaking_ = true;
     io_want_         = IoWant::Read;
+    transport_       = Transport::Tls;
 }
 
 bool Session::tls_enabled() const { return ssl_ != nullptr; }
@@ -206,7 +207,7 @@ bool Session::continue_tls_handshake() {
 Session::IoResult Session::receive(char* buf, size_t len, size_t& out_n) {
     out_n = 0;
 
-    if (ssl_ == nullptr) {
+    if (transport_ == Transport::Plain) {
         const ssize_t n = ::read(fd_, buf, len);
         if (n > 0) { out_n = static_cast<size_t>(n); io_want_ = IoWant::Read; return IoResult::Data; }
         if (n == 0) return IoResult::Closed;
@@ -214,6 +215,8 @@ Session::IoResult Session::receive(char* buf, size_t len, size_t& out_n) {
         if (errno == EINTR) { io_want_ = IoWant::Read; return IoResult::Again; }
         return IoResult::Error;
     }
+
+    if (transport_ == Transport::Rings) return receive_rings(buf, len, out_n);
 
     ERR_clear_error();
     const int n = SSL_read(ssl_.get(), buf, static_cast<int>(len));
@@ -302,8 +305,12 @@ Session::Queued Session::queue_answer(std::string_view response) {
 
 // Out of line, and the attribute is the point rather than a hint - the numbers and the reasoning
 // are on `Session::flush_output()` in the header. One call on the TLS path, which is nothing beside
-// encrypting a record.
-[[gnu::noinline]] bool Session::flush_output_tls() {
+// encrypting a record, and one on the rings' path.
+[[gnu::noinline]] bool Session::flush_output_other() {
+    return transport_ == Transport::Rings ? flush_output_rings() : flush_output_tls();
+}
+
+bool Session::flush_output_tls() {
     size_t sent_total = 0;
 
     if (tls_handshaking_) {
@@ -428,6 +435,107 @@ bool Session::first_refusal() {
 
 uint64_t Session::compress_bytes_in() const { return compress_bytes_in_; }
 uint64_t Session::compress_bytes_out() const { return compress_bytes_out_; }
+
+// ── Rings in shared memory (#52, step 2) ───────────────────────────────────
+
+Session::RingTransport::~RingTransport() {
+    if (server_bell >= 0) ::close(server_bell);
+    if (client_bell >= 0) ::close(client_bell);
+}
+
+void Session::set_local(bool local, uint64_t ring_limit) {
+    local_      = local;
+    ring_limit_ = local ? ring_limit : 0;
+}
+
+void Session::enable_rings(ring::Mapping mapping, int server_bell, int client_bell,
+                           uint64_t& bells_rung) {
+    auto r          = std::make_unique<RingTransport>();
+    r->commands     = ring::Reader(mapping.to_server(), mapping.to_server_data(), mapping.capacity());
+    r->answers      = ring::Writer(mapping.to_client(), mapping.to_client_data(), mapping.capacity());
+    r->mapping      = std::move(mapping);
+    r->server_bell  = server_bell;
+    r->client_bell  = client_bell;
+    r->bells_rung   = &bells_rung;
+    rings_          = std::move(r);
+    transport_      = Transport::Rings;
+    io_want_        = IoWant::Read;
+    OB_LOG_DEBUG("session", "fd=%d conn_id=%llu: bytes go through rings of %zu now, bells %d and %d",
+                 fd_, static_cast<unsigned long long>(conn_id_), rings_->mapping.capacity(),
+                 server_bell, client_bell);
+}
+
+int Session::server_bell() const { return rings_ ? rings_->server_bell : -1; }
+
+size_t Session::ring_bytes() const { return rings_ ? rings_->mapping.bytes() : 0; }
+
+bool Session::ring_input_waiting() const {
+    return rings_ != nullptr && rings_->commands.available() > 0;
+}
+
+bool Session::ring_prepare_to_sleep() {
+    return rings_ == nullptr || rings_->commands.prepare_to_sleep();
+}
+
+void Session::ring_woke() {
+    if (rings_) rings_->commands.woke();
+}
+
+bool Session::ring_wait_for_room() {
+    return rings_ == nullptr || rings_->answers.prepare_to_wait_for_room();
+}
+
+void Session::ring_room_wait_done() {
+    if (rings_) rings_->answers.done_waiting_for_room();
+}
+
+
+bool Session::ring_broken() const {
+    return rings_ != nullptr && (rings_->commands.broken() || rings_->answers.broken());
+}
+
+Session::IoResult Session::receive_rings(char* buf, size_t len, size_t& out_n) {
+    RingTransport& r = *rings_;
+    out_n = r.commands.read(buf, len);
+    if (r.commands.broken()) {
+        OB_LOG_WARN("session", "fd=%d conn_id=%llu: the client's counter of the command ring is not "
+                    "one it could have left; closing", fd_, static_cast<unsigned long long>(conn_id_));
+        return IoResult::Error;
+    }
+    io_want_ = IoWant::Read;
+    if (out_n == 0) return IoResult::Again;
+    // The room just made may be what a client with a full ring of commands waits for.
+    if (r.commands.producer_waiting()) {
+        ring::ring_bell(r.client_bell);
+        ++*r.bells_rung;
+    }
+    return IoResult::Data;
+}
+
+bool Session::flush_output_rings() {
+    RingTransport& r = *rings_;
+    size_t done = 0;
+    while (done < send_buf_.size()) {
+        const size_t n = r.answers.write(send_buf_.data() + done, send_buf_.size() - done);
+        if (n == 0) break;
+        done += n;
+    }
+    if (r.answers.broken()) {
+        OB_LOG_WARN("session", "fd=%d conn_id=%llu: the client's counter of the answer ring is not "
+                    "one it could have left; closing", fd_, static_cast<unsigned long long>(conn_id_));
+        return false;
+    }
+    if (done > 0) {
+        if (r.answers.publish()) {
+            ring::ring_bell(r.client_bell);
+            ++*r.bells_rung;
+        }
+        send_buf_.erase(0, done);
+    }
+    // A full ring is what a full socket buffer is: not an error, and the caller waits for room.
+    io_want_ = send_buf_.empty() ? IoWant::Read : IoWant::Write;
+    return true;
+}
 
 // ── SessionManager ───────────────────────────────────────────────────────────
 

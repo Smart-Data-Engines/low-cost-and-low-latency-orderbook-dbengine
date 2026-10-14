@@ -43,6 +43,64 @@ static void apply_auth_from_env(ob::ClientConfig& cfg) {
     if (const char* v = std::getenv("OB_TLS_VERIFY")) {
         cfg.tls_verify = !(std::strcmp(v, "0") == 0);
     }
+
+    // The node's Unix socket and its rings (#52) the same way, so every subcommand runs through
+    // them too: `OB_UNIX_SOCKET`, `OB_RINGS=1` and `OB_RING_SPIN_US`.
+    if (const char* path = std::getenv("OB_UNIX_SOCKET")) cfg.unix_socket = path;
+    if (const char* r = std::getenv("OB_RINGS"); r != nullptr && std::strcmp(r, "1") == 0) {
+        cfg.rings.enabled = true;
+    }
+    if (const char* spin = std::getenv("OB_RING_SPIN_US")) {
+        cfg.rings.spin_us = static_cast<uint32_t>(std::strtoul(spin, nullptr, 10));
+    }
+    if (const char* bytes = std::getenv("OB_RING_BYTES")) {
+        cfg.rings.bytes = std::strtoull(bytes, nullptr, 10);
+    }
+}
+
+// ── Test: large_select ───────────────────────────────────────────────────────
+
+/// An answer several times a small ring (#52): 3000 rows of one symbol, read back whole, so a client
+/// in rings of 64 KiB reads it while the node waits for room.
+static int run_large_select(const std::string& host, uint16_t port) {
+    ob::ClientConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+    apply_auth_from_env(cfg);
+    ob::OrderbookClient client(cfg);
+    if (auto conn = client.connect(); !conn) {
+        print_result("large_select", "fail", "connect failed: " + conn.error_message());
+        return 1;
+    }
+    constexpr size_t N = 1000;
+    ob::Level levels[N];
+    for (int round = 0; round < 3; ++round) {
+        for (size_t i = 0; i < N; ++i) {
+            levels[i].price = static_cast<int64_t>(50000 + i);
+            levels[i].qty   = static_cast<uint64_t>(round + 1);
+            levels[i].count = 1;
+        }
+        if (auto mi = client.minsert("CPP-BIG", "TEST-EX", ob::Side::ASK, levels, N); !mi) {
+            print_result("large_select", "fail", "minsert failed: " + mi.error_message());
+            return 1;
+        }
+    }
+    if (auto fl = client.flush(); !fl) {
+        print_result("large_select", "fail", "flush failed: " + fl.error_message());
+        return 1;
+    }
+    auto qr = client.query("SELECT * FROM 'CPP-BIG'.'TEST-EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999");
+    if (!qr) {
+        print_result("large_select", "fail", "query failed: " + qr.error_message());
+        return 1;
+    }
+    if (qr.value().rows.size() != 3 * N) {
+        print_result("large_select", "fail",
+                     "expected " + std::to_string(3 * N) + " rows, got " + std::to_string(qr.value().rows.size()));
+        return 1;
+    }
+    print_result("large_select", "pass", "3000 rows");
+    return 0;
 }
 
 // ── Test: ping ───────────────────────────────────────────────────────────────
@@ -528,6 +586,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "query_agg")    return run_query_agg(host, port);
     if (test_name == "query_buckets") return run_query_buckets(host, port);
     if (test_name == "query_named")  return run_query_named(host, port);
+    if (test_name == "large_select") return run_large_select(host, port);
     if (test_name == "shard_pool")   return run_shard_pool(coordinator, symbols);
     if (test_name == "shard_writer") return run_shard_writer(coordinator, symbols, until, out);
 
