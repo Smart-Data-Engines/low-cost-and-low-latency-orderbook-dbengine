@@ -47,12 +47,11 @@ struct TmpDir {
     ~TmpDir() { std::filesystem::remove_all(path); }
 };
 
-/// Create a minimal Engine + WAL + HLC setup for testing MultiMasterManager.
+/// Create a minimal Engine + WAL setup for testing MultiMasterManager.
 struct TestContext {
     TmpDir tmp;
     std::unique_ptr<ob::Engine> engine;
     std::unique_ptr<ob::WALWriter> wal;
-    std::unique_ptr<ob::HybridLogicalClock> hlc;
     ob::MultiMasterConfig config;
 
     explicit TestContext(uint16_t node_id = 1, uint16_t port = 0) {
@@ -67,7 +66,6 @@ struct TestContext {
         engine->open();
 
         wal = std::make_unique<ob::WALWriter>(tmp.path);
-        hlc = std::make_unique<ob::HybridLogicalClock>(node_id);
     }
 };
 
@@ -100,7 +98,7 @@ RC_GTEST_PROP(MultiMasterLoopPrevention,
     const auto local_node_id = *rc::gen::inRange<uint16_t>(1, 65535);
 
     TestContext ctx(local_node_id, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     auto hdr = make_wal_record_v2(local_node_id);
 
@@ -118,7 +116,7 @@ RC_GTEST_PROP(MultiMasterLoopPrevention,
     RC_PRE(origin_node_id != local_node_id);
 
     TestContext ctx(local_node_id, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     auto hdr = make_wal_record_v2(origin_node_id);
 
@@ -142,7 +140,7 @@ RC_GTEST_PROP(MultiMasterBootstrap,
     const auto local_node_id = *rc::gen::inRange<uint16_t>(1, 65535);
 
     TestContext ctx(local_node_id, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     // Start bootstrap — sets bootstrapping_ flag.
     mgr.start_bootstrap();
@@ -185,7 +183,7 @@ RC_GTEST_PROP(MultiMasterBootstrap,
 
 TEST(MultiMasterUnit, ConnectToPeerAddsToStates) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     // Create a PeerInfo for a peer that won't actually connect (no server).
     ob::PeerInfo peer_info{};
@@ -274,7 +272,7 @@ TEST(MultiMasterUnit, APeerThatRegistersAtANewAddressIsDialledThereFromThenOn) {
     // was restarted.
     TestContext ctx(1, ob::test::kPortsMultiMaster + 10);
     ctx.config.bind_address = "127.0.0.1";
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
     const uint16_t old_port = ob::test::kPortsMultiMaster + 11;  // nothing listens there
     const uint16_t new_port = ob::test::kPortsMultiMaster + 12;
     const int at_new = listen_on("127.0.0.1", new_port);
@@ -310,7 +308,7 @@ TEST(MultiMasterUnit, APeerRegisteredAtThisNodesOwnAddressIsNotDialled) {
     TestContext ctx(1, port);
     ctx.config.bind_address   = "127.0.0.2";
     ctx.config.advertise_host = "127.0.0.1";
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
     const int where_we_say_we_are = listen_on("127.0.0.1", port);
     ASSERT_GE(where_we_say_we_are, 0);
     // The control: a peer at an address of its own is dialled, so this setup sees a dial.
@@ -338,7 +336,7 @@ TEST(MultiMasterUnit, APeerRegisteredAtThisNodesOwnAddressIsNotDialled) {
 
 TEST(MultiMasterUnit, DisconnectPeerRemovesFromStates) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     // Initially no peers.
     auto states = mgr.peer_states();
@@ -364,7 +362,7 @@ TEST(MultiMasterUnit, DisconnectPeerRemovesFromStates) {
 
 TEST(MultiMasterUnit, MmPeersDoesNotListAConnectionThatHasNotIdentifiedItself) {
     TestContext ctx(1, ob::test::kPortsMultiMaster);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
     mgr.start();
 
     int sock = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -428,7 +426,7 @@ TEST(MultiMasterUnit, MmPeersDoesNotListAConnectionThatHasNotIdentifiedItself) {
 
 TEST(MultiMasterUnit, MmPeersCommandTsvFormat) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     std::string result = mgr.handle_mm_peers_command();
 
@@ -456,7 +454,7 @@ TEST(MultiMasterUnit, MmPeersCommandTsvFormat) {
 
 TEST(MultiMasterUnit, MmConflictsCommandTsvFormat) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     std::string result = mgr.handle_mm_conflicts_command();
 
@@ -480,7 +478,7 @@ TEST(MultiMasterUnit, MmConflictsCommandTsvFormat) {
 
 TEST(MultiMasterUnit, MmConflictsCommandWithEntries) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     // Add a conflict via the conflict resolver.
     auto& resolver = const_cast<ob::ConflictResolver&>(mgr.conflict_resolver());
@@ -500,7 +498,7 @@ TEST(MultiMasterUnit, MmConflictsCommandWithEntries) {
 
 TEST(MultiMasterUnit, BootstrappingInitiallyFalse) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     EXPECT_FALSE(mgr.is_bootstrapping());
 }
@@ -509,7 +507,7 @@ TEST(MultiMasterUnit, BootstrappingInitiallyFalse) {
 
 TEST(MultiMasterUnit, StartBootstrapSetsFlag) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     mgr.start_bootstrap();
     EXPECT_TRUE(mgr.is_bootstrapping());
@@ -521,7 +519,7 @@ TEST(MultiMasterUnit, BootstrapStateHasAnExit) {
     // self-inflicted outage waiting for its first caller — the same shape as #73 in the failover
     // state machine.
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     mgr.start_bootstrap();
     ASSERT_TRUE(mgr.is_bootstrapping());
@@ -534,7 +532,7 @@ TEST(MultiMasterUnit, AFailedBootstrapStillLeavesTheState) {
     // Failing is not a reason to keep refusing writes for ever. The node says what happened and
     // becomes usable; an operator can then decide to restart it.
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     mgr.start_bootstrap();
     mgr.finish_bootstrap(/*succeeded=*/false);
@@ -543,7 +541,7 @@ TEST(MultiMasterUnit, AFailedBootstrapStillLeavesTheState) {
 
 TEST(MultiMasterUnit, FinishingWithoutStartingIsHarmless) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     mgr.finish_bootstrap(/*succeeded=*/true);
     EXPECT_FALSE(mgr.is_bootstrapping());
@@ -553,7 +551,7 @@ TEST(MultiMasterUnit, FinishingWithoutStartingIsHarmless) {
 
 TEST(MultiMasterUnit, ConnectedPeerCountInitiallyZero) {
     TestContext ctx(1, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     EXPECT_EQ(mgr.connected_peer_count(), 0u);
 }
@@ -562,7 +560,7 @@ TEST(MultiMasterUnit, ConnectedPeerCountInitiallyZero) {
 
 TEST(MultiMasterUnit, LoopPreventionSameOriginRejected) {
     TestContext ctx(42, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     auto hdr = make_wal_record_v2(42);  // origin == local node_id
     bool applied = mgr.handle_remote_record(42, hdr, nullptr, 0);
@@ -577,7 +575,7 @@ TEST(MultiMasterUnit, LoopPreventionSameOriginRejected) {
 
 TEST(MultiMasterUnit, LoopPreventionDifferentOriginAccepted) {
     TestContext ctx(42, 0);
-    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal);
 
     auto hdr = make_wal_record_v2(99);  // origin != local node_id
     bool applied = mgr.handle_remote_record(99, hdr, nullptr, 0);

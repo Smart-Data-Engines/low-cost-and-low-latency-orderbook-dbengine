@@ -581,8 +581,7 @@ inline constexpr uint64_t kMeshEventListen = ~uint64_t{0};
 
 class MultiMasterManager {
 public:
-    explicit MultiMasterManager(MultiMasterConfig config, Engine& engine,
-                                WALWriter& wal, HybridLogicalClock& hlc);
+    explicit MultiMasterManager(MultiMasterConfig config, Engine& engine, WALWriter& wal);
     ~MultiMasterManager();
 
     MultiMasterManager(const MultiMasterManager&) = delete;
@@ -794,7 +793,6 @@ private:
     MultiMasterConfig config_;
     Engine& engine_;
     WALWriter& wal_;
-    HybridLogicalClock& hlc_;
 
     std::unique_ptr<PeerRegistry> peer_registry_;
     std::unique_ptr<ConflictResolver> conflict_resolver_;

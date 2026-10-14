@@ -2805,6 +2805,68 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 240. The engine did not build with clang 21 ✅ **P3**
+
+**Found building #52's fuzz harnesses** with the development machine's default clang, which a system
+upgrade had made clang 21.1.8. CI builds with GCC 12 and 13 and clang 18. A Debug build failed on two
+objects, and neither failure was a defect the older compilers could see:
+- `src/anti_entropy.cpp`, on `-Wunused-private-field`. `AntiEntropyManager::registry_`, a reference
+  to the peer registry, was set in the constructor and read nowhere: the peers come from the injected
+  reconciliation pass (#57). The test fixture built a `PeerRegistry` only to hand it over, under a
+  comment saying the reference stayed in the constructor "because the manager still owns the
+  reference".
+- googletest's own `gtest-all.cc`, on `-Wcharacter-conversion` in `gtest-printers.h`. Our
+  `-Wall -Wextra -Werror` were added before the dependencies were fetched, so they reached
+  googletest's sources too - pitfall 62's mechanism, the other way round. All 133 test files include
+  the same header and compiled clean, because googletest declares its include directories `SYSTEM`
+  to the code that uses them.
+
+**The check that exists for the first one missed it.** `tests/test_field_usage.cpp` (#104) reports a
+member written and never read, and it keyed members by name. Sixty of the 507 names it surveys are
+declared in more than one header, and a read of any of them counted for all: six other classes read
+a `registry_` of their own. It keys by name and header now. A bare name belongs to the classes whose
+members its file defines; a member reached through an object, or a bare name the rule cannot place,
+is credited to every class that declares it, so the rule's mistakes are members reported as read.
+- **Its first run found a second one, which no compiler reports.** `MultiMasterManager::hlc_` was set
+  in the constructor and read nowhere: the clock is fed by the engine, in
+  `Engine::apply_remote_delta()` and on its own writes.
+- **Its mutation table found that the first version still missed `registry_`.** It placed a file by
+  its own name, and `src/engine_compaction.cpp` defines the engine's members under a name no header
+  has, so its reads of the engine's `registry_` were credited to every class. With `registry_` put
+  back, that version reported nothing (`run-field-usage-6f9be55.log`). A file is placed by its
+  `Class::member(` definitions now.
+
+**Done.**
+- `registry_` and `hlc_` are gone, with the constructor parameters that carried them.
+- The warning flags come after the dependencies. google/benchmark's own `-Werror` is off: on by
+  default ("Build Release candidates with -Werror"), it would stop this build at a later compiler's
+  first warning in its sources, as googletest's did, though they compile clean under clang 21.
+- The field check as above, and `FieldUsage.AnOccurrenceIsCreditedToTheClassesItCanBelongTo`, which
+  surveys a tree it builds: a dead member beside a live one of the same name, a file named after no
+  header, a read through an object, and a definition the rule cannot read.
+
+**Measured** on the i3-7100U: clang 21.1.8 builds the tree with no warning, and `ctest -j1` passes
+**1999/1999** in 289.54 s; GCC 15.2 builds it with no warning, and `ctest -j1` passes **1999/1999** in 292.89 s.
+
+**Mutations.** Ten rows (`evidence/2026-10-14-clang-21/`), and every verdict as predicted. Both dead
+members put back are reported, and `registry_` with a read beside it - in its own file, or through
+an object in another - is not. Six changes to the rule are each killed by a named test: the rule
+before this item, a member reached through an object placed like a bare name, an occurrence it
+cannot place credited to none or to one class, a file placed by its name, and a call in a body read
+as a definition.
+
+CI still builds with GCC 12 and 13 and clang 18, so the next compiler's first warning will again be
+met on a machine that upgraded, not by a check.
+
+**Found by this item's CI, in #52's tests:** `Ring.AFullWriterIsWokenWhenTheReaderMakesRoom` failed
+under ThreadSanitizer on its own precondition - "the writer never waited" - having exercised
+nothing. Its reader began at once, and a reader faster than the writer kept the ring from filling;
+pitfall 133's shape. The reader begins now once the writer has said it waits for room, so the wait
+the test is about happens in every run.
+
+- Effort: S | Impact: the tree builds with the newest clang, and the check for a member nothing reads
+  sees one beside a live member of the same name
+
 ### 239. A client resuming a subscription from a book, as documented, lost updates ✅ **P2**
 
 **Found reading `BOOK`'s documentation against the code**, looking for what #45's subscriptions still

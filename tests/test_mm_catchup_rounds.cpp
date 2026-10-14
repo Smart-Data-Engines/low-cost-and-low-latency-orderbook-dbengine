@@ -63,7 +63,7 @@ struct CatchupNode {
         engine->open();
         wal = std::make_unique<ob::WALWriter>(tmp.path + "/mm_wal", rotate_bytes);
         hlc = std::make_unique<ob::HybridLogicalClock>(kSelf);
-        mm  = std::make_unique<ob::MultiMasterManager>(config, *engine, *wal, *hlc);
+        mm  = std::make_unique<ob::MultiMasterManager>(config, *engine, *wal);
     }
 
     /// `n` DELTA records of one symbol from `origin`, numbered from `first`.

@@ -9,7 +9,6 @@
 #include <gtest/gtest.h>
 
 #include "orderbook/engine.hpp"
-#include "orderbook/hlc.hpp"
 #include "orderbook/multi_master.hpp"
 #include "orderbook/wal.hpp"
 
@@ -29,7 +28,6 @@ struct ReceivingNode {
     TmpDir tmp;
     std::unique_ptr<ob::Engine> engine;
     std::unique_ptr<ob::WALWriter> wal;
-    std::unique_ptr<ob::HybridLogicalClock> hlc;
     ob::MultiMasterConfig config;
     std::unique_ptr<ob::MultiMasterManager> mm;
 
@@ -41,8 +39,7 @@ struct ReceivingNode {
         engine = std::make_unique<ob::Engine>(tmp.path);
         engine->open();
         wal = std::make_unique<ob::WALWriter>(tmp.path + "/mm_wal");
-        hlc = std::make_unique<ob::HybridLogicalClock>(1);
-        mm  = std::make_unique<ob::MultiMasterManager>(config, *engine, *wal, *hlc);
+        mm  = std::make_unique<ob::MultiMasterManager>(config, *engine, *wal);
     }
 };
 
