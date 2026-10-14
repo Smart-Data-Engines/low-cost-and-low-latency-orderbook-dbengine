@@ -312,6 +312,10 @@ public:
     AdmissionController& admission_for_test() { return admission_; }
     SyncBudget& sync_budget_for_test() { return sync_budget_; }
 
+    /// How long the WAL sync in flight has run, or nothing while none is (#190 step 9): what a
+    /// refusal for want of room says, and what a test reads while it holds a sync.
+    std::optional<std::chrono::steady_clock::duration> wal_sync_running_for() const;
+
     /// The line a write refused for want of room is logged with: with a WAL sync running, that the
     /// device is slower than the writes; without one, that the flush cannot make progress (#190
     /// step 9). A function of its inputs so that a test can read it without a five-second wait.

@@ -118,6 +118,8 @@ TEST(WalBudget, AWriterPastTheBudgetWaitsForASyncAndGoesOnOnceItIsDone) {
         ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }))
             << "no sync began: the writer never waited for one, and the flush is an hour away";
     }
+    EXPECT_TRUE(engine.wal_sync_running_for().has_value())
+        << "a refusal now would not know a sync was running";
     // The writer asked for the sync it is waiting for, and waits while it is held.
     const uint64_t held_at = written.load();
     std::this_thread::sleep_for(milliseconds(300));
@@ -161,6 +163,18 @@ TEST(WalBudget, ASyncTellsTheBudgetWhatItWrote) {
     engine.flush_incremental();
     EXPECT_NE(engine.sync_budget_for_test().bytes(), 4 * MiB)
         << "FLUSH synced 3 MB of WAL and the budget did not hear of it";
+    engine.close();
+}
+
+TEST(WalBudget, ASyncThatIsDoneIsNotRunning) {
+    TempDir dir("ob_wal_budget_done_");
+    ob::Engine engine(dir.path, kAnHour, ob::FsyncPolicy::INTERVAL);
+    engine.open();
+    EXPECT_FALSE(engine.wal_sync_running_for().has_value());
+    for (uint64_t i = 0; i < 10; ++i) ASSERT_EQ(write(engine, i), ob::OB_OK);
+    engine.flush_incremental();
+    EXPECT_FALSE(engine.wal_sync_running_for().has_value())
+        << "a sync that ended still reads as running, so every later refusal would blame it";
     engine.close();
 }
 

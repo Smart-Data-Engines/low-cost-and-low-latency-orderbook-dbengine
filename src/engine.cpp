@@ -3344,13 +3344,8 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
 
     if (!got_room) {
         registry_.increment_counter("ob_writer_backpressure_refusals_total");
-        const auto sync_began = wal_sync_started_.load(std::memory_order_relaxed);
-        std::optional<std::chrono::steady_clock::duration> sync_running_for;
-        if (sync_began != std::chrono::steady_clock::time_point{}) {
-            sync_running_for = std::chrono::steady_clock::now() - sync_began;
-        }
         OB_LOG_ERROR("engine", "%s",
-                     room_refusal_reason(sync_running_for,
+                     room_refusal_reason(wal_sync_running_for(),
                                          wal_sync_bytes_.load(std::memory_order_relaxed)).c_str());
         return false;
     }
@@ -3664,6 +3659,12 @@ void Engine::flush_tick() {
         }
 }
 
+
+std::optional<std::chrono::steady_clock::duration> Engine::wal_sync_running_for() const {
+    const auto began = wal_sync_started_.load(std::memory_order_relaxed);
+    if (began == std::chrono::steady_clock::time_point{}) return std::nullopt;
+    return std::chrono::steady_clock::now() - began;
+}
 
 std::string Engine::room_refusal_reason(
     std::optional<std::chrono::steady_clock::duration> sync_running_for, uint64_t sync_bytes) {
