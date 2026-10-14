@@ -36,6 +36,13 @@ namespace {
 /// An interval no test can wait out, so "it finished" can only mean the flush was asked for.
 constexpr uint64_t kOneHourNs = 3'600'000'000'000ULL;
 
+/// Under `--fsync-policy none`, so that what a writer runs into is the queue's ceiling. Under
+/// `interval` it meets the WAL budget first (#190 step 9) - a sync's worth of WAL, 4 MiB before the
+/// first sync, where these thousand-level records are about 24 kB each - and waits for a sync long
+/// before a million rows are queued: these tests then passed through the budget's path and
+/// exercised the ceiling not at all. `none` syncs nothing, so the budget does not bind.
+constexpr ob::FsyncPolicy kTheCeilingBinds = ob::FsyncPolicy::NONE;
+
 /// Rows above `MAX_PENDING_ROWS` (1,000,000), written 1000 at a time.
 constexpr int kLevelsPerDelta = 1000;
 constexpr int kDeltas         = 1100;
@@ -91,7 +98,7 @@ ob::ob_status_t fill_past_the_ceiling(ob::Engine& engine) {
 
 TEST(PendingBackpressure, AWriterAtTheCeilingWaitsForAFlushRatherThanForTheInterval) {
     const std::string dir = temp_dir("backp_ask_");
-    ob::Engine engine(dir, kOneHourNs);
+    ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
     engine.open();
 
     // On another thread with a bound, so the unfixed code fails this test in a minute with a
@@ -137,7 +144,7 @@ TEST(PendingBackpressure, AWriterAtTheCeilingWaitsForAFlushRatherThanForTheInter
 
 TEST(PendingBackpressure, TheWaitIsCountedSoAnOperatorCanSeeItHappened) {
     const std::string dir = temp_dir("backp_count_");
-    ob::Engine engine(dir, kOneHourNs);
+    ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
     engine.open();
 
     auto written = std::async(std::launch::async, [&engine]() { return fill_past_the_ceiling(engine); });

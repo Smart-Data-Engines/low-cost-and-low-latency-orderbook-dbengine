@@ -3337,13 +3337,13 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
         registry_.increment_counter("ob_writer_wal_budget_waits_total");
         if (wal_budget_wait_.begin()) {
             OB_LOG_WARN("engine",
-                        "A writer is waiting for the WAL to reach the device: %.1f MB is unsynced, "
-                        "against a budget of %.1f MB - about a second of the device's writing, by "
-                        "the syncs measured so far, and %.1f MB before the first. The flush has "
+                        "A writer is waiting for the WAL to reach the device: %.1f MiB is unsynced, "
+                        "against a budget of %.1f MiB - about a second of the device's writing, by "
+                        "the syncs measured so far, and %.1f MiB before the first. The flush has "
                         "been asked to run now; the write is refused if no room comes within %lld s.",
-                        static_cast<double>(unsynced()) / 1e6,
-                        static_cast<double>(sync_budget_.bytes()) / 1e6,
-                        static_cast<double>(SyncBudget::Config{}.initial_bytes) / 1e6,
+                        static_cast<double>(unsynced()) / 1048576.0,
+                        static_cast<double>(sync_budget_.bytes()) / 1048576.0,
+                        static_cast<double>(SyncBudget::Config{}.initial_bytes) / 1048576.0,
                         static_cast<long long>(kBackpressureDeadline.count()));
         }
     }
@@ -3682,12 +3682,12 @@ std::string Engine::room_refusal_reason(
         // the one printed for every refusal at 5 MB/s, where nothing had failed (#190 step 9).
         std::snprintf(line, sizeof(line),
                       "No room came in %lld s, so this write is refused rather than accepted. The "
-                      "flush's WAL sync has run for %.0f ms, writing back %.1f MB: the device takes "
+                      "flush's WAL sync has run for %.0f ms, writing back %.1f MiB: the device takes "
                       "the WAL slower than the writes arrive, and ob_wal_sync_budget_bytes is what a "
                       "sync may now have to write.",
                       static_cast<long long>(kBackpressureDeadline.count()),
                       std::chrono::duration<double, std::milli>(*sync_running_for).count(),
-                      static_cast<double>(sync_bytes) / 1e6);
+                      static_cast<double>(sync_bytes) / 1048576.0);
     } else {
         std::snprintf(line, sizeof(line),
                       "The pending queue did not free room in %lld s, so this write is refused "

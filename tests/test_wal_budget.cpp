@@ -179,9 +179,9 @@ TEST(WalBudget, ASyncThatIsDoneIsNotRunning) {
 }
 
 TEST(WalBudget, ARefusalWithASyncRunningSaysTheDeviceIsSlowerThanTheWrites) {
-    const std::string slow = ob::Engine::room_refusal_reason(milliseconds(5200), 34'000'000);
+    const std::string slow = ob::Engine::room_refusal_reason(milliseconds(5200), 34 * MiB);
     EXPECT_NE(slow.find("has run for 5200 ms"), std::string::npos) << slow;
-    EXPECT_NE(slow.find("34.0 MB"), std::string::npos) << slow;
+    EXPECT_NE(slow.find("34.0 MiB"), std::string::npos) << slow;
     EXPECT_EQ(slow.find("cannot make progress"), std::string::npos)
         << "a flush syncing at the device's rate is making progress: " << slow;
 
