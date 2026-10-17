@@ -2805,6 +2805,68 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 241. Code scanning's open alerts in our own code ✅ **P3**
+
+Fifteen were open on `master` on 17 October 2026, all from the `security-and-quality` suite, and
+all fifteen are fixed in code; none is dismissed.
+
+- **Nine unused locals** (`cpp/unused-local-variable`): the status of seven `std::to_chars` calls in
+  the C++ client's two write formatters, and the end position of two `std::from_chars` calls in the
+  query engine. Neither hid a defect. The formatters write into a buffer of at least 64 KB, and the
+  query engine's conversions are handed an integer literal and nothing else: the parser takes an
+  `INT_LIT` token there, and `book_args()` strips the spaces before it. Each call now takes the one
+  field it reads.
+- **A static function nothing called** (`cpp/unused-static-function`): `migration_key()` in
+  `src/shard_coordinator.cpp`, there since the first sharding commit. It carried `[[maybe_unused]]`,
+  which is why neither compiler said so: the attribute tells them not to. #196 keeps a move's state
+  in the shard map, and nothing ever wrote the key. Deleted.
+- **A comparison that was always true** (`cpp/constant-comparison`): the mesh's plain send loop
+  tested `sent < 0` after the branches for `sent > 0` and `sent == 0`, neither of which reaches it.
+  The tail after that test, "sent == 0: treat as EAGAIN", could not run at all, because the
+  `sent == 0` branch above it does the same and logs it. Both are gone. That branch's comment said
+  the loop had spun on `sent == 0` before it existed. It had not: the tail had handled the case since
+  the loop's first version (`5384d18`), with no log line. The comment says that now.
+- **A declaration hiding another** (`cpp/declaration-hides-variable`): the replication client's TLS
+  handshake reason, `why`, declared inside the scope of the dial's. Renamed.
+- **Two stack addresses that could escape** (`cpp/stack-address-escape`). Neither was a stack
+  address, and what each pointed at was real:
+  - **The engine held a raw pointer to the server's read-only flag** (`set_read_only_flag()`). It
+    was valid for as long as the server's member order and an explicit `engine_.reset()` at the top
+    of its destructor said so - "nested by convention rather than by construction", as #92 put it.
+    The engine owns the flag now, because the engine is what toggles it. The server sets it from
+    `--read-only` before `open()` and reads `Engine::read_only()`.
+  - **The destructor's reset went with it, because that pointer was its only reason.** The order it
+    imposed was the engine first, on the one way out that throws - a port that would not bind -
+    while the metrics server was still serving. That server is started before the bind and reads
+    the engine's registry. The members' own order now stops it before the engine closes.
+  - **`ReplicationManager::set_engine(this)`.** The setter took `mtx_` because a store after
+    `start()` raced the epoll thread, which ThreadSanitizer had reported once. The engine is a
+    constructor argument now and the pointer is `const`, so neither the race nor the setter exists.
+- **A `switch` with three cases over 30 lines** (`cpp/long-switch`): `execute_command()`'s `SELECT`
+  (35), `BOOK` (34) and `STATUS` (84).
+  - `SELECT` and `BOOK` were the same code around a different call: the bootstrap refusal, the row
+    builder, the latency histogram and the counters. They are one `answer_read()` now.
+  - `STATUS` is `answer_status()`, moved line for line: 61 lines, compared by a script before the
+    case was replaced.
+  - The switch still has no `default:` (pitfall 109). Its longest case is 27 lines.
+
+**Tests.** What moved is pinned, and so is a path no test reached:
+- `FailoverRoles.TheReadOnlyFlagFollowsTheStartAndEveryRoleTransition`: the flag through `open()`,
+  promotions and a demotion, read from the engine.
+- `ExecuteCommandTest.EachReadIsCountedOnceAsAQueryAndARefusedOneIsNot`: a `SELECT` and a `BOOK`
+  each count once in STATUS, and a refused `BOOK` does not count. Nothing in the suite had counted a
+  `BOOK`.
+- `tests/integration/test_read_only.py`: **no test had ever started a node with `--read-only`.** The
+  replicas the fixtures start are refused writes by their role, in the same words, so a
+  `--read-only` that reached nothing passed the whole battery. Here the node is standalone, so the
+  refusal can only be the flag's, and the control is the same node without it.
+
+**Found by this item's local run, on a university network:** `NetDial.SaysWhyNothingAnswered`
+dialled `no-such-host.invalid` and expected "does not resolve". The resolver there has a search
+domain with a wildcard record, so it tried `no-such-host.invalid.sggw.edu.pl` too, got an address,
+and the dial timed out instead. A name under `.invalid` never resolves (RFC 6761) only when it is
+absolute, so the test dials `no-such-host.invalid.` now.
+
 ### 240. The engine did not build with clang 21 ✅ **P3**
 
 **Found building #52's fuzz harnesses** with the development machine's default clang, which a system
