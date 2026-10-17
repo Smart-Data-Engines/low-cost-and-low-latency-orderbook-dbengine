@@ -4065,7 +4065,8 @@ Engine::SealCadence Engine::seal_cadence(bool requested,
                                          std::optional<std::chrono::steady_clock::time_point> last_due,
                                          std::chrono::steady_clock::time_point now,
                                          std::chrono::nanoseconds interval, size_t drained_since) {
-    const bool due = !requested || !last_due.has_value() || now - *last_due >= interval;
+    const std::chrono::nanoseconds period = std::max<std::chrono::nanoseconds>(interval, kSealCadence);
+    const bool due = !requested || !last_due.has_value() || now - *last_due >= period;
     return SealCadence{due, due ? drained_since : 0};
 }
 

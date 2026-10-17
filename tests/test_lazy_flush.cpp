@@ -313,6 +313,18 @@ TEST(SealCadence, ATickAskedForAnIntervalLaterSealsOnEveryRowSince) {
     EXPECT_FALSE(before.due) << "a nanosecond short of the interval";
 }
 
+TEST(SealCadence, AShortIntervalDoesNotShortenTheCadence) {
+    // The default interval is 100 ms, and at the write ceiling the ticks asked for came every 250
+    // ms: a cadence of the interval alone sealed as often as without one (diag10d/).
+    const auto now = Clock::now();
+    EXPECT_FALSE(ob::Engine::seal_cadence(/*requested=*/true, now - 400ms, now, 100ms, 1).due)
+        << "a tick asked for 400 ms after the last due seal sealed what was due";
+    EXPECT_TRUE(ob::Engine::seal_cadence(/*requested=*/true, now - ob::Engine::kSealCadence, now,
+                                         100ms, 1).due);
+    // A longer interval is the longer cadence.
+    EXPECT_FALSE(ob::Engine::seal_cadence(/*requested=*/true, now - 2s, now, 5s, 1).due);
+}
+
 TEST(SealCadence, TheFirstTickSealsWhatIsDueWhoeverAskedForIt) {
     const auto now = Clock::now();
     const auto c = ob::Engine::seal_cadence(/*requested=*/true, std::nullopt, now, 1s, 17);

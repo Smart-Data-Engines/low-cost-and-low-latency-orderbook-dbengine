@@ -374,6 +374,10 @@ public:
     static constexpr std::chrono::milliseconds kSealAge{10'000};
     static constexpr size_t kUnsealedRowsBudget = 4'000'000;
     static constexpr size_t kSealsPerTick = 64;
+    /// The longest a tick asked for waits to seal what is due (`seal_cadence()`): a second, what a
+    /// sync of the WAL budget is meant to take (`SyncBudget::Config::target`), and about what one of
+    /// master's ticks took at the write ceiling, where they ran back to back.
+    static constexpr std::chrono::milliseconds kSealCadence{1'000};
     /// What FLUSH, close(), a snapshot and a store's own seal say they drained: they take every
     /// store, and no share limits them.
     static constexpr size_t kNoRowLimit = std::numeric_limits<size_t>::max();
@@ -404,12 +408,17 @@ public:
                                             bool seal_due = true);
 
     /// Whether a tick seals what is due, and the drained rows its share is reckoned on (#190,
-    /// step 9): the seals keep the interval's cadence, whoever asks for a tick.
+    /// step 9): the seals keep a cadence of their own, whoever asks for a tick.
     /// - A tick the interval woke - or a test - seals what is due, as it always did.
-    /// - A tick asked for sooner - by the WAL budget, or by a full pending queue - seals only for
-    ///   the unsealed-rows budget, until an interval has passed since the last tick that sealed what
-    ///   was due.
+    /// - A tick asked for - by the WAL budget, or by a full pending queue - seals only for the
+    ///   unsealed-rows budget, until `kSealCadence` or the interval, whichever is longer, has passed
+    ///   since the last tick that sealed what was due.
     /// - That later tick reckons its share on every row drained since.
+    ///
+    /// Not the interval alone: it is 100 ms by default, and at the write ceiling the ticks are
+    /// asked for back to back and last as long as their syncs. Master's took about a second each
+    /// there, and the budget's 250 ms, so a cadence of 100 ms held nothing back - measured, 4 143
+    /// seals a round with it against 4 140 without (`diag10d/`).
     ///
     /// Measured on the m9g.xlarge at 10 MB/s, before this: the budget asked for ticks 2.5-4 times as
     /// often, each sealed its share, and every store was sealed about once a round where master
