@@ -719,8 +719,12 @@ public:
     /// Handle FAILOVER command — returns wire-protocol response.
     std::string handle_failover_command(const std::string& target_node_id);
 
-    /// Set external read-only flag pointer (toggled during role transitions).
-    void set_read_only_flag(std::atomic<bool>* flag);
+    /// Whether the server refuses client writes as a replica: `--read-only` at the start, then every
+    /// role transition. The engine owns it because the engine is what toggles it; it used to hold a
+    /// raw pointer into the server's storage instead, valid for as long as the server's member
+    /// order and destructor said so, and reported by CodeQL as `cpp/stack-address-escape`.
+    void set_read_only(bool read_only);
+    bool read_only() const { return read_only_.load(std::memory_order_acquire); }
 
     // ── Multi-master replication ──────────────────────────────────────────────
 
@@ -957,14 +961,14 @@ private:
     std::atomic<NodeRole>                node_role_{NodeRole::STANDALONE};
     std::atomic<uint64_t>                current_epoch_{0};
 
-    // External read-only flag (owned by TcpServer, toggled during role transitions)
-    std::atomic<bool>*                   read_only_flag_{nullptr};
+    /// See `read_only()`. Set by the start's configuration and by every role transition.
+    std::atomic<bool>                    read_only_{false};
 
     /// Client writes are refused (`OB_ERR_READ_ONLY`), decided under `mtx_` - the lock a write
     /// holds from its WAL append to its broadcast. Set by every demotion before it touches the
     /// stream, cleared only by a promotion (#204).
     ///
-    /// `read_only_flag_` cannot do this alone: the server reads it before it calls the engine, so a
+    /// `read_only_` cannot do this alone: the server reads it before it calls the engine, so a
     /// write that passed that check could still be appended - and answered OK - after a demotion
     /// had stopped the stream, or after a handover had announced where the stream ends. Measured:
     /// 4308 acknowledged writes a planned FAILOVER's target never received. Replicated records are

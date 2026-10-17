@@ -265,8 +265,8 @@ def test_the_promoted_node_accepts_writes(healthy_cluster):
         client.close()
 
     assert len(rows) == 1, (
-        "the promoted node did not accept a write; read_only_flag_ is probably still "
-        "set after the role transition")
+        "the promoted node did not accept a write; the engine's read-only flag is probably "
+        "still set after the role transition")
 
 
 def test_a_pool_client_follows_the_new_primary(healthy_cluster):
@@ -379,7 +379,7 @@ def test_a_primary_that_lost_its_lease_refuses_writes(healthy_cluster):
     `handle_primary_lease_lost()` used to call `demote_to_replica()` **only** when it could read a
     leader key carrying a non-empty address. After a revoke there is no key and therefore no
     address, so in the one case that matters the Engine was never told: `node_role_` stayed PRIMARY,
-    `read_only_flag_` stayed unset, `ROLE` kept answering "PRIMARY <epoch>", and the node kept
+    its read-only flag stayed unset, `ROLE` kept answering "PRIMARY <epoch>", and the node kept
     accepting writes — until it happened to stand for election again, and indefinitely if it never
     did.
 

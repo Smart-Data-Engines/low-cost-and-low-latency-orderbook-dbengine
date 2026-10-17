@@ -669,6 +669,139 @@ void execute_writes(std::span<const Command> cmds,
     stats.total_inserts.fetch_add(taken, std::memory_order_relaxed);
 }
 
+namespace {
+
+/// A read's answer - `SELECT` and `BOOK` - with what both do around the engine's call: the refusal
+/// during a snapshot bootstrap, the rows formatted as the engine hands them over, and the latency
+/// and counters every read shares. `read` makes the call with the row callback it is given and
+/// returns the engine's refusal, empty when there is none.
+///
+/// Refused during a bootstrap because a replica installing a snapshot is replacing the store under
+/// itself (#142), and an answer composed across that is an answer about two trees. Each row is
+/// formatted as it arrives (#49 step 3), not collected first: the vector of rows that was replaced
+/// was three quarters of a turned-over heap's page faults, so the latency includes formatting.
+template <typename Read>
+std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
+                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
+    session.increment_commands();
+    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+    const auto started = std::chrono::steady_clock::now();
+    QueryResponseBuilder reply(shape);
+    try {
+        const std::string err = read([&](const QueryResult& r) { reply.add(r); });
+        if (!err.empty()) {
+            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, session.fd(),
+                         sanitise_for_log(err, 256).c_str());
+            return format_error(err);
+        }
+    } catch (const std::exception& e) {
+        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, session.fd(),
+                     sanitise_for_log(e.what(), 256).c_str());
+        return format_error(e.what());
+    }
+    std::string answer = reply.finish();
+    if (registry) {
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        // One histogram for both reads. A second one would split the operator's view of "how long
+        // does a read take here" across two names for no reason a dashboard cares about, and
+        // `ob_total_queries` is the count an operator already alerts on.
+        registry->observe_histogram("ob_query_latency_seconds", secs);
+        registry->increment_counter("ob_total_queries");
+    }
+    session.increment_queries();
+    stats.total_queries.fetch_add(1, std::memory_order_relaxed);
+    return answer;
+}
+
+/// `STATUS`, from a snapshot taken for this answer rather than from the `ServerStats` every
+/// connection shares. Everything in it but three counters is a vector, strings and plain integers,
+/// which was safe while one thread ran every command and is a data race - on a vector - the moment
+/// two reactors answer `STATUS` at once. The three counters are atomics.
+std::string answer_status(const ServerStats& stats, Engine& engine, const Session& session) {
+    ServerStats snap;
+    snap.total_queries.store(stats.total_queries.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+    snap.total_inserts.store(stats.total_inserts.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+    snap.active_sessions.store(stats.active_sessions.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+    auto es = engine.stats();
+    snap.engine_metrics.pending_rows   = es.pending_rows;
+    snap.engine_metrics.wal_file_index = es.wal_file_index;
+    snap.engine_metrics.segment_count  = es.segment_count;
+    snap.engine_metrics.symbol_count   = es.symbol_count;
+
+    // Copy replication metrics
+    snap.replicas.clear();
+    for (const auto& r : es.replicas) {
+        snap.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset,
+                                  r.lag_bytes, r.lag_known});
+    }
+    snap.is_replica            = es.is_replica;
+    snap.repl_confirmed_file   = es.repl_confirmed_file;
+    snap.repl_confirmed_offset = es.repl_confirmed_offset;
+    snap.repl_records_replayed = es.repl_records_replayed;
+    snap.repl_connected        = es.repl_connected;
+    snap.bootstrapping         = es.bootstrapping;
+    snap.joining               = es.joining;
+    snap.joining_stream_id     = es.joining_stream_id;
+    snap.joining_since_ns      = es.joining_since_ns;
+    snap.joining_reason        = es.joining_reason;
+    snap.snapshot_bytes_received = es.snapshot_bytes_received;
+    snap.snapshot_bytes_total  = es.snapshot_bytes_total;
+    snap.snapshot_active       = es.snapshot_active;
+
+    // Failover state
+    snap.node_role           = static_cast<uint8_t>(es.node_role);
+    snap.current_epoch       = es.current_epoch;
+    snap.primary_address     = es.primary_address;
+    snap.lease_ttl_remaining = es.lease_ttl_remaining;
+
+    // Compression metrics from the requesting session
+    snap.compress_bytes_in  = session.compress_bytes_in();
+    snap.compress_bytes_out = session.compress_bytes_out();
+
+    // TTL / data retention metrics
+    snap.ttl_hours            = es.ttl_hours;
+    snap.ttl_segments_deleted = es.ttl_segments_deleted;
+    snap.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
+
+    // Flush integrity
+    snap.segment_merge_refused = es.segment_merge_refused;
+
+    // Sharding metrics
+    snap.shard_id              = es.shard_id;
+    snap.shard_status          = es.shard_status;
+    snap.shard_symbols_count   = es.shard_symbols_count;
+    snap.shard_map_version     = es.shard_map_version;
+    snap.migration_in_progress = es.migration_in_progress;
+    snap.migration_symbol      = es.migration_symbol;
+    snap.migration_target_shard = es.migration_target_shard;
+    snap.migration_progress_pct = es.migration_progress_pct;
+    snap.shard_routing_errors  = es.shard_routing_errors;
+
+    // Multi-master metrics
+    snap.mm_node_role = static_cast<uint8_t>(es.node_role);
+    if (es.node_role == NodeRole::MULTI_MASTER) {
+        snap.mm_node_id           = es.mm_node_id;
+        snap.mm_peer_count        = es.mm_peer_count;
+        snap.mm_connected_peers   = es.mm_connected_peers;
+        snap.mm_conflicts_total   = es.mm_conflicts_total;
+        snap.mm_anti_entropy_runs = es.mm_anti_entropy_runs;
+        snap.mm_anti_entropy_repairs = es.mm_anti_entropy_repairs;
+        snap.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
+        snap.mm_hlc_logical       = es.mm_hlc_logical;
+        snap.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
+    }
+
+    OB_LOG_DEBUG("tcp_server", "STATUS for fd=%d: role=%u replicas=%zu", session.fd(),
+                 static_cast<unsigned>(snap.node_role), snap.replicas.size());
+    return format_status(snap, session.identity());
+}
+
+}  // namespace
+
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -737,75 +870,27 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::SELECT: {
-        session.increment_commands();
-        // Reject queries during snapshot bootstrap.
-        if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        auto t0_select = std::chrono::steady_clock::now();
-        // Each row formatted as the engine hands it over (#49 step 3), not collected first: the
-        // vector of rows this replaced was three quarters of a turned-over heap's page faults. So the
-        // latency observed below includes formatting the reply, which it did not before.
-        //
         // An aggregate query calls the callback exactly once, with agg_values set and the row
         // fields left at zero, and the builder answers it as aggregates. Formatting that as a data
         // row is what made SPREAD, MID_PRICE, IMBALANCE and VWAP return zeros to every network
-        // client while the engine computed them correctly.
+        // client while the engine computed them correctly. The engine fills `shape` in as it
+        // parses the query.
         QueryShape shape;
-        QueryResponseBuilder reply(shape);
-        try {
-            std::string err = engine.execute(cmd.raw_sql, [&](const QueryResult& r) {
-                reply.add(r);
-            }, shape);
-            if (!err.empty()) {
-                return format_error(err);
-            }
-        } catch (const std::exception& e) {
-            return format_error(e.what());
-        }
-        std::string answer = reply.finish();
-        if (registry) {
-            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_select).count();
-            registry->observe_histogram("ob_query_latency_seconds", secs);
-            registry->increment_counter("ob_total_queries");
-        }
-        session.increment_queries();
-        stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-        return answer;
+        return answer_read("SELECT", engine, session, stats, registry, shape, [&](auto row) {
+            return engine.execute(cmd.raw_sql, row, shape);
+        });
     }
 
     case CommandType::BOOK: {
-        session.increment_commands();
-        // The same refusal a `SELECT` gets during bootstrap, and for the same reason: a replica
-        // installing a snapshot is replacing the store under itself (#142), and an answer composed
-        // across that is an answer about two trees.
-        if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        auto t0_book = std::chrono::steady_clock::now();
         // The canonical seven, deliberately: projection is #139's and belongs to `SELECT`, and a
         // second column list to keep in step is a second thing to get wrong before anybody asked
         // for it.
         QueryShape shape;
         shape.columns = all_query_columns();
-        QueryResponseBuilder reply(shape);
-        try {
-            std::string err = engine.read_book(cmd.book_args.symbol, cmd.book_args.exchange,
-                                               cmd.book_args.depth,
-                                               [&](const QueryResult& r) { reply.add(r); });
-            if (!err.empty()) return format_error(err);
-        } catch (const std::exception& e) {
-            return format_error(e.what());
-        }
-        std::string answer = reply.finish();
-        if (registry) {
-            double secs =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_book).count();
-            // The same histogram a row query uses. A second one would split the operator's view of
-            // "how long does a read take here" across two names for no reason a dashboard cares
-            // about, and `ob_total_queries` is the count an operator already alerts on.
-            registry->observe_histogram("ob_query_latency_seconds", secs);
-            registry->increment_counter("ob_total_queries");
-        }
-        session.increment_queries();
-        stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-        return answer;
+        return answer_read("BOOK", engine, session, stats, registry, shape, [&](auto row) {
+            return engine.read_book(cmd.book_args.symbol, cmd.book_args.exchange,
+                                    cmd.book_args.depth, row);
+        });
     }
     case CommandType::INSERT:
     case CommandType::MINSERT: {
@@ -839,90 +924,9 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         return format_pong();
 
-    case CommandType::STATUS: {
+    case CommandType::STATUS:
         session.increment_commands();
-        // A snapshot for this answer, not the `ServerStats` every connection shares. Everything
-        // below is a vector, strings and plain integers, which was safe while one thread ran every
-        // command and is a data race - on a vector - the moment two reactors answer `STATUS` at
-        // once. Only the three counters are shared, and they are atomics.
-        ServerStats snap;
-        snap.total_queries.store(stats.total_queries.load(std::memory_order_relaxed),
-                                 std::memory_order_relaxed);
-        snap.total_inserts.store(stats.total_inserts.load(std::memory_order_relaxed),
-                                 std::memory_order_relaxed);
-        snap.active_sessions.store(stats.active_sessions.load(std::memory_order_relaxed),
-                                   std::memory_order_relaxed);
-        auto es = engine.stats();
-        snap.engine_metrics.pending_rows   = es.pending_rows;
-        snap.engine_metrics.wal_file_index = es.wal_file_index;
-        snap.engine_metrics.segment_count  = es.segment_count;
-        snap.engine_metrics.symbol_count   = es.symbol_count;
-
-        // Copy replication metrics
-        snap.replicas.clear();
-        for (const auto& r : es.replicas) {
-            snap.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset,
-                                      r.lag_bytes, r.lag_known});
-        }
-        snap.is_replica            = es.is_replica;
-        snap.repl_confirmed_file   = es.repl_confirmed_file;
-        snap.repl_confirmed_offset = es.repl_confirmed_offset;
-        snap.repl_records_replayed = es.repl_records_replayed;
-        snap.repl_connected        = es.repl_connected;
-        snap.bootstrapping         = es.bootstrapping;
-        snap.joining               = es.joining;
-        snap.joining_stream_id     = es.joining_stream_id;
-        snap.joining_since_ns      = es.joining_since_ns;
-        snap.joining_reason        = es.joining_reason;
-        snap.snapshot_bytes_received = es.snapshot_bytes_received;
-        snap.snapshot_bytes_total  = es.snapshot_bytes_total;
-        snap.snapshot_active       = es.snapshot_active;
-
-        // Failover state
-        snap.node_role           = static_cast<uint8_t>(es.node_role);
-        snap.current_epoch       = es.current_epoch;
-        snap.primary_address     = es.primary_address;
-        snap.lease_ttl_remaining = es.lease_ttl_remaining;
-
-        // Compression metrics from the requesting session
-        snap.compress_bytes_in  = session.compress_bytes_in();
-        snap.compress_bytes_out = session.compress_bytes_out();
-
-        // TTL / data retention metrics
-        snap.ttl_hours            = es.ttl_hours;
-        snap.ttl_segments_deleted = es.ttl_segments_deleted;
-        snap.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
-
-        // Flush integrity
-        snap.segment_merge_refused = es.segment_merge_refused;
-
-        // Sharding metrics
-        snap.shard_id              = es.shard_id;
-        snap.shard_status          = es.shard_status;
-        snap.shard_symbols_count   = es.shard_symbols_count;
-        snap.shard_map_version     = es.shard_map_version;
-        snap.migration_in_progress = es.migration_in_progress;
-        snap.migration_symbol      = es.migration_symbol;
-        snap.migration_target_shard = es.migration_target_shard;
-        snap.migration_progress_pct = es.migration_progress_pct;
-        snap.shard_routing_errors  = es.shard_routing_errors;
-
-        // Multi-master metrics
-        snap.mm_node_role = static_cast<uint8_t>(es.node_role);
-        if (es.node_role == NodeRole::MULTI_MASTER) {
-            snap.mm_node_id           = es.mm_node_id;
-            snap.mm_peer_count        = es.mm_peer_count;
-            snap.mm_connected_peers   = es.mm_connected_peers;
-            snap.mm_conflicts_total   = es.mm_conflicts_total;
-            snap.mm_anti_entropy_runs = es.mm_anti_entropy_runs;
-            snap.mm_anti_entropy_repairs = es.mm_anti_entropy_repairs;
-            snap.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
-            snap.mm_hlc_logical       = es.mm_hlc_logical;
-            snap.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
-        }
-
-        return format_status(snap, session.identity());
-    }
+        return answer_status(stats, engine, session);
 
     case CommandType::BACKUP: {
         session.increment_commands();
@@ -2272,7 +2276,6 @@ TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
     , secrets_(load_secrets_or_exit(config_))
     , tls_(load_tls_or_exit(config_))
-    , read_only_(config_.read_only)
 {
     // Where backups go (#34), checked before the engine opens the data directory: a backup directory
     // inside it would be read as the engine's own segments, and removed by a replica's bootstrap.
@@ -2369,6 +2372,8 @@ TcpServer::TcpServer(ServerConfig config)
                                        },
                                        config_.wal_rotate_bytes,
                                        config_.wal_dir);
+    // Before `open()`, whose failover election and multi-master start may set it in turn.
+    engine_->set_read_only(config_.read_only);
 
     // When the certificate in force stops being valid, for the alert that warns before it does
     // (#238); 0 without TLS. Each reload sets it again.
@@ -2377,11 +2382,11 @@ TcpServer::TcpServer(ServerConfig config)
 }
 
 TcpServer::~TcpServer() {
-    // The engine first, while `read_only_` - declared after it, so destroyed before it - still lives:
-    // the engine holds a pointer to it (`set_read_only_flag()`) and a failover manager stopping in
-    // the engine's close() may still write it. `run()` closes the engine on every way out it
-    // returns by; this is the way out it throws from, a port that would not bind.
-    engine_.reset();
+    // `run()` closes the engine on every way out it returns by; this is the way out it throws from,
+    // a port that would not bind, and the members go in reverse order of declaration: the metrics
+    // server, which reads the engine's registry, stops before the engine closes. The engine holds
+    // nothing of this object's - its read-only flag used to be a pointer to a member here, and was
+    // what made this destructor reset the engine first by hand.
     if (listen_fd_ >= 0) ::close(listen_fd_);
     if (unix_listen_fd_ >= 0) ::close(unix_listen_fd_);
 }
@@ -2409,7 +2414,6 @@ struct ReactorShared {
     const LoadedSecrets&     secrets;
     std::atomic<bool>&       running;
     std::atomic<bool>&       draining;
-    std::atomic<bool>&       read_only;
     ServerStats&             stats;
     ShardCoordinator*        shard_coord;
     MetricsServer*           metrics_server;
@@ -2499,7 +2503,6 @@ private:
     const LoadedSecrets&     secrets_;
     std::atomic<bool>&       running_;
     std::atomic<bool>&       draining_;
-    std::atomic<bool>&       read_only_;
     ServerStats&             stats_;
     ShardCoordinator*        shard_coord_;
     BackupRunner*            backups_;
@@ -2590,7 +2593,6 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , secrets_(shared.secrets)
     , running_(shared.running)
     , draining_(shared.draining)
-    , read_only_(shared.read_only)
     , stats_(shared.stats)
     , shard_coord_(shared.shard_coord)
     , backups_(shared.backups)
@@ -3297,7 +3299,7 @@ void Reactor::run_loop() {
                             const auto apply_held_writes = [&]() -> bool {
                                 if (pending_writes_.empty()) return true;
                                 execute_writes(pending_writes_, *engine_, *session, stats_,
-                                               read_only_.load(std::memory_order_acquire),
+                                               engine_->read_only(),
                                                &engine_->registry(), shard_coord_,
                                                write_answers_);
                                 pending_writes_.clear();
@@ -3335,7 +3337,7 @@ void Reactor::run_loop() {
                                 // caller at a time, and released before the answer is queued.
                                 std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
                                 if (serialised_across_reactors(cmd.type)) alone.lock();
-                                std::string response = execute_command(cmd, *engine_, *session, stats_, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store(), backups_);
+                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store(), backups_);
                                 if (alone.owns_lock()) alone.unlock();
 
                                 if (response.empty()) {
@@ -3528,8 +3530,6 @@ void Reactor::run_loop() {
 }  // namespace
 
 void TcpServer::run() {
-    // Wire up the dynamic read-only flag so failover transitions toggle it.
-    engine_->set_read_only_flag(&read_only_);
     engine_->set_compaction_enabled(config_.compaction);
     engine_->set_book_huge_pages(config_.book_huge_pages);
     engine_->set_write_admission_enabled(config_.write_admission);
@@ -3664,7 +3664,7 @@ void TcpServer::run() {
     std::vector<Reactor*> dealt_to;
     std::mutex            admin_mtx;
     ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
-                         draining_,  read_only_, stats, shard_coord.get(), metrics_server_.get(),
+                         draining_,  stats, shard_coord.get(), metrics_server_.get(),
                          &dealt_to, admin_mtx, backups.get()};
 
     // 7-8. Reactor 0 holds the listening sockets and runs on this thread; the others have a thread

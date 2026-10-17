@@ -470,24 +470,19 @@ constexpr int replication_wait_ms(bool catchup_can_progress) {
 
 class ReplicationManager {
 public:
-    explicit ReplicationManager(ReplicationConfig config, WALWriter& wal);
+    /// `engine` is what the manager takes snapshots from and publishes gauges through, or null for a
+    /// manager that serves the stream alone, as tests drive it.
+    ///
+    /// Fixed at construction. It used to be handed over by a setter, which had to take `mtx_`: the
+    /// epoll thread reads it, and a store after `start()` was a data race ThreadSanitizer reported
+    /// on the first test to make one. The setter also stored the owning engine's `this`, which
+    /// CodeQL reported as `cpp/stack-address-escape`. A pointer that cannot change after
+    /// construction can be neither.
+    explicit ReplicationManager(ReplicationConfig config, WALWriter& wal, Engine* engine = nullptr);
     ~ReplicationManager();
 
     ReplicationManager(const ReplicationManager&) = delete;
     ReplicationManager& operator=(const ReplicationManager&) = delete;
-
-    /// Set the Engine pointer so the manager can call create_snapshot().
-    /// Hand the manager the engine it takes snapshots from and publishes gauges through.
-    ///
-    /// Takes `mtx_`, and that is not decoration: every reader of `engine_` is on the epoll thread
-    /// under this mutex (`publish_replica_gauges()` once per pass, `handle_snapshot_request()` and
-    /// `begin_snapshot_transfer()` from the data path), so a plain store here is a data race with a
-    /// running loop. Both production callers set it *before* `start()`, which is why nothing had
-    /// reported it — ThreadSanitizer did, on the first test to set it the other way round.
-    void set_engine(Engine* engine) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        engine_ = engine;
-    }
 
     /// Start the replication server (binds port, starts epoll thread).
     void start();
@@ -548,7 +543,7 @@ private:
     std::function<void()> snapshot_gate_for_test_;
     ReplicationConfig config_;
     WALWriter&        wal_;
-    Engine*           engine_{nullptr};
+    Engine* const     engine_;
     std::thread       thread_;
     std::atomic<bool> running_{false};
     int               listen_fd_{-1};

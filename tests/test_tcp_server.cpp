@@ -667,6 +667,22 @@ TEST_F(ExecuteCommandTest, StatusReturnsStats) {
     EXPECT_NE(response.find("inserts"), std::string::npos);
 }
 
+namespace {
+
+/// STATUS's values: the answer is "OK", a header line naming them, then one line of them, by tab.
+std::vector<std::string> status_values(const std::string& answer) {
+    const auto header_end = answer.find('\n', answer.find('\n') + 1);
+    if (header_end == std::string::npos) return {};
+    const auto values_end = answer.find('\n', header_end + 1);
+    if (values_end == std::string::npos) return {};
+    std::vector<std::string> values;
+    std::istringstream row(answer.substr(header_end + 1, values_end - header_end - 1));
+    for (std::string field; std::getline(row, field, '\t');) values.push_back(field);
+    return values;
+}
+
+}  // namespace
+
 // STATUS answers the engine's figures from a snapshot of its own (#151). Formatting from the shared
 // ServerStats instead - which STATUS no longer writes, because two client loops answering STATUS at
 // once would race on its vector - answers zeros for every engine figure, and nothing in this suite
@@ -687,19 +703,58 @@ TEST_F(ExecuteCommandTest, StatusAnswersTheEnginesFiguresNotTheSharedDefaults) {
     status.type = ob::CommandType::STATUS;
     const std::string answer = ob::execute_command(status, *engine_, session, stats_);
 
-    // "OK", the header, then the values under it.
-    const auto header_end = answer.find('\n', answer.find('\n') + 1);
-    ASSERT_NE(header_end, std::string::npos) << answer;
-    const auto values_end = answer.find('\n', header_end + 1);
-    ASSERT_NE(values_end, std::string::npos) << answer;
-    std::vector<std::string> values;
-    std::istringstream row(answer.substr(header_end + 1, values_end - header_end - 1));
-    for (std::string field; std::getline(row, field, '\t');) values.push_back(field);
+    const std::vector<std::string> values = status_values(answer);
     ASSERT_EQ(values.size(), 7u) << "sessions queries inserts pending_rows wal_file segments "
                                     "symbols, got: " << answer;
     EXPECT_EQ(values[6], "1") << "one symbol written and STATUS counts " << values[6]
                               << ", which is what an answer from the shared defaults says";
     EXPECT_NE(values[3], "0") << "a row pending and STATUS says none";
+}
+
+// `SELECT` and `BOOK` are one `answer_read()` since #241: they were the same code around a different
+// call. Each is counted once as a query, and a read the engine refuses is not counted at all. Read
+// back through STATUS, which is where an operator reads it.
+TEST_F(ExecuteCommandTest, EachReadIsCountedOnceAsAQueryAndARefusedOneIsNot) {
+    ob::Session session(fd_server_);
+    ob::Command insert{};
+    insert.type = ob::CommandType::INSERT;
+    insert.insert_args.symbol   = "READS";
+    insert.insert_args.exchange = "EX";
+    insert.insert_args.side     = 0;
+    insert.insert_args.price    = 100;
+    insert.insert_args.qty      = 5;
+    insert.insert_args.count    = 1;
+    ASSERT_EQ(ob::execute_command(insert, *engine_, session, stats_), "OK\n\n");
+    ob::Command flush{};
+    flush.type = ob::CommandType::FLUSH;
+    ASSERT_EQ(ob::execute_command(flush, *engine_, session, stats_), "OK\n\n");
+
+    ob::Command select{};
+    select.type    = ob::CommandType::SELECT;
+    select.raw_sql = "SELECT * FROM 'READS'.'EX'";
+    const std::string rows = ob::execute_command(select, *engine_, session, stats_);
+    ASSERT_EQ(rows.substr(0, 2), "OK") << rows;
+
+    ob::Command book{};
+    book.type               = ob::CommandType::BOOK;
+    book.book_args.symbol   = "READS";
+    book.book_args.exchange = "EX";
+    book.book_args.depth    = 10;
+    const std::string levels = ob::execute_command(book, *engine_, session, stats_);
+    ASSERT_EQ(levels.substr(0, 2), "OK") << levels;
+
+    ob::Command nowhere = book;
+    nowhere.book_args.symbol = "NOWHERE";
+    const std::string refused = ob::execute_command(nowhere, *engine_, session, stats_);
+    ASSERT_EQ(refused.substr(0, 4), "ERR ") << refused;
+
+    ob::Command status{};
+    status.type = ob::CommandType::STATUS;
+    const std::string answer = ob::execute_command(status, *engine_, session, stats_);
+    const std::vector<std::string> values = status_values(answer);
+    ASSERT_EQ(values.size(), 7u) << answer;
+    EXPECT_EQ(values[1], "2") << "a SELECT and a BOOK answered and a BOOK refused, and STATUS "
+                                 "counts " << values[1] << " queries";
 }
 
 // Test UNKNOWN command → returns "ERR unknown command\n"

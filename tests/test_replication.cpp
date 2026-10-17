@@ -175,8 +175,7 @@ protected:
         cfg.port = port_;
         cfg.max_replicas = 4;
         cfg.wal_identity = wal_identity;
-        auto mgr = std::make_unique<ob::ReplicationManager>(cfg, *wal_);
-        if (engine != nullptr) mgr->set_engine(engine);
+        auto mgr = std::make_unique<ob::ReplicationManager>(cfg, *wal_, engine);
         mgr->start();
         // Give the epoll thread time to start and bind.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

@@ -956,27 +956,23 @@ size_t OrderbookClient::format_insert(std::string_view symbol,
     }
     *p++ = ' ';
 
-    auto [p1, ec1] = std::to_chars(p, buf + send_buf_.size(), price);
-    p = p1;
+    // Every number here goes in through `.ptr`, and the status is not read: `to_chars` fails only
+    // for want of room, the buffer is at least 64 KB, and a number is at most twenty characters.
+    // Bound to a name nothing reads, the status is what CodeQL's `cpp/unused-local-variable`
+    // reports.
+    char* const end = buf + send_buf_.size();
+    p = std::to_chars(p, end, price).ptr;
     *p++ = ' ';
-
-    auto [p2, ec2] = std::to_chars(p, buf + send_buf_.size(), qty);
-    p = p2;
+    p = std::to_chars(p, end, qty).ptr;
     *p++ = ' ';
-
-    auto [p3, ec3] = std::to_chars(p, buf + send_buf_.size(), count);
-    p = p3;
+    p = std::to_chars(p, end, count).ptr;
 
     // Only when the caller gave one. Writing a client-side "now" instead would move the clock that
     // decides a row's time from the server to the caller - a different guarantee wearing the same
     // name - and it would make "stamp it on arrival" unsayable (#105).
     if (event_time_ns) {
         *p++ = ' ';
-        // The status is dropped rather than named: `to_chars` can only fail for want of room, the
-        // buffer is 64 KB and this is at most twenty digits. Every other conversion in this
-        // function does the same - and naming a variable nobody reads is what CodeQL's
-        // `cpp/unused-local-variable` is for.
-        p = std::to_chars(p, buf + send_buf_.size(), *event_time_ns).ptr;
+        p = std::to_chars(p, end, *event_time_ns).ptr;
     }
     *p++ = '\n';
 
@@ -1010,11 +1006,12 @@ size_t OrderbookClient::format_minsert(std::string_view symbol,
     }
     *p++ = ' ';
 
-    auto [pn, ecn] = std::to_chars(p, end, n_levels);
-    p = pn;
+    // Numbers in through `.ptr`, as in format_insert, and for its reason: the buffer is at least
+    // 64 KB, and the loop below keeps 80 bytes free before each line of three.
+    p = std::to_chars(p, end, n_levels).ptr;
     if (event_time_ns) {
         *p++ = ' ';
-        p = std::to_chars(p, end, *event_time_ns).ptr;   // see format_insert on the dropped status
+        p = std::to_chars(p, end, *event_time_ns).ptr;
     }
     *p++ = '\n';
 
@@ -1031,16 +1028,11 @@ size_t OrderbookClient::format_minsert(std::string_view symbol,
             end = buf + send_buf_.size();
         }
 
-        auto [pp, ecp] = std::to_chars(p, end, levels[i].price);
-        p = pp;
+        p = std::to_chars(p, end, levels[i].price).ptr;
         *p++ = ' ';
-
-        auto [pq, ecq] = std::to_chars(p, end, levels[i].qty);
-        p = pq;
+        p = std::to_chars(p, end, levels[i].qty).ptr;
         *p++ = ' ';
-
-        auto [pc, ecc] = std::to_chars(p, end, levels[i].count);
-        p = pc;
+        p = std::to_chars(p, end, levels[i].count).ptr;
         *p++ = '\n';
     }
 
