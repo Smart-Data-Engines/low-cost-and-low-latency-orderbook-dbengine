@@ -3368,9 +3368,6 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
 void Engine::flush_loop() {
     const auto interval = std::chrono::nanoseconds(flush_interval_ns_);
     while (!stop_flush_.load(std::memory_order_relaxed)) {
-        // Whether someone asked for this tick rather than the interval bringing it: such a tick's
-        // seals keep the interval's cadence (seal_cadence(), #190 step 9).
-        bool requested = false;
         // Interruptible wait. A plain sleep_for() here made close() block until
         // the current interval elapsed, because join() cannot interrupt a
         // sleeping thread: shutdown took up to flush_interval_ns_ for no reason,
@@ -3385,7 +3382,6 @@ void Engine::flush_loop() {
             // Cleared **before** the tick, not after: a request that arrives while this tick runs
             // is about rows this tick may not have seen, so it has to cause the next one.
             if (woken && !stop_requested) flush_now_.store(false, std::memory_order_relaxed);
-            requested = woken && !stop_requested;
             if (stop_requested) {
                 // close() performs the final drain, sync, segment flush and WAL
                 // flush itself, so leaving now loses nothing.
@@ -3396,7 +3392,9 @@ void Engine::flush_loop() {
 
         try {
             registry_.increment_counter("ob_flush_ticks_total");
-            flush_tick(requested);
+            // Paced: its seals keep their cadence however often the ticks come (seal_cadence(),
+            // #190 step 9).
+            flush_tick(/*paced=*/true);
             publish_decoded_columns();
             if (consecutive_flush_failures_ > 0) {
                 OB_LOG_INFO("engine", "flush_loop: flushing again after %llu failed tick(s)",
@@ -3434,7 +3432,7 @@ void Engine::publish_counter_delta(const char* name, uint64_t total, uint64_t& p
     }
 }
 
-void Engine::flush_tick(bool requested) {
+void Engine::flush_tick(bool paced) {
         // The whole tick is one flush, so a client FLUSH cannot interleave with it - and neither can
         // another tick, the publications below included: `flush_tick_for_test()` runs one on a test's
         // thread while the loop can run its own, which a mesh decision waiting for the copy of the
@@ -3539,16 +3537,16 @@ void Engine::flush_tick(bool requested) {
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
         // readable, and retention below stays where it was until a restart (#160). What it seals
         // is its share: about what it drained (#165 part 2a, kSealRows) - since the last tick that
-        // sealed what was due, because one asked for sooner than the interval seals only for the
+        // sealed what was due, because a tick sooner than the seals' cadence seals only for the
         // budget (#190 step 9).
         drained_since_due_seal_ += taken;
         const SealCadence cadence =
-            seal_cadence(requested, last_due_seal_tick_, tick_started,
+            seal_cadence(paced, last_due_seal_tick_, tick_started,
                          std::chrono::nanoseconds(flush_interval_ns_), drained_since_due_seal_);
         if (!cadence.due) {
-            OB_LOG_DEBUG("engine", "flush tick asked for %.0f ms after the last that sealed what was "
-                                   "due: sealing only for the budget, %zu drained row(s) carried to "
-                                   "the next",
+            OB_LOG_DEBUG("engine", "flush tick %.0f ms after the last that sealed what was due: "
+                                   "sealing only for the budget, %zu drained row(s) carried to the "
+                                   "next",
                          ms_since(*last_due_seal_tick_, tick_started), drained_since_due_seal_);
         }
         flush_write_and_merge(/*seal_all=*/false, cadence.drained_rows, /*claim_regardless=*/false,
@@ -4041,7 +4039,7 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     // each, tick after tick - while the stores due by rows waited behind it and the unsealed rows
     // grew to the budget (#205).
     for (const bool due_by_rows : {true, false}) {
-        if (!seal_due) break;   // a tick asked for sooner than the interval (seal_cadence())
+        if (!seal_due) break;   // a tick sooner than the seals' cadence (seal_cadence())
         for (size_t i = 0; i < candidates.size(); ++i) {
             if (picks.size() >= kSealsPerTick) break;
             if (taken[i]) continue;
@@ -4061,12 +4059,12 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     return picks;
 }
 
-Engine::SealCadence Engine::seal_cadence(bool requested,
+Engine::SealCadence Engine::seal_cadence(bool paced,
                                          std::optional<std::chrono::steady_clock::time_point> last_due,
                                          std::chrono::steady_clock::time_point now,
                                          std::chrono::nanoseconds interval, size_t drained_since) {
     const std::chrono::nanoseconds period = std::max<std::chrono::nanoseconds>(interval, kSealCadence);
-    const bool due = !requested || !last_due.has_value() || now - *last_due >= period;
+    const bool due = !paced || !last_due.has_value() || now - *last_due >= period;
     return SealCadence{due, due ? drained_since : 0};
 }
 
@@ -4137,10 +4135,10 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
                              std::max(kSealRows, drained_rows), total - std::min(total, sealed_rows),
                              total);
             } else {
-                // A tick asked for sooner than the interval has no share: what is due waits for the
-                // interval's tick (seal_cadence()).
+                // A tick sooner than the seals' cadence has no share: what is due waits for the
+                // next tick that keeps it (seal_cadence()).
                 OB_LOG_DEBUG("engine", "sealing %zu store(s) for the budget; %zu due store(s) wait for "
-                                       "the interval's tick; %zu of %zu unsealed row(s) stay in memory",
+                                       "the seals' cadence; %zu of %zu unsealed row(s) stay in memory",
                              seals.size(), deferred, total - std::min(total, sealed_rows), total);
             }
         }

@@ -285,49 +285,49 @@ TEST(SealPolicy, SealAllTakesEveryOne) {
 
 // ── The seals' cadence (#190 step 9) ─────────────────────────────────────────
 //
-// A tick someone asks for between intervals - the WAL budget's, a full queue's - must not seal
-// what is due sooner than the interval would: measured at 10 MB/s, the budget's extra ticks sealed
-// every store about once a round where master sealed 40% of them, and put 10-11% more bytes on the
-// device for each level.
+// However often the flush loop ticks, it seals what is due at most once a `kSealCadence` or an
+// interval: measured at 10 MB/s, the budget's shorter ticks each sealed their share, every store was
+// sealed about once a round where master sealed 40% of them, and the device took 10-11% more bytes
+// for each level.
 
-TEST(SealCadence, ATickTheIntervalBroughtSealsWhatIsDueOnWhatItDrained) {
+TEST(SealCadence, ATestsTickSealsWhatIsDueOnWhatItDrained) {
     const auto now = Clock::now();
-    const auto c = ob::Engine::seal_cadence(/*requested=*/false, now - 1ms, now, 1s, 4'321);
-    EXPECT_TRUE(c.due) << "a tick the interval brought (or a test's) seals what is due";
+    const auto c = ob::Engine::seal_cadence(/*paced=*/false, now - 1ms, now, 1s, 4'321);
+    EXPECT_TRUE(c.due) << "a tick that is not paced seals what is due, as every tick did";
     EXPECT_EQ(c.drained_rows, 4'321u);
 }
 
-TEST(SealCadence, ATickAskedForSoonerSealsOnlyForTheBudget) {
+TEST(SealCadence, APacedTickSoonerThanTheCadenceSealsOnlyForTheBudget) {
     const auto now = Clock::now();
-    const auto c = ob::Engine::seal_cadence(/*requested=*/true, now - 400ms, now, 1s, 4'321);
-    EXPECT_FALSE(c.due) << "a tick asked for 400 ms after the last due seal sealed what is due";
+    const auto c = ob::Engine::seal_cadence(/*paced=*/true, now - 400ms, now, 1s, 4'321);
+    EXPECT_FALSE(c.due) << "a paced tick 400 ms after the last due seal sealed what is due";
     EXPECT_EQ(c.drained_rows, 0u) << "a tick that seals nothing due has no share to reckon";
 }
 
-TEST(SealCadence, ATickAskedForAnIntervalLaterSealsOnEveryRowSince) {
+TEST(SealCadence, APacedTickACadenceLaterSealsOnEveryRowSince) {
     const auto now = Clock::now();
-    const auto at = ob::Engine::seal_cadence(/*requested=*/true, now - 1s, now, 1s, 9'000);
-    EXPECT_TRUE(at.due) << "an interval since the last due seal, to the nanosecond";
+    const auto at = ob::Engine::seal_cadence(/*paced=*/true, now - 1s, now, 1s, 9'000);
+    EXPECT_TRUE(at.due) << "a cadence since the last due seal, to the nanosecond";
     EXPECT_EQ(at.drained_rows, 9'000u) << "its share is reckoned on every row drained since";
-    const auto before = ob::Engine::seal_cadence(/*requested=*/true, now - 1s + 1ns, now, 1s, 9'000);
-    EXPECT_FALSE(before.due) << "a nanosecond short of the interval";
+    const auto before = ob::Engine::seal_cadence(/*paced=*/true, now - 1s + 1ns, now, 1s, 9'000);
+    EXPECT_FALSE(before.due) << "a nanosecond short of the cadence";
 }
 
 TEST(SealCadence, AShortIntervalDoesNotShortenTheCadence) {
-    // The default interval is 100 ms, and at the write ceiling the ticks asked for came every 250
-    // ms: a cadence of the interval alone sealed as often as without one (diag10d/).
+    // The default interval is 100 ms, and at the write ceiling the budget's ticks came every 250 ms:
+    // a cadence of the interval alone sealed as often as without one (diag10d/).
     const auto now = Clock::now();
-    EXPECT_FALSE(ob::Engine::seal_cadence(/*requested=*/true, now - 400ms, now, 100ms, 1).due)
-        << "a tick asked for 400 ms after the last due seal sealed what was due";
-    EXPECT_TRUE(ob::Engine::seal_cadence(/*requested=*/true, now - ob::Engine::kSealCadence, now,
+    EXPECT_FALSE(ob::Engine::seal_cadence(/*paced=*/true, now - 400ms, now, 100ms, 1).due)
+        << "a paced tick 400 ms after the last due seal sealed what was due";
+    EXPECT_TRUE(ob::Engine::seal_cadence(/*paced=*/true, now - ob::Engine::kSealCadence, now,
                                          100ms, 1).due);
     // A longer interval is the longer cadence.
-    EXPECT_FALSE(ob::Engine::seal_cadence(/*requested=*/true, now - 2s, now, 5s, 1).due);
+    EXPECT_FALSE(ob::Engine::seal_cadence(/*paced=*/true, now - 2s, now, 5s, 1).due);
 }
 
-TEST(SealCadence, TheFirstTickSealsWhatIsDueWhoeverAskedForIt) {
+TEST(SealCadence, TheFirstTickSealsWhatIsDue) {
     const auto now = Clock::now();
-    const auto c = ob::Engine::seal_cadence(/*requested=*/true, std::nullopt, now, 1s, 17);
+    const auto c = ob::Engine::seal_cadence(/*paced=*/true, std::nullopt, now, 1s, 17);
     EXPECT_TRUE(c.due);
     EXPECT_EQ(c.drained_rows, 17u);
 }
@@ -338,7 +338,7 @@ TEST(SealPolicy, ATickThatSealsNothingDueStillSealsForTheBudget) {
     std::vector<ob::Engine::SealCandidate> under{candidate(ob::Engine::kSealRows, 1s, now),
                                                  candidate(10, 11s, now)};
     EXPECT_TRUE(ob::Engine::pick_seals(under, now, false, ob::Engine::kSealRows, /*seal_due=*/false)
-                    .empty()) << "a tick asked for sooner than the interval sealed what was due";
+                    .empty()) << "a tick sooner than the seals' cadence sealed what was due";
     EXPECT_EQ(ob::Engine::pick_seals(under, now, false, ob::Engine::kSealRows).size(), 2u)
         << "the control: the same stores are due on a tick that seals what is due";
 
@@ -349,12 +349,11 @@ TEST(SealPolicy, ATickThatSealsNothingDueStillSealsForTheBudget) {
     for (size_t i = 0; i < stores; ++i) over.push_back(candidate(kEach, 1s, now));
     const auto picks = ob::Engine::pick_seals(over, now, false, 0, /*seal_due=*/false);
     EXPECT_LE((stores - picks.size()) * kEach, ob::Engine::kUnsealedRowsBudget)
-        << "a tick asked for sooner than the interval left the unsealed rows over the budget";
+        << "a tick sooner than the seals' cadence left the unsealed rows over the budget";
 }
 
-TEST(SealCadence, TheFlushLoopSaysWhetherARequestBroughtTheTick) {
-    // The cadence is decided in the tick, from a flag only the loop knows: a test's tick runs as the
-    // interval's, so nothing behavioural sees the loop pass `false` for every tick.
+TEST(SealCadence, TheFlushLoopsTicksArePaced) {
+    // A test's tick is not paced, so nothing behavioural sees the loop's ticks lose their pacing.
     std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/engine.cpp");
     ASSERT_TRUE(in) << "cannot read src/engine.cpp";
     const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -363,10 +362,8 @@ TEST(SealCadence, TheFlushLoopSaysWhetherARequestBroughtTheTick) {
     const auto end = src.find("\n}\n", begin);
     ASSERT_NE(end, std::string::npos);
     const std::string body = src.substr(begin, end - begin);
-    EXPECT_NE(body.find("requested = woken && !stop_requested;"), std::string::npos)
-        << "the loop no longer records that a request woke it";
-    EXPECT_NE(body.find("flush_tick(requested);"), std::string::npos)
-        << "the loop no longer tells the tick that a request brought it";
+    EXPECT_NE(body.find("flush_tick(/*paced=*/true);"), std::string::npos)
+        << "the flush loop's ticks are no longer paced";
 }
 
 // ── The engine's wiring ──────────────────────────────────────────────────────
@@ -563,9 +560,9 @@ TEST(LazyFlush, StoresThatComeDueTogetherAreSealedOverSeveralTicks) {
     engine.close();
 }
 
-TEST(LazyFlush, ATickAskedForSoonerThanTheIntervalLeavesWhatIsDueToTheNext) {
-    // The interval out of the way, every tick run here: the first seals what is due, a requested one
-    // straight after drains and leaves the store due, and the interval's next one seals it.
+TEST(LazyFlush, APacedTickSoonerThanTheCadenceLeavesWhatIsDueToTheNext) {
+    // The loop out of the way, every tick run here: the first seals what is due, a paced one straight
+    // after drains and leaves the store due, and the next tick that is not paced seals it.
     TempDir dir;
     ob::Engine engine(dir.path, 3'600'000'000'000ULL, ob::FsyncPolicy::NONE);
     engine.open();
@@ -584,25 +581,25 @@ TEST(LazyFlush, ATickAskedForSoonerThanTheIntervalLeavesWhatIsDueToTheNext) {
     ASSERT_GT(first, 0u) << "the premise: a store due by rows is sealed by a tick";
 
     fill();
-    engine.requested_flush_tick_for_test();
+    engine.paced_flush_tick_for_test();
     EXPECT_EQ(segments_on_disk(dir.path, "A"), first)
-        << "a tick asked for between intervals sealed a store only the cadence makes wait";
+        << "a paced tick sooner than the cadence sealed a store only the cadence makes wait";
     EXPECT_EQ(engine.registry().gauge_value("ob_unsealed_rows"), static_cast<int64_t>(per_fill))
-        << "the requested tick did not drain the rows it leaves unsealed";
-    EXPECT_EQ(rows_answered(engine, "A"), 2 * per_fill) << "a requested tick's rows are not readable";
+        << "the paced tick did not drain the rows it leaves unsealed";
+    EXPECT_EQ(rows_answered(engine, "A"), 2 * per_fill) << "a paced tick's rows are not readable";
 
     engine.flush_tick_for_test();
-    EXPECT_GT(segments_on_disk(dir.path, "A"), first) << "the interval's tick did not seal what was due";
+    EXPECT_GT(segments_on_disk(dir.path, "A"), first) << "the next tick did not seal what was due";
     EXPECT_EQ(engine.registry().gauge_value("ob_unsealed_rows"), 0);
     EXPECT_EQ(rows_answered(engine, "A"), 2 * per_fill);
     engine.close();
 }
 
-TEST(LazyFlush, TheIntervalsTickSharesOnEveryRowDrainedSinceTheLastDueSeal) {
-    // Three stores due by rows, drained by a requested tick that seals none of them: the interval's
-    // next tick drains nothing itself, and on its own drain its share would be kSealRows - one store,
-    // the first due always being taken. Reckoned on every row drained since the last due seal, its
-    // share covers all three.
+TEST(LazyFlush, TheNextDueSealSharesOnEveryRowDrainedSinceTheLast) {
+    // Three stores due by rows, drained by a paced tick that seals none of them: the next tick drains
+    // nothing itself, and on its own drain its share would be kSealRows - one store, the first due
+    // always being taken. Reckoned on every row drained since the last due seal, its share covers
+    // all three.
     TempDir dir;
     ob::Engine engine(dir.path, 3'600'000'000'000ULL, ob::FsyncPolicy::NONE);
     engine.open();
@@ -617,15 +614,15 @@ TEST(LazyFlush, TheIntervalsTickSharesOnEveryRowDrainedSinceTheLastDueSeal) {
     fill("A");
     fill("B");
     fill("C");
-    engine.requested_flush_tick_for_test();
+    engine.paced_flush_tick_for_test();
     ASSERT_EQ(segments_on_disk(dir.path, "A") + segments_on_disk(dir.path, "B") +
                   segments_on_disk(dir.path, "C"), 0u)
-        << "the premise: a tick asked for between intervals seals none of them";
+        << "the premise: a paced tick sooner than the cadence seals none of them";
 
     engine.flush_tick_for_test();
     EXPECT_GT(segments_on_disk(dir.path, "A"), 0u);
     EXPECT_GT(segments_on_disk(dir.path, "B"), 0u)
-        << "the interval's tick reckoned its share on what it drained itself, not on every row since";
+        << "the next due seal reckoned its share on what it drained itself, not on every row since";
     EXPECT_GT(segments_on_disk(dir.path, "C"), 0u);
     engine.close();
 }
