@@ -149,6 +149,13 @@ public:
     }
     /// One tick, leaving its seal's sync in the background as the loop's does (#190).
     void flush_tick_leaving_the_sync_for_test() { flush_tick(); }
+    /// One tick as one asked for between intervals runs - the WAL budget's, or a full queue's - whose
+    /// seals keep the interval's cadence (#190, step 9). Its seal's sync taken in, as above.
+    void requested_flush_tick_for_test() {
+        flush_tick(/*requested=*/true);
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+        receive_seal_sync(/*wait=*/true);
+    }
 
     /// Hold every background seal sync numbered `from` or later after it is numbered and before its
     /// syncfs(), until a later call moves `from` past it: a sync the device takes seconds over, on a
@@ -388,10 +395,35 @@ public:
     /// small stores due by age in bulk. Below the budget a due store after the first is taken only
     /// while the rows picked stay within the share - a younger one that fits after an older one
     /// that does not, so the share is filled - and the first due store is always taken, the oldest
-    /// due by rows if there is one, so none waits behind a share it is bigger than.
+    /// due by rows if there is one, so none waits behind a share it is bigger than. With `seal_due`
+    /// false it takes only what the budget makes it: a tick asked for sooner than the interval
+    /// (`seal_cadence()`).
     static std::vector<SealPick> pick_seals(const std::vector<SealCandidate>& candidates,
                                             std::chrono::steady_clock::time_point now,
-                                            bool seal_all, size_t drained_rows);
+                                            bool seal_all, size_t drained_rows,
+                                            bool seal_due = true);
+
+    /// Whether a tick seals what is due, and the drained rows its share is reckoned on (#190,
+    /// step 9): the seals keep the interval's cadence, whoever asks for a tick.
+    /// - A tick the interval woke - or a test - seals what is due, as it always did.
+    /// - A tick asked for sooner - by the WAL budget, or by a full pending queue - seals only for
+    ///   the unsealed-rows budget, until an interval has passed since the last tick that sealed what
+    ///   was due.
+    /// - That later tick reckons its share on every row drained since.
+    ///
+    /// Measured on the m9g.xlarge at 10 MB/s, before this: the budget asked for ticks 2.5-4 times as
+    /// often, each sealed its share, and every store was sealed about once a round where master
+    /// sealed 40% of them. That is 10-11% more bytes on the device for each level, a segment's files
+    /// and their metadata being a fixed cost of each seal, and 6-7% fewer levels a second
+    /// (evidence/2026-10-14-wal-sync-budget/, `diag10/`). Pure: the caller logs.
+    struct SealCadence {
+        bool   due{true};          ///< seal what is due, within the share
+        size_t drained_rows{0};    ///< the rows the share is reckoned on
+    };
+    static SealCadence seal_cadence(bool requested,
+                                    std::optional<std::chrono::steady_clock::time_point> last_due,
+                                    std::chrono::steady_clock::time_point now,
+                                    std::chrono::nanoseconds interval, size_t drained_since);
 
     /// Engine-level statistics for monitoring.
     struct Stats {
@@ -1440,7 +1472,10 @@ private:
     /// the life of the process - which stops the node dying (#112) and leaves it never flushing
     /// again, a guarantee absent in production rather than a crash. The tick contains no
     /// `continue`, `break` or `return`, which is what made moving it out of the loop mechanical.
-    void flush_tick();
+    ///
+    /// `requested` is a tick someone asked for between intervals; its seals keep the interval's
+    /// cadence (`seal_cadence()`).
+    void flush_tick(bool requested = false);
 
     /// Failed `fsync` counts already published, so the counter is fed a delta rather than a total.
     ///
@@ -1539,7 +1574,7 @@ private:
     /// its own: what drop_symbol() needs, because the last checkpoint can be older than a seal that
     /// claims nothing (seal_symbol()), and a restart replays from it.
     int flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless = false,
-                              bool sync_in_background = false);
+                              bool sync_in_background = false, bool seal_due = true);
 
     // ── The seal's sync in the background (#190) ──────────────────────────────
     //
@@ -1573,7 +1608,8 @@ private:
     };
     /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
     /// the share of a tick that drained `drained_rows` (`pick_seals()`). Holds `flush_mtx_`.
-    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only, size_t drained_rows);
+    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only, size_t drained_rows,
+                                   bool seal_due = true);
     /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
     /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
     /// `flush_mtx_`; `mtx_` or not.
@@ -1661,6 +1697,11 @@ private:
     /// sealed after a restart can never be taken for one an old checkpoint vouched for. Under
     /// flush_mtx_.
     uint64_t seal_epoch_{0};
+
+    /// When a tick last sealed what was due, and the rows drained since (`seal_cadence()`). The
+    /// flush tick's, under `flush_mtx_`.
+    std::optional<std::chrono::steady_clock::time_point> last_due_seal_tick_;
+    size_t drained_since_due_seal_{0};
 };
 
 } // namespace ob

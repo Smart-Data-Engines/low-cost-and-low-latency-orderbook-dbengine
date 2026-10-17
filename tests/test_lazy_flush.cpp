@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -281,6 +283,80 @@ TEST(SealPolicy, SealAllTakesEveryOne) {
     for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kAll);
 }
 
+// ── The seals' cadence (#190 step 9) ─────────────────────────────────────────
+//
+// A tick someone asks for between intervals - the WAL budget's, a full queue's - must not seal
+// what is due sooner than the interval would: measured at 10 MB/s, the budget's extra ticks sealed
+// every store about once a round where master sealed 40% of them, and put 10-11% more bytes on the
+// device for each level.
+
+TEST(SealCadence, ATickTheIntervalBroughtSealsWhatIsDueOnWhatItDrained) {
+    const auto now = Clock::now();
+    const auto c = ob::Engine::seal_cadence(/*requested=*/false, now - 1ms, now, 1s, 4'321);
+    EXPECT_TRUE(c.due) << "a tick the interval brought (or a test's) seals what is due";
+    EXPECT_EQ(c.drained_rows, 4'321u);
+}
+
+TEST(SealCadence, ATickAskedForSoonerSealsOnlyForTheBudget) {
+    const auto now = Clock::now();
+    const auto c = ob::Engine::seal_cadence(/*requested=*/true, now - 400ms, now, 1s, 4'321);
+    EXPECT_FALSE(c.due) << "a tick asked for 400 ms after the last due seal sealed what is due";
+    EXPECT_EQ(c.drained_rows, 0u) << "a tick that seals nothing due has no share to reckon";
+}
+
+TEST(SealCadence, ATickAskedForAnIntervalLaterSealsOnEveryRowSince) {
+    const auto now = Clock::now();
+    const auto at = ob::Engine::seal_cadence(/*requested=*/true, now - 1s, now, 1s, 9'000);
+    EXPECT_TRUE(at.due) << "an interval since the last due seal, to the nanosecond";
+    EXPECT_EQ(at.drained_rows, 9'000u) << "its share is reckoned on every row drained since";
+    const auto before = ob::Engine::seal_cadence(/*requested=*/true, now - 1s + 1ns, now, 1s, 9'000);
+    EXPECT_FALSE(before.due) << "a nanosecond short of the interval";
+}
+
+TEST(SealCadence, TheFirstTickSealsWhatIsDueWhoeverAskedForIt) {
+    const auto now = Clock::now();
+    const auto c = ob::Engine::seal_cadence(/*requested=*/true, std::nullopt, now, 1s, 17);
+    EXPECT_TRUE(c.due);
+    EXPECT_EQ(c.drained_rows, 17u);
+}
+
+TEST(SealPolicy, ATickThatSealsNothingDueStillSealsForTheBudget) {
+    const auto now = Clock::now();
+    // Due by rows and by age, under the budget: nothing.
+    std::vector<ob::Engine::SealCandidate> under{candidate(ob::Engine::kSealRows, 1s, now),
+                                                 candidate(10, 11s, now)};
+    EXPECT_TRUE(ob::Engine::pick_seals(under, now, false, ob::Engine::kSealRows, /*seal_due=*/false)
+                    .empty()) << "a tick asked for sooner than the interval sealed what was due";
+    EXPECT_EQ(ob::Engine::pick_seals(under, now, false, ob::Engine::kSealRows).size(), 2u)
+        << "the control: the same stores are due on a tick that seals what is due";
+
+    // Over the budget: memory is what it bounds, whatever the cadence.
+    constexpr size_t kEach = 30'000;
+    const size_t stores = ob::Engine::kUnsealedRowsBudget / kEach * 3 / 2;
+    std::vector<ob::Engine::SealCandidate> over;
+    for (size_t i = 0; i < stores; ++i) over.push_back(candidate(kEach, 1s, now));
+    const auto picks = ob::Engine::pick_seals(over, now, false, 0, /*seal_due=*/false);
+    EXPECT_LE((stores - picks.size()) * kEach, ob::Engine::kUnsealedRowsBudget)
+        << "a tick asked for sooner than the interval left the unsealed rows over the budget";
+}
+
+TEST(SealCadence, TheFlushLoopSaysWhetherARequestBroughtTheTick) {
+    // The cadence is decided in the tick, from a flag only the loop knows: a test's tick runs as the
+    // interval's, so nothing behavioural sees the loop pass `false` for every tick.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/engine.cpp");
+    ASSERT_TRUE(in) << "cannot read src/engine.cpp";
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto begin = src.find("void Engine::flush_loop() {");
+    ASSERT_NE(begin, std::string::npos) << "flush_loop not found - did it get renamed?";
+    const auto end = src.find("\n}\n", begin);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = src.substr(begin, end - begin);
+    EXPECT_NE(body.find("requested = woken && !stop_requested;"), std::string::npos)
+        << "the loop no longer records that a request woke it";
+    EXPECT_NE(body.find("flush_tick(requested);"), std::string::npos)
+        << "the loop no longer tells the tick that a request brought it";
+}
+
 // ── The engine's wiring ──────────────────────────────────────────────────────
 
 TEST(LazyFlush, ATickSealsNothingThatIsNotDueAndAQueryReadsTheRows) {
@@ -472,6 +548,73 @@ TEST(LazyFlush, StoresThatComeDueTogetherAreSealedOverSeveralTicks) {
         EXPECT_EQ(segments_on_disk(dir.path, s), 1u) << s;
         EXPECT_EQ(rows_answered(engine, s), 80 * kLevels) << s;
     }
+    engine.close();
+}
+
+TEST(LazyFlush, ATickAskedForSoonerThanTheIntervalLeavesWhatIsDueToTheNext) {
+    // The interval out of the way, every tick run here: the first seals what is due, a requested one
+    // straight after drains and leaves the store due, and the interval's next one seals it.
+    TempDir dir;
+    ob::Engine engine(dir.path, 3'600'000'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    uint64_t seq = 1;
+    size_t per_fill = 0;
+    const auto fill = [&] {
+        per_fill = 0;
+        while (per_fill < ob::Engine::kSealRows) {
+            insert(engine, "A", seq++, 1000);
+            per_fill += 1000;
+        }
+    };
+    fill();
+    engine.flush_tick_for_test();
+    const size_t first = segments_on_disk(dir.path, "A");
+    ASSERT_GT(first, 0u) << "the premise: a store due by rows is sealed by a tick";
+
+    fill();
+    engine.requested_flush_tick_for_test();
+    EXPECT_EQ(segments_on_disk(dir.path, "A"), first)
+        << "a tick asked for between intervals sealed a store only the cadence makes wait";
+    EXPECT_EQ(engine.registry().gauge_value("ob_unsealed_rows"), static_cast<int64_t>(per_fill))
+        << "the requested tick did not drain the rows it leaves unsealed";
+    EXPECT_EQ(rows_answered(engine, "A"), 2 * per_fill) << "a requested tick's rows are not readable";
+
+    engine.flush_tick_for_test();
+    EXPECT_GT(segments_on_disk(dir.path, "A"), first) << "the interval's tick did not seal what was due";
+    EXPECT_EQ(engine.registry().gauge_value("ob_unsealed_rows"), 0);
+    EXPECT_EQ(rows_answered(engine, "A"), 2 * per_fill);
+    engine.close();
+}
+
+TEST(LazyFlush, TheIntervalsTickSharesOnEveryRowDrainedSinceTheLastDueSeal) {
+    // Three stores due by rows, drained by a requested tick that seals none of them: the interval's
+    // next tick drains nothing itself, and on its own drain its share would be kSealRows - one store,
+    // the first due always being taken. Reckoned on every row drained since the last due seal, its
+    // share covers all three.
+    TempDir dir;
+    ob::Engine engine(dir.path, 3'600'000'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    uint64_t seq = 1;
+    const auto fill = [&](const char* symbol) {
+        for (size_t rows = 0; rows < ob::Engine::kSealRows; rows += 1000) insert(engine, symbol, seq++, 1000);
+    };
+    fill("Z");
+    engine.flush_tick_for_test();
+    ASSERT_GT(segments_on_disk(dir.path, "Z"), 0u) << "the premise: the first tick seals what is due";
+
+    fill("A");
+    fill("B");
+    fill("C");
+    engine.requested_flush_tick_for_test();
+    ASSERT_EQ(segments_on_disk(dir.path, "A") + segments_on_disk(dir.path, "B") +
+                  segments_on_disk(dir.path, "C"), 0u)
+        << "the premise: a tick asked for between intervals seals none of them";
+
+    engine.flush_tick_for_test();
+    EXPECT_GT(segments_on_disk(dir.path, "A"), 0u);
+    EXPECT_GT(segments_on_disk(dir.path, "B"), 0u)
+        << "the interval's tick reckoned its share on what it drained itself, not on every row since";
+    EXPECT_GT(segments_on_disk(dir.path, "C"), 0u);
     engine.close();
 }
 

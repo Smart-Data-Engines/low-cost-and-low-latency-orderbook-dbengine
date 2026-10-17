@@ -816,6 +816,8 @@ target_link_libraries(test_lazy_flush
         orderbook_engine
         GTest::gtest_main
 )
+# The flush loop's cadence check reads src/engine.cpp (#190 step 9).
+target_compile_definitions(test_lazy_flush PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 gtest_discover_tests(test_lazy_flush PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── #165 part 2a: which segments a checkpoint vouches for while rows wait ───
