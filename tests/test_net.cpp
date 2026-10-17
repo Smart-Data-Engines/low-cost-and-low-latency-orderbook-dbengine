@@ -288,7 +288,10 @@ TEST(NetDial, SaysWhyNothingAnswered) {
     EXPECT_LT(dial("127.0.0.1", port, 1000, false, why, "test"), 0);
     EXPECT_NE(why.find("refused"), std::string::npos) << why;
     why.clear();
-    EXPECT_LT(dial("no-such-host.invalid", 9, 1000, false, why, "test"), 0);
+    // Absolute, with the trailing dot: a name under `.invalid` never resolves (RFC 6761), but a
+    // relative one is tried again with the host's search domains, and a network whose domain has a
+    // wildcard record answers that. On one, this dial got an address and timed out instead.
+    EXPECT_LT(dial("no-such-host.invalid.", 9, 1000, false, why, "test"), 0);
     EXPECT_NE(why.find("does not resolve"), std::string::npos) << why;
     why.clear();
     EXPECT_LT(dial("127.0.0.1", 0, 1000, false, why, "test"), 0);
