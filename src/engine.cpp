@@ -3392,9 +3392,7 @@ void Engine::flush_loop() {
 
         try {
             registry_.increment_counter("ob_flush_ticks_total");
-            // Paced: its seals keep their cadence however often the ticks come (seal_cadence(),
-            // #190 step 9).
-            flush_tick(/*paced=*/true);
+            flush_tick();
             publish_decoded_columns();
             if (consecutive_flush_failures_ > 0) {
                 OB_LOG_INFO("engine", "flush_loop: flushing again after %llu failed tick(s)",
@@ -3432,7 +3430,7 @@ void Engine::publish_counter_delta(const char* name, uint64_t total, uint64_t& p
     }
 }
 
-void Engine::flush_tick(bool paced) {
+void Engine::flush_tick() {
         // The whole tick is one flush, so a client FLUSH cannot interleave with it - and neither can
         // another tick, the publications below included: `flush_tick_for_test()` runs one on a test's
         // thread while the loop can run its own, which a mesh decision waiting for the copy of the
@@ -3536,25 +3534,11 @@ void Engine::flush_tick(bool paced) {
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
         // readable, and retention below stays where it was until a restart (#160). What it seals
-        // is its share: about what it drained (#165 part 2a, kSealRows) - since the last tick that
-        // sealed what was due, because a tick sooner than the seals' cadence seals only for the
-        // budget (#190 step 9).
-        drained_since_due_seal_ += taken;
-        const SealCadence cadence =
-            seal_cadence(paced, last_due_seal_tick_, tick_started,
-                         std::chrono::nanoseconds(flush_interval_ns_), drained_since_due_seal_);
-        if (!cadence.due) {
-            OB_LOG_DEBUG("engine", "flush tick %.0f ms after the last that sealed what was due: "
-                                   "sealing only for the budget, %zu drained row(s) carried to the "
-                                   "next",
-                         ms_since(*last_due_seal_tick_, tick_started), drained_since_due_seal_);
-        }
-        flush_write_and_merge(/*seal_all=*/false, cadence.drained_rows, /*claim_regardless=*/false,
-                              /*sync_in_background=*/true, cadence.due);
-        if (cadence.due) {
-            last_due_seal_tick_ = tick_started;
-            drained_since_due_seal_ = 0;
-        }
+        // is its share: about what it drained (#165 part 2a, kSealRows) - and, while admission is
+        // in force, the stores due by age that what it drained pays for (#190 step 9).
+        age_seal_credit_.earn(admission_.active(), taken);
+        flush_write_and_merge(/*seal_all=*/false, taken, /*claim_regardless=*/false,
+                              /*sync_in_background=*/true, &age_seal_credit_);
         const auto sealed = TickClock::now();
 
         // Update gauge: WAL file index.
@@ -3991,7 +3975,7 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
 std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate>& candidates,
                                                  std::chrono::steady_clock::time_point now,
                                                  bool seal_all, size_t drained_rows,
-                                                 bool seal_due) {
+                                                 size_t by_age_limit) {
     std::vector<SealPick> picks;
     if (seal_all) {
         for (size_t i = 0; i < candidates.size(); ++i) picks.push_back(SealPick{i, SealReason::kAll});
@@ -4006,11 +3990,13 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
                              : std::max(kSealRows, drained_rows + drained_rows / 4);
     std::vector<bool> taken(candidates.size(), false);
     size_t picked_rows = 0;
+    size_t picked_by_age = 0;
     const auto take = [&](size_t i, SealReason why) {
         picks.push_back(SealPick{i, why});
         taken[i] = true;
         left -= std::min(left, candidates[i].rows);
         picked_rows += candidates[i].rows;
+        if (why == SealReason::kAge) ++picked_by_age;
     };
 
     // Over the budget: the stores holding the most rows first, oldest first among equals, past the
@@ -4039,9 +4025,10 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     // each, tick after tick - while the stores due by rows waited behind it and the unsealed rows
     // grew to the budget (#205).
     for (const bool due_by_rows : {true, false}) {
-        if (!seal_due) break;   // a tick sooner than the seals' cadence (seal_cadence())
         for (size_t i = 0; i < candidates.size(); ++i) {
             if (picks.size() >= kSealsPerTick) break;
+            // What the rows drained paid for (AgeSealCredit), the budget's among them.
+            if (!due_by_rows && picked_by_age >= by_age_limit) break;
             if (taken[i]) continue;
             const SealCandidate& c = candidates[i];
             const bool due = due_by_rows ? c.rows >= kSealRows
@@ -4059,17 +4046,23 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     return picks;
 }
 
-Engine::SealCadence Engine::seal_cadence(bool paced,
-                                         std::optional<std::chrono::steady_clock::time_point> last_due,
-                                         std::chrono::steady_clock::time_point now,
-                                         std::chrono::nanoseconds interval, size_t drained_since) {
-    const std::chrono::nanoseconds period = std::max<std::chrono::nanoseconds>(interval, kSealCadence);
-    const bool due = !paced || !last_due.has_value() || now - *last_due >= period;
-    return SealCadence{due, due ? drained_since : 0};
+void Engine::AgeSealCredit::earn(bool device_bound, size_t drained_rows) {
+    device_bound_ = device_bound;
+    // Full while the device keeps up, so that the first tick it does not may still seal a tick's
+    // worth; what a tick drains past what the credit holds is not kept.
+    rows_ = device_bound ? std::min(kFull, rows_ + std::min(drained_rows, kFull)) : kFull;
+}
+
+size_t Engine::AgeSealCredit::allowance() const {
+    return device_bound_ ? rows_ / kRowsPerAgeSeal : kSealsPerTick;
+}
+
+void Engine::AgeSealCredit::spend(size_t n) {
+    if (device_bound_) rows_ -= std::min(rows_, n * kRowsPerAgeSeal);
 }
 
 std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* only,
-                                               size_t drained_rows, bool seal_due) {
+                                               size_t drained_rows, AgeSealCredit* credit) {
     // Oldest first: the order a budget and a per-tick limit take them in.
     std::vector<std::pair<std::chrono::steady_clock::time_point, ColumnarStore*>> by_age;
     by_age.reserve(unsealed_.size());
@@ -4086,8 +4079,9 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     }
 
     const auto now = std::chrono::steady_clock::now();
+    const size_t by_age_limit = credit != nullptr ? credit->allowance() : kSealsPerTick;
     const auto picks = pick_seals(candidates, now, seal_all || only != nullptr, drained_rows,
-                                  seal_due);
+                                  by_age_limit);
     std::vector<Seal> seals;
     seals.reserve(picks.size());
     size_t by_rows = 0, by_age_count = 0, by_budget = 0, sealed_rows = 0;
@@ -4100,6 +4094,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
         if (p.why == SealReason::kAge) ++by_age_count;
         if (p.why == SealReason::kBudget) ++by_budget;
     }
+    if (credit != nullptr) credit->spend(by_age_count);
 
     if (!seal_all && only == nullptr) {
         const size_t total = unsealed_rows_.load(std::memory_order_relaxed);
@@ -4127,20 +4122,12 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
         }
         const size_t deferred = due - std::min(due, by_rows + by_age_count);
         if (!seals.empty() || deferred > 0) {
-            if (seal_due) {
-                OB_LOG_DEBUG("engine", "sealing %zu store(s): %zu by rows, %zu by age, %zu by the "
-                                       "budget; %zu due store(s) wait past this tick's share of %zu "
-                                       "row(s); %zu of %zu unsealed row(s) stay in memory",
-                             seals.size(), by_rows, by_age_count, by_budget, deferred,
-                             std::max(kSealRows, drained_rows), total - std::min(total, sealed_rows),
-                             total);
-            } else {
-                // A tick sooner than the seals' cadence has no share: what is due waits for the
-                // next tick that keeps it (seal_cadence()).
-                OB_LOG_DEBUG("engine", "sealing %zu store(s) for the budget; %zu due store(s) wait for "
-                                       "the seals' cadence; %zu of %zu unsealed row(s) stay in memory",
-                             seals.size(), deferred, total - std::min(total, sealed_rows), total);
-            }
+            OB_LOG_DEBUG("engine", "sealing %zu store(s): %zu by rows, %zu by age, %zu by the budget; "
+                                   "%zu due store(s) wait past this tick's share of %zu row(s) and "
+                                   "%zu seal(s) by age; %zu of %zu unsealed row(s) stay in memory",
+                         seals.size(), by_rows, by_age_count, by_budget, deferred,
+                         std::max(kSealRows, drained_rows), by_age_limit,
+                         total - std::min(total, sealed_rows), total);
         }
     }
     return seals;
@@ -4238,8 +4225,21 @@ void Engine::drop_unsealed_locked() {
     registry_.set_gauge("ob_unsealed_rows", 0);
 }
 
+void Engine::age_unsealed_blocks_for_test(std::chrono::steady_clock::duration by) {
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    size_t blocks = 0;
+    for (auto& entry : unsealed_) {
+        for (UnsealedBlock& b : entry.second.blocks) {
+            b.published -= by;
+            ++blocks;
+        }
+    }
+    OB_LOG_DEBUG("engine", "test: %zu unsealed block(s) of %zu store(s) aged by %.0f ms", blocks,
+                 unsealed_.size(), std::chrono::duration<double, std::milli>(by).count());
+}
+
 int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless,
-                                  bool sync_in_background, bool seal_due) {
+                                  bool sync_in_background, AgeSealCredit* credit) {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
@@ -4252,7 +4252,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
     // and out of the index, so their rows vanished from every query until a restart found them.
     using SealClock = std::chrono::steady_clock;
     const auto started = SealClock::now();
-    std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows, seal_due);
+    std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows, credit);
     const std::exception_ptr write_failure = write_seals(seals);
     const auto written = SealClock::now();
 
