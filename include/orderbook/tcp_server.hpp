@@ -242,6 +242,9 @@ struct ServerConfig {
 
     /// --auth-secret-file: `<identity> <secret>` lines. Empty = client authentication disabled.
     std::string auth_secret_file;
+    /// --auth-acl-file: each identity's role and the symbols and exchanges it reaches (#31). Empty =
+    /// every identity is admin and reaches everything, as before #31.
+    std::string auth_acl_file;
 
     /// --migration-identity: the identity from the file above this shard authenticates as on
     /// another shard's client port when it moves a symbol there (#196). Empty: none, which a target
@@ -621,6 +624,21 @@ bool allowed_before_authentication(CommandType t);
 /// Same shape as `allowed_before_authentication()`: no `default:`, so a new command does not build
 /// until somebody decides which kind it is.
 bool serialised_across_reactors(CommandType t);
+
+/// Whether `role` may run `t` (#31): `Read` the queries and the node's own state, `Write` the
+/// writes and FLUSH too, `Admin` everything. Same shape as `allowed_before_authentication()`: no
+/// `default:`, so a new command does not build until somebody decides who may run it.
+bool role_allows(Role role, CommandType t);
+
+/// What an authenticated session's permissions say to `cmd` (#31): empty when it may run it, and
+/// otherwise the refusal after `forbidden: `. Checked in order:
+/// - the role (`role_allows()`);
+/// - for an identity with lists, the commands that name symbols beyond them (SHARD_MAP,
+///   SHARD_INFO, MIGRATE, ADOPT);
+/// - the symbol and exchange of a write, a BOOK, a SELECT or a SUBSCRIBE against the lists.
+/// `queries` parses a SELECT or SUBSCRIBE for its symbol, and only for an identity with lists; a
+/// query that does not parse is left to its handler, which refuses it with the parser's message.
+std::string permission_refusal(const Command& cmd, const Session& session, QueryEngine* queries);
 
 /// Where a configuration value came from. For `--print-config`, which exists to answer exactly
 /// that: a list of values does not tell an operator which of them they chose.

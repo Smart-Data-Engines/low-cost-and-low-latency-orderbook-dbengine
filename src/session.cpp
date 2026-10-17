@@ -592,9 +592,10 @@ bool Session::authenticated() const { return authenticated_; }
 
 const std::string& Session::identity() const { return identity_; }
 
-void Session::set_authenticated(std::string identity) {
+void Session::set_authenticated(std::string identity, Permissions permissions) {
     authenticated_ = true;
     identity_      = std::move(identity);
+    permissions_   = std::move(permissions);
     // The challenge has been spent. Leaving it in place would let the same response be replayed on
     // this connection, which matters less than the cross-connection case but costs nothing to close.
     pending_nonce_.clear();
