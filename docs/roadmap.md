@@ -2867,6 +2867,26 @@ domain with a wildcard record, so it tried `no-such-host.invalid.sggw.edu.pl` to
 and the dial timed out instead. A name under `.invalid` never resolves (RFC 6761) only when it is
 absolute, so the test dials `no-such-host.invalid.` now.
 
+**Measured** on the i3-7100U (`evidence/2026-10-17-code-scanning/`):
+- GCC 15.2 builds the tree with no warning, and `ctest -j1` passes **2001/2001** in 456.66 s.
+- clang 21.1.8 builds it with no warning, and `ctest -j1` passes **2001/2001** in 302.75 s.
+- The integration modules the change touches pass 51 of 51 in 8:20, none skipped: `test_read_only`,
+  `test_smoke`, `test_failover`, `test_handover` and the three replication modules.
+- On the pull request, the CodeQL analysis shows no open alert.
+
+**Mutations.** Eight rows, every verdict as predicted:
+- **Six are killed, each by a named test:**
+  - the server dropping `--read-only`, by the integration test alone;
+  - a promotion or a demotion that leaves the flag alone, by `FailoverRoles`;
+  - a read not counted, or a refused one counted, by the new `ExecuteCommandTest`;
+  - STATUS answered from the shared stats, by #151's test for exactly that.
+- **Two controls survive:** a log line reworded in each place the item added one.
+- **The first run held seven.** Its uncounted read deleted the line that counts, which left a
+  parameter unused, and `-Werror` refused the build (pitfall 562). The row adds zero now.
+
+- Effort: S | Impact: no code scanning alert is open in our own code, the engine owns the flag it
+  toggles, and `--read-only` has a test
+
 ### 240. The engine did not build with clang 21 ✅ **P3**
 
 **Found building #52's fuzz harnesses** with the development machine's default clang, which a system
