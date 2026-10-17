@@ -351,6 +351,9 @@ TEST(SealPolicy, SealsByAgeStopAtTheirLimitAndNothingElseDoes) {
         << "not the oldest three by age, or a store due by rows was held by their limit";
     EXPECT_EQ(ob::Engine::pick_seals(c, now, false, drained).size(), 12u)
         << "the control: without a limit every due store fits the share";
+    EXPECT_EQ(indices(ob::Engine::pick_seals(c, now, false, drained, /*by_age_limit=*/0)),
+              (std::vector<size_t>{10, 11}))
+        << "a credit spent to nothing held a store due by rows";
 
     // Over the budget, every store due by age: memory is what it bounds, whatever paid for what.
     constexpr size_t kEach = 30'000;
@@ -360,6 +363,15 @@ TEST(SealPolicy, SealsByAgeStopAtTheirLimitAndNothingElseDoes) {
     const auto picks = ob::Engine::pick_seals(over, now, false, 0, /*by_age_limit=*/0);
     EXPECT_LE((stores - picks.size()) * kEach, ob::Engine::kUnsealedRowsBudget)
         << "the limit on seals by age left the unsealed rows over the budget";
+
+    // And what the budget took of stores due by age counts against the limit: one taken over the
+    // budget and a limit of two leave room for one more, the oldest.
+    std::vector<ob::Engine::SealCandidate> mixed;
+    for (int i = 0; i < 5; ++i) mixed.push_back(candidate(1, ob::Engine::kSealAge + 10s, now));
+    for (int i = 0; i < 62; ++i) mixed.push_back(candidate(65'000, ob::Engine::kSealAge + 1s, now));
+    EXPECT_EQ(indices(ob::Engine::pick_seals(mixed, now, false, 0, /*by_age_limit=*/2)),
+              (std::vector<size_t>{0, 5}))
+        << "the budget's seals of stores due by age were not counted against the limit";
 }
 
 // ── The engine's wiring ──────────────────────────────────────────────────────
