@@ -2157,6 +2157,45 @@ both should come back empty.
 general trim would make two different files the same secret, and for a secret that is a property
 worth keeping rather than a convenience to remove.
 
+### Permissions
+
+Without more, every identity may run every command. `--auth-acl-file` (`auth-acl-file = ...`) gives
+each identity a role, and if you want, the symbols and exchanges it reaches (#31):
+
+```
+# /etc/orderbook/permissions - no secrets, so others may read it; only its owner may write it
+grafana  role=read
+ingest   role=write  symbols=BTC-*,ETH-*  exchanges=BINANCE
+ops      role=admin
+```
+
+| Role | Runs |
+|------|------|
+| `read` | `SELECT`, `BOOK`, `SUBSCRIBE`, `UNSUBSCRIBE`, `STATUS`, `ROLE`, `MM_PEERS`, `MM_CONFLICTS`, and `PING`, `QUIT`, `COMPRESS`, `AUTH` |
+| `write` | all of `read`, and `INSERT`, `MINSERT`, `FLUSH` |
+| `admin` | everything, and `FAILOVER`, `MIGRATE`, `ADOPT`, `BACKUP`, `SHARD_MAP` and `SHARD_INFO` are its alone |
+
+- **`symbols=` and `exchanges=`** are lists of patterns: a name, or a prefix ending in `*`. A write,
+  `BOOK`, `SELECT` or `SUBSCRIBE` of a symbol outside them is refused. An identity with a list may
+  not run `SHARD_MAP`, `SHARD_INFO`, `MIGRATE` or `ADOPT` whatever its role, since those name or move
+  any symbol. Its `STATUS` leaves out which symbol a migration is moving.
+- **A refusal** is `ERR forbidden: <identity> (<role>) may not run <command>` or `ERR forbidden:
+  <identity> may not <command> '<symbol>'.'<exchange>'`. The session stays open, and the next command
+  of a batch is answered as usual. Each refusal is a `WARN` line and counts in
+  `ob_auth_forbidden_total`. `STATUS` shows an authenticated session's `role:` under its
+  `identity:` - `admin` for every identity when there is no file.
+- **Every identity of the secret file needs a line**, and every line an identity of the secret
+  file. The server refuses to start otherwise, naming the identity, and refuses:
+  - an unknown field, a field given twice, or a line without `role=`;
+  - a role other than the three, an empty pattern, or a `*` that is not the last character;
+  - a permissions file that is not a regular file, that someone other than the server's user or
+    root owns, or that its group or others may write: whoever can write it decides what every
+    identity may do, so it is checked the way sshd checks `authorized_keys`;
+  - `--auth-acl-file` without `--auth-secret-file`;
+  - a `--migration-identity` that is not an admin without lists, since a migration runs `ADOPT` on
+    the other shard.
+- **The file is read at start.** A change takes a restart, as a change of the secret file does.
+
 ### Clients
 
 ```python

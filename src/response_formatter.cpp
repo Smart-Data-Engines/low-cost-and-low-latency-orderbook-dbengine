@@ -399,7 +399,7 @@ std::string format_pong() {
 
 // ── format_status ─────────────────────────────────────────────────────────────
 
-std::string format_status(const ServerStats& stats, std::string_view identity) {
+std::string format_status(const ServerStats& stats, std::string_view identity, std::string_view role) {
     std::string out;
     out += "OK\n";
     out += kStatusHeader;
@@ -558,6 +558,12 @@ std::string format_status(const ServerStats& stats, std::string_view identity) {
     out += "identity: ";
     out += identity.empty() ? std::string_view{"-"} : identity;
     out += '\n';
+    // What it may run (#31), beside who it is; absent where nobody authenticated.
+    if (!role.empty()) {
+        out += "role: ";
+        out += role;
+        out += '\n';
+    }
 
     // Flush integrity
     out += "segment_merge_refused: ";
@@ -582,9 +588,13 @@ std::string format_status(const ServerStats& stats, std::string_view identity) {
         // Migration metrics (when migration is in progress)
         if (stats.migration_in_progress) {
             out += "migration_in_progress: 1\n";
-            out += "migration_symbol: ";
-            out += stats.migration_symbol;
-            out += '\n';
+            // Absent for a session that reaches listed symbols alone (#31): the symbol moving may
+            // be one it does not.
+            if (!stats.migration_symbol.empty()) {
+                out += "migration_symbol: ";
+                out += stats.migration_symbol;
+                out += '\n';
+            }
             out += "migration_target_shard: ";
             out += stats.migration_target_shard;
             out += '\n';

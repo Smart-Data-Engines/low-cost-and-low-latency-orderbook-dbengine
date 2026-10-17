@@ -8,6 +8,7 @@
 #include <openssl/sha.h>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -89,10 +90,11 @@ void check_file_or_throw(const std::string& path) {
 /// A secret beginning with '#' therefore becomes a comment - and the file then has no significant
 /// line left, so it is *refused* rather than silently treated as absent. Refusing is the point;
 /// `openssl rand -hex 32`, which the operations guide prescribes, never produces one.
-std::vector<std::pair<size_t, std::string>> significant_lines(const std::string& path) {
+std::vector<std::pair<size_t, std::string>> significant_lines(const std::string& path,
+                                                             const char* what = "secret file") {
     std::ifstream in(path);
     if (!in) {
-        throw std::runtime_error("secret file '" + path + "' cannot be opened");
+        throw std::runtime_error(std::string(what) + " '" + path + "' cannot be opened");
     }
     std::vector<std::pair<size_t, std::string>> out;
     std::string line;
@@ -259,7 +261,7 @@ SecretStore SecretStore::load_client_file(const std::string& path) {
             throw std::runtime_error("secret file '" + path + "' line " + std::to_string(lineno) +
                                      ": identity '" + identity + "' appears twice");
         }
-        store.credentials_.push_back(Credential{std::move(identity), std::move(secret)});
+        store.credentials_.push_back(Credential{std::move(identity), std::move(secret), Permissions{}});
     }
     return store;
 }
@@ -285,8 +287,171 @@ SecretStore SecretStore::load_cluster_file(const std::string& path) {
     // No identity: a node's identity is its node_id, which arrives in the handshake that
     // authentication precedes. An empty identity is also what goes into the HMAC input on the two
     // cluster surfaces, so the value here is the wire behaviour rather than a placeholder.
-    store.credentials_.push_back(Credential{std::string{}, secret});
+    store.credentials_.push_back(Credential{std::string{}, secret, Permissions{}});
     return store;
+}
+
+// ── Permissions (#31) ─────────────────────────────────────────────────────────
+
+std::string_view role_name(Role role) {
+    switch (role) {
+    case Role::Read:  return "read";
+    case Role::Write: return "write";
+    case Role::Admin: return "admin";
+    }
+    return "admin";
+}
+
+std::optional<Role> role_from_name(std::string_view name) {
+    if (name == "read") return Role::Read;
+    if (name == "write") return Role::Write;
+    if (name == "admin") return Role::Admin;
+    return std::nullopt;
+}
+
+namespace {
+
+/// A name, or a prefix when the pattern ends in `*`.
+bool matches(std::string_view pattern, std::string_view name) {
+    if (!pattern.empty() && pattern.back() == '*') {
+        const std::string_view prefix = pattern.substr(0, pattern.size() - 1);
+        return name.substr(0, prefix.size()) == prefix;
+    }
+    return pattern == name;
+}
+
+bool any_matches(const std::vector<std::string>& patterns, std::string_view name) {
+    if (patterns.empty()) return true;
+    for (const std::string& p : patterns) {
+        if (matches(p, name)) return true;
+    }
+    return false;
+}
+
+/// `A,B*` into its patterns; empty with `why` set when one is empty or has a `*` before its end.
+std::vector<std::string> parse_patterns(std::string_view list, std::string& why) {
+    std::vector<std::string> out;
+    size_t at = 0;
+    while (true) {
+        const size_t comma = list.find(',', at);
+        const std::string_view one = list.substr(at, comma == std::string_view::npos ? std::string_view::npos
+                                                                                      : comma - at);
+        if (one.empty()) {
+            why = "an empty pattern";
+            return {};
+        }
+        const size_t star = one.find('*');
+        if (star != std::string_view::npos && star + 1 != one.size()) {
+            why = "'*' before the end of '" + std::string(one) + "' - a pattern is a name or a prefix ending in '*'";
+            return {};
+        }
+        out.emplace_back(one);
+        if (comma == std::string_view::npos) break;
+        at = comma + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool Permissions::reaches(std::string_view symbol, std::string_view exchange) const {
+    return any_matches(symbols, symbol) && any_matches(exchanges, exchange);
+}
+
+void check_permissions_file(const std::string& path, uid_t server_uid) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        throw std::runtime_error("permissions file '" + path + "' cannot be read: " +
+                                 std::strerror(errno));
+    }
+    // A FIFO would hold the start until something writes to it, and a device is no policy.
+    if (!S_ISREG(st.st_mode)) {
+        throw std::runtime_error("permissions file '" + path + "' is not a regular file");
+    }
+    if (st.st_uid != server_uid && st.st_uid != 0) {
+        throw std::runtime_error("permissions file '" + path + "' is owned by uid " +
+                                 std::to_string(st.st_uid) + ", neither this server's user (uid " +
+                                 std::to_string(server_uid) + ") nor root, and its owner could "
+                                 "give any identity anything");
+    }
+    if ((st.st_mode & 0022) != 0) {
+        char mode[16];
+        std::snprintf(mode, sizeof(mode), "%04o", static_cast<unsigned>(st.st_mode & 07777));
+        throw std::runtime_error("permissions file '" + path + "' is writable beyond its owner (mode " +
+                                 mode + "), and whoever can write it decides what every identity may "
+                                 "do; chmod go-w it");
+    }
+    OB_LOG_DEBUG("auth", "permissions file %s: a regular file of uid %u, mode %04o",
+                 path.c_str(), static_cast<unsigned>(st.st_uid),
+                 static_cast<unsigned>(st.st_mode & 07777));
+}
+
+void SecretStore::apply_acl_file(const std::string& path) {
+    check_permissions_file(path, ::geteuid());
+    const auto lines = significant_lines(path, "permissions file");
+    std::vector<bool> named(credentials_.size(), false);
+    const auto refuse = [&](size_t lineno, const std::string& what) {
+        throw std::runtime_error("permissions file '" + path + "' line " + std::to_string(lineno) +
+                                 ": " + what);
+    };
+    for (const auto& [lineno, line] : lines) {
+        // Tokens split on spaces and tabs: nothing here is a secret, so nothing may hold a space.
+        std::vector<std::string> tokens;
+        size_t at = line.find_first_not_of(" \t");
+        while (at != std::string::npos) {
+            const size_t end = line.find_first_of(" \t", at);
+            tokens.push_back(line.substr(at, end == std::string::npos ? std::string::npos : end - at));
+            at = end == std::string::npos ? std::string::npos : line.find_first_not_of(" \t", end);
+        }
+        if (tokens.empty()) continue;   // spaces alone
+        const std::string& identity = tokens[0];
+        size_t index = credentials_.size();
+        for (size_t i = 0; i < credentials_.size(); ++i) {
+            if (credentials_[i].identity == identity) index = i;
+        }
+        if (index == credentials_.size()) {
+            refuse(lineno, "identity '" + sanitise_for_log(identity) + "' is not in the secret file");
+        }
+        if (named[index]) refuse(lineno, "identity '" + identity + "' appears twice");
+        named[index] = true;
+
+        Permissions perms;
+        bool has_role = false, has_symbols = false, has_exchanges = false;
+        for (size_t t = 1; t < tokens.size(); ++t) {
+            const size_t eq = tokens[t].find('=');
+            const std::string key = tokens[t].substr(0, eq);
+            const std::string value = eq == std::string::npos ? std::string{} : tokens[t].substr(eq + 1);
+            if (eq == std::string::npos) refuse(lineno, "'" + sanitise_for_log(tokens[t]) + "' is not key=value");
+            bool* seen = key == "role" ? &has_role : key == "symbols" ? &has_symbols
+                       : key == "exchanges" ? &has_exchanges : nullptr;
+            if (seen == nullptr) {
+                refuse(lineno, "unknown field '" + sanitise_for_log(key) + "' - the fields are role, symbols and exchanges");
+            }
+            if (*seen) refuse(lineno, "field '" + key + "' appears twice");
+            *seen = true;
+            if (key == "role") {
+                const auto role = role_from_name(value);
+                if (!role.has_value()) {
+                    refuse(lineno, "role '" + sanitise_for_log(value) + "' - a role is read, write or admin");
+                }
+                perms.role = *role;
+            } else {
+                std::string why;
+                std::vector<std::string> patterns = parse_patterns(value, why);
+                if (patterns.empty()) refuse(lineno, "field '" + key + "': " + why);
+                (key == "symbols" ? perms.symbols : perms.exchanges) = std::move(patterns);
+            }
+        }
+        if (!has_role) refuse(lineno, "identity '" + identity + "' has no role= field");
+        credentials_[index].permissions = std::move(perms);
+    }
+    for (size_t i = 0; i < credentials_.size(); ++i) {
+        if (!named[i]) {
+            throw std::runtime_error("permissions file '" + path + "' has no line for identity '" +
+                                     credentials_[i].identity + "': with the file, every identity's "
+                                     "permissions are written down");
+        }
+    }
 }
 
 const Credential* SecretStore::find(std::string_view identity) const {
