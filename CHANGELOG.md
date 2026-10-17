@@ -11,6 +11,18 @@ here as `#N`.
 
 ### Added
 
+- Permissions per identity, opt-in with `--auth-acl-file` (#31). Each identity of the secret file
+  gets a role:
+  - `read` runs the queries;
+  - `write` runs the writes as well;
+  - `admin` runs everything, and alone runs `FAILOVER`, `MIGRATE`, `ADOPT`, `BACKUP`, `SHARD_MAP`
+    and `SHARD_INFO`.
+
+  An identity may also be limited to symbols and exchanges, by name or prefix. A refusal is
+  `ERR forbidden: ...` and keeps the session. Without the file every identity may run every
+  command, as before. `STATUS` of an authenticated session has a `role:` line under `identity:`,
+  `admin` without the file. The file must be a regular file that only its owner, the server's
+  user or root, may write.
 - Rings in shared memory for a client on the node's host (#52, step 2). A session through the Unix
   socket moves with `RINGS`: the answer brings the descriptors of a sealed memfd and two eventfds,
   and from there commands and answers go through two single-producer rings - the same bytes the

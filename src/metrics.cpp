@@ -59,6 +59,10 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_auth_failures_total",
                                      "Failed client authentication attempts. Each one also closed "
                                      "a session, so a rising number means someone is trying."));
+    counters_.push_back(make_counter("ob_auth_forbidden_total",
+                                     "Commands an authenticated identity ran and its permissions "
+                                     "refused (#31): a client using more than it was given, or a "
+                                     "permissions file narrower than the clients it serves."));
     counters_.push_back(make_counter("ob_refused_commands_total",
                                      "Command lines the parser refused: an unknown word, or a known "
                                      "command carrying a token its grammar has no place for. A "

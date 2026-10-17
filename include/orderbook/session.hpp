@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/auth.hpp"
 #include "orderbook/ring.hpp"
 #include "orderbook/tls.hpp"
 
@@ -253,7 +254,12 @@ public:
     /// Who this connection authenticated as. Empty while unauthenticated.
     const std::string& identity() const;
 
-    void set_authenticated(std::string identity);
+    /// What it may run (#31): its credential's permissions, copied without the secret. Admin and
+    /// unrestricted while unauthenticated or without --auth-acl-file, which is what the checks that
+    /// read it are skipped for anyway.
+    const Permissions& permissions() const { return permissions_; }
+
+    void set_authenticated(std::string identity, Permissions permissions = {});
 
     /// The outstanding challenge, or empty when none is outstanding.
     ///
@@ -344,6 +350,7 @@ private:
     // Authentication (#30)
     bool        authenticated_{false};
     std::string identity_;
+    Permissions permissions_;
     std::string pending_nonce_;
     uint32_t    auth_attempts_{0};
 

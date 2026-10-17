@@ -225,6 +225,16 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
         if (!config.auth_secret_file.empty()) {
             out.clients = SecretStore::load_client_file(config.auth_secret_file);
         }
+        if (!config.auth_acl_file.empty()) {
+            // Permissions of identities nobody can authenticate as would be a file that does
+            // nothing, which an operator takes for a policy in force (#31).
+            if (config.auth_secret_file.empty()) {
+                throw std::runtime_error("--auth-acl-file '" + config.auth_acl_file + "' names the "
+                                         "permissions of identities, and there are none without "
+                                         "--auth-secret-file");
+            }
+            out.clients.apply_acl_file(config.auth_acl_file);
+        }
         if (!config.cluster_secret_file.empty()) {
             out.cluster = SecretStore::load_cluster_file(config.cluster_secret_file);
         }
@@ -257,6 +267,20 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
                      config.migration_identity.c_str(),
                      out.client_auth_enabled() ? "" : ", which is not given");
         std::exit(1);
+    }
+    if (!config.migration_identity.empty()) {
+        // ADOPT moves a symbol and runs for admins alone, and names symbols any list leaves out
+        // (#31): an identity that may not run it would fail the first MIGRATE, without moving a row.
+        const Permissions& p = out.clients.find(config.migration_identity)->permissions;
+        if (p.role != Role::Admin || !p.unrestricted()) {
+            std::fprintf(stderr,
+                         "Error: --migration-identity '%s' is %s%s in --auth-acl-file: a shard moving "
+                         "a symbol runs ADOPT on the other shard, which takes an admin reaching every "
+                         "symbol.\n",
+                         config.migration_identity.c_str(), std::string(role_name(p.role)).c_str(),
+                         p.unrestricted() ? "" : " with a list of symbols or exchanges");
+            std::exit(1);
+        }
     }
 
     if (out.client_auth_enabled()) {
@@ -414,12 +438,13 @@ std::string handle_auth(const Command& cmd,
         return format_error("auth_failed");
     }
 
-    session.set_authenticated(cred->identity);
+    session.set_authenticated(cred->identity, cred->permissions);
     if (registry) registry->increment_counter("ob_auth_success_total");
-    OB_LOG_INFO("auth", "conn_id=%llu from %s: authenticated as identity=%s",
+    OB_LOG_INFO("auth", "conn_id=%llu from %s: authenticated as identity=%s, role=%s%s",
                 static_cast<unsigned long long>(session.conn_id()),
                 peer_address(session.fd()).c_str(),
-                cred->identity.c_str());
+                cred->identity.c_str(), std::string(role_name(cred->permissions.role)).c_str(),
+                cred->permissions.unrestricted() ? "" : ", reaching listed symbols and exchanges only");
     return "OK AUTH " + cred->identity + "\n\n";
 }
 
@@ -498,8 +523,123 @@ bool deferrable_write(const Command& cmd, const Session& session,
                       const SecretStore* client_secrets) {
     if (cmd.type != CommandType::INSERT && cmd.type != CommandType::MINSERT) return false;
     // The gate `execute_command()` puts in front of its switch. A write it would refuse is left to
-    // it, so the refusal is its answer and not a second spelling of it.
-    return client_secrets == nullptr || session.authenticated();
+    // it, so the refusal is its answer and not a second spelling of it - the permissions' too
+    // (#31): a write held back here is applied by execute_writes(), which checks nothing.
+    if (client_secrets == nullptr) return true;
+    return session.authenticated() && permission_refusal(cmd, session, nullptr).empty();
+}
+
+namespace {
+
+/// The command's word, for a refusal and a log line.
+const char* command_verb(CommandType t) {
+    switch (t) {
+    case CommandType::SELECT:       return "SELECT";
+    case CommandType::INSERT:       return "INSERT";
+    case CommandType::MINSERT:      return "MINSERT";
+    case CommandType::FLUSH:        return "FLUSH";
+    case CommandType::PING:         return "PING";
+    case CommandType::STATUS:       return "STATUS";
+    case CommandType::ROLE:         return "ROLE";
+    case CommandType::FAILOVER:     return "FAILOVER";
+    case CommandType::QUIT:         return "QUIT";
+    case CommandType::COMPRESS:     return "COMPRESS";
+    case CommandType::SHARD_MAP:    return "SHARD_MAP";
+    case CommandType::SHARD_INFO:   return "SHARD_INFO";
+    case CommandType::MIGRATE:      return "MIGRATE";
+    case CommandType::ADOPT:        return "ADOPT";
+    case CommandType::MM_PEERS:     return "MM_PEERS";
+    case CommandType::MM_CONFLICTS: return "MM_CONFLICTS";
+    case CommandType::SUBSCRIBE:    return "SUBSCRIBE";
+    case CommandType::UNSUBSCRIBE:  return "UNSUBSCRIBE";
+    case CommandType::AUTH:         return "AUTH";
+    case CommandType::BOOK:         return "BOOK";
+    case CommandType::BACKUP:       return "BACKUP";
+    case CommandType::RINGS:        return "RINGS";
+    case CommandType::UNKNOWN:      return "an unknown command";
+    }
+    return "an unknown command";
+}
+
+}  // namespace
+
+bool role_allows(Role role, CommandType t) {
+    switch (t) {
+    // Every role: a session's own state and the queries.
+    case CommandType::SELECT:
+    case CommandType::BOOK:
+    case CommandType::SUBSCRIBE:
+    case CommandType::UNSUBSCRIBE:
+    case CommandType::STATUS:
+    case CommandType::ROLE:
+    case CommandType::MM_PEERS:
+    case CommandType::MM_CONFLICTS:
+    case CommandType::PING:
+    case CommandType::QUIT:
+    case CommandType::COMPRESS:
+    // The session's transport, like COMPRESS: every command it carries through the rings meets
+    // the same check here as through the socket (#52).
+    case CommandType::RINGS:
+    case CommandType::AUTH:
+    case CommandType::UNKNOWN:   // refused anyway, by the parser's own message
+        return true;
+    // Write and Admin: the writes, and the flush that makes them history.
+    case CommandType::INSERT:
+    case CommandType::MINSERT:
+    case CommandType::FLUSH:
+        return role != Role::Read;
+    // Admin alone: what moves a cluster, copies a node or shows how symbols are placed.
+    case CommandType::FAILOVER:
+    case CommandType::MIGRATE:
+    case CommandType::ADOPT:
+    case CommandType::BACKUP:
+    case CommandType::SHARD_MAP:
+    case CommandType::SHARD_INFO:
+        return role == Role::Admin;
+    }
+    return false;
+}
+
+std::string permission_refusal(const Command& cmd, const Session& session, QueryEngine* queries) {
+    const Permissions& p = session.permissions();
+    const std::string& who = session.identity();
+    const char* verb = command_verb(cmd.type);
+    if (!role_allows(p.role, cmd.type)) {
+        return who + " (" + std::string(role_name(p.role)) + ") may not run " + verb;
+    }
+    if (p.unrestricted()) return {};
+    const auto reach = [&](const std::string& symbol, const std::string& exchange) -> std::string {
+        if (p.reaches(symbol, exchange)) return {};
+        return who + " may not " + verb + " '" + symbol + "'.'" + exchange + "'";
+    };
+    switch (cmd.type) {
+    case CommandType::SHARD_MAP:
+    case CommandType::SHARD_INFO:
+    case CommandType::MIGRATE:
+    case CommandType::ADOPT:
+        // These name or move symbols beyond any list: only an identity without lists runs them.
+        return who + " may not run " + verb + ": it reaches some symbols and exchanges, and " + verb +
+               " names any";
+    case CommandType::INSERT:
+        return reach(cmd.insert_args.symbol, cmd.insert_args.exchange);
+    case CommandType::MINSERT:
+        return reach(cmd.minsert_args.symbol, cmd.minsert_args.exchange);
+    case CommandType::BOOK:
+        return reach(cmd.book_args.symbol, cmd.book_args.exchange);
+    case CommandType::SELECT:
+    case CommandType::SUBSCRIBE: {
+        if (queries == nullptr) return {};
+        QueryAST ast;
+        // A query that does not parse runs nothing, and its handler refuses it with the parser's
+        // own message; one that parses names the symbol it reads.
+        if (!queries->parse(cmd.type == CommandType::SELECT ? cmd.raw_sql : cmd.subscribe_sql, ast).empty()) {
+            return {};
+        }
+        return reach(ast.symbol, ast.exchange);
+    }
+    default:
+        return {};
+    }
 }
 
 void execute_writes(std::span<const Command> cmds,
@@ -795,9 +935,14 @@ std::string answer_status(const ServerStats& stats, Engine& engine, const Sessio
         snap.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
     }
 
+    // The symbol a migration moves is not every session's to know (#31).
+    if (!session.permissions().unrestricted()) snap.migration_symbol.clear();
+
     OB_LOG_DEBUG("tcp_server", "STATUS for fd=%d: role=%u replicas=%zu", session.fd(),
                  static_cast<unsigned>(snap.node_role), snap.replicas.size());
-    return format_status(snap, session.identity());
+    return format_status(snap, session.identity(),
+                         session.authenticated() ? role_name(session.permissions().role)
+                                                 : std::string_view{});
 }
 
 }  // namespace
@@ -830,6 +975,19 @@ std::string execute_command(const Command& cmd,
         }
         if (!session.authenticated() && !allowed_before_authentication(cmd.type)) {
             return format_error("unauthenticated");
+        }
+        // What the identity may run (#31). The session stays open: a refusal of a permission is
+        // not a failed authentication, and the next command of a batch is answered as usual.
+        if (session.authenticated()) {
+            if (const std::string refusal = permission_refusal(cmd, session, &engine.query_engine());
+                !refusal.empty()) {
+                if (registry) registry->increment_counter("ob_auth_forbidden_total");
+                OB_LOG_WARN("auth", "conn_id=%llu from %s: forbidden: %s",
+                            static_cast<unsigned long long>(session.conn_id()),
+                            peer_address(session.fd()).c_str(), sanitise_for_log(refusal, 512).c_str());
+                session.increment_commands();
+                return format_error("forbidden: " + refusal);
+            }
         }
     }
 
@@ -1191,6 +1349,7 @@ const std::vector<std::string>& known_flags() {
         "coordinator-endpoints",
         "coordinator-lease-ttl",
         "auth-secret-file",
+        "auth-acl-file",
         "backup-dir",
         "bind",
         "book-huge-pages",
@@ -1286,6 +1445,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
         {"backup-dir", {"<DIR>", "Where BACKUP writes this node's backups, one directory each; not the data or the WAL directory, nor inside either. Without it BACKUP is refused (#34)"}},
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
+        {"auth-acl-file", {"<PATH>", "Each identity's permissions, '<identity> role=read|write|admin [symbols=A,B*] [exchanges=X*]' per line (#31). Empty: every identity is admin and reaches everything"}},
         {"migration-identity", {"<IDENTITY>", "The identity from --auth-secret-file a shard authenticates as on another shard's client port, moving a symbol there"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "
@@ -1799,6 +1959,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.migration_identity = std::string{cursor.value()};
         } else if (arg == "--auth-secret-file") {
             config.auth_secret_file = std::string{cursor.value()};
+        } else if (arg == "--auth-acl-file") {
+            config.auth_acl_file = std::string{cursor.value()};
         } else if (arg == "--cluster-secret-file") {
             config.cluster_secret_file = std::string{cursor.value()};
         } else if (arg == "--compaction") {
@@ -2168,6 +2330,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     // The *path*, and there is no value to print because the secret is never a field of
     // ServerConfig. `--print-config` exists to be pasted into a ticket.
     line("auth-secret-file", c.auth_secret_file.empty() ? "(none)" : c.auth_secret_file);
+    line("auth-acl-file", c.auth_acl_file.empty() ? "(none)" : c.auth_acl_file);
     line("backup-dir", c.backup_dir.empty() ? "(none)" : c.backup_dir);
     line("migration-identity", c.migration_identity.empty() ? "(none)" : c.migration_identity);
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
