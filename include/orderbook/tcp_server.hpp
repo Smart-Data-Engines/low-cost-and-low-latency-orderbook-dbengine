@@ -534,7 +534,6 @@ private:
     LoadedTlsContexts tls_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
-    std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
     int                      listen_fd_{-1};
     /// The Unix socket's listener (#52), -1 without --unix-socket. Closed by the accepting reactor
     /// at a drain's start, like the port's.

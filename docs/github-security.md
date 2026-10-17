@@ -285,6 +285,16 @@ person's attention were both read, and are recorded here rather than left in a w
   should be a roadmap item instead of a comment nobody wrote. The command under "Verify afterwards" prints what is
 actually enforced, which is the only answer worth trusting.
 
+**Since #241 (17 October 2026) no alert is open in our own code.** Fifteen were open on `master` that
+day, every one from the quality suite, and each was fixed in code rather than dismissed. The roadmap
+item has them one by one. Two of them are worth knowing here:
+- **`set_read_only_flag()` is gone.** The engine owns the read-only flag, because the engine is what
+  toggles it, so the raw pointer above no longer exists.
+- **Alert 8 was the exception to the rule about liveness above.** It reported `migration_key()`,
+  which nothing called. Both compilers stayed quiet because it carried `[[maybe_unused]]`, and that
+  attribute asks a compiler not to answer the question. The build is right about liveness only where
+  nothing has told it to look away.
+
 ### 1.1 Two ways this configuration drifted, and the check that now stops it
 
 Both were found by applying this document's checklist to a second repository. That is the useful part
@@ -564,8 +574,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ ruleset: io-uring-build removed with the transport it built — #147; it was added with #108
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
-⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness
-⚙️ decide the query suite: security-and-quality keeps 44 unactioned alerts, see §1
+✅ no CodeQL alert open in our own code: the fifteen open on 17 October 2026 fixed in code, none dismissed — #241, see §1
+⚙️ decide the query suite (security-and-quality or the default), see §1
 ✅ all FetchContent dependencies pinned to commit SHAs
 ✅ third-party actions pinned to commit SHAs
 ✅ organisation defaults for new repositories: scanning, push protection, Dependabot, dep graph

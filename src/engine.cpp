@@ -409,9 +409,7 @@ void Engine::open() {
 
         // Multi-master nodes always accept writes — reset read-only flag
         // that may have been set by FailoverManager's initial election.
-        if (read_only_flag_) {
-            read_only_flag_->store(false, std::memory_order_release);
-        }
+        read_only_.store(false, std::memory_order_release);
 
         // Tell FailoverManager to skip election logic for multi-master nodes.
         if (failover_mgr_) {
@@ -434,8 +432,7 @@ void Engine::open() {
     } else {
         // Non-MM mode: create ReplicationManager if port configured (Requirement 7.4).
         if (repl_config_.port > 0) {
-            repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
-            repl_mgr_->set_engine(this);
+            repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_, this);
             repl_mgr_->start();
         }
 
@@ -2804,8 +2801,7 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
 
     // Start ReplicationManager if not already running.
     if (!repl_mgr_ && repl_config_.port > 0) {
-        repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
-        repl_mgr_->set_engine(this);
+        repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_, this);
         lock.unlock();
         repl_mgr_->start();
         lock.lock();
@@ -2814,9 +2810,7 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     node_role_.store(NodeRole::PRIMARY, std::memory_order_release);
 
     // Toggle dynamic read-only flag: PRIMARY accepts writes.
-    if (read_only_flag_) {
-        read_only_flag_->store(false, std::memory_order_release);
-    }
+    read_only_.store(false, std::memory_order_release);
     // The only place writes open again (#204): last, once this node is primary in every answer.
     writes_closed_.store(false, std::memory_order_relaxed);
 
@@ -2831,9 +2825,7 @@ void Engine::close_writes_locked() {
     node_role_.store(NodeRole::REPLICA, std::memory_order_release);
 
     // Toggle dynamic read-only flag: REPLICA rejects writes.
-    if (read_only_flag_) {
-        read_only_flag_->store(true, std::memory_order_release);
-    }
+    read_only_.store(true, std::memory_order_release);
 
     // Update metrics registry node role and epoch gauge.
     registry_.set_node_role("replica");
@@ -3077,8 +3069,9 @@ NodeRole Engine::node_role() const {
     return node_role_.load(std::memory_order_acquire);
 }
 
-void Engine::set_read_only_flag(std::atomic<bool>* flag) {
-    read_only_flag_ = flag;
+void Engine::set_read_only(bool read_only) {
+    read_only_.store(read_only, std::memory_order_release);
+    OB_LOG_DEBUG("engine", "read-only set to %s", read_only ? "true" : "false");
 }
 
 uint64_t Engine::current_epoch() const {

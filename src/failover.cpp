@@ -1392,7 +1392,7 @@ void FailoverManager::handle_primary_lease_lost() {
     // non-empty address. In the case that matters most it cannot: a revoked or expired lease deletes
     // the key, so there is no address to find, and the demotion never reached the Engine at all.
     // The FailoverManager's own role_ went to REPLICA while the Engine kept node_role_ == PRIMARY,
-    // read_only_flag_ unset, and ROLE answering "PRIMARY <epoch>" — so the node went on accepting
+    // its read-only flag unset, and ROLE answering "PRIMARY <epoch>" — so the node went on accepting
     // writes for as long as it took to stand for election again, and indefinitely if it never did.
     // That is the larger half of #82, and it is pitfall 28 in the very path pitfall 28 is about:
     // when a role moves, every component that answers questions about it has to be told.

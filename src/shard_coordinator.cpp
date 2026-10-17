@@ -24,12 +24,6 @@ static std::string shard_node_key(const std::string& prefix,
     return prefix + "shards/" + shard_id;
 }
 
-[[maybe_unused]]
-static std::string migration_key(const std::string& prefix,
-                                 const std::string& symbol_key) {
-    return prefix + "migrations/" + symbol_key;
-}
-
 // ── ShardCoordinator lifetime ─────────────────────────────────────────────────
 
 ShardCoordinator::ShardCoordinator(ShardCoordinatorConfig config, Engine& engine)

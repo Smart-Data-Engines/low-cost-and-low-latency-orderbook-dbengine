@@ -1131,10 +1131,14 @@ static std::string agg_func_arg(const std::string& expr) {
 }
 
 // Parse a uint32 from a string, returning 0 on failure.
+//
+// Where the conversion stopped is not read, here or in parse_i64(): the parser hands these an
+// integer literal and nothing else (`parse_agg_call()` takes an INT_LIT token, `book_args()` strips
+// the spaces before it), so a conversion either takes all of it or fails.
 static uint32_t parse_u32(const std::string& s) {
     if (s.empty()) return 0;
     uint32_t v = 0;
-    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    const std::errc ec = std::from_chars(s.data(), s.data() + s.size(), v).ec;
     return (ec == std::errc{}) ? v : 0;
 }
 
@@ -1142,7 +1146,7 @@ static uint32_t parse_u32(const std::string& s) {
 static int64_t parse_i64(const std::string& s) {
     if (s.empty()) return 0;
     int64_t v = 0;
-    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    const std::errc ec = std::from_chars(s.data(), s.data() + s.size(), v).ec;
     return (ec == std::errc{}) ? v : 0;
 }
 

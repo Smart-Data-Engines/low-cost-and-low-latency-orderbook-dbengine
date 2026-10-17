@@ -69,6 +69,32 @@ TEST(FailoverRoles, Property10_DemotionDisablesWrites) {
     });
 }
 
+// ── The read-only flag the server reads before every write ───────────────────
+//
+// The engine owns it since #241, because the engine is what sets it at every role change; it used to
+// write through a raw pointer to a member of the server. The server hands it `--read-only` before
+// `open()`, and from then on each promotion clears it and each demotion sets it.
+
+TEST(FailoverRoles, TheReadOnlyFlagFollowsTheStartAndEveryRoleTransition) {
+    TempDir dir;
+    ob::Engine engine(dir.path);
+    EXPECT_FALSE(engine.read_only()) << "an engine nobody configured refuses writes";
+
+    engine.set_read_only(true);   // what the server does with --read-only, before open()
+    engine.open();
+    EXPECT_TRUE(engine.read_only()) << "opening a standalone engine undid the start's --read-only";
+
+    engine.promote_to_primary(ob::EpochValue{3});
+    EXPECT_FALSE(engine.read_only()) << "a promotion left the flag the server reads set";
+
+    engine.demote_to_replica("");
+    EXPECT_TRUE(engine.read_only()) << "a demotion left the flag the server reads clear";
+
+    engine.promote_to_primary(ob::EpochValue{4});
+    EXPECT_FALSE(engine.read_only()) << "a second promotion left the flag set";
+    engine.close();
+}
+
 // ── Property 15: ROLE command format ─────────────────────────────────────────
 
 TEST(FailoverRoles, Property15_RoleCommandFormat_Standalone) {

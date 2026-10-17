@@ -107,6 +107,14 @@ here as `#N`.
 
 ### Fixed
 
+- Code scanning has no open alert in our own code (#241). All fifteen were fixed in code and none
+  was dismissed. The engine owns its read-only flag where it held a raw pointer into the server's
+  storage. The replication manager gets its engine at construction instead of through a setter that
+  had to lock against its own loop. If a port will not bind, the server now stops its metrics endpoint
+  before the engine closes. Before, the engine went first while the endpoint could still read the
+  engine's registry. The rest are an unreachable static function, an always-true comparison with dead
+  code behind it, a hidden declaration, nine unused locals and a `switch` whose longest cases are
+  functions now.
 - The tree builds with clang 21 (#240). It failed on a member nothing read,
   `AntiEntropyManager::registry_`, which is gone, and in googletest's own sources, which the
   warnings-as-errors meant for our code no longer reach. The test that looks for a member written and

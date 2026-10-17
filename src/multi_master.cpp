@@ -1547,41 +1547,27 @@ bool MultiMasterManager::try_drain_send_buf_plain(PeerConnection& peer) {
 
         if (sent == 0) {
             // Neither progress nor an error. A stream socket should not answer a non-empty send()
-            // this way, and before this branch existed the loop simply spun on it — a wedged io
-            // thread with no log line to say why. Treat it as "come back later", which is the
-            // only interpretation that cannot lose the buffer.
+            // this way, so it is logged; before this branch a tail at the end of the loop armed
+            // EPOLLOUT for it and said nothing. Treat it as "come back later", which is the only
+            // interpretation that cannot lose the buffer.
             OB_LOG_WARN("mm", "Peer %u: send() returned 0 for %zu pending bytes — waiting for "
                               "EPOLLOUT", peer.node_id, peer.send_buf.size());
             arm_epollout(peer);
             return true;
         }
 
-        if (sent < 0) {
-            int err = errno;
-            if (err == EAGAIN || err == EWOULDBLOCK) {
-                // Socket buffer full — arm EPOLLOUT and wait.
-                arm_epollout(peer);
-                return true;
-            }
+        // What is left is sent < 0: neither branch above lets this iteration reach here.
+        const int err = errno;
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            // Socket buffer full — arm EPOLLOUT and wait.
+            arm_epollout(peer);
+            return true;
+        }
 
-            if (err == EPIPE || err == ECONNRESET) {
-                // Connection lost — disconnect and schedule reconnect.
-                OB_LOG_WARN("mm", "Peer %u send error: %s — disconnecting",
-                            peer.node_id, std::strerror(err));
-                peer.connected = false;
-                if (peer.fd >= 0) {
-                    release_tls(peer);
-                    ::close(peer.fd);
-                    peer.fd = -1;
-                }
-                peer.send_buf.clear();
-                // Schedule reconnect (will be fully implemented in task 10.1).
-                return false;
-            }
-
-            // Other error — treat as disconnect.
-            OB_LOG_ERROR("mm", "Peer %u send error: %s — disconnecting",
-                         peer.node_id, std::strerror(err));
+        if (err == EPIPE || err == ECONNRESET) {
+            // Connection lost — disconnect; the reconnect loop dials the peer again.
+            OB_LOG_WARN("mm", "Peer %u send error: %s — disconnecting",
+                        peer.node_id, std::strerror(err));
             peer.connected = false;
             if (peer.fd >= 0) {
                 release_tls(peer);
@@ -1592,9 +1578,17 @@ bool MultiMasterManager::try_drain_send_buf_plain(PeerConnection& peer) {
             return false;
         }
 
-        // sent == 0: unusual but possible — treat as EAGAIN.
-        arm_epollout(peer);
-        return true;
+        // Other error — treat as disconnect.
+        OB_LOG_ERROR("mm", "Peer %u send error: %s — disconnecting",
+                     peer.node_id, std::strerror(err));
+        peer.connected = false;
+        if (peer.fd >= 0) {
+            release_tls(peer);
+            ::close(peer.fd);
+            peer.fd = -1;
+        }
+        peer.send_buf.clear();
+        return false;
     }
 
     return true;

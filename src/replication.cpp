@@ -417,9 +417,10 @@ bool SnapshotManifest::from_json(std::string_view json, SnapshotManifest& out) {
 
 // ── ReplicationManager ────────────────────────────────────────────────────────
 
-ReplicationManager::ReplicationManager(ReplicationConfig config, WALWriter& wal)
+ReplicationManager::ReplicationManager(ReplicationConfig config, WALWriter& wal, Engine* engine)
     : config_(std::move(config))
     , wal_(wal)
+    , engine_(engine)
     // No notification: run_loop() already comes back every 100 ms and polls. See
     // poll_snapshot_preparation() in the header for why that is enough here.
     , snapshot_builder_([] {})
@@ -714,9 +715,9 @@ void ReplicationManager::note_io_error(const char* what, const char* detail) {
     // The counter is what an operator can alarm on; the log is loud once and then quiet, because
     // whatever made one pass throw will usually make the next one throw too.
     //
-    // Guarded on the engine because that is the only route this class has to the registry, and
-    // `set_engine()` is called before `start()` at both production sites (#99 measured that). An
-    // engine-less manager exists in tests only, and there the log line is the whole report.
+    // Guarded on the engine because that is the only route this class has to the registry, and both
+    // production sites construct the manager with one. An engine-less manager exists in tests only,
+    // and there the log line is the whole report.
     if (engine_ != nullptr) {
         engine_->registry().increment_counter("ob_repl_io_errors_total");
     }
@@ -1843,7 +1844,7 @@ void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
     const uint64_t token = next_snapshot_token_++;
 
     // The pointer is captured by value rather than read from the member on the worker, so the
-    // worker never touches state this manager can change under it.
+    // worker never touches this manager at all.
     Engine* engine = engine_;
     std::function<void()> gate = snapshot_gate_for_test_;
     if (!snapshot_builder_.start(token, [engine, gate] {
@@ -2309,11 +2310,11 @@ void ReplicationClient::connect_to_primary() {
             throw std::runtime_error("ReplicationClient: cannot require the primary's certificate "
                                      "to cover " + config_.primary_host);
         }
-        std::string why;
-        if (!tls_->blocking_handshake(&why)) {
+        std::string handshake_why;
+        if (!tls_->blocking_handshake(&handshake_why)) {
             close_socket();
             throw std::runtime_error("ReplicationClient: TLS handshake with " +
-                                     config_.primary_host + " failed: " + why);
+                                     config_.primary_host + " failed: " + handshake_why);
         }
         reader_.set_tls(tls_);
         OB_LOG_INFO("repl_client", "TLS established with primary %s:%u, certificate cn=%s",
