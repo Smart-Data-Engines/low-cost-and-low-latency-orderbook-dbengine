@@ -1210,8 +1210,10 @@ Apache-2.0.
 
 **v0.1.0** is the tag on `555ad74`, annotated and unsigned: no key to sign tags exists yet. Its run
 built and attested both architectures' packages, the wheel and the sdist, and published them with
-`SHA256SUMS` as the GitHub release. PYPI_FACTS Checked from what it published rather than from the
-run's log (`evidence/2026-10-12-release-0.1.0/`):
+`SHA256SUMS` as the GitHub release. On 18 October, on the owner's approval of the `pypi`
+environment, the same run published the wheel and the sdist to PyPI (`pip install
+orderbook-dbengine`). Checked from what it published rather than from the run's log
+(`evidence/2026-10-12-release-0.1.0/`):
 - every file against `SHA256SUMS` and its attestation, which names `release.yml` at the tag, the
   commit and a GitHub-hosted runner; a changed copy has none, and the right file is refused under
   another tag;
@@ -1219,7 +1221,13 @@ run's log (`evidence/2026-10-12-release-0.1.0/`):
   (x86-64), each on a host made to look as if the engine had never been there. The unit started as
   `orderbook` on 9090, took writes and gave them back;
 - #215's two-host series on the installed server: a replica joined in 0.48 - 1.03 s, and with the
-  primary killed in the join, none of 101 725 and 197 545 acknowledged writes was missing.
+  primary killed in the join, none of 101 725 and 197 545 acknowledged writes was missing;
+- PyPI's two files from its own APIs (`pypi_check.py`): each has the SHA-256 that `SHA256SUMS`
+  gives it, and a PEP 740 attestation from `release.yml` in the `pypi` environment whose subject
+  is that file. The simple index that pip reads lists both with the same digests;
+- the client installed from PyPI, pinned by its hash, against the installed server on both hosts:
+  Python 3.9 on Amazon Linux 2023 and 3.14 on Ubuntu 26.04. Each wrote one level at a time and in a
+  batch, and read the rows back.
 
 What is left of this item is signed tags: the key, and `required_signatures` with it.
 
