@@ -195,32 +195,19 @@ Engine::~Engine() {
 
 namespace {
 
-/// Put a book composed by price into a live buffer, by the seqlock's writer protocol as
-/// apply_delta() follows it - though nothing reads yet at a start, a writer that skipped it here
-/// would be the one place a later change to who reads first could make a torn read.
+/// Put a book composed by price into a live buffer, through install_book() - whose seqlock protocol is
+/// built on fences, which ThreadSanitizer cannot compile here.
 void install_live_book(SoABuffer& buf, const ColumnarStore::PricedBook& book) {
-    const auto install = [&](SoASide& side, uint8_t which) {
-        const uint64_t ver = side.version.load(std::memory_order_relaxed);
-        side.version.store(ver + 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_release);
-        uint32_t depth = 0;
-        for (const SnapshotRow& r : book.rows) {
-            if (r.side != which || depth >= SoASide::MAX_LEVELS) continue;
-            side.prices[depth]       = r.price;
-            side.quantities[depth]   = r.quantity;
-            side.order_counts[depth] = r.order_count;
-            ++depth;
-        }
-        side.depth = depth;
-        if (which == SIDE_BID) {
-            buf.sequence_number.store(book.as_of->sequence_number, std::memory_order_relaxed);
-            buf.last_timestamp_ns.store(book.as_of->timestamp_ns, std::memory_order_relaxed);
-        }
-        std::atomic_thread_fence(std::memory_order_release);
-        side.version.store(ver + 2, std::memory_order_relaxed);
-    };
-    install(buf.bid, SIDE_BID);
-    install(buf.ask, SIDE_ASK);
+    std::vector<Level> bids, asks;
+    for (const SnapshotRow& r : book.rows) {
+        Level level{};
+        level.price = r.price;
+        level.qty   = r.quantity;
+        level.cnt   = r.order_count;
+        (r.side == SIDE_BID ? bids : asks).push_back(level);
+    }
+    install_book(buf, bids.data(), bids.size(), asks.data(), asks.size(),
+                 book.as_of->sequence_number, book.as_of->timestamp_ns);
 }
 
 }  // namespace

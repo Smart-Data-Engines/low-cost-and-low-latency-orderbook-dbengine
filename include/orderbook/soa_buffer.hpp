@@ -92,6 +92,14 @@ ob_status_t remove_level(SoASide& side, int64_t price);
 ob_status_t apply_delta(SoABuffer& buf, const DeltaUpdate& update,
                         const Level* levels, bool& gap_detected);
 
+/// Replace both sides of `buf` with these levels - `bids` descending, `asks` ascending, each at most
+/// MAX_LEVELS - and its label with (`sequence_number`, `timestamp_ns`), by the seqlock writer protocol
+/// `apply_delta()` follows: what a start's rebuild of a live book from history writes (#235). Here and
+/// not in the engine because the protocol is built on fences, which ThreadSanitizer cannot compile -
+/// this file is the one built without it.
+void install_book(SoABuffer& buf, const Level* bids, size_t n_bids, const Level* asks, size_t n_asks,
+                  uint64_t sequence_number, uint64_t timestamp_ns);
+
 /// The update a snapshot is as of: one update's sequence number and timestamp.
 struct SnapshotLabel {
     uint64_t sequence_number;
