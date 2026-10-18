@@ -269,6 +269,7 @@ and replay it.
 | `ERR auth_no_challenge` | a response arrived with no challenge outstanding |
 | `ERR already_authenticated` | this session has already authenticated |
 | `ERR auth_disabled` | the server is not running with `--auth-secret-file` |
+| `ERR forbidden: ...` | the session's identity may not run that command, or not on that symbol (`--auth-acl-file`, #31); the session stays open |
 
 `AUTH` does not count as the session's first command, so `AUTH` followed by `COMPRESS LZ4` works.
 
@@ -594,6 +595,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--advertise-host` | `<HOST>` | The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1). A name, an IPv4 or an IPv6 address; an IPv6 one is published in brackets, `[::1]:21591` |
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
 | `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
+| `--auth-acl-file` | `<PATH>` | Each identity's permissions, `<identity> role=read\|write\|admin [symbols=A,B*] [exchanges=X*]` per line (#31). A regular file only its owner, the server's user or root, may write. Empty: every identity is admin and reaches every symbol. `docs/operations.md`, "Permissions" |
 | `--backup-dir` | `<DIR>` | Where `BACKUP` writes this node's backups, one directory each: hard links on the data directory's filesystem, a checked copy on another. Not the data or the WAL directory, inside either or holding either - the start is refused. Without it `BACKUP` is refused (#34; `docs/operations.md`, "Backing up and restoring a node") |
 | `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |
 | `--book-huge-pages` | `on\|off` | Whether the books - one a symbol, 48 KB each - are made in 2 MiB regions the kernel is asked to back with transparent huge pages (default: on). It pays at thousands of symbols, where a write to a book otherwise walks the page table; `off` makes each book on the heap, as before #51. `docs/operations.md`, "Huge pages for the books" |

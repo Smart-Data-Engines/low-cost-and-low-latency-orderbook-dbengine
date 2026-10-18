@@ -550,9 +550,44 @@ gives channel binding.
 
 - Effort: L | Impact: **Unblocks production adoption**
 
-### 31. Access control
+### 31. Access control ✅
 - Read-only users, per-symbol and per-exchange ACLs, admin-only commands (`FAILOVER`, `MIGRATE`)
 - Effort: M | Impact: Multi-tenant deployments, compliance conversations
+
+**Done** (spec `smart-data-engine-workspace/specs/access-control/`). Authentication (#30) named every
+client and gave every name every command.
+- **The file.** `--auth-acl-file` gives each identity of the secret file a role and, if wanted, the
+  symbols and exchanges it reaches, as names or prefixes ending in `*`. It is a file of its own
+  because a secret is the rest of its line, spaces and all, so a field written after it could not be
+  told from the secret. The permissions are no secret either, but whoever can write them decides
+  what every identity may do: the file must be regular, its owner's alone to write, and owned by
+  the server's user or root.
+- **The roles:**
+  - `read` runs the queries and the node's state;
+  - `write` the writes and `FLUSH` as well;
+  - `admin` everything, and `FAILOVER`, `MIGRATE`, `ADOPT`, `BACKUP`, `SHARD_MAP` and `SHARD_INFO`
+    are its alone.
+- **The lists.** A write, `BOOK`, `SELECT` or `SUBSCRIBE` of a symbol outside an identity's lists is
+  refused. The commands that name or move any symbol need an identity without lists, whatever its
+  role.
+- **The check stands where authentication's does,** in front of `execute_command()`'s switch. A
+  write the permissions refuse is not held for `execute_writes()`, which checks nothing: the batch
+  path cannot go around it.
+- **Refusals.** A refusal is `ERR forbidden: ...`, names the command or the symbol, and keeps the
+  session. Each is a `WARN` line and counts in `ob_auth_forbidden_total`. With the file, every
+  identity needs a line: each one's permissions are written down, never defaulted. Without the
+  file, every identity is an admin reaching everything, which is every node before this item.
+
+`tests/test_auth.cpp` holds the file: each malformed line refused by name, with no secret in the
+message. `tests/test_auth_gate.cpp` holds the rest:
+- the role table, over the whole enumeration and with no `default:` label;
+- each role taking every command of the one below it;
+- the refusals, with the session kept;
+- the lists in every command that names a symbol.
+
+`tests/integration/test_access_control.py` holds it over the wire, `SUBSCRIBE` and a pipelined batch
+of writes included. Twelve mutants, among them the check left out of the batch path, each killed,
+and a control that survived: the spec's `tasks.md`.
 
 ### 32. Configuration file support ✅
 - `--config <path>`, flat `key = value` with `#` comments, CLI flags overriding file values.
@@ -15517,7 +15552,6 @@ The capability items are in the table below.
 | **P3** | The WAL's budget keeps the device busy with fewer syncs (#242) | M | On a device slower than the writes, at 7 - 10 MB/s, its syncs' journal costs 1 - 2% of the levels a second |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Point-in-time recovery (#34, what is left of it) | M | A restore to a moment between two backups; backup and restore themselves shipped |
-| **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
 ## Known gaps and honest caveats

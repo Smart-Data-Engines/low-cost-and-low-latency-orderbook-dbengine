@@ -83,9 +83,16 @@ exist: `--tls-client` for client sessions, `--tls-replication` for the replicati
 [docs/operations.md](docs/operations.md). Every one of them is **off by default**, and a node with
 none of them carries every query and every row in the clear.
 
-**Not authorisation.** Every authenticated identity may run every command, including `FAILOVER` and
-`MIGRATE`. Per-identity permissions are roadmap item #31, and they will attach to exactly the
-identity name this scheme establishes.
+**Authorisation is per identity, and opt-in** (#31). With `--auth-acl-file` each identity of the
+secret file has a role and, optionally, the symbols and exchanges it reaches:
+- `read` runs the queries;
+- `write` runs the writes as well;
+- `admin` runs everything, `FAILOVER`, `MIGRATE` and `BACKUP` among it.
+
+A refusal is `ERR forbidden: ...` and leaves the session open. **Without the file every identity
+may run every command**, which is how every node before #31 behaved. The server refuses a
+permissions file that anyone but its owner - the server's user or root - may write. See "Permissions" in
+[docs/operations.md](docs/operations.md).
 
 **Not protection against an active man-in-the-middle — that comes from TLS, and only when the name
 is checked as well as the chain.** This is worth understanding rather than glossing, because it is

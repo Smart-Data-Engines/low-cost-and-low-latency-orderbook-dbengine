@@ -1,7 +1,10 @@
 #pragma once
 
+#include <sys/types.h>
+
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,12 +80,47 @@ inline constexpr size_t kMaxIdentityChars = 64;
 
 // ── Credential ────────────────────────────────────────────────────────────────
 
-/// One named credential. The identity is what a human reads in a log line; it carries no
-/// permissions whatsoever - every authenticated identity may run every command. Attaching
-/// permissions to exactly this name is roadmap item #31.
+/// What an identity may run (#31). Each role takes every command of the one before it:
+/// `Read` the queries and the node's own state, `Write` the writes and FLUSH as well, `Admin` the
+/// commands that move a cluster or copy a node - FAILOVER, MIGRATE, ADOPT, BACKUP, SHARD_MAP and
+/// SHARD_INFO. Which command is which is `role_allows()`, beside the command list.
+enum class Role : uint8_t { Read, Write, Admin };
+
+/// "read", "write" or "admin"; and back, nullopt for anything else.
+std::string_view role_name(Role role);
+std::optional<Role> role_from_name(std::string_view name);
+
+/// An identity's permissions (#31), apart from its secret: a session holds these and never the
+/// secret, for the reason `Session` gives.
+///
+/// The symbols and exchanges are patterns, each a name or a prefix ending in `*`. An empty list
+/// reaches every one, and an identity whose lists are both empty is unrestricted. Without
+/// --auth-acl-file every identity is `Admin` and unrestricted, which is what every identity was
+/// before #31.
+struct Permissions {
+    Role role{Role::Admin};
+    std::vector<std::string> symbols;
+    std::vector<std::string> exchanges;
+
+    bool unrestricted() const { return symbols.empty() && exchanges.empty(); }
+
+    /// Whether `symbol` on `exchange` is inside both lists.
+    bool reaches(std::string_view symbol, std::string_view exchange) const;
+};
+
+/// Refuse a permissions file (#31) that is not a regular file, that someone other than
+/// `server_uid` or root owns, or that its group or others may write. Others may read it - it holds
+/// no secret - but whoever can write it decides what every identity may do from the next start,
+/// which is the rule sshd keeps for authorized_keys. Throws std::runtime_error naming the file
+/// and the reason.
+void check_permissions_file(const std::string& path, uid_t server_uid);
+
+/// One named credential. The identity is what a human reads in a log line, and its permissions
+/// are what it may run (#31).
 struct Credential {
     std::string identity;
     std::string secret;
+    Permissions permissions;
 };
 
 // ── SecretStore ───────────────────────────────────────────────────────────────
@@ -104,6 +142,16 @@ public:
 
     /// Load the cluster secret: exactly one non-empty line, the whole line being the secret.
     static SecretStore load_cluster_file(const std::string& path);
+
+    /// Give each identity the permissions --auth-acl-file names for it (#31): one line per
+    /// identity, `<identity> role=read|write|admin [symbols=A,B*] [exchanges=X,Y*]`.
+    ///
+    /// A file of its own rather than fields after the secret, because a secret is the rest of its
+    /// line, spaces and all: a field after it could not be told from the secret's own text. Every
+    /// identity of this store needs a line and every line an identity of this store, so with the
+    /// file each identity's permissions are a decision someone wrote down. Throws
+    /// std::runtime_error naming the file, the line and the field on every refusal.
+    void apply_acl_file(const std::string& path);
 
     /// Look up by identity. nullptr means unknown - and the caller must answer an unknown identity
     /// exactly as it answers a wrong response, so that the wire does not report which names exist.

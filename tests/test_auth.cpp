@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -398,4 +399,145 @@ TEST(AuthSurfaceLabel, EveryEnumeratorHasADistinctNonEmptyLabel) {
     EXPECT_EQ(surface_label(AuthSurface::Client), "client");
     EXPECT_EQ(surface_label(AuthSurface::Replication), "replication");
     EXPECT_EQ(surface_label(AuthSurface::MultiMaster), "mm");
+}
+
+// ── Permissions (#31) ─────────────────────────────────────────────────────────
+
+namespace {
+
+SecretStore three_identities() {
+    const auto path = write_secret_file("acl_secrets",
+                                        "reader 0123456789abcdef0123456789abcdef\n"
+                                        "writer 1123456789abcdef0123456789abcdef\n"
+                                        "boss   2123456789abcdef0123456789abcdef\n");
+    SecretStore store = SecretStore::load_client_file(path);
+    std::filesystem::remove(path);
+    return store;
+}
+
+/// What apply_acl_file() refuses `acl` with, or "" when it takes it.
+std::string acl_refusal(const std::string& acl) {
+    SecretStore store = three_identities();
+    const auto path = write_secret_file("acl_file", acl, 0644);
+    std::string why;
+    try {
+        store.apply_acl_file(path);
+    } catch (const std::runtime_error& e) {
+        why = e.what();
+    }
+    std::filesystem::remove(path);
+    return why;
+}
+
+}  // namespace
+
+TEST(Permissions, WithoutAFileEveryIdentityIsAnUnrestrictedAdmin) {
+    const SecretStore store = three_identities();
+    for (const char* who : {"reader", "writer", "boss"}) {
+        ASSERT_NE(store.find(who), nullptr);
+        EXPECT_EQ(store.find(who)->permissions.role, Role::Admin) << who;
+        EXPECT_TRUE(store.find(who)->permissions.unrestricted()) << who;
+    }
+}
+
+TEST(Permissions, AFileGivesEachIdentityItsRoleAndItsLists) {
+    SecretStore store = three_identities();
+    const auto path = write_secret_file("acl_ok",
+                                        "# who may do what\n"
+                                        "reader role=read\n"
+                                        "writer   role=write symbols=BTC-*,ETH-USD exchanges=BINANCE\n"
+                                        "\n"
+                                        "boss role=admin\n", 0644);
+    store.apply_acl_file(path);
+    std::filesystem::remove(path);
+    EXPECT_EQ(store.find("reader")->permissions.role, Role::Read);
+    EXPECT_TRUE(store.find("reader")->permissions.unrestricted());
+    const Permissions& w = store.find("writer")->permissions;
+    EXPECT_EQ(w.role, Role::Write);
+    EXPECT_EQ(w.symbols, (std::vector<std::string>{"BTC-*", "ETH-USD"}));
+    EXPECT_EQ(w.exchanges, (std::vector<std::string>{"BINANCE"}));
+    EXPECT_EQ(store.find("boss")->permissions.role, Role::Admin);
+    EXPECT_EQ(store.find("boss")->secret, "2123456789abcdef0123456789abcdef") << "the secret is untouched";
+}
+
+TEST(Permissions, EveryMalformedLineIsRefusedByName) {
+    const std::string rest = "writer role=write\nboss role=admin\n";
+    const struct { std::string acl; const char* says; } cases[] = {
+        {"carol role=read\n" + rest, "identity 'carol' is not in the secret file"},
+        {"reader role=read\nreader role=read\n" + rest, "identity 'reader' appears twice"},
+        {"reader role=read colour=red\n" + rest, "unknown field 'colour' - the fields are role, symbols and exchanges"},
+        {"reader role=read role=write\n" + rest, "field 'role' appears twice"},
+        {"reader symbols=BTC\n" + rest, "identity 'reader' has no role= field"},
+        {"reader role=root\n" + rest, "role 'root' - a role is read, write or admin"},
+        {"reader role=read symbols=\n" + rest, "field 'symbols': an empty pattern"},
+        {"reader role=read symbols=BTC,,ETH\n" + rest, "field 'symbols': an empty pattern"},
+        {"reader role=read exchanges=B*N\n" + rest, "'*' before the end of 'B*N'"},
+        {"reader role=read readonly\n" + rest, "'readonly' is not key=value"},
+        {rest, "has no line for identity 'reader'"},
+    };
+    for (const auto& c : cases) {
+        const std::string why = acl_refusal(c.acl);
+        EXPECT_NE(why.find(c.says), std::string::npos) << c.acl << "-> " << why;
+        EXPECT_EQ(why.find("0123456789abcdef"), std::string::npos) << "a refusal named a secret: " << why;
+    }
+    EXPECT_EQ(acl_refusal("reader role=read\n" + rest), "") << "the control: a whole file is taken";
+}
+
+TEST(Permissions, AFileOnlyItsOwnerMayWriteIsTakenAndNoOther) {
+    const uid_t mine = ::geteuid();
+    const auto refusal = [](const std::string& path, uid_t server_uid) -> std::string {
+        try {
+            check_permissions_file(path, server_uid);
+        } catch (const std::runtime_error& e) {
+            return e.what();
+        }
+        return "";
+    };
+    const std::string acl = "reader role=read\nwriter role=write\nboss role=admin\n";
+    const auto path = write_secret_file("acl_file_modes", acl, 0644);
+    EXPECT_EQ(refusal(path, mine), "") << "the control: readable by all, written by its owner alone";
+    for (const mode_t mode : {0664, 0620, 0646, 0666}) {
+        ::chmod(path.c_str(), mode);
+        EXPECT_NE(refusal(path, mine).find("is writable beyond its owner"), std::string::npos)
+            << std::oct << mode;
+    }
+    // apply_acl_file() asks before it reads: a whole, valid file others may write is refused.
+    ::chmod(path.c_str(), 0664);
+    SecretStore store = three_identities();
+    EXPECT_THROW(store.apply_acl_file(path), std::runtime_error);
+    ::chmod(path.c_str(), 0600);
+    EXPECT_EQ(refusal(path, mine), "");
+    if (mine != 0) {
+        // The test cannot give the file away, so it names another user as the server's.
+        EXPECT_NE(refusal(path, mine + 1).find("is owned by uid " + std::to_string(mine)),
+                  std::string::npos);
+    }
+    std::filesystem::remove(path);
+    EXPECT_EQ(refusal("/etc/passwd", mine + 1), "") << "root's file, 0644: taken whoever runs the server";
+    EXPECT_NE(refusal(std::filesystem::temp_directory_path().string(), mine).find("is not a regular file"),
+              std::string::npos);
+    EXPECT_NE(refusal("/nonexistent/ob-permissions", mine).find("cannot be read"), std::string::npos);
+}
+
+TEST(Permissions, APatternIsANameOrAPrefix) {
+    Permissions p;
+    EXPECT_TRUE(p.reaches("ANY", "WHERE")) << "no list reaches everything";
+    p.symbols = {"BTC-*", "ETH-USD"};
+    EXPECT_TRUE(p.reaches("BTC-USD", "X"));
+    EXPECT_TRUE(p.reaches("BTC-", "X")) << "a prefix matches itself";
+    EXPECT_TRUE(p.reaches("ETH-USD", "X"));
+    EXPECT_FALSE(p.reaches("ETH-USDT", "X")) << "a name is not a prefix";
+    EXPECT_FALSE(p.reaches("BTC", "X"));
+    p.exchanges = {"BINANCE"};
+    EXPECT_TRUE(p.reaches("BTC-USD", "BINANCE"));
+    EXPECT_FALSE(p.reaches("BTC-USD", "COINBASE")) << "both lists must reach";
+    EXPECT_FALSE(p.unrestricted());
+}
+
+TEST(Permissions, RolesHaveOneSpellingEach) {
+    for (const Role r : {Role::Read, Role::Write, Role::Admin}) {
+        EXPECT_EQ(role_from_name(role_name(r)), r);
+    }
+    EXPECT_FALSE(role_from_name("Admin").has_value()) << "lower case, as the file is";
+    EXPECT_FALSE(role_from_name("").has_value());
 }

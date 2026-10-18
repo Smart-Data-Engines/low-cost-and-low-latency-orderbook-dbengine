@@ -371,3 +371,76 @@ TEST_F(AuthGateTest, WithAuthenticationOffNotOneCommandChanges) {
     ob::Session fresh(fd_server_);
     EXPECT_EQ(run_open(fresh, "COMPRESS LZ4"), "OK COMPRESS LZ4\n\n");
 }
+
+// ── Permissions (#31) ─────────────────────────────────────────────────────────
+
+TEST(AuthGateStatic, TheRoleTableHasNoDefaultLabel) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    ASSERT_TRUE(in) << "cannot read src/tcp_server.cpp";
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto begin = src.find("bool role_allows(Role role, CommandType t) {");
+    ASSERT_NE(begin, std::string::npos) << "role table not found - did it get renamed?";
+    const auto end = src.find("\n}\n", begin);
+    ASSERT_NE(end, std::string::npos);
+    EXPECT_EQ(src.substr(begin, end - begin).find("default:"), std::string::npos)
+        << "a default label would decide the next command's role by accident";
+}
+
+TEST(AuthGateStatic, EachRoleTakesEveryCommandOfTheOneBelowIt) {
+    size_t read = 0, write = 0, admin = 0;
+    for (int i = 0; i <= static_cast<int>(ob::CommandType::UNKNOWN); ++i) {
+        const auto t = static_cast<ob::CommandType>(i);
+        const bool r = ob::role_allows(ob::Role::Read, t);
+        const bool w = ob::role_allows(ob::Role::Write, t);
+        const bool a = ob::role_allows(ob::Role::Admin, t);
+        EXPECT_TRUE(!r || w) << "write lost a command read has: " << i;
+        EXPECT_TRUE(!w || a) << "admin lost a command write has: " << i;
+        EXPECT_TRUE(a) << "admin may run everything: " << i;
+        read += r;
+        write += w;
+        admin += a;
+    }
+    EXPECT_LT(read, write) << "the writes are write's";
+    EXPECT_LT(write, admin) << "something is admin's alone";
+    EXPECT_FALSE(ob::role_allows(ob::Role::Read, ob::CommandType::INSERT));
+    EXPECT_FALSE(ob::role_allows(ob::Role::Read, ob::CommandType::FLUSH));
+    EXPECT_FALSE(ob::role_allows(ob::Role::Write, ob::CommandType::FAILOVER));
+    EXPECT_FALSE(ob::role_allows(ob::Role::Write, ob::CommandType::BACKUP));
+    EXPECT_FALSE(ob::role_allows(ob::Role::Write, ob::CommandType::SHARD_MAP));
+    // The session's transport is every role's: the commands it carries meet the check as they are.
+    EXPECT_TRUE(ob::role_allows(ob::Role::Read, ob::CommandType::COMPRESS));
+    EXPECT_TRUE(ob::role_allows(ob::Role::Read, ob::CommandType::RINGS));
+}
+
+TEST_F(AuthGateTest, AReaderMayNotWriteAndKeepsItsSession) {
+    ob::Session s(fd_server_);
+    s.set_authenticated("alice", ob::Permissions{ob::Role::Read, {}, {}});
+    EXPECT_EQ(run(s, "INSERT BTCUSD BINANCE bid 50000 10 1"),
+              "ERR forbidden: alice (read) may not run INSERT\n");
+    EXPECT_EQ(run(s, "FLUSH"), "ERR forbidden: alice (read) may not run FLUSH\n");
+    EXPECT_EQ(run(s, "FAILOVER node-2"), "ERR forbidden: alice (read) may not run FAILOVER\n");
+    EXPECT_EQ(run(s, "PING"), "PONG\n") << "a refused permission is not a closed session";
+    EXPECT_FALSE(ob::deferrable_write(ob::parse_command("INSERT BTCUSD BINANCE bid 50000 10 1"), s, &store_))
+        << "a write the permissions refuse is not held for execute_writes(), which checks nothing";
+}
+
+TEST_F(AuthGateTest, AListReachesItsSymbolsInEveryCommandThatNamesOne) {
+    ob::Session s(fd_server_);
+    s.set_authenticated("alice", ob::Permissions{ob::Role::Admin, {"BTC*"}, {}});
+    EXPECT_EQ(run(s, "INSERT BTCUSD BINANCE bid 50000 10 1").rfind("OK", 0), 0u);
+    EXPECT_EQ(run(s, "INSERT ETHUSD BINANCE bid 3000 10 1"),
+              "ERR forbidden: alice may not INSERT 'ETHUSD'.'BINANCE'\n");
+    EXPECT_EQ(run(s, "SELECT * FROM 'ETHUSD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 1"),
+              "ERR forbidden: alice may not SELECT 'ETHUSD'.'BINANCE'\n");
+    EXPECT_EQ(run(s, "BOOK ETHUSD BINANCE"), "ERR forbidden: alice may not BOOK 'ETHUSD'.'BINANCE'\n");
+    EXPECT_EQ(run(s, "SUBSCRIBE * FROM 'ETHUSD'.'BINANCE'"),
+              "ERR forbidden: alice may not SUBSCRIBE 'ETHUSD'.'BINANCE'\n");
+    // An admin with a list: the commands that name or move any symbol are not its.
+    EXPECT_EQ(run(s, "SHARD_MAP").rfind("ERR forbidden: alice may not run SHARD_MAP", 0), 0u);
+    EXPECT_EQ(run(s, "MIGRATE BTCUSD.BINANCE shard-1").rfind("ERR forbidden: alice may not run MIGRATE", 0), 0u);
+    // The control: a query of a symbol it reaches goes to the engine.
+    EXPECT_EQ(run(s, "SELECT * FROM 'BTCUSD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 1").find("forbidden"),
+              std::string::npos);
+    EXPECT_FALSE(ob::deferrable_write(ob::parse_command("INSERT ETHUSD BINANCE bid 3000 10 1"), s, &store_));
+    EXPECT_TRUE(ob::deferrable_write(ob::parse_command("INSERT BTCUSD BINANCE bid 50000 10 1"), s, &store_));
+}
