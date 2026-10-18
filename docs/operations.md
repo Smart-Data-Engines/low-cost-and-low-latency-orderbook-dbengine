@@ -935,7 +935,10 @@ integration test holds the names against what a running node serves.
   bind there and the gauge is 0.
 - `ob_unsealed_rows` — rows drained, readable, and waiting in memory for their store's seal (#165
   part 2a): a store is sealed at 65 536 rows or when its oldest are ten seconds old, and every store
-  together is held under four million rows. These are the rows a crash replays from the WAL, and
+  together is held under four million rows. While admission is in force, so the device is slower
+  than the writes, the rows a tick drained pay for the stores it seals by age: one for each 8 192
+  rows. A store due by age waits for a tick that has paid for it, and each such seal costs the device
+  about 16 kB beyond its rows (#190, step 9). These are the rows a crash replays from the WAL, and
   `ob_seals_total` counts the seals. A value that sits at the budget means seals cannot keep up —
   the flush's write rate, not its interval, is what to look at. At `--log-level DEBUG` each seal
   says what it wrote, and each tick that took rows, at its end, where its time went — two lines of
