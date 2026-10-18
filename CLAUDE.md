@@ -4180,16 +4180,17 @@ Learned the hard way. Check here before debugging.
      history, then ask. Found when `ACatchupThatLosesGroundIsEnded` passed alone and failed after
      another test in the same process.
 
-568. **A book written one way can be read two ways.** The live book (`BOOK`, every aggregate without
-     `GROUP BY`) applies an update by price, and history (`WHERE AT`, the series) keys a row by its
-     position in the update (#233). A test that writes a book and reads only one of them proves one
-     model. Read the live book and `WHERE AT` the same instant, level by level, as
-     `test_example_binance_live.py` does; the writer it holds sends a side's levels best first, then
-     the prices that left it with a quantity of 0.
-569. **What survives a restart is history, not the live book.** A start replays the WAL's tail into
-     the live book and rebuilds nothing from the segments (#235): after a clean stop `BOOK` refuses
-     the symbol, after SIGKILL it holds the tail. A test of the live book that restarts a node is
-     testing that, not recovery.
+568. **A book written one way can be read two ways.** Until #233 closed, the live book (`BOOK`,
+     every aggregate without `GROUP BY`) applied an update by price, and history (`WHERE AT`, the
+     series) keyed a row by its position in the update. Both read by price now, and history starts
+     from a book summary. A test that writes a book and reads only one of them still proves one
+     reader. Read the live book and `WHERE AT` the same instant, level by level, as
+     `test_book_by_price.cpp`'s property and `test_example_binance_live.py` do.
+569. **What survives a restart was history, not the live book.** Until #235 closed, a start replayed
+     the WAL's tail into the live book and rebuilt nothing from the segments: after a clean stop
+     `BOOK` refused the symbol, and after SIGKILL it held the tail. A start rebuilds every live book
+     by price from the store now, from the newest summary. A test of the live book that restarts a
+     node tests that rebuild.
 570. **"Nothing has been flushed" is false on a node with a tick.** The default flush interval is
      100 ms, and the shared cluster runs it, so a control that history holds nothing until the test
      flushes races the tick - and loses where round trips are slowest, under TSan (PR #249's run).

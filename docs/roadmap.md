@@ -2861,6 +2861,26 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 243. A series of the book reads every row of its range **P2**
+
+**Found measuring #233's reading by price** (`evidence/2026-10-18-incremental-books/` in the workspace).
+A series applies every row of its range to a book kept by price, because any row can set a better
+price or remove the best. Read by level, it read the rows of level 0, one an update for a writer of
+whole sides.
+- On the x86 host: an hour of a 100-level bid side, rewritten whole with its removals, and
+  `OPEN`/`HIGH`/`LOW`/`CLOSE`/`TWAP(bid)` by the minute over the last ten minutes, each read after
+  the merges the load started.
+- At 1 M rows: 3.0-3.7 ms, against master's 0.36-0.50 ms.
+- At 3 M rows: 15.6-17.5 ms, against 0.71-1.46 ms - about 30 ns a row of the range, decoded and
+  applied.
+
+**A fix reads one row a change of the best price.** A track of the best bid and ask per segment,
+written at the seal beside the book summaries, would be kept true the same way: a row published
+later at or before a track's time removes the track.
+
+- Effort: M | Impact: a series over a long range costs 7-12 times what it did before #233, for a
+  writer of whole sides; a writer of diffs got a wrong answer before
+
 ### 242. The WAL's budget costs 1 - 2% of the levels a second on a device at 7 - 10 MB/s **P3**
 
 **Found closing #190.** Step 9 of #190 bounds the WAL waiting for a sync.
@@ -3263,7 +3283,7 @@ replica, passes on both: it is the control.
 - Effort: M | Impact: on a network reached over IPv6 alone a node could be reached by nothing and
   could reach no primary or peer
 
-### 235. The live book does not come back with the node: a start rebuilds it from the WAL's tail alone **P1**
+### 235. The live book does not come back with the node: a start rebuilds it from the WAL's tail alone ✅ **P1**
 
 **Found with #233, writing #43's example.** Measured on v0.1.0, on one node:
 - bids `[100, 99]` and asks `[101]`, a `FLUSH`, then bid `[98]`, which only the WAL's tail holds;
@@ -3279,6 +3299,16 @@ not measured yet - a failover or a snapshot bootstrap is whatever was written si
 What a start rebuilds the book from depends on what an update means, which is #233's question. The
 spec `smart-data-engine-workspace/specs/one-book-live-and-in-history/` holds both items. Two strict
 xfails in `test_crash_recovery.py`, one after a clean stop and one after SIGKILL, name this item.
+
+**Closed with #233 (PR #275, 18 October 2026).** A start rebuilds every symbol's live book by price
+from the store, once the recovered records are in it and before anything serves or writes. It starts
+from the newest book summary and the rows after it, so `BOOK` after a start is `WHERE AT` the last
+instant. A snapshot install and a store adopted on disk do the same with the store they bring.
+- Both strict xfails pass.
+- Unit tests cover a clean stop, a crash, and the rule that `BOOK` after a start is the book at the
+  last instant.
+- On the x86 host, 3 M rows: the start took 21 ms, as on master, with the 100 levels master's
+  `BOOK` refused.
 
 - Effort: M | Impact: after any restart the live book, and every aggregate read from it, answers a
   book the market never had until each level is written again
@@ -3313,7 +3343,7 @@ Master is 0.1.1.dev0.
 
 - Effort: S | Impact: a build of master could be taken for the release it followed, by an operator
   and by a package manager
-### 233. The live book and the stored history disagree about which level a write is **P1**
+### 233. The live book and the stored history disagree about which level a write is ✅ **P1**
 
 **Found writing #43's example.** A write is read two ways, and the two disagree about which level each
 of its prices is:
@@ -3343,6 +3373,34 @@ A fix decides what an update means, and the other view follows:
 - **either, said per update**: neither the wire nor the WAL record carries that today.
 
 `test_live_book.py` has both writers as strict xfails naming this item.
+
+**Closed by decision B' (PR #275, 18 October 2026)**: an update is a set of price levels, everywhere.
+Spec `smart-data-engine-workspace/specs/incremental-books/`, the decision in
+`specs/one-book-live-and-in-history/design.md`.
+- **History reads by price.** `WHERE AT`, a `SNAPSHOT` and the series apply every row up to their
+  instant in time order, each setting its price's quantity, a quantity of 0 removing the price -
+  the live book's rule. A row's `level` in an answer is its position in that book. Both strict
+  xfails pass. A property test writes random diffs and side replacements and asks history for the
+  live book after each.
+- **History written by a writer of top levels without removals reads differently.** The prices
+  that dropped out of its updates stay in the book, as they always did in the live one.
+- **A book summary bounds a read**: `book.<time>.v1` beside a symbol's segments, the book by price
+  as of one instant, in codec columns. A read applies only the rows after the newest one before it.
+  A seal writes one every 65 536 rows of a symbol, 32 rows a price for a deeper book. A row
+  published later with a time at or before a summary's removes that summary first. Merges carry
+  summaries; snapshots, backups and migrations do as segment files.
+- **`MREPLACE` sends a side whole.** The node removes every price the side holds and the update
+  does not name, in the same `DELTA` record, removals first: a full side has no room for a new
+  price until they are applied (pitfall 598). There is no new record format.
+  `capabilities: replace_side`; `replace_side()` in both clients and `ob_replace_side()` in the C
+  API.
+- **Measured against master** (`evidence/2026-10-18-incremental-books/`; x86 host, a 100-level
+  side rewritten whole with its removals, each read after the merges):
+  - load the same within 1-5%;
+  - `AT` at the end 0.15-1.07 ms against 1.02-3.68 ms at 3 M rows, and in the middle 1.20-2.15
+    against 1.11-1.79;
+  - summaries 6 kB over 75 MB;
+  - a series 7-12 times master's, because it reads every row of its range: filed as #243.
 
 - Effort: M-L | Impact: an application reading the live book and one reading history disagree about
   the best price, silently, for any writer that does not use the encoding above
@@ -15404,7 +15462,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #233, #235, #242.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #242, #243.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -15543,8 +15601,7 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
-| **P1** | The live book and history agree about which level a write is (#233) | M–L | One write answers two best prices - the live book's and history's - for any writer that does not send removals after its levels |
-| **P1** | The live book comes back with the node (#235) | M | After a stop the book is gone, and after a crash it is the WAL's tail: every live aggregate answers a book the market never had |
+| **P2** | A series of the book reads one row a change of the best price (#243) | M | Since #233 a series applies every row of its range by price: 7-12 times the time it took for a writer of whole sides |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P3** | Signed release tags (#42, what is left of it) | S | v0.1.0 went out unsigned; a signed tag lets a user check it is ours without trusting the host it came from |
