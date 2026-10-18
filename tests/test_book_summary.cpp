@@ -185,20 +185,40 @@ TEST(BookSummaryFile, RefusesWhatIsNotOneAndSaysWhy) {
     ob::BookSummary back;
 
     std::string flipped = good;
-    flipped.back() ^= 1;   // a price's padding: the prices' CRC
+    flipped.back() ^= 1;   // inside the last column: the prices' CRC
     EXPECT_NE(ob::decode_book_summary(flipped, back).find("CRC"), std::string::npos);
     std::string header = good;
     header[20] ^= 1;       // inside as_of_ts: the header's CRC
     EXPECT_NE(ob::decode_book_summary(header, back).find("header fails its CRC"), std::string::npos);
     EXPECT_NE(ob::decode_book_summary(good.substr(0, 10), back).find("shorter than its header"),
               std::string::npos);
-    EXPECT_NE(ob::decode_book_summary(good.substr(0, good.size() - 1), back).find("holds"),
+    EXPECT_NE(ob::decode_book_summary(good.substr(0, good.size() - 1), back).find("CRC"),
               std::string::npos);
     std::string magic = good;
     magic[0] = 'X';
     EXPECT_NE(ob::decode_book_summary(magic, back).find("magic"), std::string::npos);
     // The control: the bytes as written read back.
     EXPECT_EQ(ob::decode_book_summary(good, back), "");
+}
+
+TEST(BookSummaryFile, ABookOfClosePricesFromOneUpdateIsAFewBytesAPrice) {
+    // What the columns are for: 1000 prices a tick apart, all set by one update, cost a few bytes a
+    // price - fixed records cost forty, which made a summary of a deep book larger than the rows
+    // between two of them.
+    ob::BookSummary s;
+    s.header.as_of_ts = kBase;
+    for (int64_t i = 0; i < 1000; ++i) {
+        ob::SnapshotRow r = row(kBase, ob::SIDE_BID, 1'000'000 - i, static_cast<uint64_t>(1 + i % 50), 7);
+        s.rows.push_back(r);
+    }
+    s.header.rows = 1000;
+    const std::string bytes = ob::encode_book_summary(s);
+    EXPECT_LT(bytes.size(), 1000u * 6) << bytes.size() << " bytes for 1000 prices";
+    ob::BookSummary back;
+    ASSERT_EQ(ob::decode_book_summary(bytes, back), "");
+    ASSERT_EQ(back.rows.size(), 1000u);
+    EXPECT_EQ(back.rows[999].price, 1'000'000 - 999);
+    EXPECT_EQ(back.rows[999].quantity, 1u + 999 % 50);
 }
 
 TEST(BookSummaryFile, ItsNameIsOneOfASegmentsFiles) {

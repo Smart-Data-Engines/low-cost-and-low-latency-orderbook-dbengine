@@ -1,9 +1,12 @@
 #include "orderbook/book_summary.hpp"
 
+#include "orderbook/column_codec.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/logger.hpp"
 
+#include <array>
 #include <bit>
+#include <span>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -21,8 +24,11 @@ constexpr uint32_t kVersion = 1;
 
 // magic, version, rows, as_of_ts, as_of_seq, payload CRC, header CRC
 constexpr size_t kHeaderBytes = 8 + 4 + 4 + 8 + 8 + 4 + 4;
-// ts, seq, price, qty, count, side, three bytes of padding
-constexpr size_t kRowBytes = 8 + 8 + 8 + 8 + 4 + 1 + 3;
+
+// The prices are columns, each a column_codec block behind its length, as a segment's are in
+// format 3 - time, sequence, price, quantity, count, side - so a book whose prices are close together
+// and were set by a few updates costs a few bytes a price, where fixed records cost forty.
+constexpr size_t kColumns = 6;
 
 template <typename T>
 void put(std::string& out, T v) {
@@ -66,22 +72,31 @@ std::string parse_header(std::string_view bytes, BookSummaryHeader& out, uint32_
 }  // namespace
 
 std::string encode_book_summary(const BookSummary& summary) {
-    std::string payload;
-    payload.reserve(summary.rows.size() * kRowBytes);
+    const size_t n = summary.rows.size();
+    std::array<std::vector<uint64_t>, kColumns> columns;
+    for (auto& c : columns) c.reserve(n);
     for (const SnapshotRow& r : summary.rows) {
-        put<uint64_t>(payload, r.timestamp_ns);
-        put<uint64_t>(payload, r.sequence_number);
-        put<int64_t>(payload, r.price);
-        put<uint64_t>(payload, r.quantity);
-        put<uint32_t>(payload, r.order_count);
-        put<uint8_t>(payload, r.side);
-        payload.append(3, '\0');
+        columns[0].push_back(r.timestamp_ns);
+        columns[1].push_back(r.sequence_number);
+        columns[2].push_back(static_cast<uint64_t>(r.price));   // reinterpreted, as segments are
+        columns[3].push_back(r.quantity);
+        columns[4].push_back(r.order_count);
+        columns[5].push_back(r.side);
+    }
+    std::string payload;
+    std::string block;
+    const column_codec::EncodeOptions options{};
+    for (const auto& c : columns) {
+        block.clear();
+        column_codec::encode(c, options, block);
+        column_codec::put_varint(payload, block.size());
+        payload += block;
     }
     std::string out;
     out.reserve(kHeaderBytes + payload.size());
     out.append(kMagic, sizeof(kMagic));
     put<uint32_t>(out, kVersion);
-    put<uint32_t>(out, static_cast<uint32_t>(summary.rows.size()));
+    put<uint32_t>(out, static_cast<uint32_t>(n));
     put<uint64_t>(out, summary.header.as_of_ts);
     put<uint64_t>(out, summary.header.as_of_seq);
     put<uint32_t>(out, crc_of(payload.data(), payload.size()));
@@ -93,27 +108,39 @@ std::string encode_book_summary(const BookSummary& summary) {
 std::string decode_book_summary(std::string_view bytes, BookSummary& out) {
     uint32_t payload_crc = 0;
     if (std::string err = parse_header(bytes, out.header, payload_crc); !err.empty()) return err;
-    const size_t payload = bytes.size() - kHeaderBytes;
-    if (payload != static_cast<size_t>(out.header.rows) * kRowBytes) {
-        return "book summary says " + std::to_string(out.header.rows) + " prices and holds " +
-               std::to_string(payload) + " bytes of them";
-    }
-    const char* p = bytes.data() + kHeaderBytes;
-    if (crc_of(p, payload) != payload_crc) return "book summary prices fail their CRC";
-    out.rows.clear();
-    out.rows.reserve(out.header.rows);
-    uint16_t level[2] = {0, 0};
-    for (uint32_t i = 0; i < out.header.rows; ++i, p += kRowBytes) {
-        SnapshotRow r{};
-        r.timestamp_ns    = get<uint64_t>(p);
-        r.sequence_number = get<uint64_t>(p + 8);
-        r.price           = get<int64_t>(p + 16);
-        r.quantity        = get<uint64_t>(p + 24);
-        r.order_count     = get<uint32_t>(p + 32);
-        r.side            = get<uint8_t>(p + 36);
-        if (r.side != SIDE_BID && r.side != SIDE_ASK) {
-            return "book summary price " + std::to_string(i) + " has side " + std::to_string(r.side);
+    const std::span<const char> payload(bytes.data() + kHeaderBytes, bytes.size() - kHeaderBytes);
+    if (crc_of(payload.data(), payload.size()) != payload_crc) return "book summary prices fail their CRC";
+    const size_t n = out.header.rows;
+    std::array<std::vector<uint64_t>, kColumns> columns;
+    size_t at = 0;
+    for (size_t c = 0; c < kColumns; ++c) {
+        uint64_t len = 0;
+        if (!column_codec::get_varint(payload, at, len) || len > payload.size() - at) {
+            return "book summary column " + std::to_string(c) + " is cut short";
         }
+        std::string why;
+        if (!column_codec::decode(payload.subspan(at, len), n, columns[c], &why)) {
+            return "book summary column " + std::to_string(c) + " does not decode: " + why;
+        }
+        at += len;
+    }
+    if (at != payload.size()) {
+        return "book summary holds " + std::to_string(payload.size() - at) + " bytes past its columns";
+    }
+    out.rows.clear();
+    out.rows.reserve(n);
+    uint16_t level[2] = {0, 0};
+    for (size_t i = 0; i < n; ++i) {
+        SnapshotRow r{};
+        r.timestamp_ns    = columns[0][i];
+        r.sequence_number = columns[1][i];
+        r.price           = static_cast<int64_t>(columns[2][i]);
+        r.quantity        = columns[3][i];
+        r.order_count     = static_cast<uint32_t>(columns[4][i]);
+        if (columns[4][i] > UINT32_MAX || (columns[5][i] != SIDE_BID && columns[5][i] != SIDE_ASK)) {
+            return "book summary price " + std::to_string(i) + " has a count or a side no row has";
+        }
+        r.side        = static_cast<uint8_t>(columns[5][i]);
         r.level_index = level[r.side]++;
         out.rows.push_back(r);
     }

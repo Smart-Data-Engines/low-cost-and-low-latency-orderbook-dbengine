@@ -14,8 +14,9 @@
 // - a client's event time (#105), a peer's backlog - makes it false, and the store removes the
 // summaries it falsifies before that row can be read (`ColumnarStore::publish_blocks()`).
 //
-// The file is fixed records behind a header, each part with its CRC32C: a summary that does not read
-// back is no summary, and a reader falls back to composing the rows themselves.
+// The file is a header and the prices as columns, each a `column_codec` block as a segment's columns
+// are, with a CRC32C for the header and one for the columns: a summary that does not read back is no
+// summary, and a reader falls back to composing the rows themselves.
 
 #include "orderbook/data_model.hpp"
 
