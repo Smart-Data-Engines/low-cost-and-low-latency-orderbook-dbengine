@@ -2916,10 +2916,16 @@ ColumnarStore::TimeOrderedCost ColumnarStore::scan_gathered(
     uint64_t held = 0;
     const auto add_run = [&](std::unique_ptr<Run> run) {
         if (run->rows.empty()) return;
-        std::stable_sort(run->rows.begin(), run->rows.end(),
-                         [](const SnapshotRow& a, const SnapshotRow& b) {
-                             return a.timestamp_ns < b.timestamp_ns;
-                         });
+        // A candidate whose rows arrived in time order - every one, unless a client gave event times
+        // out of it - is in order already, and one pass says so: the sort is the stable one, so it
+        // would leave such a run as it is, at n log n comparisons. Measured on a series of the book,
+        // which reads every row of its range by price since #233.
+        const auto by_time = [](const SnapshotRow& a, const SnapshotRow& b) {
+            return a.timestamp_ns < b.timestamp_ns;
+        };
+        if (!std::is_sorted(run->rows.begin(), run->rows.end(), by_time)) {
+            std::stable_sort(run->rows.begin(), run->rows.end(), by_time);
+        }
         cost.kept += run->rows.size();
         held += run->rows.size();
         cost.max_held = std::max(cost.max_held, held);
