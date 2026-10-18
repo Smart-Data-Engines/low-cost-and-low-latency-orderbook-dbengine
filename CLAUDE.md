@@ -4357,6 +4357,18 @@ Learned the hard way. Check here before debugging.
      - So "more bytes a level on the device, so fewer levels a second behind the cap" needs the
        scope's `io.stat` (`wbytes`, the harness's `charged_mb`), not the device's sectors. Read
        that way at 7 MB/s, every round of every build used 99.3-100% of the cap.
+597. **Under `interval` a test that needs no tick while it writes now meets the WAL budget's.**
+     `StartReadsWalOnce.AStartReportsTheTornFilesItsFirstPassSteppedOver` wrote 2.6 MB of WAL in
+     1 MiB files with the flush an hour away, and took it as given that the first file would survive
+     the stop.
+     - Past half the budget a writer asks for a tick. It asks again while that tick's sync runs,
+       because the request flag is cleared when the tick begins.
+     - The first tick seals; once its seal sync in the background is done, a later tick appends the
+       checkpoint and syncs it, and retention may then remove the first file.
+     - Retention is the only path that removes a WAL file here, and with no budget nothing asked for
+       a tick. It failed once, under ASan on CI, and in none of 40 runs on the laptop.
+     - The test writes under `none` now, where the budget asks for nothing. A test that needs a
+       tick not to happen has to rule out whatever can ask for one.
 
 ## Current state and open problems
 
