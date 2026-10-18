@@ -281,6 +281,66 @@ static int run_minsert(const std::string& host, uint16_t port) {
     return 0;
 }
 
+// ── Test: replace_side ───────────────────────────────────────────────────────
+// MREPLACE through the client (#233): it asks for `replace_side`, the side becomes exactly the
+// replacement, and a replacement of no levels empties the side. Read back with BOOK, whose answer
+// has the seven columns `query()` parses.
+
+static int run_replace_side(const std::string& host, uint16_t port) {
+    ob::ClientConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+    apply_auth_from_env(cfg);
+
+    ob::OrderbookClient client(cfg);
+    if (auto conn = client.connect(); !conn) {
+        print_result("replace_side", "fail", "connect failed: " + conn.error_message());
+        return 1;
+    }
+    auto caps = client.capabilities();
+    if (!caps || caps.value().count("replace_side") == 0) {
+        print_result("replace_side", "fail", "the server does not announce replace_side");
+        return 1;
+    }
+
+    const ob::Level held[] = {{100, 1, 1}, {99, 2, 1}, {98, 3, 1}};
+    if (auto mi = client.minsert("CPP-RS", "TEST-EX", ob::Side::BID, held, 3); !mi) {
+        print_result("replace_side", "fail", "minsert failed: " + mi.error_message());
+        return 1;
+    }
+    const ob::Level replacement[] = {{101, 5, 1}, {99, 7, 1}};
+    if (auto rs = client.replace_side("CPP-RS", "TEST-EX", ob::Side::BID, replacement, 2); !rs) {
+        print_result("replace_side", "fail", "replace_side failed: " + rs.error_message());
+        return 1;
+    }
+    auto book = client.query("BOOK CPP-RS TEST-EX");
+    if (!book) {
+        print_result("replace_side", "fail", "BOOK failed: " + book.error_message());
+        return 1;
+    }
+    std::string got;
+    for (const auto& row : book.value().rows) {
+        got += std::to_string(row.price) + ":" + std::to_string(row.quantity) + " ";
+    }
+    if (got != "101:5 99:7 ") {
+        print_result("replace_side", "fail", "the bids are not the replacement: " + got);
+        return 1;
+    }
+
+    if (auto rs = client.replace_side("CPP-RS", "TEST-EX", ob::Side::BID, nullptr, 0); !rs) {
+        print_result("replace_side", "fail", "the empty replacement failed: " + rs.error_message());
+        return 1;
+    }
+    auto empty = client.query("BOOK CPP-RS TEST-EX");
+    if (!empty || !empty.value().rows.empty()) {
+        print_result("replace_side", "fail", "the empty replacement left rows in the book");
+        return 1;
+    }
+
+    print_result("replace_side", "pass", "bids=" + got);
+    return 0;
+}
+
 // ── Test: query_agg ──────────────────────────────────────────────────────────
 // Exercises the aggregate response over a real socket: values, scale factors, and
 // the row API refusing a shape it cannot represent. The unit tests for this parser
@@ -539,7 +599,7 @@ static int run_shard_writer(const std::string& coordinator, const std::string& s
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " --host <host> --port <port>"
-              << " --test <ping|insert_query|minsert|query_agg>\n"
+              << " --test <ping|insert_query|minsert|replace_side|query_agg>\n"
               << "       " << prog << " --test shard_pool --coordinator <URL> --symbols <A,B,...>\n"
               << "       " << prog << " --test shard_writer --coordinator <URL> --symbols <A>"
               << " --until <FILE> --out <FILE>\n";
@@ -583,6 +643,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "ping")         return run_ping(host, port);
     if (test_name == "insert_query") return run_insert_query(host, port);
     if (test_name == "minsert")      return run_minsert(host, port);
+    if (test_name == "replace_side") return run_replace_side(host, port);
     if (test_name == "query_agg")    return run_query_agg(host, port);
     if (test_name == "query_buckets") return run_query_buckets(host, port);
     if (test_name == "query_named")  return run_query_named(host, port);

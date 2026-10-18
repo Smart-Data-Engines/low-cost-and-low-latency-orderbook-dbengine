@@ -87,6 +87,13 @@ def test_cpp_minsert_of_100_levels(binary, cluster):
     assert result["status"] == "pass", result["message"]
 
 
+def test_cpp_replace_side(binary, cluster):
+    # MREPLACE through OrderbookClient::replace_side (#233): the client asks for the capability,
+    # the side becomes exactly the replacement, and an empty one empties it.
+    result = run_cpp_test(binary, cluster.primary().tcp_port, "replace_side")
+    assert result["status"] == "pass", result["message"]
+
+
 def test_cpp_aggregates_with_scales(binary, cluster):
     """Covers query_agg() end to end, including the row API refusing that shape."""
     result = run_cpp_test(binary, cluster.primary().tcp_port, "query_agg")
