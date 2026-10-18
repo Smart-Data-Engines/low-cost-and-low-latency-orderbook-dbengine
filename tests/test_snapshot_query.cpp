@@ -1,9 +1,10 @@
 // #167 and #168: what a SNAPSHOT answers.
 //
-// A SNAPSHOT reconstructs the book at a time: for each (side, level), the row at or before it. It
-// kept the last row a scan delivered, which is the latest only while rows arrive in time order -
-// and they do not when a client gives its own event times (#105) or a mesh peer's backlog is applied
-// after a partition, so a correction for an earlier instant replaced the book it came after (#168).
+// A SNAPSHOT reconstructs the book at a time - by price since #233: every row at or before it applied
+// in time order, each setting its price's quantity. It kept the last row a scan delivered, which is
+// the latest only while rows arrive in time order - and they do not when a client gives its own event
+// times (#105) or a mesh peer's backlog is applied after a partition, so a correction for an earlier
+// instant replaced the book it came after (#168).
 // It answered in the order of a hash map. And over the wire it answered no columns at all: the
 // shape the formatter prints was assigned below its return (#167), which these check through the
 // shape the engine hands back, since that is all the formatter reads.
@@ -84,14 +85,15 @@ struct Fixture {
     }
 };
 
-ob::SnapshotRow level(uint64_t ts, uint8_t side, uint16_t level_index, int64_t price) {
+ob::SnapshotRow level(uint64_t ts, uint8_t side, uint16_t level_index, int64_t price,
+                      uint64_t quantity = 5) {
     ob::SnapshotRow r{};
     r.timestamp_ns    = ts;
     r.sequence_number = 1;
     r.side            = side;
     r.level_index     = level_index;
     r.price           = price;
-    r.quantity        = 5;
+    r.quantity        = quantity;
     r.order_count     = 1;
     return r;
 }
@@ -106,16 +108,22 @@ std::vector<int64_t> prices(const std::vector<ob::QueryResult>& rows) {
     return out;
 }
 
+std::vector<uint64_t> quantities(const std::vector<ob::QueryResult>& rows) {
+    std::vector<uint64_t> out;
+    for (const auto& r : rows) out.push_back(r.quantity);
+    return out;
+}
+
 }  // namespace
 
-TEST(SnapshotQuery, ALevelsLatestRowAtOrBeforeTheTimeIsTheAnswer) {
-    // The shape #168 was measured with: one level written twice in one flush, the later event
+TEST(SnapshotQuery, APricesLatestRowAtOrBeforeTheTimeIsTheAnswer) {
+    // The shape #168 was measured with: one price written twice in one flush, the later event
     // time first. The book at 10 s is the one written at 5 s; the one at 4 s is the correction.
     Fixture f;
-    f.segment({level(kBase + 5 * kSec, kBid, 0, 100), level(kBase + 3 * kSec, kBid, 0, 101)});
-    EXPECT_EQ(prices(f.snapshot(at(kBase + 10 * kSec))), (std::vector<int64_t>{100}))
+    f.segment({level(kBase + 5 * kSec, kBid, 0, 100, 5), level(kBase + 3 * kSec, kBid, 0, 100, 7)});
+    EXPECT_EQ(quantities(f.snapshot(at(kBase + 10 * kSec))), (std::vector<uint64_t>{5}))
         << "the correction for 3 s replaced the book written at 5 s";
-    EXPECT_EQ(prices(f.snapshot(at(kBase + 4 * kSec))), (std::vector<int64_t>{101}));
+    EXPECT_EQ(quantities(f.snapshot(at(kBase + 4 * kSec))), (std::vector<uint64_t>{7}));
     EXPECT_TRUE(f.snapshot(at(kBase + 2 * kSec)).empty());
 }
 
@@ -127,34 +135,34 @@ TEST(SnapshotQuery, ACorrectionInALaterSegmentIsTheAnswerOnlyAtItsOwnTime) {
     // start, which puts the correction first and makes the old rule right by luck. So this pins the
     // answer, not the defect: #168's own test is the one above.
     Fixture f;
-    f.segment({level(kBase + 5 * kSec, kBid, 0, 100)});
-    f.segment({level(kBase + 3 * kSec, kBid, 0, 101)});
-    EXPECT_EQ(prices(f.snapshot(at(kBase + 10 * kSec))), (std::vector<int64_t>{100}));
-    EXPECT_EQ(prices(f.snapshot(at(kBase + 4 * kSec))), (std::vector<int64_t>{101}));
+    f.segment({level(kBase + 5 * kSec, kBid, 0, 100, 5)});
+    f.segment({level(kBase + 3 * kSec, kBid, 0, 100, 7)});
+    EXPECT_EQ(quantities(f.snapshot(at(kBase + 10 * kSec))), (std::vector<uint64_t>{5}));
+    EXPECT_EQ(quantities(f.snapshot(at(kBase + 4 * kSec))), (std::vector<uint64_t>{7}));
 }
 
 TEST(SnapshotQuery, ATieOnTheTimestampKeepsTheLaterWritten) {
-    // What every row got before: the last one delivered. Two writes of one level at one instant
+    // What every row got before: the last one delivered. Two writes of one price at one instant
     // arrive in the order they were written.
     Fixture f;
-    f.segment({level(kBase + 5 * kSec, kBid, 0, 100), level(kBase + 5 * kSec, kBid, 0, 102)});
-    EXPECT_EQ(prices(f.snapshot(at(kBase + 10 * kSec))), (std::vector<int64_t>{102}));
+    f.segment({level(kBase + 5 * kSec, kBid, 0, 100, 5), level(kBase + 5 * kSec, kBid, 0, 100, 9)});
+    EXPECT_EQ(quantities(f.snapshot(at(kBase + 10 * kSec))), (std::vector<uint64_t>{9}));
 }
 
-TEST(SnapshotQuery, TheBookComesBidsFirstThenAsksEachByLevel) {
+TEST(SnapshotQuery, TheBookComesBidsFirstThenAsksEachFromTheBest) {
     // The order BOOK answers in. A hash map made it a property of the hash, and a LIMIT kept
     // whichever levels the hash put first.
     Fixture f;
-    f.segment({level(kBase + 1 * kSec, kAsk, 1, 211), level(kBase + 1 * kSec, kBid, 2, 102),
-               level(kBase + 1 * kSec, kAsk, 0, 210), level(kBase + 1 * kSec, kBid, 0, 100),
+    f.segment({level(kBase + 1 * kSec, kAsk, 1, 211), level(kBase + 1 * kSec, kBid, 2, 100),
+               level(kBase + 1 * kSec, kAsk, 0, 210), level(kBase + 1 * kSec, kBid, 0, 102),
                level(kBase + 1 * kSec, kBid, 1, 101)});
     const auto rows = f.snapshot(at(kBase + 10 * kSec));
-    EXPECT_EQ(prices(rows), (std::vector<int64_t>{100, 101, 102, 210, 211}));
+    EXPECT_EQ(prices(rows), (std::vector<int64_t>{102, 101, 100, 210, 211}));
     ASSERT_EQ(rows.size(), 5u);
     EXPECT_EQ(rows[3].side, kAsk);
     EXPECT_EQ(rows[3].level, 0u);
     EXPECT_EQ(prices(f.snapshot(at(kBase + 10 * kSec) + " LIMIT 2")),
-              (std::vector<int64_t>{100, 101}));
+              (std::vector<int64_t>{102, 101}));
 }
 
 TEST(SnapshotQuery, ASnapshotSaysWhichColumnsItAnswers) {

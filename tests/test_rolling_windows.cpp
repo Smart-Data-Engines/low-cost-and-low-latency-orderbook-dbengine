@@ -275,8 +275,10 @@ TEST(Rolling, NearTheEpochTheWindowReachesNoFurtherThanZero) {
 
 TEST(Rolling, ASeriesWindowIsTheBookThroughTheWholeWindow) {
     Fixture f;
-    // The bid: 100 from the start of minute 0, 110 from minute 1 on, 90 for the last half of minute 2.
+    // The bid: 100 from the start of minute 0, 110 from minute 1 on, 90 for the last half of minute 2
+    // - an update that removes the two bids it replaces, since the book is read by price (#233).
     f.segment({row(kBase, 100, 1, 0), row(kBase, 200, 1, 1), row(kBase + kMin, 110, 1, 0),
+               row(kBase + 2 * kMin + 30 * kSec, 110, 0, 0), row(kBase + 2 * kMin + 30 * kSec, 100, 0, 0),
                row(kBase + 2 * kMin + 30 * kSec, 90, 1, 0)});
     const auto got = f.buckets("SELECT OPEN(bid), HIGH(bid), LOW(bid), CLOSE(bid), TWAP(bid) FROM 'BK'.'EX'" +
                                range(kBase, kBase + 3 * kMin - 1) + " GROUP BY TIME_BUCKET(1m) ROLLING 3m");
@@ -293,6 +295,7 @@ TEST(Rolling, ASeriesWindowIsTheBookThroughTheWholeWindow) {
 TEST(Rolling, ASeriesWindowReachesBeforeTheRangeToo) {
     Fixture f;
     f.segment({row(kBase, 100, 1, 0), row(kBase, 200, 1, 1), row(kBase + kMin, 110, 1, 0),
+               row(kBase + 2 * kMin + 30 * kSec, 110, 0, 0), row(kBase + 2 * kMin + 30 * kSec, 100, 0, 0),
                row(kBase + 2 * kMin + 30 * kSec, 90, 1, 0)});
     // Only minute 2 answered, and its window is the same three minutes as above: the book of the
     // two before the range is read, not cut away as a step-2 bucket's first window is cut at lo.

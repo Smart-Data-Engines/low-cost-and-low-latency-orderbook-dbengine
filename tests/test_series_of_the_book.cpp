@@ -3,10 +3,12 @@
 // (`ColumnarStore::scan_by_time()`) and the book of its best levels just before the range
 // (`latest_per_level()` with the levels wanted).
 //
-// A series is a value of the book `AT` answers - level 0 of each side - at every instant: a step
-// function that changes only at the instants with a row of level 0, once every row of the instant
-// is applied. The oracles here compute it from that definition, from the rows a plain scan delivers
-// and the order it delivers them in, and know nothing of runs, heaps or windows.
+// A series is a value of the book `AT` answers - the best price of each side, the book read by price
+// (#233, decision B') - at every instant: a step function that changes only at the instants with a
+// row, once every row of the instant is applied. The oracles here compute it from that definition,
+// from the rows a plain scan delivers and the order it delivers them in, and know nothing of runs,
+// heaps or windows. Until #233 the definition was level 0 of each side, which is the best price only
+// for a writer whose every update is the whole side.
 
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
@@ -55,6 +57,13 @@ ob::SnapshotRow row(uint64_t ts, uint8_t side, uint16_t level, int64_t price) {
     r.price           = price;
     r.quantity        = static_cast<uint64_t>(price % 7 + 1);
     r.order_count     = 1;
+    return r;
+}
+
+/// A row that removes its price: quantity 0.
+ob::SnapshotRow removal(uint64_t ts, uint8_t side, uint16_t level, int64_t price) {
+    ob::SnapshotRow r = row(ts, side, level, price);
+    r.quantity = 0;
     return r;
 }
 
@@ -156,21 +165,30 @@ struct OracleTop {
     std::optional<int64_t> bid, ask;
 };
 
-/// Level 0 of each side of the book at `t`: the latest row at or before it, a tie to the row
-/// delivered later.
+/// The best price of each side of the book at `t`, by price: every row at or before it applied in
+/// time order - a tie in the order delivered - each setting its price's quantity, a quantity of 0
+/// removing the price; then the highest bid and the lowest ask.
 OracleTop top_at(const std::vector<ob::SnapshotRow>& rows, uint64_t t) {
-    OracleTop top;
-    std::optional<uint64_t> bid_ts, ask_ts;
+    std::vector<ob::SnapshotRow> upto;
     for (const auto& r : rows) {
-        if (r.level_index != 0 || r.timestamp_ns > t) continue;
-        auto& ts = r.side == ob::SIDE_BID ? bid_ts : ask_ts;
-        auto& px = r.side == ob::SIDE_BID ? top.bid : top.ask;
+        if (r.timestamp_ns <= t) upto.push_back(r);
+    }
+    std::stable_sort(upto.begin(), upto.end(), [](const ob::SnapshotRow& a, const ob::SnapshotRow& b) {
+        return a.timestamp_ns < b.timestamp_ns;
+    });
+    std::map<int64_t, uint64_t> bids, asks;
+    for (const auto& r : upto) {
         if (r.side != ob::SIDE_BID && r.side != ob::SIDE_ASK) continue;
-        if (!ts.has_value() || r.timestamp_ns >= *ts) {
-            ts = r.timestamp_ns;
-            px = r.price;
+        auto& book = r.side == ob::SIDE_BID ? bids : asks;
+        if (r.quantity == 0) {
+            book.erase(r.price);
+        } else {
+            book[r.price] = r.quantity;
         }
     }
+    OracleTop top;
+    if (!bids.empty()) top.bid = bids.rbegin()->first;
+    if (!asks.empty()) top.ask = asks.begin()->first;
     return top;
 }
 
@@ -213,11 +231,11 @@ const char* series_name(S s) {
 
 /// One function of one series over the window [ws, we], from the instants the series is in force.
 int64_t oracle_window(Fn fn, S s, const std::vector<ob::SnapshotRow>& rows, uint64_t ws, uint64_t we) {
-    // The instants a value begins in the window: its first, and every one with a row of level 0.
+    // The instants a value begins in the window: its first, and every one with a row.
     std::vector<uint64_t> points{ws};
     for (const auto& r : rows) {
-        if (r.level_index == 0 && (r.side == ob::SIDE_BID || r.side == ob::SIDE_ASK) &&
-            r.timestamp_ns > ws && r.timestamp_ns <= we) {
+        if ((r.side == ob::SIDE_BID || r.side == ob::SIDE_ASK) && r.timestamp_ns > ws &&
+            r.timestamp_ns <= we) {
             points.push_back(r.timestamp_ns);
         }
     }
@@ -579,12 +597,12 @@ TEST(SeriesQuery, AConditionOnPriceSideOrLevelBesideASeriesIsRefused) {
 
 // ── The series ─────────────────────────────────────────────────────────────────
 
-TEST(SeriesQuery, ARowThatLosesItsTieWasNeverInForce) {
-    // Two bids at one instant, the higher delivered first: the book at that instant holds the
-    // later, so the higher was in force at no instant and is not the bucket's HIGH.
+TEST(SeriesQuery, APriceRemovedAtTheInstantItIsSetWasNeverInForce) {
+    // At one instant a bid of 200 is set and removed, and one of 150 set: the book at that instant
+    // holds 100 and 150, so 200 was in force at no instant and is not the bucket's HIGH.
     Fixture f;
     f.segment({row(kBase + 1 * kSec, 0, 0, 100), row(kBase + 2 * kSec, 0, 0, 200),
-               row(kBase + 2 * kSec, 0, 0, 150)});
+               removal(kBase + 2 * kSec, 0, 0, 200), row(kBase + 2 * kSec, 0, 1, 150)});
     const auto got = f.buckets("SELECT OPEN(bid), HIGH(bid), LOW(bid), CLOSE(bid) FROM 'BK'.'EX' "
                                "WHERE timestamp BETWEEN " + std::to_string(kBase) + " AND " +
                                std::to_string(kBase + 9 * kSec) + " GROUP BY TIME_BUCKET(10s)");
@@ -623,7 +641,7 @@ TEST(SeriesQuery, BeforeASidesFirstRowItsSeriesIsNull) {
 TEST(SeriesQuery, TheBookBeforeTheRangeIsItsOpen) {
     Fixture f;
     f.segment({row(kBase + 1 * kSec, 0, 0, 100), row(kBase + 1 * kSec, 0, 1, 99)});
-    f.segment({row(kBase + 15 * kSec, 0, 3, 50)});   // no best level: skipped by the read before
+    f.segment({row(kBase + 15 * kSec, 0, 3, 50)});   // a price below the best: the best stays
     const auto got = f.buckets("SELECT OPEN(bid), TWAP(bid) FROM 'BK'.'EX' WHERE timestamp >= " +
                                std::to_string(kBase + 20 * kSec) + " AND timestamp <= " +
                                std::to_string(kBase + 39 * kSec) + " GROUP BY TIME_BUCKET(10s)");
@@ -690,9 +708,9 @@ TEST(SeriesQuery, TheHeaderCarriesEachColumnsScale) {
     EXPECT_EQ(a.shape.bucket_columns[4].scale, 1);
 }
 
-// Random rows of both sides at level 0 and below it, in segments and blocks, ties on the time,
-// random ranges - open at either end or not - intervals, functions, series and limits: every
-// bucket is what the definition says.
+// Random rows of both sides at level 0 and below it, a quarter of them removals, in segments and
+// blocks, ties on the time, random ranges - open at either end or not - intervals, functions, series
+// and limits: every bucket is what the definition says.
 RC_GTEST_PROP(SeriesProperty, EveryBucketIsTheDefinitions, ()) {
     Fixture f;
     int64_t price = 0;
@@ -700,10 +718,12 @@ RC_GTEST_PROP(SeriesProperty, EveryBucketIsTheDefinitions, ()) {
         std::vector<ob::SnapshotRow> rows;
         for (int i = 0; i < n; ++i) {
             ++price;
-            rows.push_back(row(kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40)) * (kSec / 2),
-                               static_cast<uint8_t>(*rc::gen::inRange(0, 2)),
-                               static_cast<uint16_t>(*rc::gen::inRange(0, 3)),
-                               90 + *rc::gen::inRange<int64_t>(0, 21)));
+            ob::SnapshotRow r = row(kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40)) * (kSec / 2),
+                                    static_cast<uint8_t>(*rc::gen::inRange(0, 2)),
+                                    static_cast<uint16_t>(*rc::gen::inRange(0, 3)),
+                                    90 + *rc::gen::inRange<int64_t>(0, 21));
+            if (*rc::gen::inRange(0, 4) == 0) r.quantity = 0;
+            rows.push_back(r);
         }
         return rows;
     };
