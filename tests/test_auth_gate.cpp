@@ -127,7 +127,7 @@ TEST(AuthGateStatic, ExactlyFourCommandTypesAreAllowedBeforeAuthentication) {
 
 TEST(AuthGateStatic, EverySensitiveCommandRequiresAuthentication) {
     for (auto t : {ob::CommandType::SELECT, ob::CommandType::INSERT, ob::CommandType::MINSERT,
-                   ob::CommandType::FLUSH, ob::CommandType::STATUS, ob::CommandType::ROLE,
+                   ob::CommandType::MREPLACE, ob::CommandType::FLUSH, ob::CommandType::STATUS, ob::CommandType::ROLE,
                    ob::CommandType::FAILOVER, ob::CommandType::COMPRESS,
                    ob::CommandType::SHARD_MAP, ob::CommandType::SHARD_INFO,
                    ob::CommandType::MIGRATE, ob::CommandType::ADOPT, ob::CommandType::MM_PEERS,

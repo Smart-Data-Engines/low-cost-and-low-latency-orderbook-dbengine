@@ -492,6 +492,53 @@ TEST(BatchInsertSession, SessionMinsertOneShot) {
     EXPECT_EQ(cmd.minsert_args.symbol, "AAPL");
 }
 
+// ── A MREPLACE block is framed like a MINSERT (#233) ─────────────────────────
+// Without this the session hands the header and each level line to the parser as commands of
+// their own: the header is refused for its missing lines, and every level line is `unknown`.
+TEST(BatchInsertSession, SessionFramesAMreplaceBlockLikeAMinsert) {
+    const std::string wire =
+        "MREPLACE AAPL NASDAQ ask 2\n"
+        "10050 100 3\n"
+        "10051 200 5\n"
+        "PING\n";
+
+    ob::Session session(-1);
+    std::vector<std::string> all_results;
+    for (size_t i = 0; i < wire.size(); ++i) {
+        for (auto& r : session.feed(wire.data() + i, 1)) all_results.push_back(std::move(r));
+    }
+
+    ASSERT_EQ(all_results.size(), 2u) << "the block was not framed as one element";
+    const auto cmd = ob::parse_minsert(all_results[0]);
+    ASSERT_EQ(cmd.type, ob::CommandType::MREPLACE) << cmd.error;
+    EXPECT_EQ(cmd.minsert_args.n_levels, 2u);
+    EXPECT_EQ(cmd.minsert_args.side, 1u);
+    EXPECT_EQ(all_results[1], "PING");
+}
+
+// ── A MREPLACE of no levels is one line, and the line after it is a command ───
+TEST(BatchInsertSession, SessionPassesAMreplaceOfNoLevelsThroughAsOneLine) {
+    const std::string wire = "mreplace AAPL NASDAQ bid 0\nPING\n";
+    ob::Session session(-1);
+    const auto results = session.feed(wire.data(), wire.size());
+    ASSERT_EQ(results.size(), 2u) << "the line after an empty replacement was taken as its level";
+    EXPECT_EQ(results[0], "mreplace AAPL NASDAQ bid 0");
+    EXPECT_EQ(results[1], "PING");
+    const auto cmd = ob::parse_command(results[0]);
+    ASSERT_EQ(cmd.type, ob::CommandType::MREPLACE) << cmd.error;
+    EXPECT_EQ(cmd.minsert_args.n_levels, 0u);
+    EXPECT_TRUE(cmd.minsert_args.levels.empty());
+}
+
+// ── A word that only starts like a block keyword is a line of its own ────────
+TEST(BatchInsertSession, SessionDoesNotFrameAWordThatOnlyStartsWithTheKeyword) {
+    const std::string wire = "MREPLACEX AAPL NASDAQ bid 2\nPING\n";
+    ob::Session session(-1);
+    const auto results = session.feed(wire.data(), wire.size());
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results[1], "PING");
+}
+
 // ── SessionMinsertByteByByte: MINSERT fed byte by byte → 1 element ──────────
 TEST(BatchInsertSession, SessionMinsertByteByByte) {
     std::string wire =

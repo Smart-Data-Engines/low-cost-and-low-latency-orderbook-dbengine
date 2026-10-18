@@ -88,6 +88,8 @@ constexpr Canonical kCanonical[] = {
     {"BACKUP STATUS",                           CommandType::BACKUP},
     {"RINGS",                                   CommandType::RINGS},
     {"RINGS 1048576",                           CommandType::RINGS},   // the optional size
+    {"MREPLACE AAA EX bid 2\n100\t5\t1\n101\t6\t1\n",  CommandType::MREPLACE},
+    {"MREPLACE AAA EX ask 0",                   CommandType::MREPLACE},   // empties the side
 };
 
 } // namespace
@@ -558,4 +560,103 @@ TEST(CommandArity, AMmConflictsLimitThatIsNotANumberIsRefusedRatherThanDefaulted
     const Command bare = parse_command("MM_CONFLICTS");
     ASSERT_EQ(bare.type, CommandType::MM_CONFLICTS);
     EXPECT_EQ(bare.mm_conflicts_limit, 100u) << "the default is still the default when nobody asked";
+}
+
+// ── MREPLACE (#233, the incremental books) ────────────────────────────────────
+//
+// MINSERT's block with another meaning: the parser reads it field for field the same way, so these
+// tests compare the two rather than restating every refusal, and add what only MREPLACE has - a
+// block of no levels, which is one line.
+
+TEST(Mreplace, ReadsTheBlockExactlyAsMinsertReadsIt) {
+    const std::string body = " AAA EX ask 3 1700000000000000000\n100\t5\t1\n101\t6\n102\t7\t4\n";
+    const Command minsert = parse_like_a_transport("MINSERT" + body);
+    const Command replace = parse_like_a_transport("MREPLACE" + body);
+    ASSERT_EQ(minsert.type, CommandType::MINSERT) << minsert.error;
+    ASSERT_EQ(replace.type, CommandType::MREPLACE) << replace.error;
+    const MinsertArgs& a = minsert.minsert_args;
+    const MinsertArgs& b = replace.minsert_args;
+    EXPECT_EQ(a.symbol, b.symbol);
+    EXPECT_EQ(a.exchange, b.exchange);
+    EXPECT_EQ(a.side, b.side);
+    EXPECT_EQ(a.n_levels, b.n_levels);
+    EXPECT_EQ(a.timestamp_ns, b.timestamp_ns);
+    ASSERT_EQ(a.levels.size(), b.levels.size());
+    for (size_t i = 0; i < a.levels.size(); ++i) {
+        EXPECT_EQ(a.levels[i].price, b.levels[i].price) << "level " << i;
+        EXPECT_EQ(a.levels[i].qty, b.levels[i].qty) << "level " << i;
+        EXPECT_EQ(a.levels[i].count, b.levels[i].count) << "level " << i;
+    }
+}
+
+TEST(Mreplace, NoLevelsIsOneLineThatEmptiesTheSideAndMinsertStillRefusesIt) {
+    const Command empty = parse_like_a_transport("MREPLACE AAA EX bid 0 1700000000000000000");
+    ASSERT_EQ(empty.type, CommandType::MREPLACE) << empty.error;
+    EXPECT_EQ(empty.minsert_args.n_levels, 0u);
+    EXPECT_TRUE(empty.minsert_args.levels.empty());
+    ASSERT_TRUE(empty.minsert_args.timestamp_ns.has_value());
+    EXPECT_EQ(*empty.minsert_args.timestamp_ns, 1700000000000000000ull);
+
+    // A MINSERT of no levels changes nothing, and is refused - now by name rather than as
+    // `unknown command` about a command the server has (#222).
+    const Command nothing = parse_like_a_transport("MINSERT AAA EX bid 0");
+    EXPECT_EQ(nothing.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(nothing.error, "MINSERT number of levels is not 1 to 1000: '0'"))
+        << nothing.error;
+    EXPECT_TRUE(mentions(nothing.error, usage_of("MINSERT"))) << nothing.error;
+}
+
+TEST(Mreplace, ALevelCountItCannotReadIsRefusedByName) {
+    std::string over = "MREPLACE AAA EX bid 1001\n";
+    for (int i = 0; i < 1001; ++i) over += std::to_string(100 + i) + "\t1\n";
+    const Command too_many = parse_like_a_transport(over);
+    EXPECT_EQ(too_many.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(too_many.error, "MREPLACE number of levels is not 0 to 1000: '1001'"))
+        << too_many.error;
+    EXPECT_TRUE(mentions(too_many.error, usage_of("MREPLACE"))) << too_many.error;
+
+    const Command word = parse_like_a_transport("MREPLACE AAA EX bid many\n100\t5\n");
+    EXPECT_EQ(word.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(word.error, "'many'")) << word.error;
+
+    // The control: the ceiling itself is accepted.
+    std::string at = "MREPLACE AAA EX bid 1000\n";
+    for (int i = 0; i < 1000; ++i) at += std::to_string(100 + i) + "\t1\n";
+    const Command ceiling = parse_like_a_transport(at);
+    EXPECT_EQ(ceiling.type, CommandType::MREPLACE) << ceiling.error;
+}
+
+TEST(Mreplace, LevelLinesThatNeverCameAreRefusedByName) {
+    // What a compressed frame can carry: a header announcing lines it does not have.
+    const Command short_block = parse_like_a_transport("MREPLACE AAA EX bid 3\n100\t5\n");
+    EXPECT_EQ(short_block.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(short_block.error, "MREPLACE announced 3 level line(s) and carried 1"))
+        << short_block.error;
+    const Command header_only = parse_like_a_transport("MREPLACE AAA EX bid 2");
+    EXPECT_TRUE(mentions(header_only.error, "MREPLACE announced 2 level line(s) and carried 0"))
+        << header_only.error;
+}
+
+TEST(Mreplace, ItsFieldRefusalsNameItRatherThanMinsert) {
+    expect_field_refused(parse_like_a_transport("MREPLACE AAA EX buy 1\n100\t5\n"),
+                         "MREPLACE side", "buy", usage_of("MREPLACE"));
+    const Command price = parse_like_a_transport("MREPLACE AAA EX bid 1\n100.5\t5\n");
+    expect_field_refused(price, "price on level line 1", "100.5", kLevelLineTakes);
+    const Command time = parse_like_a_transport("MREPLACE AAA EX bid 0 0");
+    EXPECT_EQ(time.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(time.error, "event time 0")) << time.error;
+}
+
+TEST(Mreplace, FormatsBackToTheLineItWasReadFrom) {
+    const Command block = parse_like_a_transport("MREPLACE AAA EX ask 2 17\n100\t5\t1\n101\t6\t2\n");
+    ASSERT_EQ(block.type, CommandType::MREPLACE) << block.error;
+    EXPECT_EQ(format_command(block), "MREPLACE AAA EX ask 2 17\n100 5 1\n101 6 2\n");
+    const Command again = parse_like_a_transport(format_command(block));
+    EXPECT_EQ(again.type, CommandType::MREPLACE) << again.error;
+
+    const Command empty = parse_like_a_transport("MREPLACE AAA EX bid 0");
+    ASSERT_EQ(empty.type, CommandType::MREPLACE) << empty.error;
+    EXPECT_EQ(format_command(empty), "MREPLACE AAA EX bid 0\n");
+    const Command empty_again = parse_like_a_transport(format_command(empty));
+    EXPECT_EQ(empty_again.type, CommandType::MREPLACE) << empty_again.error;
 }

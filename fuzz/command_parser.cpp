@@ -34,7 +34,8 @@ bool same_meaning(const ob::Command& a, const ob::Command& b) {
             && x.price == y.price && x.qty == y.qty && x.count == y.count
             && x.timestamp_ns == y.timestamp_ns;
     }
-    case ob::CommandType::MINSERT: {
+    case ob::CommandType::MINSERT:
+    case ob::CommandType::MREPLACE: {
         const auto& x = a.minsert_args;
         const auto& y = b.minsert_args;
         if (!(x.symbol == y.symbol && x.exchange == y.exchange && x.side == y.side
@@ -105,11 +106,12 @@ void check_round_trip(const ob::Command& command, bool complete_batch) {
     OB_LOG_DEBUG("fuzz", "Command round trip: type=%d batch=%d",
                  static_cast<int>(command.type), complete_batch);
     if (command.type == ob::CommandType::UNKNOWN) return;
-    // parse_command accepts a MINSERT header before the session has read its payload.
-    if (command.type == ob::CommandType::MINSERT && !complete_batch) return;
+    // A block - MINSERT, or MREPLACE (#233) - is checked where it was read as one.
+    const bool block = command.type == ob::CommandType::MINSERT ||
+                       command.type == ob::CommandType::MREPLACE;
+    if (block && !complete_batch) return;
     const std::string canonical = ob::format_command(command);
-    const ob::Command reparsed = command.type == ob::CommandType::MINSERT
-        ? ob::parse_minsert(canonical) : ob::parse_command(canonical);
+    const ob::Command reparsed = block ? ob::parse_minsert(canonical) : ob::parse_command(canonical);
     ob::fuzz::require(reparsed.type == command.type, "formatting changed the command type");
     ob::fuzz::require(same_meaning(command, reparsed), "formatting changed what the command means");
     // Kept alongside the structural check rather than replaced by it: this one also fails for a

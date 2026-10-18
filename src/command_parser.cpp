@@ -126,6 +126,10 @@ static constexpr CommandGrammar kGrammar[] = {
      "BOOK <symbol> <exchange> [depth]", true},
     {CommandType::BACKUP,       "BACKUP",       2, "BACKUP, or BACKUP STATUS", true},
     {CommandType::RINGS,        "RINGS",        2, "RINGS [bytes]", true},
+    {CommandType::MREPLACE,     "MREPLACE",     6,
+     "MREPLACE <symbol> <exchange> <bid|ask> <n_levels> [event_time_ns], then one "
+     "<price> <qty> [count] line per level; the side becomes exactly these levels, and 0 levels "
+     "empties it", true},
 };
 
 static_assert(std::size(kGrammar) == static_cast<size_t>(CommandType::UNKNOWN),
@@ -367,6 +371,11 @@ Command parse_command(std::string_view line) {
         cmd.insert_args = std::move(args);
         return cmd;
     }
+
+    // A block keyword on a line of its own: a `MREPLACE` of no levels, which is one line because
+    // there is nothing to frame (#233), or a block whose level lines never came. One parser for
+    // both shapes, so the line is answered as the command it names rather than as `unknown`.
+    if (iequals(first, "MINSERT") || iequals(first, "MREPLACE")) return parse_minsert(trimmed);
 
     if (iequals(first, "FLUSH"))  { cmd.type = CommandType::FLUSH;  return cmd; }
     if (iequals(first, "PING"))   { cmd.type = CommandType::PING;   return cmd; }
@@ -648,18 +657,29 @@ Command parse_minsert(std::string_view block) {
 
     // ── Parse header ──────────────────────────────────────────────────────
     // The keyword before the length: a block of something else is unknown, not a short MINSERT.
+    // `MREPLACE` is the same block with another meaning (#233) - the side becomes exactly its
+    // levels - so it is read here, field for field, and may carry no levels at all.
     auto header_tokens = tokenize(lines[0]);
-    if (header_tokens.empty() || !iequals(header_tokens[0], "MINSERT")) return cmd;
+    if (header_tokens.empty()) return cmd;
+    CommandType kind = CommandType::UNKNOWN;
+    if (iequals(header_tokens[0], "MINSERT")) {
+        kind = CommandType::MINSERT;
+    } else if (iequals(header_tokens[0], "MREPLACE")) {
+        kind = CommandType::MREPLACE;
+    } else {
+        return cmd;
+    }
+    const CommandGrammar& g = grammar_of(kind);
     if (header_tokens.size() < 5) {
-        return refuse_with_usage(cmd, CommandType::MINSERT,
-                            "MINSERT needs a symbol, an exchange, a side and a number of levels");
+        return refuse_with_usage(cmd, kind,
+                                 std::string(g.keyword) +
+                                     " needs a symbol, an exchange, a side and a number of levels");
     }
 
     // The header's arity comes from the same table as every single-line command, because the field
     // #105 will add is a header field - and a batch that carried it to a server too old to know it
     // would otherwise be accepted with the time discarded, which is the defect #105 is about, one
     // layer out (#107).
-    const CommandGrammar& g = grammar_of(CommandType::MINSERT);
     if (g.max_tokens && header_tokens.size() > *g.max_tokens) {
         return refuse(cmd, extra_token_message(g, header_tokens[*g.max_tokens]));
     }
@@ -668,26 +688,40 @@ Command parse_minsert(std::string_view block) {
     args.symbol   = std::string(header_tokens[1]);
     args.exchange = std::string(header_tokens[2]);
 
-    if (!read_side(cmd, header_tokens[3], args.side, CommandType::MINSERT)) return cmd;
+    if (!read_side(cmd, header_tokens[3], args.side, kind)) return cmd;
 
-    // n_levels
+    // n_levels: at least one for a MINSERT, which without levels changes nothing; none allowed for
+    // a MREPLACE, which then empties the side. Refused by name rather than as `unknown command`,
+    // which is what a count of 0 or 1001 used to be answered with - #222's silence, one field it
+    // had not reached.
     {
+        const uint16_t least = kind == CommandType::MREPLACE ? 0 : 1;
         uint16_t nl_val = 0;
         auto sv = header_tokens[4];
         auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), nl_val);
-        if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
-        if (nl_val == 0 || nl_val > MAX_LEVELS) return cmd;
+        if (ec != std::errc{} || ptr != sv.data() + sv.size() || nl_val < least ||
+            nl_val > MAX_LEVELS) {
+            return refuse_with_usage(cmd, kind,
+                                     std::string(g.keyword) + " number of levels is not " +
+                                         std::to_string(least) + " to " +
+                                         std::to_string(MAX_LEVELS) + ": '" + std::string(sv) +
+                                         "'");
+        }
         args.n_levels = nl_val;
     }
 
     // optional event time for the whole batch (#105)
     if (header_tokens.size() >= 6 &&
-        !read_event_time(cmd, header_tokens[5], "MINSERT", args.timestamp_ns)) {
+        !read_event_time(cmd, header_tokens[5], g.keyword, args.timestamp_ns)) {
         return cmd;
     }
 
     // ── Parse payload lines ───────────────────────────────────────────────
-    if (lines.size() < static_cast<size_t>(1 + args.n_levels)) return cmd;
+    if (lines.size() < static_cast<size_t>(1 + args.n_levels)) {
+        return refuse(cmd, std::string(g.keyword) + " announced " +
+                               std::to_string(args.n_levels) + " level line(s) and carried " +
+                               std::to_string(lines.size() - 1));
+    }
 
     args.levels.reserve(args.n_levels);
     // One buffer for every level line, not one per line — see tokenize_into().
@@ -712,18 +746,19 @@ Command parse_minsert(std::string_view block) {
 
         MinsertArgs::Level lvl{0, 0, 1};
         const size_t line = static_cast<size_t>(i) + 1;
-        if (!read_write_field(cmd, toks[0], lvl.price, CommandType::MINSERT, "price", line,
-                              kPriceUnit) ||
-            !read_write_field(cmd, toks[1], lvl.qty, CommandType::MINSERT, "quantity", line) ||
+        if (!read_write_field(cmd, toks[0], lvl.price, kind, "price", line, kPriceUnit) ||
+            !read_write_field(cmd, toks[1], lvl.qty, kind, "quantity", line) ||
             (toks.size() >= 3 &&
-             !read_write_field(cmd, toks[2], lvl.count, CommandType::MINSERT, "count", line))) {
+             !read_write_field(cmd, toks[2], lvl.count, kind, "count", line))) {
             return cmd;
         }
 
         args.levels.push_back(lvl);
     }
 
-    cmd.type = CommandType::MINSERT;
+    // No DEBUG line for an accepted block: this is the ingest path, and the engine logs what a
+    // replacement removed where it knows it.
+    cmd.type = kind;
     cmd.minsert_args = std::move(args);
     return cmd;
 }
@@ -760,9 +795,10 @@ std::string format_command(const Command& cmd) {
         return out;
     }
 
-    case CommandType::MINSERT: {
+    case CommandType::MINSERT:
+    case CommandType::MREPLACE: {
         const auto& a = cmd.minsert_args;
-        std::string out = "MINSERT ";
+        std::string out = cmd.type == CommandType::MREPLACE ? "MREPLACE " : "MINSERT ";
         out += a.symbol;
         out += ' ';
         out += a.exchange;
