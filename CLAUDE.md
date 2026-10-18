@@ -4334,6 +4334,24 @@ Learned the hard way. Check here before debugging.
      budget's wait and its request for a tick - and exercised the queue's ceiling not at all. One of
      them noticed only because it counted the queue's waits. They run under `none` now, where the
      budget does not bind; a test of a limit has to say which limit it reaches.
+595. **Levels a second over a round of fixed size credit the build that leaves more of what it
+     acknowledged unwritten when the round ends.** Under `interval` an acknowledged write is in the
+     WAL's page cache, and the round's clock stops at the last acknowledgement. At 7 MB/s master's
+     12 M-level rounds ended with 12-27 MB not yet through the cap, and the WAL budget's with 9-13
+     MB. That is 2 s of a 64 s round, and it read as the budget costing 4% of the throughput. Master's
+     own two rounds that left 12 MB took as many levels a second as the budget's. Compare builds
+     whose unsynced backlog differs over rounds long enough for the tail not to count, or record the
+     tail (`measure_vector_refresh.py --after-quiet`).
+596. **A cgroup's write cap does not count the device's bytes.**
+     - systemd parses `IOWriteBandwidthMax` in powers of 1000: `7M` is `wbps=7000000` in the scope's
+       `io.max`.
+     - The cap counts the scope's own writes. That includes the journal write its `fsync` forces:
+       a 21 MB file written and synced passed 21 016 576 bytes through it, its pages and one 16 kB
+       log write.
+     - `/sys/block/<dev>/stat` counts every writer on the device, and the kernel's own.
+     - So "more bytes a level on the device, so fewer levels a second behind the cap" needs the
+       scope's `io.stat` (`wbytes`, the harness's `charged_mb`), not the device's sectors. Read
+       that way at 7 MB/s, every round of every build used 99.3-100% of the cap.
 
 ## Current state and open problems
 
