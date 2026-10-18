@@ -1893,7 +1893,7 @@ the rows after it, at most 65 536 rows of the symbol, more for a deep book. The 
 came from a summary:
 
 ```
-live books restored: 256 symbol(s), 256 from a summary and 0 from the first row, 25600 level(s), in 41 ms
+live books restored: <symbols> symbol(s), <n> from a summary and <m> from the first row, <levels> level(s), in <ms> ms
 ```
 
 A store written before #233 has no summaries until the first seal after the upgrade writes one, so
