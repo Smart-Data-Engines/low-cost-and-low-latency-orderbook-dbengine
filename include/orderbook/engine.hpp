@@ -88,6 +88,12 @@ struct ClientWrite {
     /// that reached the log after the adoption was abandoned would leave a row on a shard that
     /// neither owns nor adopts its symbol - which nothing drops again.
     uint64_t           adoption{0};
+    /// Whether the update is the whole side (`MREPLACE`, the incremental books' resynchronisation):
+    /// every price the side holds and the update does not name is removed. The engine adds those
+    /// removals to the update, as levels of quantity 0 after its own, before the update is numbered
+    /// and logged - so the WAL record, the replicas, the peers and history all see an ordinary
+    /// update, and no record format changes.
+    bool               replace_side{false};
 };
 
 /// What happened to one write of a batch: the status `apply_delta()` returns for it, or - where
@@ -203,6 +209,11 @@ public:
     /// Apply a delta update: WAL → SoA buffer (gap detection) → enqueue for columnar flush.
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
+
+    /// `apply_delta()` for an update that is the whole side (`ClientWrite::replace_side`): the
+    /// side's prices it does not name are removed, by levels of quantity 0 the engine adds to it.
+    /// `delta.n_levels` may be 0, which empties the side.
+    ob_status_t replace_side(const DeltaUpdate& delta, const Level* levels);
 
     /// Apply a record streamed from a primary on the replication link.
     ///
@@ -1394,7 +1405,8 @@ private:
     /// acquisition of `mtx_` either way: a wrapper that checked `has_seen()`, released the lock and
     /// delegated would leave a window between the check and the append.
     ob_status_t apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
-                                 DuplicatePolicy policy, bool multi_master);
+                                 DuplicatePolicy policy, bool multi_master,
+                                 bool replace_side = false);
 
     /// The one local write path: `apply_delta()`, `apply_delta_replicated()`, `apply_delta_mm()`
     /// and both batch entry points are this, with one write or with several. One acquisition of

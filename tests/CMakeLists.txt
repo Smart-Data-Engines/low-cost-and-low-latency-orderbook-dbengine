@@ -431,6 +431,12 @@ target_compile_definitions(test_write_batch
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# A side replacement (MREPLACE, the incremental books of #233): the removals the engine adds, read
+# back out of the live book and the WAL, in a batch and after a restart.
+ob_add_engine_test(test_replace_side
+    test_replace_side.cpp
+)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )

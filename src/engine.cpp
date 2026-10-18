@@ -26,10 +26,14 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <set>
 #include <thread>
+#include <unordered_set>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -1050,6 +1054,11 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
     return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply, /*multi_master=*/false);
 }
 
+ob_status_t Engine::replace_side(const DeltaUpdate& delta_in, const Level* levels) {
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply, /*multi_master=*/false,
+                            /*replace_side=*/true);
+}
+
 ob_status_t Engine::apply_delta_replicated(const DeltaUpdate& delta_in, const Level* levels) {
     return apply_delta_impl(delta_in, levels, DuplicatePolicy::DropIfSeen, /*multi_master=*/false);
 }
@@ -1068,11 +1077,12 @@ void Engine::apply_deltas_mm(std::span<const ClientWrite> writes,
 }
 
 ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
-                                     DuplicatePolicy policy, bool multi_master) {
+                                     DuplicatePolicy policy, bool multi_master, bool replace_side) {
     // A batch of one. What a write that could not be applied threw is carried in the outcome
     // rather than thrown out of the batch, so it is thrown here - with the text it always had,
     // because that text is what a client is answered with.
-    const ClientWrite write{&delta_in, levels};
+    ClientWrite write{&delta_in, levels};
+    write.replace_side = replace_side;
     WriteOutcome outcome;
     apply_local_writes(std::span<const ClientWrite>(&write, 1),
                        std::span<WriteOutcome>(&outcome, 1), policy, multi_master);
@@ -1099,10 +1109,109 @@ struct BatchScratch {
     std::vector<WalDelta>        records;
     std::vector<size_t>          write_of;   // the write each WAL record belongs to
     std::vector<WalBatchOutcome> wal;
+    /// The levels each write is applied with: the caller's, or - for an update that replaces its
+    /// side - `combined[i]`, the caller's and the removals the engine added (#233, MREPLACE). Here
+    /// because the multi-master path reads them after `mtx_` is released.
+    std::vector<const Level*>    levels;
+    std::vector<std::vector<Level>> combined;
     bool                         in_use{false};
 };
 
 thread_local BatchScratch batch_scratch;
+
+/// The levels each admitted write of a batch is applied with: the caller's, or, for an update that
+/// replaces its side (`ClientWrite::replace_side`), the caller's followed by a level of quantity 0
+/// for every price the side holds when the write is applied and the update does not name.
+///
+/// "When the write is applied": a batch is applied in memory only after its WAL write, so a replace
+/// that follows another write to its side in the same batch is planned on a copy of the side with
+/// that write applied. The copy does not model the eviction a full side makes: it can only hold
+/// more prices than the book, and a removal of a price the book no longer holds is `OB_OK` and
+/// changes nothing. The opposite error, a price the book holds and no removal names, cannot happen.
+///
+/// The removals are added best first, in the side's own order, so a record is the same on every
+/// run. Returns how many were added. Caller holds `mtx_`; `live_side` reads the book under it.
+template <typename LiveSide>
+size_t plan_side_replacements(std::span<const ClientWrite> writes, BatchScratch& s,
+                              LiveSide&& live_side) {
+    const size_t n = writes.size();
+    s.levels.resize(n);
+    bool any = false;
+    for (size_t i = 0; i < n; ++i) {
+        s.levels[i] = writes[i].levels;
+        any = any || (writes[i].replace_side && s.state[i] == WriteState::Admitted);
+    }
+    if (!any) return 0;
+
+    // Only the sides a replace in this batch names are followed.
+    std::set<std::pair<std::string, uint8_t>> replaced;
+    for (size_t i = 0; i < n; ++i) {
+        if (writes[i].replace_side && s.state[i] == WriteState::Admitted) {
+            replaced.emplace(s.keys[i], s.deltas[i].side);
+        }
+    }
+    std::map<std::pair<std::string, uint8_t>, std::unordered_set<int64_t>> held;
+    if (s.combined.size() < n) s.combined.resize(n);
+    size_t removed_total = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (s.state[i] != WriteState::Admitted) continue;
+        DeltaUpdate& delta = s.deltas[i];
+        const auto id = std::make_pair(s.keys[i], delta.side);
+        if (replaced.count(id) == 0) continue;
+        auto [entry, fresh] = held.try_emplace(id);
+        std::unordered_set<int64_t>& prices = entry->second;
+        if (fresh) {
+            if (const SoASide* side = live_side(s.keys[i], delta.side)) {
+                for (uint32_t k = 0; k < side->depth; ++k) prices.insert(side->prices[k]);
+            }
+        }
+        const Level* named = writes[i].levels;
+        if (!writes[i].replace_side) {
+            for (uint16_t k = 0; k < delta.n_levels; ++k) {
+                if (named[k].qty == 0) {
+                    prices.erase(named[k].price);
+                } else {
+                    prices.insert(named[k].price);
+                }
+            }
+            continue;
+        }
+
+        std::unordered_set<int64_t> in_update;
+        for (uint16_t k = 0; k < delta.n_levels; ++k) in_update.insert(named[k].price);
+        std::vector<int64_t> removals;
+        for (const int64_t price : prices) {
+            if (in_update.count(price) == 0) removals.push_back(price);
+        }
+        if (delta.side == SIDE_BID) {
+            std::sort(removals.begin(), removals.end(), std::greater<>());
+        } else {
+            std::sort(removals.begin(), removals.end());
+        }
+
+        std::vector<Level>& combined = s.combined[i];
+        combined.assign(named, named + delta.n_levels);
+        for (const int64_t price : removals) combined.push_back(Level{price, 0, 0, 0});
+        // At most the update's MAX_LEVELS and the book's: well inside the record's 16-bit count.
+        if (combined.size() > std::numeric_limits<uint16_t>::max()) {
+            throw std::length_error("Engine: a side replacement of " +
+                                    std::to_string(combined.size()) + " levels");
+        }
+        const uint16_t written = delta.n_levels;
+        delta.n_levels = static_cast<uint16_t>(combined.size());
+        s.levels[i] = combined.data();
+
+        prices.clear();
+        for (const Level& level : combined) {
+            if (level.qty != 0) prices.insert(level.price);
+        }
+        removed_total += removals.size();
+        OB_LOG_DEBUG("engine", "replace side %s %s: %u level(s) written, %zu removed",
+                     s.keys[i].c_str(), delta.side == SIDE_BID ? "bid" : "ask",
+                     static_cast<unsigned>(written), removals.size());
+    }
+    return removed_total;
+}
 
 /// The thread's scratch, or a fresh one if the thread's is in use. Nothing re-enters the write
 /// path from inside it today - the subscribers are queued to, the replicas and the peers are
@@ -1314,10 +1423,20 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
 
     // 3. Number each write and assemble its WAL record - in the order and with the numbers a
     //    single write would have got, because this is the order the writes arrived in and the
-    //    lock has not been released since.
+    //    lock has not been released since. A write that replaces its side gets its removals
+    //    first, so that what is numbered and logged is an ordinary update (#233, MREPLACE).
     s.records.clear();
     s.write_of.clear();
     try {
+        const size_t removed = plan_side_replacements(
+            writes, s, [this](const std::string& key, uint8_t side) -> const SoASide* {
+                const auto it = buffers_.find(key);
+                if (it == buffers_.end() || !it->second) return nullptr;
+                return side == SIDE_BID ? &it->second->bid : &it->second->ask;
+            });
+        if (removed != 0) {
+            registry_.increment_counter("ob_replace_side_removed_levels_total", removed);
+        }
         for (size_t i = 0; i < n; ++i) {
             if (s.state[i] != WriteState::Admitted) continue;
             DeltaUpdate& delta = s.deltas[i];
@@ -1340,7 +1459,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             // Each node numbers only its own stream, which is what makes (origin, sequence)
             // comparable across a cluster (Requirement 2.1, 2.2).
             const bool gap = observe_sequence(delta, mm_config_.node_id, s.keys[i]);
-            s.records.push_back(WalDelta{&delta, writes[i].levels, hlc,
+            s.records.push_back(WalDelta{&delta, s.levels[i], hlc,
                                          multi_master ? mm_config_.node_id : uint16_t{0}, gap});
             s.write_of.push_back(i);
             s.state[i] = WriteState::InWal;
@@ -1373,12 +1492,12 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
         }
         try {
             if (multi_master) {
-                note_local_hlcs(s.deltas[i], writes[i].levels, s.hlcs[i]);
+                note_local_hlcs(s.deltas[i], s.levels[i], s.hlcs[i]);
             } else if (repl_mgr_) {
                 // Within the same lock, to keep the replicas in WAL order (Requirement 1.2).
-                broadcast_to_replicas(s.deltas[i], writes[i].levels, s.wal[k].position);
+                broadcast_to_replicas(s.deltas[i], s.levels[i], s.wal[k].position);
             }
-            outcomes[i].status = apply_in_memory(s.keys[i], s.deltas[i], writes[i].levels);
+            outcomes[i].status = apply_in_memory(s.keys[i], s.deltas[i], s.levels[i]);
         } catch (const std::exception& e) {
             // The record is in the WAL, as it was when a single write threw here.
             outcomes[i].error = e.what();
@@ -1443,7 +1562,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
         if (!s.wal[k].error.empty()) continue;
         const size_t i = s.write_of[k];
         try {
-            broadcast_to_peers(s.deltas[i], writes[i].levels, s.hlcs[i]);
+            broadcast_to_peers(s.deltas[i], s.levels[i], s.hlcs[i]);
         } catch (const std::exception& e) {
             // Applied and not sent: answered with what was thrown, as a single write was.
             outcomes[i].error = e.what();
