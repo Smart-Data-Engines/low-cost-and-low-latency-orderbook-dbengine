@@ -71,6 +71,16 @@ def device_stat(device: str) -> tuple[int, int]:
     return int(fields[6]), int(fields[9])
 
 
+def xfs_log_stat(fs: str) -> tuple[int, int, int]:
+    """The XFS journal's writes, the 512-byte blocks they wrote and its forces, from the `log` line
+    of /sys/fs/xfs/<fs>/stats/stats (xs_log_writes, xs_log_blocks, xs_log_force)."""
+    for line in open(f"/sys/fs/xfs/{fs}/stats/stats"):
+        if line.startswith("log "):
+            fields = line.split()
+            return int(fields[1]), int(fields[2]), int(fields[4])
+    raise RuntimeError(f"no log line in /sys/fs/xfs/{fs}/stats/stats")
+
+
 def counters(metrics_port: int) -> dict:
     """The COSTS counters from a node's /metrics, each summed over its label sets (pitfall 66)."""
     import urllib.request
@@ -190,6 +200,7 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             bytes_before = written_bytes(writer.proc.pid)
             costs_before = counters(writer.ports[1])
             dev_before = device_stat(args.block_device) if args.block_device else None
+            log_before = xfs_log_stat(args.xfs_stats) if args.xfs_stats else None
             began = time.monotonic()
             out = subprocess.run([probe, str(writer.tcp), str(writer.proc.pid),
                                   str(args.connections), str(args.batches), str(args.levels),
@@ -207,6 +218,14 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
                 elapsed = time.monotonic() - began
                 result["device_mb"] = round((sectors - dev_before[0]) * 512 / 1e6, 1)
                 result["device_busy_pct"] = round(100.0 * (busy_ms - dev_before[1]) / 1000 / elapsed, 1)
+            if log_before:
+                # The share of those bytes that was the filesystem's journal, and how often it was
+                # forced to the device: every fsync and syncfs that finds the journal holding
+                # something forces it, and each force writes at least the log's stripe unit.
+                writes, blocks, forces = xfs_log_stat(args.xfs_stats)
+                result["xfs_log_mb"] = round((blocks - log_before[1]) * 512 / 1e6, 1)
+                result["xfs_log_writes"] = writes - log_before[0]
+                result["xfs_log_forces"] = forces - log_before[2]
             costs_after = counters(writer.ports[1])
             for k in COSTS:
                 result[k.replace("ob_", "").replace("_total", "")] = costs_after[k] - costs_before[k]
@@ -265,13 +284,15 @@ def main() -> int:
     ap.add_argument("--root", default=os.path.join(os.getcwd(), "vector-refresh-runs"))
     ap.add_argument("--block-device", metavar="NAME",
                     help="also record what reached /sys/block/NAME and how busy it was")
+    ap.add_argument("--xfs-stats", metavar="FS",
+                    help="also record what the XFS journal of /sys/fs/xfs/FS wrote, and its forces")
     args = ap.parse_args()
     servers = [s.split("=", 1) for s in args.server]
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
             "server_cores", "probe_n", "probe_p50_ms", "probe_p99_ms", "probe_p999_ms",
             "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "budget_waits",
-            "refused", "written_mb", "device_mb", "device_busy_pct", "flush_ticks", "seals",
-            "compactions", "compaction_rows",
+            "refused", "written_mb", "device_mb", "device_busy_pct", "xfs_log_mb", "xfs_log_writes",
+            "xfs_log_forces", "flush_ticks", "seals", "compactions", "compaction_rows",
             "peer_drops", "failed")
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):
