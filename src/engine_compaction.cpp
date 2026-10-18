@@ -542,6 +542,8 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
                 fs::create_hard_link(entry.path(), to, lec);
                 if (lec) {
                     lec.clear();
+                    // OB_DURABLE: the merge's directory is published only after a syncfs() that
+                    // started once it was written (publish_staged_merges()), this file with it.
                     fs::copy_file(entry.path(), to, fs::copy_options::overwrite_existing, lec);
                 }
                 if (lec) {
