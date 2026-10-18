@@ -678,9 +678,12 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
     // Read the header before dropping it: an aggregate response has its own
     // columns, and parsing those positionally as a row used to fail with the
     // baffling "bad timestamp_ns" instead of naming the actual problem.
+    //
+    // A header and no rows - the server's answer to a query that matched nothing, and to `BOOK`
+    // of an empty book - is the header without its line end once the terminator is stripped.
+    // That is an empty answer. It used to be refused as a missing header, which made every empty
+    // result an error; found by the first test that emptied a book through this client (#233).
     auto header_end = resp.find('\n');
-    if (header_end == std::string_view::npos)
-        return Result<QueryResult>::err(OB_ERR_PARSE, "missing header");
     std::string_view header = resp.substr(0, header_end);
     if (header == "name\tvalue\tscale")
         return Result<QueryResult>::err(
@@ -705,7 +708,7 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
                         "answered with '") + std::string(header) +
                 "'; ask for SELECT * to get the columns it can read");
 
-    resp.remove_prefix(header_end + 1);
+    resp.remove_prefix(header_end == std::string_view::npos ? resp.size() : header_end + 1);
 
     // Parse data rows
     QueryResult qr;
@@ -986,14 +989,33 @@ size_t OrderbookClient::format_minsert(std::string_view symbol,
                                         Side side, const Level* levels,
                                         size_t n_levels,
                                         std::optional<uint64_t> event_time_ns) {
+    return format_levels_block("MINSERT ", symbol, exchange, side, levels, n_levels,
+                               event_time_ns);
+}
+
+size_t OrderbookClient::format_mreplace(std::string_view symbol,
+                                         std::string_view exchange,
+                                         Side side, const Level* levels,
+                                         size_t n_levels,
+                                         std::optional<uint64_t> event_time_ns) {
+    return format_levels_block("MREPLACE ", symbol, exchange, side, levels, n_levels,
+                               event_time_ns);
+}
+
+size_t OrderbookClient::format_levels_block(std::string_view keyword,
+                                             std::string_view symbol,
+                                             std::string_view exchange,
+                                             Side side, const Level* levels,
+                                             size_t n_levels,
+                                             std::optional<uint64_t> event_time_ns) {
     send_buf_.clear();
     send_buf_.resize(send_buf_.capacity());
     char* buf = send_buf_.data();
     char* p   = buf;
     char* end = buf + send_buf_.size();
 
-    // Header: "MINSERT <sym> <exch> <bid|ask> <n>\n"
-    std::memcpy(p, "MINSERT ", 8); p += 8;
+    // Header: "MINSERT <sym> <exch> <bid|ask> <n>\n", or MREPLACE's
+    std::memcpy(p, keyword.data(), keyword.size()); p += keyword.size();
     std::memcpy(p, symbol.data(), symbol.size()); p += symbol.size();
     *p++ = ' ';
     std::memcpy(p, exchange.data(), exchange.size()); p += exchange.size();
@@ -1157,6 +1179,46 @@ Result<void> OrderbookClient::minsert(std::string_view symbol,
     return parse_ok_response(rr.value());
 }
 
+Result<void> OrderbookClient::replace_side(std::string_view symbol,
+                                            std::string_view exchange,
+                                            Side side, const Level* levels,
+                                            size_t n_levels,
+                                            std::optional<uint64_t> event_time_ns) {
+    if (side != Side::BID && side != Side::ASK)
+        return Result<void>::err(OB_ERR_INVALID_ARG, "invalid side");
+    if (n_levels > 1000)
+        return Result<void>::err(OB_ERR_INVALID_ARG, "too many levels");
+    if (n_levels > 0 && levels == nullptr)
+        return Result<void>::err(OB_ERR_INVALID_ARG, "levels is null");
+
+    auto caps = capabilities();
+    if (!caps) return Result<void>::err(caps.error_code(), caps.error_message());
+    if (caps.value().count("replace_side") == 0) {
+        OB_LOG_WARN("client", "replace_side %.*s.%.*s refused before sending: the server does not "
+                    "announce replace_side", static_cast<int>(symbol.size()), symbol.data(),
+                    static_cast<int>(exchange.size()), exchange.data());
+        return Result<void>::err(
+            OB_ERR_INVALID_ARG,
+            "this server does not replace a side of a book (MREPLACE, capability replace_side): "
+            "it would answer unknown command. Nothing was sent.");
+    }
+    if (auto refusal = refuse_unsupported_event_time(event_time_ns); !refusal) {
+        return refusal;
+    }
+    OB_LOG_DEBUG("client", "replace_side %.*s.%.*s %s: %zu level(s)",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 side == Side::BID ? "bid" : "ask", n_levels);
+    size_t len = format_mreplace(symbol, exchange, side, levels, n_levels, event_time_ns);
+    auto sr = send_all(len);
+    if (!sr) return sr;
+
+    auto rr = recv_response();
+    if (!rr) return Result<void>::err(rr.error_code(), rr.error_message());
+
+    return parse_ok_response(rr.value());
+}
+
 Result<std::string> OrderbookClient::command(std::string_view line) {
     size_t len = format_simple(line);
     auto sr = send_all(len);
@@ -1275,14 +1337,13 @@ Result<std::vector<AggEntry>> OrderbookClient::parse_agg_response(std::string_vi
     if (resp.empty())
         return Res::ok({});
 
+    // A header and no aggregates is an empty answer, as in parse_query_response().
     auto header_end = resp.find('\n');
-    if (header_end == std::string_view::npos)
-        return Res::err(OB_ERR_PARSE, "missing header");
     std::string_view header = resp.substr(0, header_end);
     if (header != "name\tvalue\tscale")
         return Res::err(OB_ERR_PARSE,
                         "response holds rows, not aggregates; use query()");
-    resp.remove_prefix(header_end + 1);
+    resp.remove_prefix(header_end == std::string_view::npos ? resp.size() : header_end + 1);
 
     std::vector<AggEntry> entries;
     while (!resp.empty()) {
@@ -1794,6 +1855,20 @@ Result<void> OrderbookPool::minsert(std::string_view symbol,
 
     return execute_write([&](OrderbookClient& c) {
         return c.minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
+    });
+}
+
+Result<void> OrderbookPool::replace_side(std::string_view symbol,
+                                          std::string_view exchange,
+                                          Side side, const Level* levels,
+                                          size_t n_levels,
+                                          std::optional<uint64_t> event_time_ns) {
+    if (shard_router_)
+        return shard_router_->replace_side(symbol, exchange, side, levels, n_levels,
+                                           event_time_ns);
+
+    return execute_write([&](OrderbookClient& c) {
+        return c.replace_side(symbol, exchange, side, levels, n_levels, event_time_ns);
     });
 }
 
