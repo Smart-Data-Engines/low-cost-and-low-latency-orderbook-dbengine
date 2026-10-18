@@ -255,6 +255,21 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             costs_after = counters(writer.ports[1])
             for k in COSTS:
                 result[k.replace("ob_", "").replace("_total", "")] = costs_after[k] - costs_before[k]
+            if charged_before is not None and args.after_quiet > 0:
+                # What the device still had to take once the last write was acknowledged: the bytes
+                # that passed the cap from then until none had for `--after-quiet` seconds. A node
+                # that leaves more of what it acknowledged unwritten when the ingest ends has more
+                # here, and its levels a second counted none of it.
+                first = last = charged_bytes(args.block_device)
+                started = changed = time.monotonic()
+                while (time.monotonic() - changed < args.after_quiet
+                       and time.monotonic() - started < 120):
+                    time.sleep(0.25)
+                    now_bytes = charged_bytes(args.block_device)
+                    if now_bytes != last:
+                        last, changed = now_bytes, time.monotonic()
+                result["after_mb"] = round((last - first) / 1e6, 1)
+                result["after_s"] = round(changed - started, 1)
         result["label"] = label
         with open(writer.log, "rb") as f:
             f.seek(before)
@@ -312,13 +327,16 @@ def main() -> int:
                     help="also record what reached /sys/block/NAME and how busy it was")
     ap.add_argument("--xfs-stats", metavar="FS",
                     help="also record what the XFS journal of /sys/fs/xfs/FS wrote, and its forces")
+    ap.add_argument("--after-quiet", type=float, default=0.0, metavar="SECONDS",
+                    help="with --block-device in a capped scope: after the ingest, also record what "
+                         "passed the cap until none had for this long")
     args = ap.parse_args()
     servers = [s.split("=", 1) for s in args.server]
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
             "server_cores", "probe_n", "probe_p50_ms", "probe_p99_ms", "probe_p999_ms",
             "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "budget_waits",
             "refused", "written_mb", "device_mb", "device_busy_pct", "ingest_s", "charged_mb",
-            "xfs_log_mb", "xfs_log_writes", "xfs_log_forces", "flush_ticks", "seals", "compactions",
+            "after_mb", "after_s", "xfs_log_mb", "xfs_log_writes", "xfs_log_forces", "flush_ticks", "seals", "compactions",
             "compaction_rows", "writer_admission_delays", "writer_admission_delay_us",
             "writer_wal_budget_waits", "writer_backpressure_waits",
             "peer_drops", "failed")
