@@ -242,8 +242,8 @@ public:
     /// Replace one side of a book (`MREPLACE`, #233): afterwards the side is exactly `levels`.
     ///
     /// The server removes every price the side holds and `levels` does not name, under the lock
-    /// its write takes, and logs the removals as quantity 0 after the levels - so replicas, peers
-    /// and history see an ordinary update. `n_levels` may be 0, which empties the side.
+    /// its write takes, and logs the removals as quantity 0 in front of the levels - so replicas,
+    /// peers and history see an ordinary update. `n_levels` may be 0, which empties the side.
     ///
     /// Asks the server for `replace_side` first - once per connection, like the event time - and
     /// fails without sending a byte if it is missing: an older server answers `MREPLACE` as an

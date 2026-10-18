@@ -104,7 +104,7 @@ def test_history_holds_the_update_and_then_its_removals(primary_client):
     c.replace_side("RS-HIST", "EX", "bid", [101, 99], [5, 7], timestamp_ns=T0 + 2)
     c.flush()
     rows = [(r.price, r.quantity) for r in c.query_all("RS-HIST", "EX") if r.timestamp_ns == T0 + 2]
-    # The update's levels, then the removals best first: what the WAL record holds and what a
+    # The removals best first, then the update's levels: what the WAL record holds and what a
     # replica, a restart and an `AT` read are given.
     assert sorted(rows) == sorted([(101, 5), (99, 7), (100, 0), (98, 0)]), rows
 

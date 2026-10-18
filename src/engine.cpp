@@ -1120,8 +1120,14 @@ struct BatchScratch {
 thread_local BatchScratch batch_scratch;
 
 /// The levels each admitted write of a batch is applied with: the caller's, or, for an update that
-/// replaces its side (`ClientWrite::replace_side`), the caller's followed by a level of quantity 0
-/// for every price the side holds when the write is applied and the update does not name.
+/// replaces its side (`ClientWrite::replace_side`), a level of quantity 0 for every price the side
+/// holds when the write is applied and the update does not name, followed by the caller's.
+///
+/// The removals first, because a record is applied in order - here, on a replica, in a replay - and
+/// a full side has no room for a price it does not hold: a side of 1000 replaced by 1000 others
+/// worse than all of them took none of them and then removed the 1000 it had, which is how the
+/// first test of a full side found it. Their order against the update's own levels changes nothing
+/// else: they name different prices.
 ///
 /// "When the write is applied": a batch is applied in memory only after its WAL write, so a replace
 /// that follows another write to its side in the same batch is planned on a copy of the side with
@@ -1129,7 +1135,7 @@ thread_local BatchScratch batch_scratch;
 /// more prices than the book, and a removal of a price the book no longer holds is `OB_OK` and
 /// changes nothing. The opposite error, a price the book holds and no removal names, cannot happen.
 ///
-/// The removals are added best first, in the side's own order, so a record is the same on every
+/// The removals are written best first, in the side's own order, so a record is the same on every
 /// run. Returns how many were added. Caller holds `mtx_`; `live_side` reads the book under it.
 template <typename LiveSide>
 size_t plan_side_replacements(std::span<const ClientWrite> writes, BatchScratch& s,
@@ -1190,8 +1196,9 @@ size_t plan_side_replacements(std::span<const ClientWrite> writes, BatchScratch&
         }
 
         std::vector<Level>& combined = s.combined[i];
-        combined.assign(named, named + delta.n_levels);
+        combined.clear();
         for (const int64_t price : removals) combined.push_back(Level{price, 0, 0, 0});
+        combined.insert(combined.end(), named, named + delta.n_levels);
         // At most the update's MAX_LEVELS and the book's: well inside the record's 16-bit count.
         if (combined.size() > std::numeric_limits<uint16_t>::max()) {
             throw std::length_error("Engine: a side replacement of " +

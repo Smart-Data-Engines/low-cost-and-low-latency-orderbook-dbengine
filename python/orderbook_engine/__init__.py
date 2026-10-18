@@ -2265,8 +2265,8 @@ class OrderbookEngine:
         so a writer of whole books that sends the top N levels leaves every price that dropped out
         of them in the book. This sends `MREPLACE`, and the server removes each price the side
         holds and the call does not name - under the lock its write takes, against the book the
-        write is applied to. The log, the replicas and history see an ordinary update: these
-        levels, then a quantity 0 for each price removed.
+        write is applied to. The log, the replicas and history see an ordinary update: a quantity
+        0 for each price removed, then these levels.
 
         Empty lists empty the side. A price may appear once; the server applies the levels in
         order, as it does for `insert()`, so a repeated price ends with its last quantity.

@@ -264,16 +264,45 @@ TEST_F(CApiTest, ReplaceSideLogsAndStoresTheUpdateThenItsRemovals) {
     ob_engine_destroy(engine);
     const auto records = capi_delta_records(dir, "RPL");
     ASSERT_EQ(records.size(), 3u);
-    EXPECT_EQ(records[2], (std::vector<PriceQty>{{10350, 70}, {10200, 250}, {10300, 0}, {10100, 0}}))
-        << "the record of a replacement is not its levels and then the bids it removed, highest "
-           "first - and the asks are not the bids' business";
+    EXPECT_EQ(records[2], (std::vector<PriceQty>{{10300, 0}, {10100, 0}, {10350, 70}, {10200, 250}}))
+        << "the record of a replacement is not the bids it removed, highest first, and then its "
+           "levels - and the asks are not the bids' business";
 
     engine = ob_engine_create(dir.c_str());
     ASSERT_NE(engine, nullptr);
     const auto rows = capi_history(engine, "RPL");
     const std::vector<PriceQty> replaced(rows.end() - std::min<size_t>(rows.size(), 4), rows.end());
-    EXPECT_EQ(replaced, (std::vector<PriceQty>{{10350, 70}, {10200, 250}, {10300, 0}, {10100, 0}}))
+    EXPECT_EQ(replaced, (std::vector<PriceQty>{{10300, 0}, {10100, 0}, {10350, 70}, {10200, 250}}))
         << "history does not hold the replacement as applied";
+}
+
+TEST_F(CApiTest, ReplaceSideOfAFullSideByAnotherFullSideLeavesTheReplacement) {
+    // A full side has no room for a price it does not hold until the removals are applied, so they
+    // go first. The live book is not readable through the C API; what a second replacement removes
+    // is: the 999 prices the first one wrote and the second does not name.
+    const uint32_t n = static_cast<uint32_t>(ob::MAX_LEVELS);
+    std::vector<int64_t>  held(n), fresh(n);
+    std::vector<uint64_t> q(n, 1);
+    std::vector<uint32_t> c(n, 1);
+    for (uint32_t i = 0; i < n; ++i) {
+        held[i]  = 100000 - static_cast<int64_t>(i);
+        fresh[i] = 50000 - static_cast<int64_t>(i);
+    }
+    ASSERT_EQ(ob_apply_delta(engine, "FULL", "EX", 1, 1000ULL, held.data(), q.data(), c.data(), n, 0), OB_C_OK);
+    ASSERT_EQ(ob_replace_side(engine, "FULL", "EX", 2, 1001ULL, fresh.data(), q.data(), c.data(), n, 0), OB_C_OK);
+    ASSERT_EQ(ob_replace_side(engine, "FULL", "EX", 3, 1002ULL, fresh.data(), q.data(), c.data(), 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    const auto records = capi_delta_records(dir, "FULL");
+    ASSERT_EQ(records.size(), 3u);
+    ASSERT_EQ(records[1].size(), 2 * static_cast<size_t>(n));
+    EXPECT_EQ(records[1].front(), (PriceQty{100000, 0}));
+    EXPECT_EQ(records[1][n], (PriceQty{50000, 1}));
+    ASSERT_EQ(records[2].size(), static_cast<size_t>(n)) << "the side after the first replacement was "
+                                                            "not the replacement";
+    EXPECT_EQ(records[2].front(), (PriceQty{49999, 0}));
+    EXPECT_EQ(records[2].back(), (PriceQty{50000, 1}));
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
 }
 
 TEST_F(CApiTest, ReplaceSideWithNoLevelsEmptiesTheSide) {

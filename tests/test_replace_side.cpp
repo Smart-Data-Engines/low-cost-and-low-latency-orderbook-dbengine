@@ -158,7 +158,7 @@ TEST(ReplaceSide, TheSideIsExactlyTheUpdateAndTheOtherSideIsLeftAlone) {
     engine->close();
 }
 
-TEST(ReplaceSide, TheRecordIsTheUpdateThenItsRemovalsBestFirst) {
+TEST(ReplaceSide, TheRecordIsTheRemovalsBestFirstThenTheUpdate) {
     TempDir dir("ob_replace_record_");
     auto engine = open_engine(dir.path);
     ASSERT_EQ(write(*engine, "AAA", ob::SIDE_BID, {{100, 1}, {99, 2}, {98, 3}}, kT0 + 1), ob::OB_OK);
@@ -170,12 +170,12 @@ TEST(ReplaceSide, TheRecordIsTheUpdateThenItsRemovalsBestFirst) {
     const auto records = delta_records(dir.path, "AAA");
     ASSERT_EQ(records.size(), 4u);
     // The bids' removals best first, which for bids is the highest: 100, then 98.
-    EXPECT_EQ(records[2], (std::vector<Px>{{101, 5}, {99, 7}, {100, 0}, {98, 0}}))
-        << "the WAL record of a bid replacement is not its levels and then its removals, highest "
-           "first - a replica or a restart would be left with the prices it removed";
+    EXPECT_EQ(records[2], (std::vector<Px>{{100, 0}, {98, 0}, {101, 5}, {99, 7}}))
+        << "the WAL record of a bid replacement is not its removals, highest first, and then its "
+           "levels - a replica or a restart would be left with the prices it removed";
     // The asks' best first is the lowest: 102, 103, 104.
-    EXPECT_EQ(records[3], (std::vector<Px>{{105, 1}, {102, 0}, {103, 0}, {104, 0}}))
-        << "the WAL record of an ask replacement is not its levels and then its removals, lowest first";
+    EXPECT_EQ(records[3], (std::vector<Px>{{102, 0}, {103, 0}, {104, 0}, {105, 1}}))
+        << "the WAL record of an ask replacement is not its removals, lowest first, and then its levels";
 }
 
 TEST(ReplaceSide, NoLevelsEmptiesTheSide) {
@@ -210,7 +210,7 @@ TEST(ReplaceSide, AQuantityZeroItNamesIsARemovalItAlreadyCarries) {
     engine->close();
     const auto records = delta_records(dir.path, "AAA");
     ASSERT_EQ(records.size(), 2u);
-    EXPECT_EQ(records[1], (std::vector<Px>{{101, 5}, {100, 0}, {99, 0}}))
+    EXPECT_EQ(records[1], (std::vector<Px>{{99, 0}, {101, 5}, {100, 0}}))
         << "a price the replacement named with quantity 0 was removed twice, or 99 not at all";
 }
 
@@ -243,7 +243,7 @@ TEST(ReplaceSide, InABatchItIsPlannedAfterTheWritesBeforeIt) {
     engine->close();
     const auto records = delta_records(dir.path, "AAA");
     ASSERT_EQ(records.size(), 4u);
-    EXPECT_EQ(records[2], (std::vector<Px>{{101, 5}, {100, 0}, {97, 0}}));
+    EXPECT_EQ(records[2], (std::vector<Px>{{100, 0}, {97, 0}, {101, 5}}));
 }
 
 TEST(ReplaceSide, TheCounterCountsTheRemovals) {
@@ -256,6 +256,33 @@ TEST(ReplaceSide, TheCounterCountsTheRemovals) {
     ASSERT_TRUE(removed.has_value()) << "ob_replace_side_removed_levels_total is not in the exposition";
     EXPECT_EQ(*removed, 2u);
     engine->close();
+}
+
+TEST(ReplaceSide, AFullSideReplacedByAnotherFullSideIsOneRecordOfBoth) {
+    // The largest record a replacement makes: the book's 1000 prices removed and 1000 new ones
+    // written, 2000 levels in one DELTA - inside the record's 16-bit length (pitfall 44), which
+    // 2000 levels of 24 bytes and the update's header are.
+    TempDir dir("ob_replace_full_");
+    auto engine = open_engine(dir.path);
+    std::vector<Px> held, fresh;
+    for (int64_t i = 0; i < static_cast<int64_t>(ob::MAX_LEVELS); ++i) {
+        held.emplace_back(100'000 - i, 1);
+        fresh.emplace_back(50'000 - i, 2);
+    }
+    ASSERT_EQ(write(*engine, "BIG", ob::SIDE_BID, held, kT0 + 1), ob::OB_OK);
+    ASSERT_EQ(side_of(*engine, "BIG", ob::SIDE_BID).size(), ob::MAX_LEVELS);
+    ASSERT_EQ(replace(*engine, "BIG", ob::SIDE_BID, fresh, kT0 + 2), ob::OB_OK);
+    EXPECT_EQ(side_of(*engine, "BIG", ob::SIDE_BID), fresh)
+        << "the side is not exactly the replacement after a full side replaced a full side";
+    engine->close();
+
+    const auto records = delta_records(dir.path, "BIG");
+    ASSERT_EQ(records.size(), 2u);
+    ASSERT_EQ(records[1].size(), 2 * ob::MAX_LEVELS);
+    EXPECT_EQ(records[1].front(), (Px{100'000, 0})) << "the removals do not start at the best";
+    EXPECT_EQ(records[1][ob::MAX_LEVELS - 1], (Px{100'000 - static_cast<int64_t>(ob::MAX_LEVELS) + 1, 0}));
+    EXPECT_EQ(records[1][ob::MAX_LEVELS], fresh.front()) << "the update does not follow its removals";
+    EXPECT_EQ(records[1].back(), fresh.back());
 }
 
 TEST(ReplaceSide, ARestartFromTheWalHoldsTheSameBook) {

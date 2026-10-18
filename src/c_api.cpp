@@ -276,16 +276,18 @@ extern "C" ob_status_t ob_replace_side(ob_engine_t*    engine,
 
     try {
         std::lock_guard<std::mutex> lock(engine->mtx);
-        // The update, then a level of quantity 0 for every price the side holds and the update
-        // does not name - in the side's own order, so best first - under the lock the write takes.
-        std::vector<int64_t>  p(prices, prices + n_levels);
-        std::vector<uint64_t> q(qtys, qtys + n_levels);
-        std::vector<uint32_t> c(cnts, cnts + n_levels);
+        // A level of quantity 0 for every price the side holds and the update does not name - in
+        // the side's own order, so best first - then the update, under the lock the write takes.
+        // The removals first, as in the server's engine: a full side has no room for a new price
+        // until they are applied.
+        std::vector<int64_t>  p;
+        std::vector<uint64_t> q;
+        std::vector<uint32_t> c;
         const std::string key = std::string(symbol) + "." + exchange;
         size_t removed = 0;
         if (const auto it = engine->buffers.find(key); it != engine->buffers.end() && it->second) {
             const ob::SoASide& held = side == 0 ? it->second->bid : it->second->ask;
-            const std::unordered_set<int64_t> named(p.begin(), p.end());
+            const std::unordered_set<int64_t> named(prices, prices + n_levels);
             for (uint32_t k = 0; k < held.depth; ++k) {
                 if (named.count(held.prices[k]) != 0) continue;
                 p.push_back(held.prices[k]);
@@ -294,6 +296,9 @@ extern "C" ob_status_t ob_replace_side(ob_engine_t*    engine,
                 ++removed;
             }
         }
+        p.insert(p.end(), prices, prices + n_levels);
+        q.insert(q.end(), qtys, qtys + n_levels);
+        c.insert(c.end(), cnts, cnts + n_levels);
         OB_LOG_DEBUG("c_api", "replace side %s %s: %u level(s) written, %zu removed", key.c_str(),
                      side == 0 ? "bid" : "ask", n_levels, removed);
         return apply_locked(engine, symbol, exchange, seq, ts_ns, p.data(), q.data(), c.data(),

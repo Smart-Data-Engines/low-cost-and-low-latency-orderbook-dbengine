@@ -90,9 +90,10 @@ struct ClientWrite {
     uint64_t           adoption{0};
     /// Whether the update is the whole side (`MREPLACE`, the incremental books' resynchronisation):
     /// every price the side holds and the update does not name is removed. The engine adds those
-    /// removals to the update, as levels of quantity 0 after its own, before the update is numbered
-    /// and logged - so the WAL record, the replicas, the peers and history all see an ordinary
-    /// update, and no record format changes.
+    /// removals to the update, as levels of quantity 0 in front of its own - a full side has no
+    /// room for a new price until they are applied - before the update is numbered and logged, so
+    /// the WAL record, the replicas, the peers and history all see an ordinary update, and no
+    /// record format changes.
     bool               replace_side{false};
 };
 
