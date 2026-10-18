@@ -1012,6 +1012,10 @@ private:
     static void remove_summary_files(const std::vector<std::string>& files, std::string_view why);
     /// The summaries in an indexed segment's directory, put in its symbol's map. Caller holds the lock.
     void register_summaries_locked(const SegmentMeta& meta);
+    /// The summaries whose files are in `dir`, out of `si`: the segment they are in is leaving the
+    /// index, and its directory the disk. Every path that takes a segment out calls this - a merge,
+    /// a removal, retention - or a read would start from a file that is gone.
+    static void drop_summaries_in_locked(SymbolIndex& si, const std::string& dir);
     static std::string index_key(std::string_view symbol, std::string_view exchange);
     /// Whether this index's `key` is the engine's `dotted` one (segments_of()).
     static bool is_dotted_key(const std::string& key, std::string_view dotted);

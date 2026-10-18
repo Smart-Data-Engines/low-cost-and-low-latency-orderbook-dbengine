@@ -308,11 +308,34 @@ TEST(BookSummaryStore, ASummaryThatDoesNotReadBackIsNotStartedFrom) {
 }
 
 TEST(BookSummaryStore, ASegmentLeavingTakesItsSummariesWithIt) {
+    // Another segment of the symbol stays, so the symbol's entry in the index stays too: what goes
+    // is the summary whose file went with its directory, and the read does not start from it.
     Store s;
-    const std::string dir = s.segment({row(kBase + 1, ob::SIDE_BID, 100, 1)});
+    s.segment({row(kBase + 1, ob::SIDE_BID, 100, 1)});
+    const std::string dir = s.segment({row(kBase + 2, ob::SIDE_BID, 99, 2)});
     ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
     ASSERT_EQ(s.store->remove_segments({dir}), 1u);
     EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty());
+    const auto book = s.at(kBase + 2);
+    EXPECT_FALSE(book.from_summary.has_value());
+    EXPECT_EQ(levels_of(book.rows), composed(*s.store, kBase + 2));
+}
+
+TEST(BookSummaryStore, RetentionTakesTheSummariesOfWhatItRemoves) {
+    Store s;
+    const std::string old_dir = s.segment({row(kBase + 1, ob::SIDE_BID, 100, 1)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", old_dir).written);
+    const std::string new_dir = s.segment({row(kBase + 50 * kSec, ob::SIDE_BID, 99, 2)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", new_dir).written);
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX").size(), 2u);
+    s.store->delete_expired_segments(kBase + 10 * kSec);
+    // The newer summary stays, and still holds the price the expired segment set: the book does
+    // not lose a price because the row that set it aged out (spec incremental-books).
+    EXPECT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 50 * kSec}));
+    const auto book = s.at(kBase + 50 * kSec);
+    ASSERT_TRUE(book.from_summary.has_value());
+    ASSERT_EQ(book.rows.size(), 2u);
+    EXPECT_EQ(book.rows[0].price, 100);
 }
 
 // Random rows - in segments and blocks, a quarter of them removals, some with times before what

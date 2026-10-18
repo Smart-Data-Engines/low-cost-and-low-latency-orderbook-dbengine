@@ -943,11 +943,7 @@ bool ColumnarStore::erase_locked(const SegmentMeta& meta) {
     const auto pos = std::lower_bound(v.begin(), v.end(), meta, segment_order_less);
     if (pos == v.end() || pos->dir_path != meta.dir_path) return false;
     // Its summaries go with it: a file that leaves with its directory is no summary to start from.
-    auto& summaries = it->second.summaries;
-    for (auto s = summaries.begin(); s != summaries.end();) {
-        s = fs::path(s->second).parent_path() == fs::path(meta.dir_path) ? summaries.erase(s)
-                                                                         : std::next(s);
-    }
+    drop_summaries_in_locked(it->second, meta.dir_path);
     indexed_dirs_.erase(pos->dir_path);
     v.erase(pos);
     --indexed_count_;
@@ -2793,6 +2789,13 @@ void ColumnarStore::remove_summary_files(const std::vector<std::string>& files, 
     }
 }
 
+void ColumnarStore::drop_summaries_in_locked(SymbolIndex& si, const std::string& dir) {
+    const fs::path in(dir);
+    for (auto s = si.summaries.begin(); s != si.summaries.end();) {
+        s = fs::path(s->second).parent_path() == in ? si.summaries.erase(s) : std::next(s);
+    }
+}
+
 void ColumnarStore::register_summaries_locked(const SegmentMeta& meta) {
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(meta.dir_path, ec)) {
@@ -3482,6 +3485,7 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
                     v.begin(), limit,
                     [&](const SegmentMeta& m) { return m.end_ts_ns >= cutoff_ns; });
                 for (auto i = kept_end; i != limit; ++i) {
+                    drop_summaries_in_locked(it->second, i->dir_path);
                     indexed_dirs_.erase(i->dir_path);
                     expired.push_back(std::move(*i));
                 }
@@ -3564,6 +3568,7 @@ size_t ColumnarStore::remove_segments(const std::vector<std::string>& dirs) {
                     continue;
                 }
                 OB_LOG_DEBUG("columnar", "removed segment %s", meta.dir_path.c_str());
+                drop_summaries_in_locked(it->second, meta.dir_path);
                 indexed_dirs_.erase(meta.dir_path);
                 --indexed_count_;
                 ++removed;
