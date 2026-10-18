@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <functional>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -1048,17 +1049,6 @@ namespace {
 /// Whether a row is inside every condition of `ast` (#199, #200): its time, price, side and level,
 /// each a range inclusive at both ends. One predicate for the row scan, a snapshot's levels and a
 /// subscription's pushes, which kept three copies of the time and price checks between them.
-/// Level 0 of either side: the rows a series of the book is made of (#44 step 2), as a filter the
-/// scan applies before it builds a row (#47 step 2) - and leaves a segment without them unread.
-static RowFilter level0_of_either_side() {
-    RowFilter f;
-    f.side_lo  = SIDE_BID;
-    f.side_hi  = SIDE_ASK;
-    f.level_lo = 0;
-    f.level_hi = 0;
-    return f;
-}
-
 /// The conditions of a query a scan applies before it builds a row (#47 step 2): its price, side and
 /// level ranges. The time range is the scan's own; `row_allowed()` stays where the rows arrive, as a
 /// belt that costs a compare a row.
@@ -1435,19 +1425,21 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         // local mode, which formats nothing, was unaffected (#167).
         shape.columns = ast.projection.empty() ? all_query_columns() : ast.projection;
 
-        // The book at snap_ts: for each (side, level_index), the row with the latest timestamp at
-        // or before it - not the last row a scan delivered, which it is only while rows arrive in
-        // time order (#168) - a tie on the timestamp going to the later delivered, ordered by side,
-        // then level, bids first, as BOOK answers. Read from the newest segment down, and only the
-        // segments that can change it (#47): it was a scan of every row from time 0, 107 ms at
-        // 3 M rows on the i3 for an answer of 100 levels, and that scan is the oracle of
-        // tests/test_book_at_an_instant.cpp.
-        const ColumnarStore::BookAt book = store_.latest_per_level(snap_ts, ast.symbol, ast.exchange);
+        // The book at snap_ts by price (#233, decision B'): every row up to it applied in time
+        // order - a tie on the timestamp in the order a scan delivers - each setting its price's
+        // quantity and a quantity of 0 removing the price, as the live book applies an update. Its
+        // best MAX_LEVELS a side, bids first, each row's level its position there, as BOOK answers.
+        // Until #233 this was the latest row of each level, which is the live book only for a
+        // writer whose every update is the whole side from its best level.
+        const ColumnarStore::PricedBook book =
+            store_.book_at_by_price(snap_ts, ast.symbol, ast.exchange, MAX_LEVELS);
         OB_LOG_DEBUG("query_engine", "SNAPSHOT: symbol=%s exchange=%s at=%llu levels=%zu "
-                                     "segments read=%zu skipped=%zu blocks=%zu",
+                                     "of %zu bid and %zu ask price(s); %llu row(s) from %zu "
+                                     "candidate(s)",
                      ast.symbol.c_str(), ast.exchange.c_str(),
-                     static_cast<unsigned long long>(snap_ts), book.rows.size(), book.segments_read,
-                     book.segments_skipped, book.blocks);
+                     static_cast<unsigned long long>(snap_ts), book.rows.size(), book.bid_prices,
+                     book.ask_prices, static_cast<unsigned long long>(book.cost.kept),
+                     book.cost.candidates);
 
         // A price condition keeps the levels of that book priced within it, and was ignored (#199).
         // It is applied to the book, after the latest row of each level is chosen, not to the rows
@@ -1852,14 +1844,40 @@ struct Top {
     bool    has_ask{false};
     int64_t bid{0};
     int64_t ask{0};
+};
+
+/// The book a series reads, by price (#233, decision B'): each side's prices and quantities, so the
+/// best is the first key once a removal takes the one before it. A series used to read level 0 of
+/// each update as the best, which it is only for a writer whose every update is the whole side.
+struct PriceBook {
+    std::map<int64_t, uint64_t, std::greater<>> bids;
+    std::map<int64_t, uint64_t> asks;
     void apply(const SnapshotRow& row) {
         if (row.side == SIDE_BID) {
-            has_bid = true;
-            bid = row.price;
+            if (row.quantity == 0) {
+                bids.erase(row.price);
+            } else {
+                bids.insert_or_assign(row.price, row.quantity);
+            }
         } else if (row.side == SIDE_ASK) {
-            has_ask = true;
-            ask = row.price;
+            if (row.quantity == 0) {
+                asks.erase(row.price);
+            } else {
+                asks.insert_or_assign(row.price, row.quantity);
+            }
         }
+    }
+    Top top() const {
+        Top t;
+        if (!bids.empty()) {
+            t.has_bid = true;
+            t.bid = bids.begin()->first;
+        }
+        if (!asks.empty()) {
+            t.has_ask = true;
+            t.ask = asks.begin()->first;
+        }
+        return t;
     }
 };
 
@@ -2116,24 +2134,23 @@ struct SeriesSweep {
 /// `on_window(bucket, windows)`, in order; false from it ends the sweep, and it must eventually
 /// return false, since the windows after the last row carry what it left in force.
 ///
-/// The book just before `lo` is read with `latest_per_level()` of the best levels, and the rows
-/// from `lo` to `read_to` with `scan_by_time()` of level 0 of either side.
+/// The book just before `lo` is read by price with `book_at_by_price()`, every price of it, and the
+/// rows from `lo` to `read_to` with `scan_by_time()`, every row: under #233's decision any row can
+/// change the best price, by setting a better one or by removing the one that was.
 template <typename OnWindow>
 SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64_t lo, uint64_t hi,
                          uint64_t read_to, uint64_t first, uint64_t width,
                          const std::vector<Series>& used, OnWindow&& on_window) {
     SeriesSweep out;
-    // The book just before the range, its best levels only.
-    Top top;
+    // The book just before the range, every price of it.
+    PriceBook book;
     if (lo > 0) {
-        LevelSet best{};
-        best.bid[0] = 1;
-        best.ask[0] = 1;
-        const ColumnarStore::BookAt before = store.latest_per_level(lo - 1, ast.symbol, ast.exchange, &best);
-        for (const SnapshotRow& r : before.rows) top.apply(r);
-        out.before_read = before.segments_read;
-        out.before_skipped = before.segments_skipped;
+        const ColumnarStore::PricedBook before = store.book_at_by_price(lo - 1, ast.symbol, ast.exchange);
+        for (const SnapshotRow& r : before.rows) book.apply(r);
+        out.before_read = before.cost.candidates;
+        out.before_skipped = before.cost.skipped;
     }
+    Top top = book.top();
 
     SeriesWindows windows{};
     const auto window_of = [&](Series s) -> SeriesWindow& { return windows[static_cast<size_t>(s)]; };
@@ -2165,8 +2182,9 @@ SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64
     };
     start_window();
 
-    // The rows of one instant are applied together - the last of a side is the one in force - and
-    // then the windows before that instant are closed, and the value it brings is observed.
+    // The rows of one instant are applied together - the best after all of them is the one in
+    // force - and then the windows before that instant are closed, and the value it brings is
+    // observed.
     Top next = top;
     uint64_t at_ts = 0;
     bool pending = false;
@@ -2191,25 +2209,28 @@ SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64
     ColumnSet columns;
     columns.add(QueryColumn::TimestampNs);
     columns.add(QueryColumn::Side);
-    columns.add(QueryColumn::Level);
     columns.add(QueryColumn::Price);
+    columns.add(QueryColumn::Quantity);
     bool going = true;
     out.cost = store.scan_by_time(
-        lo, read_to, ast.symbol, ast.exchange, columns, level0_of_either_side(),
+        lo, read_to, ast.symbol, ast.exchange, columns, RowFilter{},
         [&](const SnapshotRow& r) {
             if (pending && r.timestamp_ns != at_ts) {
                 pending = false;
+                next = book.top();
                 if (!apply_instant(at_ts)) return going = false;
             }
             if (!pending) {
-                next = top;
                 at_ts = r.timestamp_ns;
                 pending = true;
             }
-            next.apply(r);
+            book.apply(r);
             return true;
         });
-    if (going && pending) going = apply_instant(at_ts);
+    if (going && pending) {
+        next = book.top();
+        going = apply_instant(at_ts);
+    }
     // The buckets after the last row: what it left in force, carried to the last one wanted.
     while (going) {
         if (!finish_window()) break;

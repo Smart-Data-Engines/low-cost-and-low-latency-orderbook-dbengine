@@ -437,6 +437,13 @@ ob_add_engine_test(test_replace_side
     test_replace_side.cpp
 )
 
+# One book live and in history (#233, decision B'), and the live book back after a start (#235): a
+# book at an instant read by price, against the live book recorded after each of random writes.
+ob_add_engine_test(test_book_by_price
+    test_book_by_price.cpp
+)
+target_link_libraries(test_book_by_price PRIVATE rapidcheck rapidcheck_gtest)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )

@@ -193,6 +193,55 @@ Engine::~Engine() {
     close();
 }
 
+void Engine::restore_live_books() {
+    const auto started = std::chrono::steady_clock::now();
+    size_t restored = 0;
+    size_t levels = 0;
+    for (const auto& [symbol, exchange] : combined_store_.symbols()) {
+        const ColumnarStore::PricedBook book =
+            combined_store_.book_at_by_price(UINT64_MAX, symbol, exchange, MAX_LEVELS);
+        if (!book.as_of) continue;   // a symbol whose rows are all past UINT64_MAX: none is
+        std::lock_guard<std::mutex> lock(mtx_);
+        SoABuffer& buf = get_or_create_buffer(symbol + "." + exchange, symbol.c_str(), exchange.c_str());
+        // The seqlock's writer protocol, as apply_delta() follows it, though nothing reads yet: the
+        // book is published before anything serves, and a writer that skipped it here would be the
+        // one place a later change to who reads first could make a torn read.
+        const auto install = [&](SoASide& side, uint8_t which) {
+            const uint64_t ver = side.version.load(std::memory_order_relaxed);
+            side.version.store(ver + 1, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release);
+            uint32_t depth = 0;
+            for (const SnapshotRow& r : book.rows) {
+                if (r.side != which || depth >= SoASide::MAX_LEVELS) continue;
+                side.prices[depth]       = r.price;
+                side.quantities[depth]   = r.quantity;
+                side.order_counts[depth] = r.order_count;
+                ++depth;
+            }
+            side.depth = depth;
+            levels += depth;
+            if (which == SIDE_BID) {
+                buf.sequence_number.store(book.as_of->sequence_number, std::memory_order_relaxed);
+                buf.last_timestamp_ns.store(book.as_of->timestamp_ns, std::memory_order_relaxed);
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            side.version.store(ver + 2, std::memory_order_relaxed);
+        };
+        install(buf.bid, SIDE_BID);
+        install(buf.ask, SIDE_ASK);
+        ++restored;
+        OB_LOG_DEBUG("engine", "live book of %s.%s restored from history: %zu bid and %zu ask "
+                               "price(s) held, as of %llu (seq %llu)",
+                     symbol.c_str(), exchange.c_str(), book.bid_prices, book.ask_prices,
+                     static_cast<unsigned long long>(book.as_of->timestamp_ns),
+                     static_cast<unsigned long long>(book.as_of->sequence_number));
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - started).count();
+    OB_LOG_INFO("engine", "live books restored: %zu symbol(s) from history, %zu level(s), in %lld ms",
+                restored, levels, static_cast<long long>(ms));
+}
+
 void Engine::open() {
     // Before anything restores a counter: the replay below seeds the tracker, and a record of this
     // node's own origin raises its counter while another origin's does not (#184).
@@ -375,6 +424,9 @@ void Engine::open() {
                     static_cast<unsigned long long>(replayed));
         flush_incremental();
     }
+
+    // Then the live book from all of it (#235), before replication, the mesh or a client can write.
+    restore_live_books();
 
     // What the flush tick's merges look at first: every partition the store holds (#165 part 2b).
     {

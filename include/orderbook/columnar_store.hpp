@@ -695,6 +695,31 @@ public:
                                  const RowFilter& filter,
                                  const std::function<bool(const SnapshotRow&)>& cb) const;
 
+    /// The book of one symbol at `at` by price (#233, decision B'): every row at or before `at`
+    /// applied in the order `scan_by_time()` delivers them - by timestamp, a tie in the order
+    /// `scan()` delivers - each setting its price's quantity, and a quantity of 0 removing the
+    /// price. That is how the live book applies an update, so for writes in time order this is the
+    /// book the live one held at `at`.
+    ///
+    /// `rows` holds the best `depth` prices of each side, bids from the highest and asks from the
+    /// lowest; each row is the one that set its price last, its `level_index` its position in the
+    /// side. `as_of` is the last row applied, of any price - the update the book holds everything
+    /// up to - and is empty when no row was.
+    struct PricedBook {
+        std::vector<SnapshotRow> rows;
+        std::optional<SnapshotRow> as_of;
+        /// Prices each side held before `depth` cut it: what a deeper read would have answered.
+        size_t bid_prices{0};
+        size_t ask_prices{0};
+        TimeOrderedCost cost{};
+    };
+    PricedBook book_at_by_price(uint64_t at, std::string_view symbol, std::string_view exchange,
+                                size_t depth = SIZE_MAX) const;
+
+    /// Every symbol the index holds, with its exchange: the ones holding a segment or a published
+    /// block. For a start that rebuilds what is kept per symbol (#235).
+    std::vector<std::pair<std::string, std::string>> symbols() const;
+
     /// The earliest start and the latest end among one symbol's segments and unsealed blocks, or
     /// nothing when it has neither (#44 step 2): the range a series without a time condition
     /// covers.

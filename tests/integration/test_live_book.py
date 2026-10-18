@@ -163,11 +163,9 @@ def test_a_symbol_the_node_has_never_seen_is_refused_by_name(primary_client):
 
 
 # #233: one write, read two ways. The live book applies an update by price - a price it does not get
-# again stays - and history keys a row by its position in the update, so the two answer different best
-# bids for the same writes. Both kinds of writer, each a strict xfail until the item decides what an
-# update means; the one encoding on which the two agree is examples/binance-live's, held by
-# test_example_binance_live.py.
-REASON_233 = "#233: the live book applies an update by price, history keys it by position"
+# again stays - and history keyed a row by its position in the update, so the two answered different
+# best bids for the same writes. History reads by price now (decision B'), so both kinds of writer get
+# one best bid; these were strict xfails until it did.
 T233 = 1_791_900_000_000_000_000
 
 
@@ -180,7 +178,6 @@ def _best_bids(engine: OrderbookEngine, symbol: str, at: int) -> tuple[int, int]
     return live, then
 
 
-@pytest.mark.xfail(strict=True, reason=REASON_233)
 def test_a_writer_of_top_levels_gets_one_best_bid_from_the_book_and_history(primary_client):
     # Each update is the side's best two levels, as a depth stream sends them.
     primary_client.insert("BOOK-233-TOP", "EX", "bid", [100, 99], [1, 1], timestamp_ns=T233)
@@ -191,7 +188,6 @@ def test_a_writer_of_top_levels_gets_one_best_bid_from_the_book_and_history(prim
     assert live == then, f"the live book's best bid is {live}, history's {then}"
 
 
-@pytest.mark.xfail(strict=True, reason=REASON_233)
 def test_a_writer_of_changed_levels_gets_one_best_bid_from_the_book_and_history(primary_client):
     # The first update is the book; the second changes one level behind the best, as a diff does.
     primary_client.insert("BOOK-233-DIFF", "EX", "bid", [1000, 990], [1, 1], timestamp_ns=T233)

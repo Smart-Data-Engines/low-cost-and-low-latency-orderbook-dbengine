@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <atomic>
 #include <bit>
@@ -2561,6 +2562,78 @@ ColumnarStore::BookAt ColumnarStore::latest_per_level(uint64_t at, std::string_v
                  static_cast<unsigned long long>(at),
                  wanted != nullptr ? ", of the levels asked for" : "", out.rows.size(),
                  out.segments_read, out.segments_skipped, out.blocks);
+    return out;
+}
+
+ColumnarStore::PricedBook ColumnarStore::book_at_by_price(uint64_t at, std::string_view symbol,
+                                                         std::string_view exchange,
+                                                         size_t depth) const {
+    PricedBook out;
+    // The row holding each price, by side. Ordered maps, so the best come first without a sort,
+    // and a removal is one erase.
+    std::map<int64_t, SnapshotRow, std::greater<>> bids;
+    std::map<int64_t, SnapshotRow> asks;
+    ColumnSet columns;
+    columns.add(QueryColumn::TimestampNs);
+    columns.add(QueryColumn::SequenceNumber);
+    columns.add(QueryColumn::Side);
+    columns.add(QueryColumn::Price);
+    columns.add(QueryColumn::Quantity);
+    columns.add(QueryColumn::OrderCount);
+    out.cost = scan_by_time(0, at, symbol, exchange, columns, RowFilter{},
+                            [&](const SnapshotRow& r) {
+                                out.as_of = r;
+                                if (r.side == SIDE_BID) {
+                                    if (r.quantity == 0) {
+                                        bids.erase(r.price);
+                                    } else {
+                                        bids.insert_or_assign(r.price, r);
+                                    }
+                                } else if (r.side == SIDE_ASK) {
+                                    if (r.quantity == 0) {
+                                        asks.erase(r.price);
+                                    } else {
+                                        asks.insert_or_assign(r.price, r);
+                                    }
+                                }
+                                return true;
+                            });
+    out.bid_prices = bids.size();
+    out.ask_prices = asks.size();
+    const auto take = [&](const auto& side) {
+        size_t level = 0;
+        for (const auto& [price, row] : side) {
+            if (level >= depth) break;
+            SnapshotRow r = row;
+            // A position past what the field holds only in a read of more than 65535 prices a
+            // side, which nothing answers: the live book holds 1000.
+            r.level_index = static_cast<uint16_t>(std::min<size_t>(level, UINT16_MAX));
+            ++level;
+            out.rows.push_back(r);
+        }
+    };
+    take(bids);
+    take(asks);
+    OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: %zu bid and %zu ask price(s), %zu "
+                             "answered; %llu row(s) read from %zu candidate(s)",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(at), out.bid_prices, out.ask_prices,
+                 out.rows.size(), static_cast<unsigned long long>(out.cost.kept),
+                 out.cost.candidates);
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> ColumnarStore::symbols() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    out.reserve(by_symbol_.size());
+    for (const auto& [key, entry] : by_symbol_) {
+        const size_t nul = key.find('\0');
+        if (nul == std::string::npos) continue;   // every key is built by index_key()
+        out.emplace_back(key.substr(0, nul), key.substr(nul + 1));
+    }
+    std::sort(out.begin(), out.end());
     return out;
 }
 

@@ -1567,6 +1567,13 @@ private:
     /// Requires combined_store_.open_existing() to have run, and the segments no surviving
     /// checkpoint vouches for to have been removed (#160): a record a remaining segment already
     /// holds is skipped by the WAL position that segment recorded (#63), which needs the index.
+    /// The live book of every symbol in the store, rebuilt from history by price (#235): the book a
+    /// `WHERE AT` of the last instant answers. A start replayed the WAL's tail into the live book and
+    /// nothing else, so after a clean stop `BOOK` refused every symbol, and after a crash held only
+    /// what came after the last checkpoint. Called by `open()` once the recovered records are
+    /// history and before anything serves or writes.
+    void restore_live_books();
+
     uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
     void flush_drain_pending();
 

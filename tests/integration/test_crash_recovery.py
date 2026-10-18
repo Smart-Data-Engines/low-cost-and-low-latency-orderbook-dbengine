@@ -259,11 +259,10 @@ def test_a_wal_in_a_directory_of_its_own_is_replayed_after_sigkill():
         shutil.rmtree(wal_dir, ignore_errors=True)
 
 
-# #235: the live book does not come back with the node. A start replays the WAL's tail into the live
-# book and nothing else, so after a clean stop - whose flush leaves no tail - `BOOK` refuses the symbol,
-# and after a crash it holds only what came after the last checkpoint. History has every row either
-# way. Strict xfails until a start rebuilds the book (spec one-book-live-and-in-history).
-REASON_235 = "#235: a start rebuilds the live book from the WAL's tail alone, not from history"
+# #235: the live book did not come back with the node. A start replayed the WAL's tail into the live
+# book and nothing else, so after a clean stop - whose flush leaves no tail - `BOOK` refused the symbol,
+# and after a crash it held only what came after the last checkpoint. A start rebuilds every live book
+# from history by price now; these were strict xfails until it did.
 
 
 def _write_a_book_and_one_more_level(node: Node, symbol: str) -> list:
@@ -290,7 +289,6 @@ def _book_after_start(node: Node, symbol: str):
         engine.close()
 
 
-@pytest.mark.xfail(strict=True, reason=REASON_235)
 def test_the_live_book_comes_back_after_a_clean_stop(node):
     node.start()
     before = _write_a_book_and_one_more_level(node, "LB235STOP")
@@ -299,7 +297,6 @@ def test_the_live_book_comes_back_after_a_clean_stop(node):
     assert _book_after_start(node, "LB235STOP") == before
 
 
-@pytest.mark.xfail(strict=True, reason=REASON_235)
 def test_the_live_book_comes_back_after_sigkill(node):
     node.start()
     before = _write_a_book_and_one_more_level(node, "LB235KILL")
