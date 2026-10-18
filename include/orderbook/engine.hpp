@@ -310,6 +310,19 @@ public:
     /// `--decoded-cache-mb`): 0 holds none, and every query decodes what it reads. Off unless set -
     /// the server sets it from its configuration, 256 MiB by default.
     void set_decoded_columns_budget(size_t bytes);
+
+    /// How many rows of a symbol a seal takes in before it writes a summary of its book (#233,
+    /// `book_summary.hpp`): the most rows a book read applies after one. 0 writes none, and every
+    /// read composes the symbol's rows from the first. A deep book waits longer, so that a summary
+    /// is never most of what it summarises: `kBookSummaryRowsPerPrice` rows a price it held last.
+    static constexpr uint64_t kDefaultBookSummaryRows = 65'536;
+    static constexpr uint64_t kBookSummaryRowsPerPrice = 32;
+    void set_book_summary_rows(uint64_t rows) { book_summary_rows_ = rows; }
+    uint64_t book_summary_rows() const { return book_summary_rows_; }
+    /// The store queries read, for what only it can say: the summaries a symbol has, what a read
+    /// started from.
+    const ColumnarStore& store() const { return combined_store_; }
+
     DecodedColumnsBudget::Stats decoded_columns_stats() const {
         return combined_store_.decoded_columns_stats();
     }
@@ -1573,6 +1586,17 @@ private:
     /// what came after the last checkpoint. Called by `open()` once the recovered records are
     /// history and before anything serves or writes.
     void restore_live_books();
+    /// The same, with `mtx_` held: after a snapshot is installed or a store found on disk adopted,
+    /// whose live books were cleared with the rest of the state they described.
+    void restore_live_books_locked();
+
+    /// Rows sealed since a symbol's last summary, and the prices that summary held.
+    struct SummaryProgress {
+        uint64_t rows{0};
+        size_t prices{0};
+    };
+    std::unordered_map<std::string, SummaryProgress> summary_progress_;
+    uint64_t book_summary_rows_{kDefaultBookSummaryRows};
 
     uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
     void flush_drain_pending();
@@ -1655,6 +1679,9 @@ private:
     /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
     /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
     size_t merge_seals_locked(const std::vector<Seal>& seals);
+    /// Write the summaries a seal has made due (#233): one for each symbol that took in
+    /// `book_summary_rows_` rows - more for a deep book - since its last. Without `mtx_`.
+    void write_book_summaries(const std::vector<Seal>& seals);
     /// Where replay starts: the drain's position, or the oldest unsealed block's start if that is
     /// earlier - claiming a waiting block's rows would lose them in a crash. **With blocks waiting
     /// this position alone does not say which segments are durable** (#165 part 2a): a seal writes

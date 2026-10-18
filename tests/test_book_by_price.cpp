@@ -257,3 +257,96 @@ TEST(LiveBookAfterAStart, TheBookAfterAStartIsTheBookAtTheLastInstant) {
     EXPECT_EQ(live_book(*reopened), book_at(*reopened, UINT64_MAX));
     reopened->close();
 }
+
+// ── With the summaries a seal writes ──────────────────────────────────────────
+
+TEST(BookByPriceWithSummaries, ASealWritesThemAndAReadStartsFromTheNewest) {
+    TempDir dir("ob_bbp_sum_");
+    auto engine = open_engine(dir.path);
+    engine->set_book_summary_rows(4);
+    uint64_t ts = kT0;
+    for (int i = 0; i < 6; ++i) {
+        ASSERT_EQ(write(*engine, ob::SIDE_BID, {level(100 - i, 1), level(90 - i, 2)}, ++ts, false),
+                  ob::OB_OK);
+        ASSERT_EQ(write(*engine, ob::SIDE_ASK, {level(110 + i, 3)}, ++ts, i % 2 == 0), ob::OB_OK);
+        engine->flush_incremental();
+    }
+    const auto summaries = engine->store().book_summaries("BBP", "EX");
+    ASSERT_FALSE(summaries.empty()) << "six seals of 3 rows each, a summary every 4 rows: none written";
+    const auto book = engine->store().book_at_by_price(UINT64_MAX, "BBP", "EX");
+    ASSERT_TRUE(book.from_summary.has_value());
+    EXPECT_EQ(*book.from_summary, summaries.back());
+    EXPECT_EQ(book_at(*engine, ts), live_book(*engine));
+    engine->close();
+}
+
+TEST(BookByPriceWithSummaries, AStartRebuildsTheLiveBookFromTheNewestSummary) {
+    TempDir dir("ob_bbp_sum_start_");
+    std::vector<Level> before;
+    {
+        auto engine = open_engine(dir.path);
+        engine->set_book_summary_rows(2);
+        uint64_t ts = kT0;
+        for (int i = 0; i < 5; ++i) {
+            ASSERT_EQ(write(*engine, ob::SIDE_BID, {level(100 + i, 1), level(99 + i, 0)}, ++ts, false),
+                      ob::OB_OK);
+            engine->flush_incremental();
+        }
+        before = live_book(*engine);
+        engine->close();
+    }
+    auto reopened = open_engine(dir.path);
+    EXPECT_FALSE(reopened->store().book_summaries("BBP", "EX").empty());
+    EXPECT_TRUE(reopened->store().book_at_by_price(UINT64_MAX, "BBP", "EX").from_summary.has_value())
+        << "a start composed the book from the first row with a summary beside the segments";
+    EXPECT_EQ(live_book(*reopened), before);
+    reopened->close();
+}
+
+TEST(BookByPriceWithSummaries, AnEventTimeBeforeASummaryFalsifiesIt) {
+    TempDir dir("ob_bbp_sum_late_");
+    auto engine = open_engine(dir.path);
+    engine->set_book_summary_rows(1);
+    ASSERT_EQ(write(*engine, ob::SIDE_BID, {level(100, 1)}, kT0 + 100, false), ob::OB_OK);
+    engine->flush_incremental();
+    ASSERT_EQ(engine->store().book_summaries("BBP", "EX"), (std::vector<uint64_t>{kT0 + 100}));
+    // A correction for an earlier instant: history at 100 holds it, which the summary does not.
+    ASSERT_EQ(write(*engine, ob::SIDE_BID, {level(99, 4)}, kT0 + 50, false), ob::OB_OK);
+    engine->flush_incremental();
+    for (uint64_t at : {kT0 + 50, kT0 + 100}) {
+        const auto then = book_at(*engine, at);
+        ASSERT_FALSE(then.empty());
+        EXPECT_EQ(std::get<2>(then.back()), 99) << "the correction at 50 is missing at " << at - kT0;
+    }
+    engine->close();
+}
+
+RC_GTEST_PROP(BookByPriceProperty, WithSummariesHistoryAtEachWriteIsStillTheLiveBook, ()) {
+    TempDir dir("ob_bbp_prop_sum_");
+    auto engine = open_engine(dir.path);
+    engine->set_book_summary_rows(*rc::gen::inRange<uint64_t>(1, 12));
+    const size_t writes = *rc::gen::inRange<size_t>(1, 40);
+    std::vector<std::pair<uint64_t, std::vector<Level>>> seen;
+    uint64_t ts = kT0;
+    for (size_t w = 0; w < writes; ++w) {
+        ts += *rc::gen::inRange<uint64_t>(1, 1000);
+        const uint8_t side = *rc::gen::inRange(0, 2) == 0 ? ob::SIDE_BID : ob::SIDE_ASK;
+        const bool replace = *rc::gen::inRange(0, 4) == 0;
+        const size_t n = *rc::gen::inRange<size_t>(replace ? 0 : 1, 8);
+        std::vector<ob::Level> levels;
+        std::map<int64_t, bool> named;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t price = *rc::gen::inRange<int64_t>(1, 30);
+            if (named.count(price) != 0) continue;
+            named[price] = true;
+            const uint64_t qty = *rc::gen::inRange(0, 4) == 0 ? 0 : *rc::gen::inRange<uint64_t>(1, 100);
+            levels.push_back(level(price, qty, *rc::gen::inRange<uint32_t>(1, 5)));
+        }
+        RC_ASSERT(write(*engine, side, levels, ts, replace) == ob::OB_OK);
+        seen.emplace_back(ts, live_book(*engine));
+        if (*rc::gen::inRange(0, 3) == 0) engine->flush_incremental();
+    }
+    engine->flush_incremental();
+    for (const auto& [at, live] : seen) RC_ASSERT(book_at(*engine, at) == live);
+    engine->close();
+}

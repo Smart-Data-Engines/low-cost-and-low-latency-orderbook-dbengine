@@ -193,53 +193,112 @@ Engine::~Engine() {
     close();
 }
 
+namespace {
+
+/// Put a book composed by price into a live buffer, by the seqlock's writer protocol as
+/// apply_delta() follows it - though nothing reads yet at a start, a writer that skipped it here
+/// would be the one place a later change to who reads first could make a torn read.
+void install_live_book(SoABuffer& buf, const ColumnarStore::PricedBook& book) {
+    const auto install = [&](SoASide& side, uint8_t which) {
+        const uint64_t ver = side.version.load(std::memory_order_relaxed);
+        side.version.store(ver + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        uint32_t depth = 0;
+        for (const SnapshotRow& r : book.rows) {
+            if (r.side != which || depth >= SoASide::MAX_LEVELS) continue;
+            side.prices[depth]       = r.price;
+            side.quantities[depth]   = r.quantity;
+            side.order_counts[depth] = r.order_count;
+            ++depth;
+        }
+        side.depth = depth;
+        if (which == SIDE_BID) {
+            buf.sequence_number.store(book.as_of->sequence_number, std::memory_order_relaxed);
+            buf.last_timestamp_ns.store(book.as_of->timestamp_ns, std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        side.version.store(ver + 2, std::memory_order_relaxed);
+    };
+    install(buf.bid, SIDE_BID);
+    install(buf.ask, SIDE_ASK);
+}
+
+}  // namespace
+
 void Engine::restore_live_books() {
     const auto started = std::chrono::steady_clock::now();
     size_t restored = 0;
     size_t levels = 0;
+    size_t from_summaries = 0;
     for (const auto& [symbol, exchange] : combined_store_.symbols()) {
         const ColumnarStore::PricedBook book =
             combined_store_.book_at_by_price(UINT64_MAX, symbol, exchange, MAX_LEVELS);
         if (!book.as_of) continue;   // a symbol whose rows are all past UINT64_MAX: none is
         std::lock_guard<std::mutex> lock(mtx_);
-        SoABuffer& buf = get_or_create_buffer(symbol + "." + exchange, symbol.c_str(), exchange.c_str());
-        // The seqlock's writer protocol, as apply_delta() follows it, though nothing reads yet: the
-        // book is published before anything serves, and a writer that skipped it here would be the
-        // one place a later change to who reads first could make a torn read.
-        const auto install = [&](SoASide& side, uint8_t which) {
-            const uint64_t ver = side.version.load(std::memory_order_relaxed);
-            side.version.store(ver + 1, std::memory_order_relaxed);
-            std::atomic_thread_fence(std::memory_order_release);
-            uint32_t depth = 0;
-            for (const SnapshotRow& r : book.rows) {
-                if (r.side != which || depth >= SoASide::MAX_LEVELS) continue;
-                side.prices[depth]       = r.price;
-                side.quantities[depth]   = r.quantity;
-                side.order_counts[depth] = r.order_count;
-                ++depth;
-            }
-            side.depth = depth;
-            levels += depth;
-            if (which == SIDE_BID) {
-                buf.sequence_number.store(book.as_of->sequence_number, std::memory_order_relaxed);
-                buf.last_timestamp_ns.store(book.as_of->timestamp_ns, std::memory_order_relaxed);
-            }
-            std::atomic_thread_fence(std::memory_order_release);
-            side.version.store(ver + 2, std::memory_order_relaxed);
-        };
-        install(buf.bid, SIDE_BID);
-        install(buf.ask, SIDE_ASK);
+        install_live_book(get_or_create_buffer(symbol + "." + exchange, symbol.c_str(), exchange.c_str()),
+                          book);
         ++restored;
+        levels += book.rows.size();
+        if (book.from_summary) ++from_summaries;
         OB_LOG_DEBUG("engine", "live book of %s.%s restored from history: %zu bid and %zu ask "
-                               "price(s) held, as of %llu (seq %llu)",
+                               "price(s) held, as of %llu (seq %llu), %llu row(s) read after %s",
                      symbol.c_str(), exchange.c_str(), book.bid_prices, book.ask_prices,
                      static_cast<unsigned long long>(book.as_of->timestamp_ns),
-                     static_cast<unsigned long long>(book.as_of->sequence_number));
+                     static_cast<unsigned long long>(book.as_of->sequence_number),
+                     static_cast<unsigned long long>(book.cost.kept),
+                     book.from_summary ? "a summary" : "the first row");
     }
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - started).count();
-    OB_LOG_INFO("engine", "live books restored: %zu symbol(s) from history, %zu level(s), in %lld ms",
-                restored, levels, static_cast<long long>(ms));
+    OB_LOG_INFO("engine", "live books restored: %zu symbol(s), %zu from a summary and %zu from the "
+                          "first row, %zu level(s), in %lld ms",
+                restored, from_summaries, restored - from_summaries, levels, static_cast<long long>(ms));
+}
+
+void Engine::restore_live_books_locked() {
+    size_t restored = 0;
+    for (const auto& [symbol, exchange] : combined_store_.symbols()) {
+        const ColumnarStore::PricedBook book =
+            combined_store_.book_at_by_price(UINT64_MAX, symbol, exchange, MAX_LEVELS);
+        if (!book.as_of) continue;
+        install_live_book(get_or_create_buffer(symbol + "." + exchange, symbol.c_str(), exchange.c_str()),
+                          book);
+        ++restored;
+    }
+    OB_LOG_INFO("engine", "live books restored from the store installed: %zu symbol(s)", restored);
+}
+
+void Engine::write_book_summaries(const std::vector<Seal>& seals) {
+    if (book_summary_rows_ == 0) return;
+    for (const Seal& s : seals) {
+        if (s.metas.empty()) continue;
+        const std::string& symbol   = s.store->symbol();
+        const std::string& exchange = s.store->exchange();
+        SummaryProgress& p = summary_progress_[symbol + std::string(1, '\0') + exchange];
+        p.rows += s.rows;
+        const uint64_t due =
+            std::max<uint64_t>(book_summary_rows_, kBookSummaryRowsPerPrice * p.prices);
+        if (p.rows < due) continue;
+        const auto started = std::chrono::steady_clock::now();
+        const ColumnarStore::SummaryWrite w =
+            combined_store_.write_book_summary(symbol, exchange, s.metas.back().dir_path);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - started).count();
+        if (w.written) {
+            p.rows = 0;
+            p.prices = w.prices;
+            registry_.increment_counter("ob_book_summaries_written_total");
+            registry_.increment_counter("ob_book_summary_bytes_total", w.bytes);
+            OB_LOG_DEBUG("engine", "book summary %s.%s: %zu price(s) as of %llu, %zu bytes, from %llu "
+                                   "row(s) read, in %.2f ms",
+                         symbol.c_str(), exchange.c_str(), w.prices,
+                         static_cast<unsigned long long>(w.as_of_ts), w.bytes,
+                         static_cast<unsigned long long>(w.rows_read), ms);
+        } else {
+            OB_LOG_DEBUG("engine", "book summary %s.%s not written: %s", symbol.c_str(),
+                         exchange.c_str(), w.why_not.c_str());
+        }
+    }
 }
 
 void Engine::open() {
@@ -2441,6 +2500,8 @@ void Engine::adopt_store_on_disk() {
     combined_store_.open_existing();
     note_store_for_compaction();
     publish_segment_count();
+    // The live books, cleared above with what they described, from the store now on disk (#235).
+    restore_live_books_locked();
 
     // Discarding the pending rows made room, and since #137 there can be a writer asleep waiting
     // for exactly that. Without this it waits out the five-second deadline and is **refused**,
@@ -2483,6 +2544,8 @@ bool Engine::install_snapshot(const std::string& staging_dir,
         OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
                     combined_store_.segment_count());
         publish_segment_count();
+        // The live books, cleared above with the store they described, from the one installed (#235).
+        restore_live_books_locked();
         pending_cv_.notify_all();          // see adopt_store_on_disk() for why
     }
 
@@ -4546,6 +4609,8 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
         }
     }
     if (ask) ask_seal_sync(*ask);
+    // The summaries this seal made due, without mtx_: one reads what the seal just put in the index.
+    write_book_summaries(seals);
     const auto merged = SealClock::now();
     const auto ms = [](SealClock::time_point from, SealClock::time_point to) {
         return std::chrono::duration<double, std::milli>(to - from).count();

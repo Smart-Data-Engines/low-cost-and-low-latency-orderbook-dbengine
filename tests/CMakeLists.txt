@@ -444,6 +444,13 @@ ob_add_engine_test(test_book_by_price
 )
 target_link_libraries(test_book_by_price PRIVATE rapidcheck rapidcheck_gtest)
 
+# The summaries a book read by price starts from (#233): the file, and a store that writes, falsifies,
+# reads back and starts from them, against composing every row.
+ob_add_engine_test(test_book_summary
+    test_book_summary.cpp
+)
+target_link_libraries(test_book_summary PRIVATE rapidcheck rapidcheck_gtest)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )

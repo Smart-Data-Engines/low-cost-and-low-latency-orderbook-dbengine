@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/book_summary.hpp"
 #include "orderbook/column_codec.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/decoded_columns.hpp"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -48,7 +50,8 @@ inline constexpr const char* kColumnsV3File = "columns.v3";
 /// segments without their data, and a replica bootstrapped from it held none of their rows.
 inline bool is_segment_file(std::string_view filename) {
     return filename == "meta.json" || filename == kColumnsV3File ||
-           (filename.size() > 4 && filename.substr(filename.size() - 4) == ".col");
+           (filename.size() > 4 && filename.substr(filename.size() - 4) == ".col") ||
+           is_book_summary_file(filename);
 }
 
 /// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets
@@ -712,9 +715,31 @@ public:
         size_t bid_prices{0};
         size_t ask_prices{0};
         TimeOrderedCost cost{};
+        /// The summary the read started from, by the time it is as of; empty when it composed the
+        /// symbol's rows from the first (`book_summary.hpp`).
+        std::optional<uint64_t> from_summary;
     };
     PricedBook book_at_by_price(uint64_t at, std::string_view symbol, std::string_view exchange,
                                 size_t depth = SIZE_MAX) const;
+
+    /// Write a summary of one symbol's book into `dir`, a directory of one of its indexed segments,
+    /// and put it in the index (#233). It is the book by price as of the latest time of a row the
+    /// symbol's segments hold, with every row at or before it - in a block too - applied. Not
+    /// written when there is nothing newer to say, and not put in the index when rows arrived while
+    /// it was written: such a summary could lack one, and its file is removed.
+    struct SummaryWrite {
+        bool written{false};
+        uint64_t as_of_ts{0};
+        size_t prices{0};
+        size_t bytes{0};
+        uint64_t rows_read{0};          ///< rows applied after the summary it started from
+        std::string why_not;            ///< empty when written
+    };
+    SummaryWrite write_book_summary(std::string_view symbol, std::string_view exchange,
+                                    const std::string& dir);
+
+    /// The times of a symbol's summaries, oldest first: what a read can start from.
+    std::vector<uint64_t> book_summaries(std::string_view symbol, std::string_view exchange) const;
 
     /// Every symbol the index holds, with its exchange: the ones holding a segment or a published
     /// block. For a start that rebuilds what is kept per symbol (#235).
@@ -949,7 +974,44 @@ private:
         std::vector<WidthTier> tiers;
         /// Published and not yet sealed, oldest first: a drain appends, a seal takes from the front.
         std::deque<std::shared_ptr<const RowBlock>> blocks;
+        /// The book summaries of this symbol (#233, `book_summary.hpp`): the file each is in, by the
+        /// time it is as of. A summary leaves this map before any row it does not hold, at or before
+        /// that time, can be read - `publish_blocks()` - and with the segment it is in.
+        std::map<uint64_t, std::string> summaries;
+        /// The time a summary being written is as of, and whether a row at or before it was
+        /// published while it was: such a summary could lack that row (`write_book_summary()`).
+        std::optional<uint64_t> pending_summary;
+        bool pending_falsified{false};
     };
+    /// What a book read takes from the index under one lock: the candidates of a time-ordered scan
+    /// and the summary it starts from.
+    struct Gathered {
+        std::vector<SegmentMeta> segments;
+        std::vector<std::shared_ptr<const RowBlock>> blocks;
+        std::shared_ptr<const void> reading;
+        std::optional<std::pair<uint64_t, std::string>> summary;   ///< as of, file
+        bool found{false};
+    };
+    /// The candidates of [start_ns, end_ns] in the order a scan delivers them, and - with
+    /// `summary_at` - the newest summary as of at most that, the candidates then from its time on.
+    /// Caller holds `index_mtx_`.
+    void gather_locked(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                       std::string_view exchange, std::optional<uint64_t> summary_at,
+                       Gathered& out) const;
+    /// scan_by_time() over what gather_locked() took.
+    TimeOrderedCost scan_gathered(const Gathered& g, uint64_t start_ns, uint64_t end_ns,
+                                  std::string_view symbol, std::string_view exchange,
+                                  ColumnSet columns, const RowFilter& filter,
+                                  const std::function<bool(const SnapshotRow&)>& cb) const;
+    /// Remove from `si` the summaries a row at `ts` falsifies - every one as of `ts` or later - and
+    /// hand back their files for the caller to remove once the lock is released.
+    static void falsify_summaries_locked(SymbolIndex& si, uint64_t ts, std::vector<std::string>& files);
+    /// Remove the files of falsified summaries, and sync their directories: a summary that a power
+    /// cut brings back after the rows it does not hold were sealed would be believed by the next
+    /// start.
+    static void remove_summary_files(const std::vector<std::string>& files, std::string_view why);
+    /// The summaries in an indexed segment's directory, put in its symbol's map. Caller holds the lock.
+    void register_summaries_locked(const SegmentMeta& meta);
     static std::string index_key(std::string_view symbol, std::string_view exchange);
     /// Whether this index's `key` is the engine's `dotted` one (segments_of()).
     static bool is_dotted_key(const std::string& key, std::string_view dotted);

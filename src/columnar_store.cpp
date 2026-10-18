@@ -1,4 +1,5 @@
 #include "orderbook/columnar_store.hpp"
+#include "orderbook/durable_file.hpp"
 #include "orderbook/codec.hpp"
 #include "orderbook/column_codec.hpp"
 #include "orderbook/crc32c.hpp"
@@ -184,14 +185,26 @@ size_t RowBufferPool::spare_rows() const {
 void ColumnarStore::publish_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks) {
     if (blocks.empty()) return;
     size_t rows = 0;
+    std::vector<std::string> falsified;
     {
         std::unique_lock<std::shared_mutex> lock(index_mtx_);
         for (const auto& b : blocks) {
             if (!b) continue;
-            by_symbol_[index_key(b->symbol, b->exchange)].blocks.push_back(b);
+            SymbolIndex& si = by_symbol_[index_key(b->symbol, b->exchange)];
+            si.blocks.push_back(b);
             rows += b->rows.size();
+            // A row at or before a summary's time, arriving after it - an event time a client gave
+            // (#105), a peer's backlog - is a row it does not hold: out of the index before anyone
+            // can read the row (#233).
+            falsify_summaries_locked(si, b->min_ts_ns, falsified);
         }
         unsealed_rows_ += rows;
+    }
+    if (!falsified.empty()) {
+        OB_LOG_INFO("columnar", "%zu book summar%s removed: a row at or before the time each is as of "
+                                "was published after it",
+                    falsified.size(), falsified.size() == 1 ? "y" : "ies");
+        remove_summary_files(falsified, "a row at or before its time was published after it");
     }
     OB_LOG_DEBUG("columnar", "published %zu block(s) of %zu row(s) for queries to read unsealed",
                  blocks.size(), rows);
@@ -929,6 +942,12 @@ bool ColumnarStore::erase_locked(const SegmentMeta& meta) {
     auto& v = tier->segments;
     const auto pos = std::lower_bound(v.begin(), v.end(), meta, segment_order_less);
     if (pos == v.end() || pos->dir_path != meta.dir_path) return false;
+    // Its summaries go with it: a file that leaves with its directory is no summary to start from.
+    auto& summaries = it->second.summaries;
+    for (auto s = summaries.begin(); s != summaries.end();) {
+        s = fs::path(s->second).parent_path() == fs::path(meta.dir_path) ? summaries.erase(s)
+                                                                         : std::next(s);
+    }
     indexed_dirs_.erase(pos->dir_path);
     v.erase(pos);
     --indexed_count_;
@@ -1060,6 +1079,17 @@ ColumnarStore::ReplaceResult ColumnarStore::replace_segments(
                              inputs.size(), output.symbol.c_str(), output.exchange.c_str(),
                              output.dir_path.c_str());
             } else {
+                // The merge carried its inputs' summaries into the output (engine_compaction.cpp):
+                // the same files, now in its directory.
+                std::unordered_set<std::string> input_dirs;
+                for (const SegmentMeta& in : inputs) input_dirs.insert(in.dir_path);
+                for (auto& [as_of, path] : it->second.summaries) {
+                    const fs::path p(path);
+                    if (input_dirs.count(p.parent_path().string()) == 0) continue;
+                    const fs::path moved = fs::path(output.dir_path) / p.filename();
+                    std::error_code ec;
+                    if (fs::exists(moved, ec)) path = moved.string();
+                }
                 for (const SegmentMeta& in : inputs) erase_locked(in);
                 insert_locked(output);
                 auto fresh = std::make_shared<ReaderGeneration>();
@@ -2573,6 +2603,23 @@ ColumnarStore::PricedBook ColumnarStore::book_at_by_price(uint64_t at, std::stri
     // and a removal is one erase.
     std::map<int64_t, SnapshotRow, std::greater<>> bids;
     std::map<int64_t, SnapshotRow> asks;
+    const auto apply = [&](const SnapshotRow& r) {
+        out.as_of = r;
+        if (r.side == SIDE_BID) {
+            if (r.quantity == 0) {
+                bids.erase(r.price);
+            } else {
+                bids.insert_or_assign(r.price, r);
+            }
+        } else if (r.side == SIDE_ASK) {
+            if (r.quantity == 0) {
+                asks.erase(r.price);
+            } else {
+                asks.insert_or_assign(r.price, r);
+            }
+        }
+        return true;
+    };
     ColumnSet columns;
     columns.add(QueryColumn::TimestampNs);
     columns.add(QueryColumn::SequenceNumber);
@@ -2580,24 +2627,37 @@ ColumnarStore::PricedBook ColumnarStore::book_at_by_price(uint64_t at, std::stri
     columns.add(QueryColumn::Price);
     columns.add(QueryColumn::Quantity);
     columns.add(QueryColumn::OrderCount);
-    out.cost = scan_by_time(0, at, symbol, exchange, columns, RowFilter{},
-                            [&](const SnapshotRow& r) {
-                                out.as_of = r;
-                                if (r.side == SIDE_BID) {
-                                    if (r.quantity == 0) {
-                                        bids.erase(r.price);
-                                    } else {
-                                        bids.insert_or_assign(r.price, r);
-                                    }
-                                } else if (r.side == SIDE_ASK) {
-                                    if (r.quantity == 0) {
-                                        asks.erase(r.price);
-                                    } else {
-                                        asks.insert_or_assign(r.price, r);
-                                    }
-                                }
-                                return true;
-                            });
+
+    // The newest summary as of at most `at` and the candidates of the rows after it, under one lock:
+    // a summary that a row published after the gather falsifies is out of the index by then, and the
+    // candidates gathered with it are the ones it was true of.
+    Gathered g;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        gather_locked(0, at, symbol, exchange, at, g);
+    }
+    uint64_t from = 0;
+    if (g.summary.has_value()) {
+        BookSummary summary;
+        if (read_book_summary(g.summary->second, summary).empty()) {
+            for (const SnapshotRow& r : summary.rows) apply(r);
+            SnapshotRow label{};
+            label.timestamp_ns    = summary.header.as_of_ts;
+            label.sequence_number = summary.header.as_of_seq;
+            out.as_of = label;
+            out.from_summary = summary.header.as_of_ts;
+            from = summary.header.as_of_ts;
+        } else {
+            // read_book_summary() said why. The rows themselves are the answer, from the first.
+            bids.clear();
+            asks.clear();
+            out.as_of.reset();
+            g = Gathered{};
+            std::shared_lock<std::shared_mutex> lock(index_mtx_);
+            gather_locked(0, at, symbol, exchange, std::nullopt, g);
+        }
+    }
+    out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{}, apply);
     out.bid_prices = bids.size();
     out.ask_prices = asks.size();
     const auto take = [&](const auto& side) {
@@ -2615,13 +2675,138 @@ ColumnarStore::PricedBook ColumnarStore::book_at_by_price(uint64_t at, std::stri
     take(bids);
     take(asks);
     OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: %zu bid and %zu ask price(s), %zu "
-                             "answered; %llu row(s) read from %zu candidate(s)",
+                             "answered; from %s, then %llu row(s) read from %zu candidate(s)",
                  static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
                  static_cast<unsigned long long>(at), out.bid_prices, out.ask_prices,
-                 out.rows.size(), static_cast<unsigned long long>(out.cost.kept),
-                 out.cost.candidates);
+                 out.rows.size(),
+                 out.from_summary ? ("the summary as of " + std::to_string(*out.from_summary)).c_str()
+                                  : "the first row",
+                 static_cast<unsigned long long>(out.cost.kept), out.cost.candidates);
     return out;
+}
+
+ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(std::string_view symbol,
+                                                              std::string_view exchange,
+                                                              const std::string& dir) {
+    SummaryWrite out;
+    // As of the latest time a segment of the symbol holds a row at: a block's rows are the next
+    // seal's, and a summary that waited for them would falsify itself on the next restart, when the
+    // WAL brings them back as a publish.
+    uint64_t as_of = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        const auto it = by_symbol_.find(index_key(symbol, exchange));
+        bool any = false;
+        if (it != by_symbol_.end()) {
+            for (const WidthTier& tier : it->second.tiers) {
+                for (const SegmentMeta& m : tier.segments) {
+                    as_of = std::max(as_of, m.end_ts_ns);
+                    any = true;
+                }
+            }
+        }
+        if (!any) {
+            out.why_not = "no segment of the symbol is indexed";
+            return out;
+        }
+        SymbolIndex& si = it->second;
+        if (!si.summaries.empty() && si.summaries.rbegin()->first >= as_of) {
+            out.why_not = "a summary as of that time is there";
+            return out;
+        }
+        si.pending_summary = as_of;
+        si.pending_falsified = false;
+    }
+    out.as_of_ts = as_of;
+    const PricedBook book = book_at_by_price(as_of, symbol, exchange);
+    out.rows_read = book.cost.kept;
+    out.prices = book.rows.size();
+    BookSummary summary;
+    summary.header.as_of_ts  = as_of;
+    summary.header.as_of_seq = book.as_of ? book.as_of->sequence_number : 0;
+    summary.header.rows      = static_cast<uint32_t>(book.rows.size());
+    summary.rows             = book.rows;
+    const std::string bytes = encode_book_summary(summary);
+    const std::string path = (fs::path(dir) / book_summary_file(as_of)).string();
+    const int err = write_file_atomically(path, bytes);
+
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
+    const auto it = by_symbol_.find(index_key(symbol, exchange));
+    const bool falsified = it == by_symbol_.end() || it->second.pending_falsified;
+    if (it != by_symbol_.end()) {
+        it->second.pending_summary.reset();
+        it->second.pending_falsified = false;
+    }
+    if (err != 0) {
+        out.why_not = std::string("cannot write ") + path + ": " + std::strerror(err);
+        return out;
+    }
+    if (falsified || indexed_dirs_.count(dir) == 0) {
+        lock.unlock();
+        std::error_code ec;
+        fs::remove(path, ec);
+        out.why_not = falsified ? "a row at or before its time was published while it was written"
+                                : "its segment left the index while it was written";
+        return out;
+    }
+    it->second.summaries[as_of] = path;
+    out.written = true;
+    out.bytes = bytes.size();
+    return out;
+}
+
+std::vector<uint64_t> ColumnarStore::book_summaries(std::string_view symbol,
+                                                    std::string_view exchange) const {
+    std::vector<uint64_t> out;
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    const auto it = by_symbol_.find(index_key(symbol, exchange));
+    if (it == by_symbol_.end()) return out;
+    for (const auto& [as_of, path] : it->second.summaries) out.push_back(as_of);
+    return out;
+}
+
+void ColumnarStore::falsify_summaries_locked(SymbolIndex& si, uint64_t ts,
+                                             std::vector<std::string>& files) {
+    if (si.pending_summary.has_value() && ts <= *si.pending_summary) si.pending_falsified = true;
+    for (auto it = si.summaries.lower_bound(ts); it != si.summaries.end();) {
+        files.push_back(it->second);
+        it = si.summaries.erase(it);
+    }
+}
+
+void ColumnarStore::remove_summary_files(const std::vector<std::string>& files, std::string_view why) {
+    std::unordered_set<std::string> dirs;
+    for (const std::string& f : files) {
+        std::error_code ec;
+        fs::remove(f, ec);
+        dirs.insert(fs::path(f).parent_path().string());
+        OB_LOG_DEBUG("columnar", "book summary %s removed: %.*s%s", f.c_str(),
+                     static_cast<int>(why.size()), why.data(), ec ? " (and it could not be)" : "");
+    }
+    for (const std::string& d : dirs) {
+        if (const int err = sync_directory(d); err != 0 && err != ENOENT) {
+            OB_LOG_WARN("columnar", "book summaries removed from %s, and the directory cannot be "
+                                    "synced (%s): a power cut could bring them back",
+                        d.c_str(), std::strerror(err));
+        }
+    }
+}
+
+void ColumnarStore::register_summaries_locked(const SegmentMeta& meta) {
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(meta.dir_path, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (!is_book_summary_file(name)) continue;
+        BookSummaryHeader header;
+        if (const std::string err = read_book_summary_header(entry.path().string(), header);
+            !err.empty()) {
+            OB_LOG_WARN("columnar", "book summary %s not used: %s", entry.path().c_str(), err.c_str());
+            continue;
+        }
+        by_symbol_[index_key(meta.symbol, meta.exchange)].summaries[header.as_of_ts] =
+            entry.path().string();
+    }
 }
 
 std::vector<std::pair<std::string, std::string>> ColumnarStore::symbols() const {
@@ -2637,46 +2822,73 @@ std::vector<std::pair<std::string, std::string>> ColumnarStore::symbols() const 
     return out;
 }
 
+void ColumnarStore::gather_locked(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                                  std::string_view exchange, std::optional<uint64_t> summary_at,
+                                  Gathered& out) const {
+    // The candidates scan() would read, in the order it delivers them - that order is each one's
+    // rank, which decides a tie on the timestamp - copied under the lock, the generation held until
+    // the files are read (#165 part 2b).
+    out.reading = reader_generation_;
+    const auto it = by_symbol_.find(index_key(symbol, exchange));
+    if (it == by_symbol_.end()) return;
+    out.found = true;
+    if (summary_at.has_value()) {
+        const auto& summaries = it->second.summaries;
+        auto s = summaries.upper_bound(*summary_at);
+        if (s != summaries.begin()) {
+            --s;
+            out.summary = std::make_pair(s->first, s->second);
+            // The rows a read applies to it: from its own time on, which it holds too - a row at
+            // that time is applied again, to the same effect, in the same order (book_summary.hpp).
+            start_ns = std::max(start_ns, s->first);
+        }
+    }
+    for (const auto& b : it->second.blocks) {
+        if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) out.blocks.push_back(b);
+    }
+    auto& segments = out.segments;
+    for (const WidthTier& tier : it->second.tiers) {
+        const auto& v = tier.segments;
+        const size_t before = segments.size();
+        const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
+        auto first = std::lower_bound(
+            v.begin(), v.end(), from,
+            [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+        for (auto i = first; i != v.end() && i->start_ts_ns <= end_ns; ++i) {
+            if (i->end_ts_ns >= start_ns) segments.push_back(*i);
+        }
+        if (before != 0 && before != segments.size()) {
+            std::inplace_merge(segments.begin(),
+                               segments.begin() + static_cast<std::ptrdiff_t>(before),
+                               segments.end(), segment_order_less);
+        }
+    }
+}
+
 ColumnarStore::TimeOrderedCost ColumnarStore::scan_by_time(
         uint64_t start_ns, uint64_t end_ns, std::string_view symbol, std::string_view exchange,
         ColumnSet columns, const RowFilter& filter,
+        const std::function<bool(const SnapshotRow&)>& cb) const {
+    Gathered g;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        gather_locked(start_ns, end_ns, symbol, exchange, std::nullopt, g);
+    }
+    return scan_gathered(g, start_ns, end_ns, symbol, exchange, columns, filter, cb);
+}
+
+ColumnarStore::TimeOrderedCost ColumnarStore::scan_gathered(
+        const Gathered& g, uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+        std::string_view exchange, ColumnSet columns, const RowFilter& filter,
         const std::function<bool(const SnapshotRow&)>& cb) const {
     columns.add(QueryColumn::TimestampNs);
     if (filter.has_price()) columns.add(QueryColumn::Price);
     if (filter.has_side()) columns.add(QueryColumn::Side);
     if (filter.has_level()) columns.add(QueryColumn::Level);
     TimeOrderedCost cost;
-    // The candidates scan() would read, in the order it delivers them - that order is each one's
-    // rank, which decides a tie on the timestamp - copied under the shared lock, the generation
-    // held until the files are read (#165 part 2b).
-    std::vector<SegmentMeta> segments;
-    std::vector<std::shared_ptr<const RowBlock>> blocks;
-    std::shared_ptr<const void> reading;
-    {
-        std::shared_lock<std::shared_mutex> lock(index_mtx_);
-        reading = reader_generation_;
-        const auto it = by_symbol_.find(index_key(symbol, exchange));
-        if (it == by_symbol_.end()) return cost;
-        for (const auto& b : it->second.blocks) {
-            if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) blocks.push_back(b);
-        }
-        for (const WidthTier& tier : it->second.tiers) {
-            const auto& v = tier.segments;
-            const size_t before = segments.size();
-            const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
-            auto first = std::lower_bound(
-                v.begin(), v.end(), from,
-                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
-            for (auto i = first; i != v.end() && i->start_ts_ns <= end_ns; ++i) {
-                if (i->end_ts_ns >= start_ns) segments.push_back(*i);
-            }
-            if (before != 0 && before != segments.size()) {
-                std::inplace_merge(segments.begin(),
-                                   segments.begin() + static_cast<std::ptrdiff_t>(before),
-                                   segments.end(), segment_order_less);
-            }
-        }
-    }
+    if (!g.found) return cost;
+    const std::vector<SegmentMeta>& segments = g.segments;
+    const std::vector<std::shared_ptr<const RowBlock>>& blocks = g.blocks;
     cost.candidates = segments.size();
     cost.blocks = blocks.size();
 
@@ -2987,7 +3199,21 @@ void ColumnarStore::rebuild_index_locked() {
     // sorted once, before being handed out per symbol, so building the index is not a sorted
     // insertion per segment.
     std::sort(found.begin(), found.end(), segment_order_less);
-    for (auto& meta : found) insert_locked(std::move(meta));
+    size_t summaries = 0;
+    for (auto& meta : found) {
+        // The summaries in its directory (#233), each checked by its header alone: the prices are
+        // read, and checked by their own CRC, when a read starts from one.
+        const std::string key = index_key(meta.symbol, meta.exchange);
+        const size_t before = by_symbol_.count(key) != 0 ? by_symbol_[key].summaries.size() : 0;
+        const SegmentMeta copy = meta;
+        insert_locked(std::move(meta));
+        register_summaries_locked(copy);
+        summaries += by_symbol_[key].summaries.size() - before;
+    }
+    if (summaries > 0) {
+        OB_LOG_INFO("columnar", "%zu book summar%s found beside the segments", summaries,
+                    summaries == 1 ? "y" : "ies");
+    }
 }
 
 void ColumnarStore::repair_ranges_locked(std::vector<SegmentMeta>& found) {
