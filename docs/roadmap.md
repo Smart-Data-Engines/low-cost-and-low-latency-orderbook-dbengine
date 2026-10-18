@@ -2805,6 +2805,29 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 242. The WAL's budget costs 1 - 2% of the levels a second on a device at 7 - 10 MB/s **P3**
+
+**Found closing #190.** Step 9 of #190 bounds the WAL waiting for a sync.
+- At a write limit its syncs come 3.5-5 times as often as master's. Each forces the XFS journal,
+  which writes at least the log's 16 kB stripe unit.
+- Over 36 M-level rounds with the tail counted, the budget took 1.7% fewer levels a second than
+  master at 7 MB/s and 0.8% fewer at 10 MB/s (m9g.xlarge, `evidence/2026-10-14-wal-sync-budget/` in
+  the workspace).
+- At 5, 15 and 30 MB/s, and with no limit, it took as many as master or more.
+
+**Fewer ticks do not help.** A tick's sync is what writes the WAL back: with the flush loop waking
+only at half the budget while admission was in force, a fifth of the cap went unused.
+
+**A fix keeps the device busy with fewer syncs:** the WAL written back ahead of its sync
+(`sync_file_range`), and a sync only at half the budget.
+- Branch `perf/wal-writeback-ahead` built the first half for #190's stalls, and was not measured
+  against this.
+- Its measure is `run190d5L.sh`'s rounds: durable levels a second within master's range at 7 and
+  10 MB/s, with step 9's worst batch and its refusals kept.
+
+- Effort: M | Impact: 1 - 2% of the levels a second while a device slower than the writes is the
+  limit, at 7 - 10 MB/s on this host
+
 ### 241. Code scanning's open alerts in our own code ✅ **P3**
 
 Fifteen were open on `master` on 17 October 2026, all from the `security-and-quality` suite, and
@@ -4929,7 +4952,7 @@ node alone, by the node back on a new connection.
 - Effort: S | Impact: a node joining a mesh that cannot serve it refuses writes for as long as it
   runs, and keeps every peer preparing snapshots
 
-### 190. At the write ceiling a flush tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue **P2**
+### 190. At the write ceiling a flush tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue ✅ **P2**
 
 **Found measuring #186's fix.** One node of 4 000 symbols under `benchmarks/pipelined_ingest` at two
 connections (Release, i3-7100U): a writer waited for room in the pending queue in four runs of eight
@@ -5186,12 +5209,14 @@ Against master (`0442ed5`), ABBA, 8 rounds a side of 12 M levels, and of 36 M wh
 - **The writes' p99.9 is the budget's waits:** 0.24-0.32 s at 7 MB/s against master's 21 ms. Master's
   writers stop instead, a few times a round, for 3.5-4.4 s.
 
-What is left of this item is that cost. Syncing less often while the device stays busy would take
-the WAL written back ahead of its sync. Branch `perf/wal-writeback-ahead` was built for the stalls
-above and is not measured against this.
+**Closed with step 9** (PR #272, 18 October).
+- On the m9g.xlarge, at every limit measured from 5 to 30 MB/s, no batch of writes waited a second.
+- At 5 MB/s no write was refused, where master refused in 7 rounds of 8.
+
+What the budget costs at 7-10 MB/s is #242.
 
 - Effort: M | Impact: writes faster than the device wait under a second, and are not refused at
-  5 MB/s; at 7-10 MB/s that costs 1-2% of the levels a second
+  5 MB/s
 
 ### 189. A mesh node of tens of thousands of (symbol, origin) pairs holds writes for 9 - 13 ms at every checkpoint, writing its whole vector down ✅ **P2**
 
@@ -15234,8 +15259,10 @@ it missed; every tick brings it up to date now, at the cost of the frontiers tha
 peer as holding nothing, resending everything since its last vector. **#186 is closed**, found
 measuring #180's cost: a node of 4 000 symbols answered a write up to 1.1 s late, all of it in the WAL
 append waiting for the ext4 journal its segments keep busy, and `--wal-dir` gives the WAL a
-filesystem of its own - no write slower than 11 ms in six runs where four stalled; **#190** is what
-remains at the ceiling, a WAL sync of 1 - 3 s on a device the segments share. **#187 is closed, and was a P0**: a mesh upgraded across #184 stored the rows of a symbol two nodes
+filesystem of its own - no write slower than 11 ms in six runs where four stalled. **#190 is
+closed** too, what remained at the ceiling: a WAL sync of 1 - 3 s on a device the segments share,
+and refused writes on a slower one. Its step 9 bounds the WAL waiting for a sync, and no batch
+waits a second at 5 - 30 MB/s; what that costs at 7 - 10 MB/s is #242. **#187 is closed, and was a P0**: a mesh upgraded across #184 stored the rows of a symbol two nodes
 wrote again on every node after an outage - 11 904, 11 404 and 16 232 where 11 000 were written -
 and closes that numbering once at a fixed base now; 11 000 everywhere. **#191 and #192 are closed**, found measuring #176: a joiner that every peer refused asked them in
 turn for ever and refused writes the whole time - 36 requests in 90 s, not one write - and asks each
@@ -15321,7 +15348,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #190, #193, #194, #223, #233, #235.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #233, #235, #242.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -15462,11 +15489,11 @@ The capability items are in the table below.
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | The live book and history agree about which level a write is (#233) | M–L | One write answers two best prices - the live book's and history's - for any writer that does not send removals after its levels |
 | **P1** | The live book comes back with the node (#235) | M | After a stop the book is gone, and after a crash it is the WAL's tail: every live aggregate answers a book the market never had |
-| **P2** | A flush tick's WAL sync at the ceiling does not keep writers waiting seconds for room (#190) | M | On a device the segments keep busy the tick's WAL sync took 1.2 - 3.0 s at the pipelined ceiling, and writers waited up to 3.4 s for room in the pending queue - 1.6 s from the refusal |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
+| **P3** | The WAL's budget keeps the device busy with fewer syncs (#242) | M | On a device slower than the writes, at 7 - 10 MB/s, its syncs' journal costs 1 - 2% of the levels a second |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Point-in-time recovery (#34, what is left of it) | M | A restore to a moment between two backups; backup and restore themselves shipped |
 | **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |

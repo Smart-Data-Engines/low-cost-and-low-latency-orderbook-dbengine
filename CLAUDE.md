@@ -4490,10 +4490,11 @@ them now while the symbol is written - rounds of pipelined copies, then a freeze
 a compare-and-swap of the map in etcd - and the target adopts it only where none of its rows is, from
 the copying connection alone, under a numbered adoption the engine checks again under its lock:
 4.8 - 142.7 ms of refused writes (median 7.4) across ten moves of 250 000 rows with two writers, and
-not one write lost (pitfalls 514-522). **#190 and #193 are open P2s** - at the write ceiling a flush
-tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wait that long for room
-in the pending queue; and a joiner checks every path of a snapshot's manifest against the filesystem
-on its mesh io thread, 5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
+not one write lost (pitfalls 514-522). **#193 is an open P2**: a joiner checks every path of a
+snapshot's manifest against the filesystem on its mesh io thread, 5 s for 70 000 files. **#190 is
+closed** by its step 9, a budget for the WAL waiting for a sync: no batch waits a second at
+5 - 30 MB/s, and none is refused at 5. **#242 (P3)** is what that costs at 7 - 10 MB/s, 1 - 2% of the
+levels a second in the journal of the more frequent syncs. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
 though the engine writes no such file.
 
 **#239**: a client resuming a subscription from a book loses nothing. The documented order was the
