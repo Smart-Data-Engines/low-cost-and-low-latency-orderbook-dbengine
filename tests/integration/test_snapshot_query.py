@@ -11,9 +11,9 @@ it nothing was.
 Over the raw protocol, for the same reason as `test_column_projection.py`: the shape of the answer
 is the thing being asked about, and our clients read a row by position.
 
-Since #47 the book is read from the newest segment down, a segment none of whose rows can be its
-level's latest not read at all; the last test asks it over many segments, with levels the newest
-ones do not hold.
+Since #233 the book is read by price - every row up to the instant applied in time order, a quantity
+of 0 removing its price - from the newest book summary before it; the last test asks it over many
+segments, with prices only the oldest holds.
 """
 from __future__ import annotations
 
@@ -35,14 +35,14 @@ HEADER = ["timestamp_ns", "price", "quantity", "order_count", "side", "level", "
 
 @pytest.fixture
 def book(cluster, primary_client: OrderbookEngine, request) -> str:
-    """One bid level written twice in one flush, the later event time first.
+    """One bid price written twice in one flush, the later event time first: 5 at 5 s, then 7 at 3 s.
 
     A symbol of this test's own: storage is append-only and `cluster` is session-scoped, so a
     shared symbol would carry the rows of every test before it.
     """
     symbol = f"SNAP-{hashlib.sha1(request.node.name.encode()).hexdigest()[:8]}"
     primary_client.insert(symbol, EXCHANGE, "bid", [100], [5], [1], timestamp_ns=BASE + 5 * SEC)
-    primary_client.insert(symbol, EXCHANGE, "bid", [101], [5], [1], timestamp_ns=BASE + 3 * SEC)
+    primary_client.insert(symbol, EXCHANGE, "bid", [100], [7], [1], timestamp_ns=BASE + 3 * SEC)
     primary_client.flush()
     return symbol
 
@@ -56,7 +56,7 @@ def test_a_snapshot_answers_its_columns_and_the_latest_row(cluster, book):
     row = dict(zip(HEADER, lines[2].split("\t")))
     assert row["timestamp_ns"] == str(BASE + 5 * SEC), (
         "the correction for 3 s replaced the book written at 5 s (#168)")
-    assert row["price"] == "100"
+    assert (row["price"], row["quantity"]) == ("100", "5")
 
 
 def test_a_snapshot_before_the_later_row_answers_the_earlier(cluster, book):
@@ -64,7 +64,7 @@ def test_a_snapshot_before_the_later_row_answers_the_earlier(cluster, book):
                       f"SELECT * FROM '{book}'.'{EXCHANGE}' WHERE AT {BASE + 4 * SEC}")
     assert lines[:2] == ["OK", "\t".join(HEADER)], lines
     assert len(lines) == 3, lines
-    assert dict(zip(HEADER, lines[2].split("\t")))["price"] == "101"
+    assert dict(zip(HEADER, lines[2].split("\t")))["quantity"] == "7"
 
 
 def test_a_snapshot_answers_the_columns_it_names(cluster, book):
@@ -75,42 +75,46 @@ def test_a_snapshot_answers_the_columns_it_names(cluster, book):
 
 @pytest.fixture
 def history(cluster, primary_client: OrderbookEngine, request) -> str:
-    """A book over 25 flushes, each sealing a segment, whose levels are not all in the newest.
+    """A book over 25 flushes, each sealing a segment, whose prices are not all in the newest.
 
-    The first flush writes ten bid levels at 0 s; flushes 1 to 23 five each, at their own second,
-    the seventh four ask levels too; the last two bid levels at 30 s, after every instant asked
-    about. A row's price says which flush wrote it: 1000 * flush + level.
+    The first flush writes ten bid prices at 0 s, 0 to 9; flushes 1 to 23 each set five new best bids,
+    1000 * flush + 0..4, at their own second, and remove the five the flush before set - so prices 5
+    to 9, under them, are only ever in the first segment. The seventh writes four asks too, 7000..7003;
+    the last flush two bids at 30 s, after every instant asked about.
     """
     symbol = f"SNAP-{hashlib.sha1(request.node.name.encode()).hexdigest()[:8]}"
-
-    def write(flush: int, side: str, levels: int, at_s: int) -> None:
-        primary_client.insert(symbol, EXCHANGE, side, [1000 * flush + lv for lv in range(levels)],
-                              [flush + 1] * levels, [1] * levels, timestamp_ns=BASE + at_s * SEC)
-
-    write(0, "bid", 10, 0)
+    top = list(range(5))
+    primary_client.insert(symbol, EXCHANGE, "bid", list(range(10)), [1] * 10, [1] * 10,
+                          timestamp_ns=BASE)
     primary_client.flush()
     for flush in range(1, 24):
-        write(flush, "bid", 5, flush)
+        new = [1000 * flush + lv for lv in range(5)]
+        primary_client.insert(symbol, EXCHANGE, "bid", new + top, [flush + 1] * 5 + [0] * 5,
+                              [1] * 10, timestamp_ns=BASE + flush * SEC)
+        top = new
         if flush == 7:
-            write(flush, "ask", 4, flush)
+            primary_client.insert(symbol, EXCHANGE, "ask", [7000 + lv for lv in range(4)], [8] * 4,
+                                  [1] * 4, timestamp_ns=BASE + flush * SEC)
         primary_client.flush()
-    write(24, "bid", 2, 30)
+    primary_client.insert(symbol, EXCHANGE, "bid", [24000, 24001], [25, 25], [1, 1],
+                          timestamp_ns=BASE + 30 * SEC)
     primary_client.flush()
     return symbol
 
 
-def test_a_snapshot_over_many_segments_answers_each_levels_latest(cluster, history):
+def test_a_snapshot_over_many_segments_answers_the_book_by_price(cluster, history):
     port = cluster.primary().tcp_port
     for at_ns in (BASE + SEC // 2, BASE + 3 * SEC + SEC // 2, BASE + 7 * SEC, BASE + 12 * SEC + 1,
                   BASE + 29 * SEC):
         lines = raw_query(port, f"SELECT * FROM '{history}'.'{EXCHANGE}' WHERE AT {at_ns}")
         assert lines[:2] == ["OK", "\t".join(HEADER)], lines
         rows = [dict(zip(HEADER, line.split("\t"))) for line in lines[2:]]
-        book = {(int(r["side"]), int(r["level"])): int(r["price"]) for r in rows}
-        assert len(book) == len(rows), f"a level answered twice at {at_ns}: {lines}"
+        got = [(int(r["side"]), int(r["level"]), int(r["price"])) for r in rows]
         newest = min((at_ns - BASE) // SEC, 23)
-        expected = {(0, lv): 1000 * (newest if lv < 5 else 0) + lv for lv in range(10)}
+        best = list(range(5)) if newest == 0 else [1000 * newest + lv for lv in range(5)]
+        bids = sorted(best + list(range(5, 10)), reverse=True)
+        want = [(0, level, price) for level, price in enumerate(bids)]
         if at_ns >= BASE + 7 * SEC:
-            expected.update({(1, lv): 7000 + lv for lv in range(4)})
-        assert book == expected, (
-            f"at {(at_ns - BASE) / SEC} s the book is not each level's latest row: {sorted(book.items())}")
+            want += [(1, level, 7000 + level) for level in range(4)]
+        assert got == want, (
+            f"at {(at_ns - BASE) / SEC} s the book is not the book by price: {got}")

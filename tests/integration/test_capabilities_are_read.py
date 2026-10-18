@@ -30,6 +30,9 @@ READERS = {
                     "EveryBoundedCommandRefusesOneTokenTooMany"),
     # The backup tool asks before it sends BACKUP, which an older server answers as unknown (#34).
     "backup": ("tools/ob_backup.cpp", 'caps.value().count("backup") == 0'),
+    # Both clients ask before they send MREPLACE, which an older server answers as unknown (#233).
+    "replace_side": ("python/orderbook_engine/__init__.py",
+                     '"replace_side" not in self.server_capabilities()'),
 }
 
 
