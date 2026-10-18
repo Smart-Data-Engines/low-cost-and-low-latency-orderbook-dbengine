@@ -486,7 +486,7 @@ add_library(orderbook_compaction STATIC src/compaction.cpp)
 target_link_libraries(orderbook_compaction PUBLIC orderbook_core)
 
 # ── Writes admitted at the rate the device takes (#190 step 5): a policy, tested on its own ──────
-add_library(orderbook_admission STATIC src/admission.cpp)
+add_library(orderbook_admission STATIC src/admission.cpp src/sync_budget.cpp)
 target_link_libraries(orderbook_admission PUBLIC orderbook_core)
 
 # ── Engine facade compiled library ────────────────────────────────────────────

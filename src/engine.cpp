@@ -1184,8 +1184,9 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             // journal, which a data directory's segments keep busy - unless the WAL has one of its own.
             const bool hint = wal_beside_data && wal >= kSlowLockMs;
             OB_LOG_WARN("engine", "A batch of %zu write(s) waited %.1f ms for the engine lock and "
-                                  "held it %.1f ms - %.1f ms of it waiting for room in the pending "
-                                  "queue, %.1f ms in the WAL append%s",
+                                  "held it %.1f ms - %.1f ms of it waiting for room (in the pending "
+                                  "queue, or for the WAL to reach the device), %.1f ms in the WAL "
+                                  "append%s",
                         writes, waited, total, room, wal,
                         hint ? "; a WAL on a filesystem of its own (--wal-dir) does not wait for "
                                "the data directory's journal"
@@ -3283,10 +3284,28 @@ void Engine::request_flush() {
 }
 
 bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
-    const auto room = [this]() {
-        return queued_rows() < MAX_PENDING_ROWS ||
-               stop_flush_.load(std::memory_order_relaxed);
+    // Room is two things (#190 step 9): space in the pending queue, and - under `interval` - WAL
+    // waiting for a sync within what one sync may write. The second is what bounds a writer's wait
+    // on a device slower than the writes: the queue alone let a million rows' WAL, 34 MB, wait for
+    // one sync, and at 5 MB/s that sync outlasted the deadline. `every` syncs each run on the
+    // writer's own thread and `none` never syncs, so under those there is no sync to wait for.
+    const bool budgeted = fsync_policy_ == FsyncPolicy::INTERVAL;
+    const auto unsynced = [this]() { return wal_.bytes_appended() - wal_.bytes_synced(); };
+    const auto queue_has_room = [this]() { return queued_rows() < MAX_PENDING_ROWS; };
+    const auto wal_has_room = [&]() { return !budgeted || unsynced() < sync_budget_.bytes(); };
+    const auto room = [&]() {
+        return (queue_has_room() && wal_has_room()) || stop_flush_.load(std::memory_order_relaxed);
     };
+    // The sync a writer will need is asked for at half the budget, so that it can run while the
+    // writer fills the other half. Measured on the m9g.xlarge at 5-15 MB/s against asking only at
+    // the whole budget: the writers' waits for it fell from 8-38 a round to 6-15, and the 5-10% of
+    // throughput the budget costs against master there did not come back - so that cost is not the
+    // sync and the writing taking turns, and what it is has not been measured yet (#190 step 9,
+    // evidence/2026-10-14-wal-sync-budget/). Once per request: the flag says one is outstanding.
+    if (budgeted && unsynced() >= sync_budget_.bytes() / 2 &&
+        !flush_now_.load(std::memory_order_relaxed)) {
+        request_flush();
+    }
     if (room()) {
         // The episode has to be closed here as well as after a wait, because the writer that
         // ends it is usually one that never waited: the flush drains the queue, and the next
@@ -3298,30 +3317,47 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
             OB_LOG_INFO("engine", "The pending queue has room again; %llu write(s) waited for it.",
                         static_cast<unsigned long long>(waited));
         }
+        if (const uint64_t waited = wal_budget_wait_.end()) {
+            OB_LOG_INFO("engine", "The WAL waiting for a sync is within its budget again; %llu "
+                                  "write(s) waited for a sync.",
+                        static_cast<unsigned long long>(waited));
+        }
         return true;
     }
 
     request_flush();
-    registry_.increment_counter("ob_writer_backpressure_waits_total");
-    if (backpressure_.begin()) {
-        OB_LOG_WARN("engine",
-                    "A writer is waiting for room in the pending queue (%zu rows). The flush has "
-                    "been asked to run now rather than at the next interval; the write is refused "
-                    "if it does not free room within %lld s.",
-                    queued_rows(),
-                    static_cast<long long>(kBackpressureDeadline.count()));
+    if (!queue_has_room()) {
+        registry_.increment_counter("ob_writer_backpressure_waits_total");
+        if (backpressure_.begin()) {
+            OB_LOG_WARN("engine",
+                        "A writer is waiting for room in the pending queue (%zu rows). The flush has "
+                        "been asked to run now rather than at the next interval; the write is refused "
+                        "if it does not free room within %lld s.",
+                        queued_rows(),
+                        static_cast<long long>(kBackpressureDeadline.count()));
+        }
+    } else {
+        registry_.increment_counter("ob_writer_wal_budget_waits_total");
+        if (wal_budget_wait_.begin()) {
+            OB_LOG_WARN("engine",
+                        "A writer is waiting for the WAL to reach the device: %.1f MiB is unsynced, "
+                        "against a budget of %.1f MiB - about a second of the device's writing, by "
+                        "the syncs measured so far, and %.1f MiB before the first. The flush has "
+                        "been asked to run now; the write is refused if no room comes within %lld s.",
+                        static_cast<double>(unsynced()) / 1048576.0,
+                        static_cast<double>(sync_budget_.bytes()) / 1048576.0,
+                        static_cast<double>(SyncBudget::Config{}.initial_bytes) / 1048576.0,
+                        static_cast<long long>(kBackpressureDeadline.count()));
+        }
     }
 
     const bool got_room = pending_cv_.wait_for(lock, kBackpressureDeadline, room);
 
     if (!got_room) {
         registry_.increment_counter("ob_writer_backpressure_refusals_total");
-        OB_LOG_ERROR("engine",
-                     "The pending queue did not free room in %lld s, so this write is refused "
-                     "rather than accepted. The flush cannot make progress - a full disk or a "
-                     "failing fsync is the usual reason, and ob_flush_errors_total and "
-                     "ob_wal_fsync_errors_total say which.",
-                     static_cast<long long>(kBackpressureDeadline.count()));
+        OB_LOG_ERROR("engine", "%s",
+                     room_refusal_reason(wal_sync_running_for(),
+                                         wal_sync_bytes_.load(std::memory_order_relaxed)).c_str());
         return false;
     }
     // Deliberately not closed here: the waiter that gets room is still inside the episode, and
@@ -3498,9 +3534,11 @@ void Engine::flush_tick() {
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
         // readable, and retention below stays where it was until a restart (#160). What it seals
-        // is its share: about what it drained (#165 part 2a, kSealRows).
+        // is its share: about what it drained (#165 part 2a, kSealRows) - and, while admission is
+        // in force, the stores due by age that what it drained pays for (#190 step 9).
+        age_seal_credit_.earn(admission_.active(), taken);
         flush_write_and_merge(/*seal_all=*/false, taken, /*claim_regardless=*/false,
-                              /*sync_in_background=*/true);
+                              /*sync_in_background=*/true, &age_seal_credit_);
         const auto sealed = TickClock::now();
 
         // Update gauge: WAL file index.
@@ -3617,6 +3655,9 @@ void Engine::flush_tick() {
                 break;
         }
         registry_.set_gauge("ob_writer_admission_rate", static_cast<int64_t>(admission_.rate()));
+        registry_.set_gauge("ob_wal_sync_budget_bytes",
+                            fsync_policy_ == FsyncPolicy::INTERVAL
+                                ? static_cast<int64_t>(sync_budget_.bytes()) : 0);
 
         // And said at WARN when a tick takes a second (#186): writers at the ceiling wait for the room
         // a tick frees in the pending queue - up to 3.4 s, measured, with every section this tick
@@ -3631,6 +3672,53 @@ void Engine::flush_tick() {
         }
 }
 
+
+std::optional<std::chrono::steady_clock::duration> Engine::wal_sync_running_for() const {
+    const auto began = wal_sync_started_.load(std::memory_order_relaxed);
+    if (began == std::chrono::steady_clock::time_point{}) return std::nullopt;
+    return std::chrono::steady_clock::now() - began;
+}
+
+std::string Engine::room_refusal_reason(
+    std::optional<std::chrono::steady_clock::duration> sync_running_for, uint64_t sync_bytes) {
+    char line[512];
+    if (sync_running_for) {
+        // Not "cannot make progress": the flush is syncing, at the device's rate. That sentence was
+        // the one printed for every refusal at 5 MB/s, where nothing had failed (#190 step 9).
+        std::snprintf(line, sizeof(line),
+                      "No room came in %lld s, so this write is refused rather than accepted. The "
+                      "flush's WAL sync has run for %.0f ms, writing back %.1f MiB: the device takes "
+                      "the WAL slower than the writes arrive, and ob_wal_sync_budget_bytes is what a "
+                      "sync may now have to write.",
+                      static_cast<long long>(kBackpressureDeadline.count()),
+                      std::chrono::duration<double, std::milli>(*sync_running_for).count(),
+                      static_cast<double>(sync_bytes) / 1048576.0);
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "The pending queue did not free room in %lld s, so this write is refused "
+                      "rather than accepted. The flush cannot make progress - a full disk or a "
+                      "failing fsync is the usual reason, and ob_flush_errors_total and "
+                      "ob_wal_fsync_errors_total say which.",
+                      static_cast<long long>(kBackpressureDeadline.count()));
+    }
+    return line;
+}
+
+void Engine::note_sync_for_budget(uint64_t bytes, std::chrono::steady_clock::duration took) {
+    // Whatever the policy: only `interval` lets the budget bind (`await_pending_room()`), and the
+    // gauge says 0 under the others, so what a sync tells it there is read by nothing.
+    const uint64_t before = sync_budget_.bytes();
+    if (sync_budget_.on_sync(bytes, took) != SyncBudget::Change::None) {
+        const uint64_t after = sync_budget_.bytes();
+        OB_LOG_DEBUG("engine", "WAL sync budget %llu -> %llu byte(s) after a sync of %llu byte(s) in "
+                               "%.1f ms",
+                     static_cast<unsigned long long>(before), static_cast<unsigned long long>(after),
+                     static_cast<unsigned long long>(bytes),
+                     std::chrono::duration<double, std::milli>(took).count());
+    }
+    // No wake-up here: the drain that follows every caller's sync wakes the writers, a chunk at a
+    // time, and one more would be a mechanism no test could tell from its absence.
+}
 
 Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const char* failure,
                                                        WalPosition& covered,
@@ -3653,6 +3741,7 @@ Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const 
         }
         batch = pending_rows_.take_all();
         detached_rows_.store(batch.rows(), std::memory_order_relaxed);
+        wal_sync_bytes_.store(ticket.bytes() - wal_.bytes_synced(), std::memory_order_relaxed);
         if (under_the_lock) under_the_lock();
         if (!ticket.owed()) {
             // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
@@ -3663,11 +3752,18 @@ Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const 
             note_wal_synced();
         }
     }
+    // In flight from here, for a refusal to say so (#190 step 9) - the test hook included, since a
+    // test holds the sync there.
+    if (ticket.owed()) wal_sync_started_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
     if (while_syncing_wal_for_test_) while_syncing_wal_for_test_();
     if (ticket.owed()) {
+        // The sync alone is what the budget measures: the device's time for these bytes.
+        const auto sync_began = std::chrono::steady_clock::now();
         const int sync_err = wal_.perform_sync(ticket);
+        const auto sync_took = std::chrono::steady_clock::now() - sync_began;
+        wal_sync_started_.store({}, std::memory_order_relaxed);
         TimedLock timed(mtx_, settling.c_str());
-        wal_.complete_sync(ticket, sync_err);
+        const uint64_t covered_bytes = wal_.complete_sync(ticket, sync_err);
         if (sync_err != 0) {
             detached_rows_.store(0, std::memory_order_relaxed);
             pending_rows_.put_back_front(std::move(batch));
@@ -3676,6 +3772,7 @@ Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const 
         // The floor follows the checkpoint this sync covered (#160): it was appended before this
         // ticket's position, and no checkpoint is appended while the caller holds `flush_mtx_`.
         note_wal_synced();
+        note_sync_for_budget(covered_bytes, sync_took);
     }
     covered = ticket.position();
     return batch;
@@ -3877,7 +3974,8 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
 
 std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate>& candidates,
                                                  std::chrono::steady_clock::time_point now,
-                                                 bool seal_all, size_t drained_rows) {
+                                                 bool seal_all, size_t drained_rows,
+                                                 size_t by_age_limit) {
     std::vector<SealPick> picks;
     if (seal_all) {
         for (size_t i = 0; i < candidates.size(); ++i) picks.push_back(SealPick{i, SealReason::kAll});
@@ -3892,11 +3990,13 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
                              : std::max(kSealRows, drained_rows + drained_rows / 4);
     std::vector<bool> taken(candidates.size(), false);
     size_t picked_rows = 0;
+    size_t picked_by_age = 0;
     const auto take = [&](size_t i, SealReason why) {
         picks.push_back(SealPick{i, why});
         taken[i] = true;
         left -= std::min(left, candidates[i].rows);
         picked_rows += candidates[i].rows;
+        if (why == SealReason::kAge) ++picked_by_age;
     };
 
     // Over the budget: the stores holding the most rows first, oldest first among equals, past the
@@ -3927,6 +4027,8 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     for (const bool due_by_rows : {true, false}) {
         for (size_t i = 0; i < candidates.size(); ++i) {
             if (picks.size() >= kSealsPerTick) break;
+            // What the rows drained paid for (AgeSealCredit), the budget's among them.
+            if (!due_by_rows && picked_by_age >= by_age_limit) break;
             if (taken[i]) continue;
             const SealCandidate& c = candidates[i];
             const bool due = due_by_rows ? c.rows >= kSealRows
@@ -3944,8 +4046,23 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     return picks;
 }
 
+void Engine::AgeSealCredit::earn(bool device_bound, size_t drained_rows) {
+    device_bound_ = device_bound;
+    // Full while the device keeps up, so that the first tick it does not may still seal a tick's
+    // worth; what a tick drains past what the credit holds is not kept.
+    rows_ = device_bound ? std::min(kFull, rows_ + std::min(drained_rows, kFull)) : kFull;
+}
+
+size_t Engine::AgeSealCredit::allowance() const {
+    return device_bound_ ? rows_ / kRowsPerAgeSeal : kSealsPerTick;
+}
+
+void Engine::AgeSealCredit::spend(size_t n) {
+    if (device_bound_) rows_ -= std::min(rows_, n * kRowsPerAgeSeal);
+}
+
 std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* only,
-                                               size_t drained_rows) {
+                                               size_t drained_rows, AgeSealCredit* credit) {
     // Oldest first: the order a budget and a per-tick limit take them in.
     std::vector<std::pair<std::chrono::steady_clock::time_point, ColumnarStore*>> by_age;
     by_age.reserve(unsealed_.size());
@@ -3962,7 +4079,9 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     }
 
     const auto now = std::chrono::steady_clock::now();
-    const auto picks = pick_seals(candidates, now, seal_all || only != nullptr, drained_rows);
+    const size_t by_age_limit = credit != nullptr ? credit->allowance() : kSealsPerTick;
+    const auto picks = pick_seals(candidates, now, seal_all || only != nullptr, drained_rows,
+                                  by_age_limit);
     std::vector<Seal> seals;
     seals.reserve(picks.size());
     size_t by_rows = 0, by_age_count = 0, by_budget = 0, sealed_rows = 0;
@@ -3975,6 +4094,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
         if (p.why == SealReason::kAge) ++by_age_count;
         if (p.why == SealReason::kBudget) ++by_budget;
     }
+    if (credit != nullptr) credit->spend(by_age_count);
 
     if (!seal_all && only == nullptr) {
         const size_t total = unsealed_rows_.load(std::memory_order_relaxed);
@@ -4003,11 +4123,11 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
         const size_t deferred = due - std::min(due, by_rows + by_age_count);
         if (!seals.empty() || deferred > 0) {
             OB_LOG_DEBUG("engine", "sealing %zu store(s): %zu by rows, %zu by age, %zu by the budget; "
-                                   "%zu due store(s) wait past this tick's share of %zu row(s); "
-                                   "%zu of %zu unsealed row(s) stay in memory",
+                                   "%zu due store(s) wait past this tick's share of %zu row(s) and "
+                                   "%zu seal(s) by age; %zu of %zu unsealed row(s) stay in memory",
                          seals.size(), by_rows, by_age_count, by_budget, deferred,
-                         std::max(kSealRows, drained_rows), total - std::min(total, sealed_rows),
-                         total);
+                         std::max(kSealRows, drained_rows), by_age_limit,
+                         total - std::min(total, sealed_rows), total);
         }
     }
     return seals;
@@ -4105,8 +4225,21 @@ void Engine::drop_unsealed_locked() {
     registry_.set_gauge("ob_unsealed_rows", 0);
 }
 
+void Engine::age_unsealed_blocks_for_test(std::chrono::steady_clock::duration by) {
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    size_t blocks = 0;
+    for (auto& entry : unsealed_) {
+        for (UnsealedBlock& b : entry.second.blocks) {
+            b.published -= by;
+            ++blocks;
+        }
+    }
+    OB_LOG_DEBUG("engine", "test: %zu unsealed block(s) of %zu store(s) aged by %.0f ms", blocks,
+                 unsealed_.size(), std::chrono::duration<double, std::milli>(by).count());
+}
+
 int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless,
-                                  bool sync_in_background) {
+                                  bool sync_in_background, AgeSealCredit* credit) {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
@@ -4119,7 +4252,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
     // and out of the index, so their rows vanished from every query until a restart found them.
     using SealClock = std::chrono::steady_clock;
     const auto started = SealClock::now();
-    std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows);
+    std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows, credit);
     const std::exception_ptr write_failure = write_seals(seals);
     const auto written = SealClock::now();
 

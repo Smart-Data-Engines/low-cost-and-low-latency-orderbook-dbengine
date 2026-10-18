@@ -5135,8 +5135,63 @@ longest wait at 30 MB/s is in all sixteen rounds the one before admission begins
 0.15 s, and at 60 MB/s in twelve of sixteen, 256-376 ms; a batch can add admission's own delay,
 capped at 500 ms, to it.
 
-- Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
-  with the WAL, and a slower device than this one would refuse them
+**Step 9: a budget for the WAL waiting for a sync** (spec
+`smart-data-engine-workspace/specs/wal-sync-budget/`, `evidence/2026-10-14-wal-sync-budget/`).
+Until admission knew the device's rate, the writers filled the pending queue's million rows, about
+34 MB of WAL at ten levels a record, and the sync after them was their wait: 4.9 s at 7 MB/s, and
+writes refused at 5 MB/s (`evidence/2026-10-14-write-ceiling-slower/`).
+- **The budget.** Under `--fsync-policy interval` a writer now also waits, before it writes, while
+  the WAL written since the last completed sync is at a budget. It asks for a tick at half of it.
+- **The syncs set it** (`SyncBudget`): 4 MiB before the first, doubled after a quick sync that used
+  half of it or more, and after a slow one what the device writes in a second at the rate that sync
+  measured.
+- **What it says.** `ob_wal_sync_budget_bytes` is the budget and `ob_writer_wal_budget_waits_total`
+  counts the waits. A refusal during a sync says how long the sync has run and how many megabytes it
+  covers.
+
+**The seals by age, paid for by rows.** The budget's ticks come about four times as often at a write
+limit, and each sealed up to 64 stores due by age. So in every round they sealed all 4 000 one-row
+stores the harness leaves, at about 16 kB each on the device.
+- While admission is in force, the rows a tick drained now pay for its seals by age: one store for
+  each 8 192 rows (`AgeSealCredit`).
+- While the device keeps up, a tick seals what master's does.
+- A cadence of a second for every tick's seals was tried first. With no limit it kept the busy
+  stores' rows past their budget, and took half of master's levels a second.
+
+Against master (`0442ed5`), ABBA, 8 rounds a side of 12 M levels, and of 36 M where the row says so.
+"Durable" is the levels over the ingest and the time until what it acknowledged had passed the cap:
+
+| m9g.xlarge, XFS, 8 rounds a side | master | step 9 |
+|---|---|---|
+| 5 MB/s: rounds refusing, worst batch | 7 of 8, 4 960 ms | **none, 430-621 ms** |
+| 7 MB/s: levels/s, worst batch | 189.5-191.6 k, 3 520-4 413 ms | 181.8-183.3 k, **332-669 ms** |
+| 10 MB/s: levels/s, worst batch | 263.6-271.8 k, 2 381-3 115 ms | 261.4-262.8 k, **223-364 ms** |
+| 15 MB/s: levels/s, worst batch | 392.0-410.1 k, 1 569-2 333 ms | 397.9-402.1 k, **412-433 ms** |
+| 30 MB/s: levels/s, worst batch | 801.4-833.5 k, 782-1 102 ms | 802.5-818.2 k, **196-540 ms** |
+| 7 MB/s, 36 M levels: levels/s, durable (median) | 185.9-186.9 k, 184.0 k | 181.1-181.6 k, 180.9 k |
+| 10 MB/s, 36 M levels: levels/s, durable (median) | 263.3-267.0 k, 262.3 k | 260.1-261.2 k, 260.2 k |
+| no limit, 12 M: levels/s, batch max | 7.686-7.745 M, 23-37 ms | 7.917-7.969 M, 12-15 ms |
+| no limit, 90 M: levels/s, batch max | 7.705-7.911 M, 22-58 ms | 7.803-7.997 M, 16-54 ms |
+
+- **With no limit nothing is lost.** p99 and p99.9 are within master's.
+- **At 7 and 10 MB/s the budget costs 1.7% and 0.8% of the durable levels a second.**
+  - In 12 M-level rounds it read as 4.0% and 1.9%. More than half of that was master's tail, the
+    writes it had acknowledged and not yet put through the cap when the round's clock stopped
+    (pitfall 595). Even over 36 M levels, master's rounds put 12.5-20.2 MB through the cap after
+    their last acknowledgement at 7 MB/s, and the budget's 1.4-4.8 MB.
+  - What is left is the XFS journal of 3.5-5 times as many syncs. Each sync forces at least the
+    log's 16 kB stripe unit.
+- **Fewer ticks did not help.** Fewer ticks while admission is in force left a fifth of the cap
+  unused, because a tick's sync is what writes the WAL back.
+- **The writes' p99.9 is the budget's waits:** 0.24-0.32 s at 7 MB/s against master's 21 ms. Master's
+  writers stop instead, a few times a round, for 3.5-4.4 s.
+
+What is left of this item is that cost. Syncing less often while the device stays busy would take
+the WAL written back ahead of its sync. Branch `perf/wal-writeback-ahead` was built for the stalls
+above and is not measured against this.
+
+- Effort: M | Impact: writes faster than the device wait under a second, and are not refused at
+  5 MB/s; at 7-10 MB/s that costs 1-2% of the levels a second
 
 ### 189. A mesh node of tens of thousands of (symbol, origin) pairs holds writes for 9 - 13 ms at every checkpoint, writing its whole vector down ✅ **P2**
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "orderbook/admission.hpp"
+#include "orderbook/sync_budget.hpp"
 #include "orderbook/aggregation.hpp"
 #include "orderbook/chunked_queue.hpp"
 #include "orderbook/columnar_store.hpp"
@@ -148,6 +149,9 @@ public:
     }
     /// One tick, leaving its seal's sync in the background as the loop's does (#190).
     void flush_tick_leaving_the_sync_for_test() { flush_tick(); }
+    /// Every unsealed block as if published `by` earlier, so that a test makes stores due by age
+    /// without waiting `kSealAge` (#190 step 9).
+    void age_unsealed_blocks_for_test(std::chrono::steady_clock::duration by);
 
     /// Hold every background seal sync numbered `from` or later after it is numbered and before its
     /// syncfs(), until a later call moves `from` past it: a sync the device takes seconds over, on a
@@ -309,6 +313,17 @@ public:
 
     /// The admission controller, for a test to show it a tick without a slow device.
     AdmissionController& admission_for_test() { return admission_; }
+    SyncBudget& sync_budget_for_test() { return sync_budget_; }
+
+    /// How long the WAL sync in flight has run, or nothing while none is (#190 step 9): what a
+    /// refusal for want of room says, and what a test reads while it holds a sync.
+    std::optional<std::chrono::steady_clock::duration> wal_sync_running_for() const;
+
+    /// The line a write refused for want of room is logged with: with a WAL sync running, that the
+    /// device is slower than the writes; without one, that the flush cannot make progress (#190
+    /// step 9). A function of its inputs so that a test can read it without a five-second wait.
+    static std::string room_refusal_reason(
+        std::optional<std::chrono::steady_clock::duration> sync_running_for, uint64_t sync_bytes);
 
     /// Keep every segment's files where they are for as long as the returned handle lives (#165 part
     /// 2b): while one is held, the tick neither merges segments nor sweeps retention. A snapshot
@@ -355,6 +370,12 @@ public:
     static constexpr std::chrono::milliseconds kSealAge{10'000};
     static constexpr size_t kUnsealedRowsBudget = 4'000'000;
     static constexpr size_t kSealsPerTick = 64;
+    /// One seal by age for every this many rows a tick drains while the device is the bottleneck
+    /// (`AgeSealCredit`), so that their files take 3-6% of what the device writes. A seal's files
+    /// cost the device about 16 kB whatever their rows - 14-19 kB on XFS on the m9g.xlarge's EBS
+    /// volume - and 8 192 rows are 280-510 kB of WAL, at 34-62 bytes a row from ten levels a record
+    /// to one.
+    static constexpr size_t kRowsPerAgeSeal = 8'192;
     /// What FLUSH, close(), a snapshot and a store's own seal say they drained: they take every
     /// store, and no share limits them.
     static constexpr size_t kNoRowLimit = std::numeric_limits<size_t>::max();
@@ -376,10 +397,51 @@ public:
     /// small stores due by age in bulk. Below the budget a due store after the first is taken only
     /// while the rows picked stay within the share - a younger one that fits after an older one
     /// that does not, so the share is filled - and the first due store is always taken, the oldest
-    /// due by rows if there is one, so none waits behind a share it is bigger than.
+    /// due by rows if there is one, so none waits behind a share it is bigger than. No more than
+    /// `by_age_limit` stores due by age are taken, those the budget took counted among them, and
+    /// nothing else is limited by it (`AgeSealCredit`).
     static std::vector<SealPick> pick_seals(const std::vector<SealCandidate>& candidates,
                                             std::chrono::steady_clock::time_point now,
-                                            bool seal_all, size_t drained_rows);
+                                            bool seal_all, size_t drained_rows,
+                                            size_t by_age_limit = kSealsPerTick);
+
+    /// The seals by age a tick may make (#190 step 9). While admission is in force - the device
+    /// takes less than the writers bring - the rows a tick drains pay for them: one for every
+    /// `kRowsPerAgeSeal`, what a tick does not use kept for the next, and no more than
+    /// `kSealsPerTick` held. While it is not, a tick may make `kSealsPerTick`, as every tick could
+    /// before, and the credit stands full for when it is. Seals by rows and for the budget are not
+    /// paid for: they bound memory, and a store due by age alone holds little of it.
+    ///
+    /// Why the rows a tick drains and not the ticks. A store due by age has waited `kSealAge`
+    /// already, and how much longer it waits costs only the WAL it keeps, while its seal costs the
+    /// device a segment's files whatever its rows. At a write limit a tick lasts as long as its WAL
+    /// sync: about a second on master, where each sync took a second's writes, and about 250 ms with
+    /// the WAL budget. With `kSealsPerTick` a tick, the budget's ticks sealed four times as many
+    /// stores by age - at 10 MB/s all 4 000 one-row stores a round's prefill left, where master
+    /// sealed 1 443-2 979 of them before the round ended - and the device took 42 bytes a level
+    /// against 39.5, with 6% fewer levels a second (`diag10e/`). The rows drained are what the device
+    /// took whatever the ticks, so the seals they pay for are too.
+    ///
+    /// Why not a clock. With a tick's seals of what is due paced to once a second, an unthrottled
+    /// node's busy stores grew past the unsealed-rows budget, which sealed 1.2 M rows in one tick; a
+    /// tick then took 528 ms, admission began, and the node took half the levels a second master
+    /// did (`d3-unthrottled/`).
+    ///
+    /// Pure: `choose_seals()` says what it allowed.
+    class AgeSealCredit {
+    public:
+        /// Before a tick's seals: the rows it drained earn its seals by age while `device_bound`.
+        void earn(bool device_bound, size_t drained_rows);
+        /// What the tick may seal by age.
+        size_t allowance() const;
+        /// After it sealed `n` stores by age.
+        void spend(size_t n);
+
+    private:
+        static constexpr size_t kFull = kSealsPerTick * kRowsPerAgeSeal;
+        bool   device_bound_{false};
+        size_t rows_{kFull};
+    };
 
     /// Engine-level statistics for monitoring.
     struct Stats {
@@ -875,6 +937,26 @@ private:
     /// Writes admitted at the rate the device takes (#190 step 5). Its interval is the flush
     /// interval, declared above and so initialised before this.
     AdmissionController admission_{AdmissionController::for_interval(std::chrono::nanoseconds(flush_interval_ns_))};
+
+    /// How much WAL may wait for a sync before a writer waits for one (#190 step 9): the backlog a
+    /// sync has to write, bounded before admission knows the device's rate. Binds under
+    /// `--fsync-policy interval` only.
+    SyncBudget sync_budget_{SyncBudget::Config{}};
+
+    /// Loud once when writers begin waiting for the WAL budget, once when they stop. Guarded by
+    /// `mtx_`, as `backpressure_` is.
+    LogEpisode wal_budget_wait_;
+
+    /// When the WAL sync in flight began - `time_point{}` while none is - and how many bytes it
+    /// writes back. Read by a refusal, which otherwise blamed a full disk or a failing `fsync` for a
+    /// device that was syncing at its own rate (#190 step 9).
+    std::atomic<std::chrono::steady_clock::time_point> wal_sync_started_{};
+    std::atomic<uint64_t> wal_sync_bytes_{0};
+
+    /// After a WAL sync that newly covered `bytes` in `took`: what it tells the budget, said on
+    /// DEBUG and in `ob_wal_sync_budget_bytes`, and a wake-up for the writers waiting for it.
+    /// Caller holds `mtx_`.
+    void note_sync_for_budget(uint64_t bytes, std::chrono::steady_clock::duration took);
 
     /// A symbol's segments whose end falls in one period: what a merge may take from.
     struct CompactionKey {
@@ -1506,8 +1588,10 @@ private:
     /// `claim_regardless` appends the checkpoint even when nothing was left to seal, after a sync of
     /// its own: what drop_symbol() needs, because the last checkpoint can be older than a seal that
     /// claims nothing (seal_symbol()), and a restart replays from it.
+    ///
+    /// `credit` is the flush tick's for seals by age, which this spends; null for the rest.
     int flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless = false,
-                              bool sync_in_background = false);
+                              bool sync_in_background = false, AgeSealCredit* credit = nullptr);
 
     // ── The seal's sync in the background (#190) ──────────────────────────────
     //
@@ -1540,8 +1624,10 @@ private:
         std::vector<SegmentMeta> metas;
     };
     /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
-    /// the share of a tick that drained `drained_rows` (`pick_seals()`). Holds `flush_mtx_`.
-    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only, size_t drained_rows);
+    /// the share of a tick that drained `drained_rows` and the seals by age `credit` allows, which it
+    /// then spends (`pick_seals()`). Holds `flush_mtx_`.
+    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only, size_t drained_rows,
+                                   AgeSealCredit* credit = nullptr);
     /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
     /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
     /// `flush_mtx_`; `mtx_` or not.
@@ -1629,6 +1715,9 @@ private:
     /// sealed after a restart can never be taken for one an old checkpoint vouched for. Under
     /// flush_mtx_.
     uint64_t seal_epoch_{0};
+
+    /// What the flush tick's seals by age may be (#190 step 9). The tick's, under `flush_mtx_`.
+    AgeSealCredit age_seal_credit_;
 };
 
 } // namespace ob

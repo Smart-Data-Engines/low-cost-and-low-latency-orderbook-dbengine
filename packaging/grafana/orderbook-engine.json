@@ -395,7 +395,7 @@
       "type": "timeseries",
       "title": "Writers waiting for room, and refused",
       "id": 11,
-      "description": "A refusal is a write the pending queue never freed room for in 5 s: the flush cannot keep up with the device, or cannot make progress at all.",
+      "description": "A wait is for room in the pending queue or, under fsync policy interval, for the WAL to reach the device; a refusal is a write that found no room in 5 s: the flush cannot keep up with the device, or cannot make progress at all, and its log line says which.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -426,6 +426,15 @@
           "refId": "B",
           "expr": "sum by (instance) (rate(ob_writer_backpressure_refusals_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
           "legendFormat": "refusals/s {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (instance) (rate(ob_writer_wal_budget_waits_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "waits for the WAL/s {{instance}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

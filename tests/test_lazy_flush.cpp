@@ -281,6 +281,99 @@ TEST(SealPolicy, SealAllTakesEveryOne) {
     for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kAll);
 }
 
+// ── Seals by age while the device is the bottleneck (#190 step 9) ────────────
+//
+// While admission is in force, the rows a tick drains pay for its seals by age: at 10 MB/s the WAL
+// budget's shorter ticks, each sealing up to `kSealsPerTick`, sealed all 4 000 one-row stores a
+// round's prefill left where master sealed 1 443-2 979 of them, and the device took 7% more bytes
+// for each level.
+
+TEST(AgeSealCredit, WhileTheDeviceKeepsUpATickMaySealAsManyAsEver) {
+    ob::Engine::AgeSealCredit credit;
+    credit.earn(/*device_bound=*/false, 0);
+    EXPECT_EQ(credit.allowance(), ob::Engine::kSealsPerTick);
+    credit.spend(ob::Engine::kSealsPerTick);
+    credit.earn(/*device_bound=*/false, 0);
+    EXPECT_EQ(credit.allowance(), ob::Engine::kSealsPerTick)
+        << "a tick of a device that keeps up was limited by what the tick before it sealed";
+}
+
+TEST(AgeSealCredit, WhileItIsTheBottleneckTheRowsDrainedPayForTheSealsByAge) {
+    ob::Engine::AgeSealCredit credit;
+    credit.earn(/*device_bound=*/true, 0);
+    ASSERT_EQ(credit.allowance(), ob::Engine::kSealsPerTick) << "the premise: the credit begins full";
+    credit.spend(ob::Engine::kSealsPerTick);
+    credit.earn(/*device_bound=*/true, 0);
+    EXPECT_EQ(credit.allowance(), 0u) << "a tick that drained nothing had seals by age paid for";
+    credit.earn(/*device_bound=*/true, 3 * ob::Engine::kRowsPerAgeSeal - 1);
+    EXPECT_EQ(credit.allowance(), 2u);
+    credit.spend(2);
+    credit.earn(/*device_bound=*/true, 1);
+    EXPECT_EQ(credit.allowance(), 1u) << "the rows a seal did not take were not kept for the next";
+}
+
+TEST(AgeSealCredit, WhatATickDoesNotSpendIsKeptUpToATicksWorth) {
+    ob::Engine::AgeSealCredit credit;
+    credit.earn(/*device_bound=*/true, 0);
+    credit.spend(ob::Engine::kSealsPerTick);
+    credit.earn(/*device_bound=*/true, 10 * ob::Engine::kRowsPerAgeSeal);
+    credit.spend(0);   // nothing was due by age
+    credit.earn(/*device_bound=*/true, 10 * ob::Engine::kRowsPerAgeSeal);
+    EXPECT_EQ(credit.allowance(), 20u) << "what a tick did not spend was lost";
+    credit.earn(/*device_bound=*/true, 1'000 * ob::Engine::kRowsPerAgeSeal);
+    EXPECT_EQ(credit.allowance(), ob::Engine::kSealsPerTick)
+        << "the credit held more than one tick may seal";
+}
+
+TEST(AgeSealCredit, ItIsFullAgainOnceTheDeviceKeepsUp) {
+    ob::Engine::AgeSealCredit credit;
+    credit.earn(/*device_bound=*/true, 0);
+    credit.spend(ob::Engine::kSealsPerTick);
+    credit.earn(/*device_bound=*/false, 0);
+    credit.spend(ob::Engine::kSealsPerTick);   // a tick that keeps up pays nothing
+    credit.earn(/*device_bound=*/true, 0);
+    EXPECT_EQ(credit.allowance(), ob::Engine::kSealsPerTick)
+        << "the device kept up for a tick and the credit stayed as the bottleneck left it";
+}
+
+TEST(SealPolicy, SealsByAgeStopAtTheirLimitAndNothingElseDoes) {
+    const auto now = Clock::now();
+    // Oldest first: ten one-row stores due by age, then two due by rows; a share for all of them.
+    std::vector<ob::Engine::SealCandidate> c;
+    for (int i = 0; i < 10; ++i) {
+        c.push_back(candidate(1, ob::Engine::kSealAge + std::chrono::seconds(10 - i), now));
+    }
+    c.push_back(candidate(ob::Engine::kSealRows, 1s, now));
+    c.push_back(candidate(ob::Engine::kSealRows, 1s, now));
+    const size_t drained = 4 * ob::Engine::kSealRows;
+    EXPECT_EQ(indices(ob::Engine::pick_seals(c, now, false, drained, /*by_age_limit=*/3)),
+              (std::vector<size_t>{0, 1, 2, 10, 11}))
+        << "not the oldest three by age, or a store due by rows was held by their limit";
+    EXPECT_EQ(ob::Engine::pick_seals(c, now, false, drained).size(), 12u)
+        << "the control: without a limit every due store fits the share";
+    EXPECT_EQ(indices(ob::Engine::pick_seals(c, now, false, drained, /*by_age_limit=*/0)),
+              (std::vector<size_t>{10, 11}))
+        << "a credit spent to nothing held a store due by rows";
+
+    // Over the budget, every store due by age: memory is what it bounds, whatever paid for what.
+    constexpr size_t kEach = 30'000;
+    const size_t stores = ob::Engine::kUnsealedRowsBudget / kEach * 3 / 2;
+    std::vector<ob::Engine::SealCandidate> over;
+    for (size_t i = 0; i < stores; ++i) over.push_back(candidate(kEach, ob::Engine::kSealAge + 1s, now));
+    const auto picks = ob::Engine::pick_seals(over, now, false, 0, /*by_age_limit=*/0);
+    EXPECT_LE((stores - picks.size()) * kEach, ob::Engine::kUnsealedRowsBudget)
+        << "the limit on seals by age left the unsealed rows over the budget";
+
+    // And what the budget took of stores due by age counts against the limit: one taken over the
+    // budget and a limit of two leave room for one more, the oldest.
+    std::vector<ob::Engine::SealCandidate> mixed;
+    for (int i = 0; i < 5; ++i) mixed.push_back(candidate(1, ob::Engine::kSealAge + 10s, now));
+    for (int i = 0; i < 62; ++i) mixed.push_back(candidate(65'000, ob::Engine::kSealAge + 1s, now));
+    EXPECT_EQ(indices(ob::Engine::pick_seals(mixed, now, false, 0, /*by_age_limit=*/2)),
+              (std::vector<size_t>{0, 5}))
+        << "the budget's seals of stores due by age were not counted against the limit";
+}
+
 // ── The engine's wiring ──────────────────────────────────────────────────────
 
 TEST(LazyFlush, ATickSealsNothingThatIsNotDueAndAQueryReadsTheRows) {
@@ -489,6 +582,49 @@ TEST(LazyFlush, ATickSealsAsManyDueRowsAsItDrained) {
     EXPECT_EQ(seal_counts_until(engine, 3), (std::vector<uint64_t>{0, 3}))
         << "a tick sealed less than it drained";
     for (const char* s : symbols) EXPECT_EQ(segments_on_disk(dir.path, s), 1u) << s;
+    engine.close();
+}
+
+TEST(LazyFlush, WhileAdmissionIsInForceATickSealsByAgeWhatItsRowsPayFor) {
+    // The loop out of the way, every tick run here: two hundred one-row stores due by age, sealed a
+    // tick's worth at a time while the device keeps up, and once admission is in force as many as the
+    // rows each tick drained pay for.
+    TempDir dir;
+    ob::Engine engine(dir.path, 3'600'000'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    uint64_t seq = 1;
+    for (size_t i = 0; i < 200; ++i) {
+        const std::string symbol = "Q" + std::to_string(i);
+        insert(engine, symbol.c_str(), seq++, 1);
+    }
+    engine.flush_tick_for_test();
+    const auto sealed = [&] { return engine.registry().counter_value("ob_seals_total"); };
+    ASSERT_EQ(sealed(), 0u) << "the premise: a store of one row is not due at once";
+    engine.age_unsealed_blocks_for_test(ob::Engine::kSealAge + 1s);
+
+    engine.flush_tick_for_test();
+    ASSERT_EQ(sealed(), ob::Engine::kSealsPerTick)
+        << "the premise: a tick of a device that keeps up seals a tick's worth by age";
+
+    // A slow tick is two intervals of this engine's hour, and its rate ~9 M rows a second, so that the
+    // writes below are not held.
+    ASSERT_EQ(engine.admission_for_test().on_tick(100'000'000'000ULL, std::chrono::hours(3)),
+              ob::AdmissionController::Change::Began);
+    engine.flush_tick_for_test();
+    ASSERT_EQ(sealed(), 2 * ob::Engine::kSealsPerTick)
+        << "the premise: the first tick the device is the bottleneck has a full credit";
+    engine.flush_tick_for_test();
+    EXPECT_EQ(sealed(), 2 * ob::Engine::kSealsPerTick)
+        << "a tick that drained nothing sealed by age while admission was in force";
+
+    // Fewer rows than make the store due, enough to pay for three seals by age.
+    for (size_t rows = 0; rows < 3 * ob::Engine::kRowsPerAgeSeal; rows += 1000) {
+        insert(engine, "BUSY", seq++, 1000);
+    }
+    engine.flush_tick_for_test();
+    EXPECT_EQ(sealed(), 2 * ob::Engine::kSealsPerTick + 3)
+        << "the seals by age were not what the rows the tick drained paid for";
+    ASSERT_TRUE(engine.admission_for_test().active()) << "the premise: admission stayed in force";
     engine.close();
 }
 

@@ -4322,6 +4322,53 @@ Learned the hard way. Check here before debugging.
      test files include that header and compiled clean, because googletest declares its include
      directories `SYSTEM` to the code that uses them, and its own sources are not that code.
      google/benchmark adds a `-Werror` of its own unless `BENCHMARK_ENABLE_WERROR` is off.
+593. **A harness that counts an event by the line one build writes reads another build's event as
+     none.** `measure_vector_refresh.py` counted refusals as `did not free room in 5 s`, and #190's
+     step 9 gives a refusal during a WAL sync a line of its own - so on the one device where the
+     step could refuse, an ABAB run would have reported it refusing nothing. Count by the clause
+     both lines share (`so this write is refused rather than accepted`), and when a change rewords a
+     line, grep the scripts as well as the tests for the old words.
+594. **When a new limit binds before an old one, the old one's tests pass through the new path.**
+     Under `--fsync-policy interval` the WAL budget (4 MiB to begin with) stops a writer long before
+     the pending queue's million rows, so `PendingBackpressure`'s tests went on finishing - by the
+     budget's wait and its request for a tick - and exercised the queue's ceiling not at all. One of
+     them noticed only because it counted the queue's waits. They run under `none` now, where the
+     budget does not bind; a test of a limit has to say which limit it reaches.
+595. **Levels a second over a round of fixed size credit the build that leaves more of what it
+     acknowledged unwritten when the round ends.** Under `interval` an acknowledged write is in the
+     WAL's page cache, and the round's clock stops at the last acknowledgement.
+     - At 7 MB/s the WAL budget read as costing 4.0% of the throughput in 12 M-level rounds, 2.8% in
+       36 M-level ones, and 1.7% with the tail counted.
+     - Even over 36 M levels master put 12.5-20.2 MB through the cap after its last
+       acknowledgement, and the budget 1.4-4.8 MB.
+     - Master's own two 12 M rounds with the smallest backlog left took as many levels a second as
+       the budget's.
+     - Compare builds whose unsynced backlog differs over rounds long enough for the tail not to
+       count, or record the tail (`measure_vector_refresh.py --after-quiet`).
+     - In short rounds the tail also holds seals of stores due by age after the ingest: one-row
+       stores of a prefill, 16 kB each.
+596. **A cgroup's write cap does not count the device's bytes.**
+     - systemd parses `IOWriteBandwidthMax` in powers of 1000: `7M` is `wbps=7000000` in the scope's
+       `io.max`.
+     - The cap counts the scope's own writes. That includes the journal write its `fsync` forces:
+       a 21 MB file written and synced passed 21 016 576 bytes through it, its pages and one 16 kB
+       log write.
+     - `/sys/block/<dev>/stat` counts every writer on the device, and the kernel's own.
+     - So "more bytes a level on the device, so fewer levels a second behind the cap" needs the
+       scope's `io.stat` (`wbytes`, the harness's `charged_mb`), not the device's sectors. Read
+       that way at 7 MB/s, every round of every build used 99.3-100% of the cap.
+597. **Under `interval` a test that needs no tick while it writes now meets the WAL budget's.**
+     `StartReadsWalOnce.AStartReportsTheTornFilesItsFirstPassSteppedOver` wrote 2.6 MB of WAL in
+     1 MiB files with the flush an hour away, and took it as given that the first file would survive
+     the stop.
+     - Past half the budget a writer asks for a tick. It asks again while that tick's sync runs,
+       because the request flag is cleared when the tick begins.
+     - The first tick seals; once its seal sync in the background is done, a later tick appends the
+       checkpoint and syncs it, and retention may then remove the first file.
+     - Retention is the only path that removes a WAL file here, and with no budget nothing asked for
+       a tick. It failed once, under ASan on CI, and in none of 40 runs on the laptop.
+     - The test writes under `none` now, where the budget asks for nothing. A test that needs a
+       tick not to happen has to rule out whatever can ask for one.
 
 ## Current state and open problems
 

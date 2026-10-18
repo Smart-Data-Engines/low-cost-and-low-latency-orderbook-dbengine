@@ -36,8 +36,9 @@ using namespace mm_engine;
 
 std::atomic<uint16_t> g_port{ob::test::kPortsStartReadsWalOnce};
 
-std::unique_ptr<ob::Engine> single_node(const std::string& dir, size_t rotate_bytes = 512ULL << 20) {
-    return std::make_unique<ob::Engine>(dir, kNoAutoFlush, ob::FsyncPolicy::INTERVAL,
+std::unique_ptr<ob::Engine> single_node(const std::string& dir, size_t rotate_bytes = 512ULL << 20,
+                                        ob::FsyncPolicy policy = ob::FsyncPolicy::INTERVAL) {
+    return std::make_unique<ob::Engine>(dir, kNoAutoFlush, policy,
                                         ob::ReplicationConfig{}, ob::ReplicationClientConfig{},
                                         ob::FailoverConfig{}, ob::TTLConfig{},
                                         ob::MultiMasterConfig{}, rotate_bytes);
@@ -168,7 +169,12 @@ TEST(StartReadsWalOnce, AStartReportsTheTornFilesItsFirstPassSteppedOver) {
     // says it stepped over is the first pass's count.
     TempDir dir("start_once_torn_");
     {
-        auto engine = single_node(dir.path, 1u << 20);
+        // Written under `none`, so that no tick runs while it writes. Under `interval` the WAL's
+        // budget asks for one at half of it (#190, step 9), and after a slow sync the budget is
+        // small enough for its ticks to seal, checkpoint and let retention take the first file
+        // before the stop - which a slow runner under ASan did. What is read back does not depend
+        // on the policy it was written under.
+        auto engine = single_node(dir.path, 1u << 20, ob::FsyncPolicy::NONE);
         engine->open();
         write_rows(*engine, "TORN", 1'000'000'000ULL, 3000, 40);
         engine->close();

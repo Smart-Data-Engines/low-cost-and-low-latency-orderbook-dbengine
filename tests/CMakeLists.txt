@@ -853,6 +853,23 @@ target_link_libraries(test_engine_admission
 )
 gtest_discover_tests(test_engine_admission PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 
+# ── #190 step 9: a budget for the WAL waiting for a sync ─────────────────────
+add_executable(test_sync_budget test_sync_budget.cpp)
+target_link_libraries(test_sync_budget
+    PRIVATE
+        orderbook_admission
+        GTest::gtest_main
+)
+gtest_discover_tests(test_sync_budget PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
+add_executable(test_wal_budget test_wal_budget.cpp)
+target_link_libraries(test_wal_budget
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_wal_budget PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── TTL retention tests (compression-and-ttl, Tasks 7.2, 8.3–8.5) ────────────
 add_executable(test_ttl_retention test_ttl_retention.cpp)
 target_link_libraries(test_ttl_retention

@@ -51,6 +51,67 @@ import measure_mesh_catchup as M  # noqa: E402
 
 BASE_TS = 1_700_000_000_000_000_000
 
+# What a round costs the device, beside what it delivered (#190 step 9): the bytes the server wrote,
+# and the ticks, seals and merges it ran, over the ingest alone - and what held the writers back:
+# admission's delays and their time, and the writes that waited for a sync or for the queue.
+COSTS = ("ob_flush_ticks_total", "ob_seals_total", "ob_compactions_total", "ob_compaction_rows_total",
+         "ob_writer_admission_delays_total", "ob_writer_admission_delay_us_total",
+         "ob_writer_wal_budget_waits_total", "ob_writer_backpressure_waits_total")
+
+
+def written_bytes(pid: int) -> int:
+    """`write_bytes` of /proc/<pid>/io: what the process sent towards the storage layer."""
+    with open(f"/proc/{pid}/io") as f:
+        for line in f:
+            if line.startswith("write_bytes:"):
+                return int(line.split()[1])
+    raise RuntimeError(f"no write_bytes in /proc/{pid}/io")
+
+
+def device_stat(device: str) -> tuple[int, int]:
+    """Sectors written and milliseconds busy, from /sys/block/<device>/stat (fields 7 and 10)."""
+    fields = open(f"/sys/block/{device}/stat").read().split()
+    return int(fields[6]), int(fields[9])
+
+
+def xfs_log_stat(fs: str) -> tuple[int, int, int]:
+    """The XFS journal's writes, the 512-byte blocks they wrote and its forces, from the `log` line
+    of /sys/fs/xfs/<fs>/stats/stats (xs_log_writes, xs_log_blocks, xs_log_force)."""
+    for line in open(f"/sys/fs/xfs/{fs}/stats/stats"):
+        if line.startswith("log "):
+            fields = line.split()
+            return int(fields[1]), int(fields[2]), int(fields[4])
+    raise RuntimeError(f"no log line in /sys/fs/xfs/{fs}/stats/stats")
+
+
+def charged_bytes(device: str) -> int | None:
+    """What this harness's cgroup - the scope that caps the writes, the server and etcd in it - wrote
+    to <device>: `wbytes` of its io.stat, counted as each write passes the cap. Beside the cap and the
+    ingest's length it says how much of the cap the round used. None without an io.stat."""
+    major_minor = open(f"/sys/block/{device}/dev").read().strip()
+    group = open("/proc/self/cgroup").read().strip().split("::", 1)[-1]
+    try:
+        for line in open(f"/sys/fs/cgroup{group}/io.stat"):
+            if line.startswith(major_minor + " "):
+                return int(dict(kv.split("=", 1) for kv in line.split()[1:])["wbytes"])
+    except FileNotFoundError:
+        return None
+    return 0
+
+
+def counters(metrics_port: int) -> dict:
+    """The COSTS counters from a node's /metrics, each summed over its label sets (pitfall 66)."""
+    import urllib.request
+    text = urllib.request.urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=10).read().decode()
+    out = {k: 0 for k in COSTS}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in out:
+            out[name] += int(float(line.rsplit(" ", 1)[1]))
+    return out
+
 
 def prefill(port: int, symbols: int, batch: int = 256) -> None:
     """One single-level MINSERT for each of `symbols` symbols, pipelined."""
@@ -154,6 +215,12 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             before = os.path.getsize(writer.log)
             result = probe_run(writer, symbols, args)
         else:
+            bytes_before = written_bytes(writer.proc.pid)
+            costs_before = counters(writer.ports[1])
+            dev_before = device_stat(args.block_device) if args.block_device else None
+            charged_before = charged_bytes(args.block_device) if args.block_device else None
+            log_before = xfs_log_stat(args.xfs_stats) if args.xfs_stats else None
+            began = time.monotonic()
             out = subprocess.run([probe, str(writer.tcp), str(writer.proc.pid),
                                   str(args.connections), str(args.batches), str(args.levels),
                                   str(args.batch)], capture_output=True, text=True, timeout=900)
@@ -161,14 +228,60 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
                 result = json.loads(out.stdout.strip().splitlines()[-1])
             else:
                 result = {"failed": (out.stderr.strip().splitlines() or ["?"])[-1][:160]}
+            result["written_mb"] = round((written_bytes(writer.proc.pid) - bytes_before) / 1e6, 1)
+            if dev_before:
+                # What reached the device, the journal and every other writer on it included, and
+                # the share of the ingest it was busy - a device below its cap and not busy is one
+                # the engine left idle.
+                sectors, busy_ms = device_stat(args.block_device)
+                elapsed = time.monotonic() - began
+                result["device_mb"] = round((sectors - dev_before[0]) * 512 / 1e6, 1)
+                result["device_busy_pct"] = round(100.0 * (busy_ms - dev_before[1]) / 1000 / elapsed, 1)
+                result["ingest_s"] = round(elapsed, 2)
+                if charged_before is not None:
+                    # What passed the cap: over the ingest's length, the share of the cap the round
+                    # used, which the device's busy time cannot say when the cap holds the writes
+                    # above its queue.
+                    result["charged_mb"] = round(
+                        (charged_bytes(args.block_device) - charged_before) / 1e6, 1)
+            if log_before:
+                # The share of those bytes that was the filesystem's journal, and how often it was
+                # forced to the device: every fsync and syncfs that finds the journal holding
+                # something forces it, and each force writes at least the log's stripe unit.
+                writes, blocks, forces = xfs_log_stat(args.xfs_stats)
+                result["xfs_log_mb"] = round((blocks - log_before[1]) * 512 / 1e6, 1)
+                result["xfs_log_writes"] = writes - log_before[0]
+                result["xfs_log_forces"] = forces - log_before[2]
+            costs_after = counters(writer.ports[1])
+            for k in COSTS:
+                result[k.replace("ob_", "").replace("_total", "")] = costs_after[k] - costs_before[k]
+            if charged_before is not None and args.after_quiet > 0:
+                # What the device still had to take once the last write was acknowledged: the bytes
+                # that passed the cap from then until none had for `--after-quiet` seconds. A node
+                # that leaves more of what it acknowledged unwritten when the ingest ends has more
+                # here, and its levels a second counted none of it.
+                first = last = charged_bytes(args.block_device)
+                started = changed = time.monotonic()
+                while (time.monotonic() - changed < args.after_quiet
+                       and time.monotonic() - started < 120):
+                    time.sleep(0.25)
+                    now_bytes = charged_bytes(args.block_device)
+                    if now_bytes != last:
+                        last, changed = now_bytes, time.monotonic()
+                result["after_mb"] = round((last - first) / 1e6, 1)
+                result["after_s"] = round(changed - started, 1)
         result["label"] = label
         with open(writer.log, "rb") as f:
             f.seek(before)
             text = f.read().decode(errors="replace")
         # What the writer said while the ingest ran: a write waiting for room in the pending queue,
-        # one refused because no room came, and a peer dropped for not draining its send buffer.
+        # or - since #190 step 9 - for the WAL to reach the device, one refused because no room
+        # came, and a peer dropped for not draining its send buffer. A refusal is counted by the
+        # clause both of its lines share: step 9 gave a refusal during a WAL sync a line of its own,
+        # and counting the old line alone would have read every such refusal as none.
         result["queue_waits"] = text.count("is waiting for room in the pending queue")
-        result["refused"] = text.count("did not free room in 5 s")
+        result["budget_waits"] = text.count("is waiting for the WAL to reach the device")
+        result["refused"] = text.count("so this write is refused rather than accepted")
         result["peer_drops"] = text.count("is not draining")
         if log_level == "DEBUG":
             took = [(int(m.group(1)), int(m.group(2))) for m in re.finditer(
@@ -210,11 +323,22 @@ def main() -> int:
                     help="1 measures the refresh alone: no peer, so no broadcast and no resend")
     ap.add_argument("--refresh-log", metavar="LABEL")
     ap.add_argument("--root", default=os.path.join(os.getcwd(), "vector-refresh-runs"))
+    ap.add_argument("--block-device", metavar="NAME",
+                    help="also record what reached /sys/block/NAME and how busy it was")
+    ap.add_argument("--xfs-stats", metavar="FS",
+                    help="also record what the XFS journal of /sys/fs/xfs/FS wrote, and its forces")
+    ap.add_argument("--after-quiet", type=float, default=0.0, metavar="SECONDS",
+                    help="with --block-device in a capped scope: after the ingest, also record what "
+                         "passed the cap until none had for this long")
     args = ap.parse_args()
     servers = [s.split("=", 1) for s in args.server]
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
             "server_cores", "probe_n", "probe_p50_ms", "probe_p99_ms", "probe_p999_ms",
-            "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "refused",
+            "probe_max_ms", "probe_over_1ms", "probe_wall_s", "queue_waits", "budget_waits",
+            "refused", "written_mb", "device_mb", "device_busy_pct", "ingest_s", "charged_mb",
+            "after_mb", "after_s", "xfs_log_mb", "xfs_log_writes", "xfs_log_forces", "flush_ticks", "seals", "compactions",
+            "compaction_rows", "writer_admission_delays", "writer_admission_delay_us",
+            "writer_wal_budget_waits", "writer_backpressure_waits",
             "peer_drops", "failed")
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):

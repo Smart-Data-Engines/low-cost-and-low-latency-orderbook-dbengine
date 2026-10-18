@@ -489,6 +489,8 @@ public:
         /// Where the log was when the ticket was taken: everything before it is what the sync
         /// covers, and the position a flush stamps into the segments it closes from those rows.
         WalPosition position() const { return position_; }
+        /// `bytes_appended()` when the ticket was taken (#190, step 9).
+        uint64_t bytes() const { return bytes_; }
 
     private:
         friend class WALWriter;
@@ -500,6 +502,8 @@ public:
         int              fd_{-1};
         std::vector<int> leaving_;
         size_t           records_{0};
+        /// `bytes_appended()` when the ticket was taken: what a completed sync has covered.
+        uint64_t         bytes_{0};
         WalPosition      position_{};
     };
 
@@ -519,8 +523,9 @@ public:
     [[nodiscard]] int perform_sync(SyncTicket& ticket);
 
     /// Under the writer's lock again: on success the records the ticket covered are no longer owed a
-    /// sync. On failure they stay owed, for the reason `flush()` gives.
-    void complete_sync(const SyncTicket& ticket, int err);
+    /// sync. On failure they stay owed, for the reason `flush()` gives. Returns how many bytes the
+    /// sync newly covered - 0 on a failure - which is what the engine measures the device by.
+    uint64_t complete_sync(const SyncTicket& ticket, int err);
 
     /// Number of records written since last sync.
     size_t pending_sync_count() const { return pending_sync_; }
@@ -542,6 +547,18 @@ public:
     /// `ob_inserts_total`; an operator asking why the WAL grows faster than the inserts wants
     /// this one, and the two are only useful together (#117).
     uint64_t records_written() const { return records_written_.load(std::memory_order_relaxed); }
+
+    /// Bytes this writer has appended since it was opened, of every record type, and how many of
+    /// them a completed sync has covered (#190, step 9). The difference is the WAL the next sync has
+    /// to write, and on a device slower than the writes it is what a writer waiting for room waits
+    /// for: at 5 MB/s, the 34 MB a full pending queue left took longer than the five seconds after
+    /// which a write is refused (evidence/2026-10-14-write-ceiling-slower/).
+    ///
+    /// Relaxed loads and stores, as `records_written_`: the writer's own thread adds under the
+    /// engine's lock, and the engine reads both under that lock when it decides whether a writer
+    /// waits. The atomics are for the readers outside it - the metrics - not for the arithmetic.
+    uint64_t bytes_appended() const { return bytes_appended_.load(std::memory_order_relaxed); }
+    uint64_t bytes_synced() const { return bytes_synced_.load(std::memory_order_relaxed); }
 
     /// Bytes written since `from`, across file boundaries, or `nullopt` when it cannot be known.
     ///
@@ -691,6 +708,21 @@ private:
     /// confirms rather than this comment.
     std::atomic<uint64_t> records_written_{0};
 
+    /// What `bytes_appended()` and `bytes_synced()` read (#190, step 9).
+    std::atomic<uint64_t> bytes_appended_{0};
+    std::atomic<uint64_t> bytes_synced_{0};
+
+    /// Moves the synced mark to `bytes` if that is further on, and returns by how much. Called
+    /// wherever a sync is known to have covered everything appended before a point: a completed
+    /// ticket, a `flush()`, and a run synced under `--fsync-policy every`. A sync path that did not
+    /// call it would leave the mark behind, and a writer would wait for a sync it does not need.
+    uint64_t note_synced_up_to(uint64_t bytes) {
+        const uint64_t before = bytes_synced_.load(std::memory_order_relaxed);
+        if (bytes <= before) return 0;
+        bytes_synced_.store(bytes, std::memory_order_relaxed);
+        return bytes - before;
+    }
+
     /// Atomic because the replication thread reads it - for every heartbeat, the stream question
     /// and a replica's handshake - while `Engine::promote_to_primary()` writes it on the failover
     /// thread. It was a plain `uint64_t` until the TSan battery on PR #241 reported the heartbeat's
@@ -738,6 +770,8 @@ private:
         // count kept in two places is a count the third writer will not keep (#94, #117).
         records_written_.store(records_written_.load(std::memory_order_relaxed) + records,
                                std::memory_order_relaxed);
+        bytes_appended_.store(bytes_appended_.load(std::memory_order_relaxed) + total,
+                              std::memory_order_relaxed);
         pending_sync_ += records;
         return written_at;
     }

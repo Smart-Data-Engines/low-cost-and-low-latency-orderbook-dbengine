@@ -34,6 +34,7 @@ FAULTS = {
                              ("ob_segment_sync_errors_total", "0 0 0 0 0 0")], 4),
     "OrderbookWritesRefused": ([("ob_writer_backpressure_refusals_total", "0 0 0 2 2 2")], 4),
     "OrderbookWritersWaiting": ([("ob_writer_backpressure_waits_total", "0+10x30")], 25),
+    "OrderbookWritersWaitingForTheWal": ([("ob_writer_wal_budget_waits_total", "0+10x30")], 25),
     "OrderbookFlushErrors": ([("ob_flush_errors_total", "0 0 1 1 1")], 3),
     "OrderbookLoopErrors": ([("ob_loop_errors_total", "0 0 0 1 1")], 4),
     "OrderbookReplicaDisconnected": ([("ob_replicas_connected", "2 2 2 2 2 1 1 1 1 1 1 1 1")], 12),
@@ -68,7 +69,8 @@ QUIET = {
 HEALTHY = [
     ("ob_checkpoints_frozen", "0x20"), ("ob_wal_fsync_errors_total", "0x20"),
     ("ob_segment_sync_errors_total", "0x20"), ("ob_writer_backpressure_refusals_total", "0x20"),
-    ("ob_writer_backpressure_waits_total", "0x20"), ("ob_flush_errors_total", "0x20"),
+    ("ob_writer_backpressure_waits_total", "0x20"), ("ob_writer_wal_budget_waits_total", "0x20"),
+    ("ob_flush_errors_total", "0x20"),
     ("ob_loop_errors_total", "0x20"), ("ob_replicas_connected", "2x20"),
     ("ob_replication_lag_bytes", "1000x20"), ("ob_replicas_lag_unknown", "0x20"),
     ("ob_current_epoch", "3x20"), ("ob_failover_abstaining", "0x20"), ("ob_mm_peers_connected", "2x20"),
