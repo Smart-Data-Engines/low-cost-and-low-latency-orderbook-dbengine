@@ -238,6 +238,26 @@ in the harness installs anything, and a containerised competitor would measure t
 
 ## Quick Start
 
+### Install a release
+
+Each [release](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/releases)
+carries the server's packages for x86-64 and ARM64 - `.deb`, `.rpm` and `.tar.gz` - which run
+wherever glibc is 2.34 or newer, with `SHA256SUMS` over every file and a build-provenance
+attestation for each, made by the release workflow on the tag. `gh attestation` needs the GitHub
+CLI 2.49 or newer:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify orderbook-dbengine_0.1.0_amd64.deb \
+    --repo Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine
+sudo apt install ./orderbook-dbengine_0.1.0_amd64.deb
+pip install orderbook-dbengine     # the Python client
+```
+
+The package installs the server and a systemd unit it does not start;
+[docs/operations.md](docs/operations.md) has the RPM, the tarball, the configuration and where the
+packages have been installed.
+
 ### Build
 
 ```bash
@@ -306,7 +326,7 @@ exchanges on both pages are replayed against the server in CI.
 ### Use from Python
 
 ```bash
-pip install .     # the client, pure Python
+pip install orderbook-dbengine     # the client, pure Python; `pip install .` in this tree
 # local mode needs the engine's C API library: a release package installs it, or build it -
 cmake --build build --target orderbook_shared
 ```

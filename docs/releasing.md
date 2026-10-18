@@ -87,9 +87,10 @@ machine nobody should install a package on, with the library named by `OB_LIB_PA
 
 None of these can be done from the API, and the release cannot run before the first two:
 
-1. **PyPI**: a *pending* trusted publisher for the project `orderbook-dbengine` (the name is free; the
-   first upload creates the project): owner `Smart-Data-Engines`, repository
-   `low-cost-and-low-latency-orderbook-dbengine`, workflow `release.yml`, environment `pypi`.
+1. **PyPI**: the trusted publisher of the project `orderbook-dbengine`: owner `Smart-Data-Engines`,
+   repository `low-cost-and-low-latency-orderbook-dbengine`, workflow `release.yml`, environment
+   `pypi`. It was set up as a *pending* publisher, and v0.1.0's upload on 18 October 2026 created
+   the project.
 2. **GitHub**: an environment named `pypi` with a required reviewer.
 3. **A key to sign tags**, and the repository's `required_signatures` with it.
 
