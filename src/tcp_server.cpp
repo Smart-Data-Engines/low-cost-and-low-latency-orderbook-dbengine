@@ -542,6 +542,7 @@ const char* command_verb(CommandType t) {
     case CommandType::SELECT:       return "SELECT";
     case CommandType::INSERT:       return "INSERT";
     case CommandType::MINSERT:      return "MINSERT";
+    case CommandType::MREPLACE:     return "MREPLACE";
     case CommandType::FLUSH:        return "FLUSH";
     case CommandType::PING:         return "PING";
     case CommandType::STATUS:       return "STATUS";
@@ -591,6 +592,7 @@ bool role_allows(Role role, CommandType t) {
     // Write and Admin: the writes, and the flush that makes them history.
     case CommandType::INSERT:
     case CommandType::MINSERT:
+    case CommandType::MREPLACE:
     case CommandType::FLUSH:
         return role != Role::Read;
     // Admin alone: what moves a cluster, copies a node or shows how symbols are placed.
@@ -628,6 +630,7 @@ std::string permission_refusal(const Command& cmd, const Session& session, Query
     case CommandType::INSERT:
         return reach(cmd.insert_args.symbol, cmd.insert_args.exchange);
     case CommandType::MINSERT:
+    case CommandType::MREPLACE:
         return reach(cmd.minsert_args.symbol, cmd.minsert_args.exchange);
     case CommandType::BOOK:
         return reach(cmd.book_args.symbol, cmd.book_args.exchange);
@@ -642,9 +645,28 @@ std::string permission_refusal(const Command& cmd, const Session& session, Query
         }
         return reach(ast.symbol, ast.exchange);
     }
-    default:
+    // Commands that name no symbol: the role above is their whole check. Listed rather than left to
+    // a default label, which is how MREPLACE (#233) first arrived here - a write naming a symbol,
+    // past the lists, with nothing to say so. Without the label a new command does not compile
+    // until somebody decides whether it names one.
+    case CommandType::FLUSH:
+    case CommandType::PING:
+    case CommandType::STATUS:
+    case CommandType::ROLE:
+    case CommandType::FAILOVER:
+    case CommandType::QUIT:
+    case CommandType::COMPRESS:
+    case CommandType::MM_PEERS:
+    case CommandType::MM_CONFLICTS:
+    case CommandType::UNSUBSCRIBE:
+    case CommandType::AUTH:
+    case CommandType::BACKUP:
+    case CommandType::RINGS:
+    case CommandType::UNKNOWN:
         return {};
     }
+    // Outside the enumeration: role_allows() refused it above already.
+    return who + " may not run " + verb;
 }
 
 void execute_writes(std::span<const Command> cmds,
