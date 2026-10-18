@@ -1,10 +1,15 @@
 // Feature: orderbook-dbengine — C API unit tests (Requirements 13.5)
 #include "orderbook/c_api.h"
+#include "orderbook/level_payload.hpp"
+#include "orderbook/types.hpp"
+#include "orderbook/wal.hpp"
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <string>
 #include <vector>
 #include <cstring>
+#include <algorithm>
+#include <utility>
 #include <atomic>
 #include <chrono>
 
@@ -195,4 +200,123 @@ TEST_F(CApiTest, ResultNextExhaustedReturnsNotFound) {
     EXPECT_EQ(st, OB_C_ERR_NOT_FOUND);
 
     ob_result_free(result);
+}
+
+// ── ob_replace_side (MREPLACE, #233) ──────────────────────────────────────────
+//
+// The embedded engine's side replacement: the WAL record and the rows are the update followed by
+// a level of quantity 0 for each price the side held and the update did not name, best first.
+
+namespace {
+
+using PriceQty = std::pair<int64_t, uint64_t>;
+
+/// The levels of every DELTA record of `symbol` in the WAL under `dir`, in file order.
+std::vector<std::vector<PriceQty>> capi_delta_records(const std::string& dir, const char* symbol) {
+    std::vector<std::vector<PriceQty>> out;
+    std::vector<ob::Level> scratch;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type != ob::WAL_RECORD_DELTA) return;
+        ob::DeltaUpdate update{};
+        std::memcpy(&update, ctx.payload, sizeof(update));
+        if (std::strcmp(update.symbol, symbol) != 0) return;
+        const ob::Level* levels = ob::levels_from_payload(ctx.payload, update.n_levels, scratch);
+        std::vector<PriceQty> record;
+        for (uint16_t i = 0; i < update.n_levels; ++i) record.emplace_back(levels[i].price, levels[i].qty);
+        out.push_back(std::move(record));
+    });
+    return out;
+}
+
+/// Every row of `symbol` in history, in the order the query returns them.
+std::vector<PriceQty> capi_history(ob_engine_t* engine, const char* symbol) {
+    const std::string sql = std::string("SELECT * FROM '") + symbol +
+                            "'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
+    std::vector<PriceQty> rows;
+    ob_result_t* result = ob_query(engine, sql.c_str());
+    if (result == nullptr) return rows;
+    uint64_t ts; int64_t price; uint64_t qty; uint32_t cnt; uint8_t side; uint16_t level;
+    while (ob_result_next(result, &ts, &price, &qty, &cnt, &side, &level) == OB_C_OK) {
+        rows.emplace_back(price, qty);
+    }
+    ob_result_free(result);
+    return rows;
+}
+
+}  // namespace
+
+TEST_F(CApiTest, ReplaceSideLogsAndStoresTheUpdateThenItsRemovals) {
+    int64_t  held_p[] = {10300, 10200, 10100};
+    uint64_t held_q[] = {100, 200, 300};
+    uint32_t held_c[] = {1, 1, 1};
+    ASSERT_EQ(ob_apply_delta(engine, "RPL", "EX", 1, 1000ULL, held_p, held_q, held_c, 3, 0), OB_C_OK);
+    int64_t  ask_p[] = {10400};
+    uint64_t ask_q[] = {50};
+    uint32_t ask_c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "RPL", "EX", 2, 1001ULL, ask_p, ask_q, ask_c, 1, 1), OB_C_OK);
+
+    int64_t  new_p[] = {10350, 10200};
+    uint64_t new_q[] = {70, 250};
+    uint32_t new_c[] = {2, 2};
+    ASSERT_EQ(ob_replace_side(engine, "RPL", "EX", 3, 1002ULL, new_p, new_q, new_c, 2, 0), OB_C_OK);
+
+    ob_engine_destroy(engine);
+    const auto records = capi_delta_records(dir, "RPL");
+    ASSERT_EQ(records.size(), 3u);
+    EXPECT_EQ(records[2], (std::vector<PriceQty>{{10350, 70}, {10200, 250}, {10300, 0}, {10100, 0}}))
+        << "the record of a replacement is not its levels and then the bids it removed, highest "
+           "first - and the asks are not the bids' business";
+
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+    const auto rows = capi_history(engine, "RPL");
+    const std::vector<PriceQty> replaced(rows.end() - std::min<size_t>(rows.size(), 4), rows.end());
+    EXPECT_EQ(replaced, (std::vector<PriceQty>{{10350, 70}, {10200, 250}, {10300, 0}, {10100, 0}}))
+        << "history does not hold the replacement as applied";
+}
+
+TEST_F(CApiTest, ReplaceSideWithNoLevelsEmptiesTheSide) {
+    int64_t  p[] = {10300, 10200};
+    uint64_t q[] = {100, 200};
+    uint32_t c[] = {1, 1};
+    ASSERT_EQ(ob_apply_delta(engine, "EMP", "EX", 1, 1000ULL, p, q, c, 2, 1), OB_C_OK);
+    ASSERT_EQ(ob_replace_side(engine, "EMP", "EX", 2, 1001ULL, nullptr, nullptr, nullptr, 0, 1), OB_C_OK);
+    ob_engine_destroy(engine);
+    const auto records = capi_delta_records(dir, "EMP");
+    ASSERT_EQ(records.size(), 2u);
+    // Asks, so lowest first.
+    EXPECT_EQ(records[1], (std::vector<PriceQty>{{10200, 0}, {10300, 0}}));
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+}
+
+TEST_F(CApiTest, ReplaceSideRefusesMoreLevelsThanTheBookHoldsRatherThanCuttingThem) {
+    // ob_apply_delta() cuts a write to MAX_LEVELS; a replacement cut short would remove prices it
+    // named, so it is refused - and refused before anything is logged.
+    const uint32_t n = static_cast<uint32_t>(ob::MAX_LEVELS) + 1;
+    std::vector<int64_t>  p(n);
+    std::vector<uint64_t> q(n, 1);
+    std::vector<uint32_t> c(n, 1);
+    for (uint32_t i = 0; i < n; ++i) p[i] = 100000 - static_cast<int64_t>(i);
+    EXPECT_EQ(ob_replace_side(engine, "BIG", "EX", 1, 1000ULL, p.data(), q.data(), c.data(), n, 0),
+              OB_C_ERR_INVALID_ARG);
+    EXPECT_EQ(ob_replace_side(engine, "BIG", "EX", 1, 1000ULL, p.data(), q.data(), c.data(), n - 1, 0),
+              OB_C_OK);
+    ob_engine_destroy(engine);
+    const auto records = capi_delta_records(dir, "BIG");
+    ASSERT_EQ(records.size(), 1u) << "the refused replacement was logged";
+    EXPECT_EQ(records[0].size(), static_cast<size_t>(ob::MAX_LEVELS));
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+}
+
+TEST_F(CApiTest, ReplaceSideRefusesWhatApplyDeltaRefuses) {
+    int64_t  p[] = {1};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    EXPECT_EQ(ob_replace_side(nullptr, "S", "EX", 1, 1ULL, p, q, c, 1, 0), OB_C_ERR_INVALID_ARG);
+    EXPECT_EQ(ob_replace_side(engine, nullptr, "EX", 1, 1ULL, p, q, c, 1, 0), OB_C_ERR_INVALID_ARG);
+    EXPECT_EQ(ob_replace_side(engine, "S", "EX", 1, 1ULL, nullptr, q, c, 1, 0), OB_C_ERR_INVALID_ARG);
+    EXPECT_EQ(ob_replace_side(engine, "S", "EX", 1, 1ULL, p, q, c, 1, 2), OB_C_ERR_INVALID_ARG);
 }
