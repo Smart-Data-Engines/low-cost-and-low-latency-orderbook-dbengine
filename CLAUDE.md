@@ -4369,6 +4369,24 @@ Learned the hard way. Check here before debugging.
        a tick. It failed once, under ASan on CI, and in none of 40 runs on the laptop.
      - The test writes under `none` now, where the budget asks for nothing. A test that needs a
        tick not to happen has to rule out whatever can ask for one.
+598. **A record that adds and removes on a full side has to remove first.** A record is applied
+     in its order everywhere: the node, a replica, a replay. A side at its 1000 levels takes no price
+     worse than all it holds.
+     - `MREPLACE` (#233) first wrote the update's levels and then the removals. A full side replaced
+       by 1000 prices below all of its own took none of them, then removed the 1000 it had, and was
+       empty.
+     - The removals go in front now. Against the update's own levels their order changes nothing
+       else, because they name different prices.
+     - Every small test passed with the wrong order. Only a full side shows it, so a test of a
+       side's capacity has to write one.
+599. **A switch over a command with a default label decides the next command by accident.**
+     `permission_refusal()` (#31) chose which commands name a symbol with a default that returned
+     no refusal.
+     - `MREPLACE` compiled through it as a write that the symbol lists did not reach.
+     - The switch lists every command now and has no default label. A static test holds that, as
+       one already held it for the role table.
+     - The static test reads the source, and a comment that spelled the label out failed it on the
+       first run.
 
 ## Current state and open problems
 
