@@ -117,6 +117,9 @@ here as `#N`.
   `WHERE AT` the last instant, after a clean stop, a crash, a snapshot bootstrap or a store adopted.
   A start used to replay the WAL's tail into the live book and nothing else, so after a clean stop
   `BOOK` refused every symbol and after a crash held only what came after the last checkpoint.
+  The embedded engine of the C API rebuilds its live books when it opens, too: a side replacement
+  after a reopen - which the Python client's local `flush()` is - removed nothing, because it found
+  the side empty.
 - A level count `MINSERT` cannot read - 0, past 1000, a word - and level lines that never came are
   refused by name, where they were answered `unknown command` (#222).
 - A pass of the client loop that nothing woke no longer reads the subscription hub's eventfd or

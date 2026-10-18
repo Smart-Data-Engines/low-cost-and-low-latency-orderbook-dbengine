@@ -305,6 +305,63 @@ TEST_F(CApiTest, ReplaceSideOfAFullSideByAnotherFullSideLeavesTheReplacement) {
     ASSERT_NE(engine, nullptr);
 }
 
+TEST_F(CApiTest, AReplacementAfterAReopenRemovesWhatTheSideHeldBefore) {
+    // The Python client's local flush() reopens the engine. A reopened engine composes its live
+    // books from history (#235); without that a replacement computed its removals against an empty
+    // side, wrote none, and history kept every price the replacement meant to remove.
+    int64_t  held_p[] = {100, 99, 98};
+    uint64_t held_q[] = {1, 1, 1};
+    uint32_t held_c[] = {1, 1, 1};
+    ASSERT_EQ(ob_replace_side(engine, "RO", "EX", 1, 1000ULL, held_p, held_q, held_c, 3, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+
+    int64_t  new_p[] = {101, 99};
+    uint64_t new_q[] = {2, 2};
+    uint32_t new_c[] = {1, 1};
+    ASSERT_EQ(ob_replace_side(engine, "RO", "EX", 2, 1001ULL, new_p, new_q, new_c, 2, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    const auto records = capi_delta_records(dir, "RO");
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[1], (std::vector<PriceQty>{{100, 0}, {98, 0}, {101, 2}, {99, 2}}))
+        << "a replacement after a reopen did not remove the prices the side held before it";
+
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+    std::vector<PriceQty> book;
+    ob_result_t* result = ob_query(engine, "SELECT * FROM 'RO'.'EX' WHERE AT 1001");
+    ASSERT_NE(result, nullptr);
+    uint64_t ts; int64_t price; uint64_t qty; uint32_t cnt; uint8_t side; uint16_t level;
+    while (ob_result_next(result, &ts, &price, &qty, &cnt, &side, &level) == OB_C_OK) {
+        book.emplace_back(price, qty);
+    }
+    ob_result_free(result);
+    EXPECT_EQ(book, (std::vector<PriceQty>{{101, 2}, {99, 2}}));
+}
+
+TEST_F(CApiTest, TheFirstWriteAfterAReopenIsNotAGap) {
+    // The restored book carries no sequence number: the caller's numbering is its own, and a
+    // client in a new process that numbers from 1 again has not skipped anything.
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "GAP", "EX", 41, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+    ASSERT_EQ(ob_apply_delta(engine, "GAP", "EX", 1, 1001ULL, p, q, c, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    size_t gaps = 0;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_GAP) ++gaps;
+    });
+    EXPECT_EQ(gaps, 0u);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+}
+
 TEST_F(CApiTest, ReplaceSideWithNoLevelsEmptiesTheSide) {
     int64_t  p[] = {10300, 10200};
     uint64_t q[] = {100, 200};

@@ -14,6 +14,7 @@
 #include "orderbook/logger.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -74,6 +75,67 @@ struct ob_engine {
     {
         // Rebuild segment index from any previously persisted segments.
         combined_store.open_existing();
+        restore_live_books();
+    }
+
+    // Get or create the live buffer of "symbol.exchange", zero-initialised. `mtx` held, or the
+    // engine not yet reachable by anyone else.
+    ob::SoABuffer& buffer(const std::string& symbol, const std::string& exchange) {
+        const std::string key = symbol + "." + exchange;
+        auto it = buffers.find(key);
+        if (it == buffers.end()) {
+            auto buf = std::make_shared<ob::SoABuffer>();
+            // Zero-initialise plain data fields; atomics are default-constructed.
+            buf->bid.depth = 0;
+            buf->ask.depth = 0;
+            buf->bid.version.store(0, std::memory_order_relaxed);
+            buf->ask.version.store(0, std::memory_order_relaxed);
+            buf->sequence_number.store(0, std::memory_order_relaxed);
+            buf->last_timestamp_ns.store(0, std::memory_order_relaxed);
+            std::strncpy(buf->symbol,   symbol.c_str(),   sizeof(buf->symbol)   - 1);
+            std::strncpy(buf->exchange, exchange.c_str(), sizeof(buf->exchange) - 1);
+            it = buffers.emplace(key, std::move(buf)).first;
+        }
+        return *it->second;
+    }
+
+    // The live book of every symbol history holds, composed by price, as the server's engine
+    // restores it at a start (#235). A side replacement computes its removals from the live book,
+    // and a reopened engine without this held none - the Python client's local flush() reopens
+    // one - so a replacement after a reopen removed nothing it should have.
+    //
+    // The sequence label stays 0, unknown, as for a book no write has reached: this engine decides
+    // a gap from its caller's own numbering (apply_delta), which a reopen does not restore, and a
+    // client in a new process numbering from 1 again has not skipped anything.
+    void restore_live_books() {
+        const auto started = std::chrono::steady_clock::now();
+        size_t restored = 0;
+        size_t levels = 0;
+        for (const auto& [symbol, exchange] : combined_store.symbols()) {
+            const ob::ColumnarStore::PricedBook book =
+                combined_store.book_at_by_price(UINT64_MAX, symbol, exchange, ob::MAX_LEVELS);
+            if (!book.as_of) continue;
+            std::vector<ob::Level> bids, asks;
+            for (const ob::SnapshotRow& r : book.rows) {
+                ob::Level level{};
+                level.price = r.price;
+                level.qty   = r.quantity;
+                level.cnt   = r.order_count;
+                (r.side == ob::SIDE_BID ? bids : asks).push_back(level);
+            }
+            ob::install_book(buffer(symbol, exchange), bids.data(), bids.size(), asks.data(),
+                             asks.size(), /*sequence_number=*/0, book.as_of->timestamp_ns);
+            ++restored;
+            levels += book.rows.size();
+            OB_LOG_DEBUG("c_api", "live book of %s.%s restored from history: %zu bid and %zu ask "
+                                  "price(s), as of %llu",
+                         symbol.c_str(), exchange.c_str(), bids.size(), asks.size(),
+                         static_cast<unsigned long long>(book.as_of->timestamp_ns));
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+        OB_LOG_INFO("c_api", "live books restored from history: %zu symbol(s), %zu level(s), in %lld ms",
+                    restored, levels, static_cast<long long>(ms));
     }
 
     // Get or create the per-symbol ColumnarStore.
@@ -164,22 +226,7 @@ ob_status_t apply_locked(ob_engine_t*    engine,
     engine->wal.append(delta, levels.data());
 
     // ── Get or create SoABuffer for this symbol.exchange ──────────────────
-    const std::string key = std::string(symbol) + "." + exchange;
-    if (engine->buffers.find(key) == engine->buffers.end()) {
-        auto buf = std::make_shared<ob::SoABuffer>();
-        // Zero-initialise plain data fields; atomics are default-constructed.
-        buf->bid.depth = 0;
-        buf->ask.depth = 0;
-        buf->bid.version.store(0, std::memory_order_relaxed);
-        buf->ask.version.store(0, std::memory_order_relaxed);
-        buf->sequence_number.store(0, std::memory_order_relaxed);
-        buf->last_timestamp_ns.store(0, std::memory_order_relaxed);
-        std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
-        std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
-        engine->buffers[key] = std::move(buf);
-    }
-
-    ob::SoABuffer* buf = engine->buffers[key].get();
+    ob::SoABuffer* buf = &engine->buffer(symbol, exchange);
 
     // ── Apply to SoA buffer (seqlock protocol inside apply_delta) ─────────
     bool gap_detected = false;
