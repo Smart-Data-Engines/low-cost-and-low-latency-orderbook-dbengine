@@ -4336,12 +4336,17 @@ Learned the hard way. Check here before debugging.
      budget does not bind; a test of a limit has to say which limit it reaches.
 595. **Levels a second over a round of fixed size credit the build that leaves more of what it
      acknowledged unwritten when the round ends.** Under `interval` an acknowledged write is in the
-     WAL's page cache, and the round's clock stops at the last acknowledgement. At 7 MB/s master's
-     12 M-level rounds ended with 12-27 MB not yet through the cap, and the WAL budget's with 9-13
-     MB. That is 2 s of a 64 s round, and it read as the budget costing 4% of the throughput. Master's
-     own two rounds that left 12 MB took as many levels a second as the budget's. Compare builds
-     whose unsynced backlog differs over rounds long enough for the tail not to count, or record the
-     tail (`measure_vector_refresh.py --after-quiet`).
+     WAL's page cache, and the round's clock stops at the last acknowledgement.
+     - At 7 MB/s the WAL budget read as costing 4.0% of the throughput in 12 M-level rounds, 2.8% in
+       36 M-level ones, and 1.7% with the tail counted.
+     - Even over 36 M levels master put 12.5-20.2 MB through the cap after its last
+       acknowledgement, and the budget 1.4-4.8 MB.
+     - Master's own two 12 M rounds with the smallest backlog left took as many levels a second as
+       the budget's.
+     - Compare builds whose unsynced backlog differs over rounds long enough for the tail not to
+       count, or record the tail (`measure_vector_refresh.py --after-quiet`).
+     - In short rounds the tail also holds seals of stores due by age after the ingest: one-row
+       stores of a prefill, 16 kB each.
 596. **A cgroup's write cap does not count the device's bytes.**
      - systemd parses `IOWriteBandwidthMax` in powers of 1000: `7M` is `wbps=7000000` in the scope's
        `io.max`.

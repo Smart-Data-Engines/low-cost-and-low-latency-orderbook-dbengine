@@ -107,6 +107,22 @@ here as `#N`.
 
 ### Fixed
 
+- A device slower than the writes no longer refuses them before admission knows its rate (#190,
+  step 9).
+  - **Before:** the writers filled the pending queue's million rows, about 34 MB of WAL, and the sync
+    after them was their wait. On an m9g.xlarge with the volume's writes capped at 5 MB/s, writes
+    were refused in 7 rounds of 8.
+  - **Now:** under `--fsync-policy interval` a writer also waits while the WAL written since the
+    last completed sync is at a budget, and asks for the flush at half of it. The syncs set the
+    budget to about a second of the device's writing.
+  - `ob_wal_sync_budget_bytes` is the budget, `ob_writer_wal_budget_waits_total` counts the waits,
+    and `OrderbookWritersWaitingForTheWal` alerts when they go on for ten minutes.
+  - While admission is in force, the rows a tick drained pay for the stores it seals by age, one
+    store for each 8 192 rows.
+  - **Measured:** no round refused at 5 MB/s, and the worst batch was 2-8 times shorter at every
+    limit from 5 to 30 MB/s. With no limit nothing was lost.
+  - **The cost:** at 7 and 10 MB/s it takes 1.7% and 0.8% of the levels a second. That is the
+    filesystem journal of the more frequent syncs.
 - Code scanning has no open alert in our own code (#241). All fifteen were fixed in code and none
   was dismissed. The engine owns its read-only flag where it held a raw pointer into the server's
   storage. The replication manager gets its engine at construction instead of through a setter that
