@@ -289,9 +289,9 @@ private:
     std::string execute_buckets(const QueryAST& ast, const RowCallback& cb, QueryShape& shape);
 
     /// One with a series function (#44 step 2): every bucket of the range answered, the series
-    /// swept through them in time order from the book just before it - `latest_per_level()` of the
-    /// best levels, then `scan_by_time()` of their rows - and the row aggregates beside it from
-    /// the scan above.
+    /// swept through them in time order from the book just before it - `book_at_by_price()`, every
+    /// price of it, then `scan_by_time()` of every row of the range, since by price any row can
+    /// change the best (#233) - and the row aggregates beside it from the scan above.
     std::string execute_series(const QueryAST& ast, const RowCallback& cb);
 
     /// One with `ROLLING` (#44 step 3): every bucket of the range answered with the aggregates of

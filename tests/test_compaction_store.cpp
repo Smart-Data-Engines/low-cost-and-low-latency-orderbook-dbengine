@@ -714,10 +714,24 @@ TEST(CompactionStore, AChainOfManyGenerationsIsReleasedWithoutRecursion) {
 }
 
 TEST(CompactionStore, AMergedSegmentSaysTheLevelsOfItsInputsRows) {
-    // #47: the book at an instant skips a segment by the levels its meta.json says it holds. A
-    // merge writes its segment through the seal's path, so it says the levels of its rows - its
-    // inputs' together - and is skipped on the same proof, before a restart and after it.
+    // #47: a scan whose filter names sides or levels skips a segment by the levels its meta.json says
+    // it holds. A merge writes its segment through the seal's path, so it says the levels of its
+    // rows - its inputs' together - and is skipped on the same proof, before a restart and after it.
     TempDir dir;
+    const auto skipped_by_its_levels = [](const ob::SegmentMeta& m) {
+        ob::RowFilter bids{};
+        bids.side_lo = ob::SIDE_BID;
+        bids.side_hi = ob::SIDE_BID;
+        EXPECT_TRUE(ob::ColumnarStore::cannot_hold(m, bids)) << "a segment of asks alone, read for the bids";
+        ob::RowFilter level3{};
+        level3.level_lo = 3;
+        level3.level_hi = 3;
+        EXPECT_TRUE(ob::ColumnarStore::cannot_hold(m, level3)) << "a level none of its inputs had";
+        ob::RowFilter level7{};
+        level7.level_lo = 7;
+        level7.level_hi = 7;
+        EXPECT_FALSE(ob::ColumnarStore::cannot_hold(m, level7)) << "a level one of its inputs had";
+    };
     const auto at_levels = [&](uint64_t ts, const std::vector<uint16_t>& levels) {
         ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
                                  ob::ColumnarStore::OwnIndex::kNo);
@@ -735,7 +749,7 @@ TEST(CompactionStore, AMergedSegmentSaysTheLevelsOfItsInputsRows) {
         const auto b = at_levels(kBase + 2 * kSec, {2, 7});
         const auto later = at_levels(kBase + 3 * kSec, {1, 2, 7});
         store.merge_segments({a, b, later});
-        before = store.latest_per_level(kBase + 10 * kSec, "A", "EX").rows;
+        before = store.book_at_by_price(kBase + 10 * kSec, "A", "EX").rows;
         ASSERT_EQ(before.size(), 3u);
 
         auto out = merged(store, dir.str(), {a, b});
@@ -747,18 +761,21 @@ TEST(CompactionStore, AMergedSegmentSaysTheLevelsOfItsInputsRows) {
         }
         ASSERT_EQ(store.replace_segments({a, b}, out, rename_to_segment).outcome,
                   ob::ColumnarStore::Replaced::kYes);
-        const auto after = store.latest_per_level(kBase + 10 * kSec, "A", "EX");
-        EXPECT_TRUE(same_rows(after.rows, before));
-        EXPECT_EQ(after.segments_read, 1u);
-        EXPECT_EQ(after.segments_skipped, 1u)
-            << "every level of the merged segment has a later row in the next, and it was read";
+        EXPECT_TRUE(same_rows(store.book_at_by_price(kBase + 10 * kSec, "A", "EX").rows, before));
+        skipped_by_its_levels(out);
     }
     // The inputs are still on the disk, as after a crash before their removal; the rebuild removes
     // them, and what is left is read from the merged segment's meta.json.
     ob::ColumnarStore reopened(dir.str());
     reopened.open_existing();
     ASSERT_EQ(reopened.last_rebuild_removed().superseded, 2u);
-    const auto read_back = reopened.latest_per_level(kBase + 10 * kSec, "A", "EX");
-    EXPECT_TRUE(same_rows(read_back.rows, before));
-    EXPECT_EQ(read_back.segments_skipped, 1u) << "the merged segment's levels did not survive its meta.json";
+    EXPECT_TRUE(same_rows(reopened.book_at_by_price(kBase + 10 * kSec, "A", "EX").rows, before));
+    size_t merged_found = 0;
+    for (const auto& m : reopened.segments_of("A.EX")) {
+        if (m.start_ts_ns != kBase + 1 * kSec) continue;   // the merged one: its inputs' earliest
+        ++merged_found;
+        ASSERT_NE(m.levels, nullptr) << "the merged segment's levels did not survive its meta.json";
+        skipped_by_its_levels(m);
+    }
+    EXPECT_EQ(merged_found, 1u);
 }

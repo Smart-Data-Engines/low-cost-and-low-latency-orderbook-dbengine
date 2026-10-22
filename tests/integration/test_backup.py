@@ -267,6 +267,72 @@ def test_a_backup_under_two_writers_restores_every_write_acknowledged_before_it(
         assert not (set(held) & after), "the backup holds writes acknowledged long after its cut"
 
 
+def book_summaries_under(path: str) -> list[str]:
+    """The book summaries (#233) under a directory, by name: `book.<as_of>.v1` beside a symbol's
+    segments."""
+    return sorted(name for _, _, names in os.walk(path) for name in names
+                  if name.startswith("book.") and name.endswith(".v1"))
+
+
+def book_levels(port: int, symbol: str) -> list[tuple[str, ...]]:
+    """`BOOK` of one symbol, each row's price, quantity, order count, side and level - the columns
+    that are the book, not the label every row of an answer shares."""
+    wire = Wire(port)
+    try:
+        answer = wire.ask(f"BOOK {symbol} {EXCH}")
+    finally:
+        wire.close()
+    assert answer.startswith("OK"), answer
+    lines = [line for line in answer.splitlines()[1:] if line]
+    header = lines[0].split("\t")
+    keep = [header.index(c) for c in ("price", "quantity", "order_count", "side", "level")]
+    return [tuple(row.split("\t")[i] for i in keep) for row in lines[1:]]
+
+
+def test_a_backup_carries_the_book_summaries_and_a_restored_node_starts_from_them():
+    """A book summary is a file beside a symbol's segments (#233), and a backup takes it along: the
+    restored node starts its live book from it, and `BOOK` answers what it answered before. A summary
+    is written once a symbol holds 65 536 rows since its last one, so the test writes 70 700: 700
+    side replacements of 100 levels, each removing the one price that left the side. It first asserts
+    a summary was written, without which nothing here would be about carrying one."""
+    symbol = "BOOKSUM"
+    first = 1_790_000_000_000_000_000
+    with tempfile.TemporaryDirectory(prefix="ob_backup_books_") as tmp:
+        node = Node(f"{tmp}/data", ["--backup-dir", f"{tmp}/backups"])
+        node.start()
+        try:
+            wire = Wire(node.port)
+            try:
+                for i in range(700):
+                    best = 1_000_000 + i
+                    body = "\n".join(f"{best - k} {1 + (i + k) % 9} 1" for k in range(100))
+                    answer = wire.ask(f"MREPLACE {symbol} {EXCH} bid 100 {first + i * 1000}\n{body}")
+                    assert answer.startswith("OK"), answer
+                assert wire.ask("FLUSH").startswith("OK")
+            finally:
+                wire.close()
+            written = book_summaries_under(node.data_dir)
+            assert written, "no book summary was written for 70 700 rows of one symbol"
+            book = book_levels(node.port, symbol)
+            assert len(book) == 100, book[:3]
+            name, st = backup_and_wait(node.port)
+            assert st["state"] == "done", st
+        finally:
+            node.stop()
+        assert book_summaries_under(f"{tmp}/backups/{name}") == written, "the backup left a summary behind"
+
+        restore(f"{tmp}/backups/{name}", f"{tmp}/restored")
+        assert book_summaries_under(f"{tmp}/restored") == written, "the restore left a summary behind"
+        back = Node(f"{tmp}/restored")
+        back.start()
+        try:
+            assert book_levels(back.port, symbol) == book
+            log = back.log_text()
+            assert re.search(r"live books restored: 1 symbol\(s\), 1 from a summary", log), log[-2000:]
+        finally:
+            back.stop()
+
+
 def test_a_primary_restored_from_a_backup_makes_its_replica_start_over():
     with tempfile.TemporaryDirectory(prefix="ob_backup_repl_") as tmp:
         repl_port = free_port()

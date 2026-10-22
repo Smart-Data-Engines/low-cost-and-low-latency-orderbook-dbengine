@@ -262,9 +262,9 @@ ob_add_columnar_test(test_segment_index
 )
 target_compile_definitions(test_segment_index PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 
-# ── #47 step 1: the book at an instant reads only the segments that can change it ─
-ob_add_columnar_test(test_book_at_an_instant
-    test_book_at_an_instant.cpp
+# ── #47: the (side, level) pairs a segment holds, and a scan's filter on them ──
+ob_add_columnar_test(test_level_set
+    test_level_set.cpp
 )
 
 # ── #165 part 2a: drained rows in published blocks until a seal writes them ───
