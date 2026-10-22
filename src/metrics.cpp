@@ -182,6 +182,17 @@ MetricsRegistry::MetricsRegistry() {
                                      "Batches of writes that waited for admission at the device's rate"));
     counters_.push_back(make_counter("ob_writer_admission_delay_us_total",
                                      "Microseconds batches of writes waited for admission, in all"));
+    // Side replacements (MREPLACE, #233): the levels of quantity 0 the engine added to an update
+    // that is the whole side, one for each price the side held and the update did not name.
+    counters_.push_back(make_counter("ob_replace_side_removed_levels_total",
+                                     "Levels a side replacement removed: prices the side held that "
+                                     "the update did not name"));
+    // Book summaries (#233): what a book read starts from instead of a symbol's first row.
+    counters_.push_back(make_counter("ob_book_summaries_written_total",
+                                     "Summaries of a symbol's book by price written beside its "
+                                     "segments, each the start of the book reads after it"));
+    counters_.push_back(make_counter("ob_book_summary_bytes_total",
+                                     "Bytes of the book summaries written"));
     // Mesh events whose handling threw and which the io loop abandoned (#112). Registered in the
     // same change that writes it: measured, an ENOSPC on a peer's delta used to end that thread
     // outright, and every outside signal - PING, MM_PEERS, the peer's `connected` row - stayed

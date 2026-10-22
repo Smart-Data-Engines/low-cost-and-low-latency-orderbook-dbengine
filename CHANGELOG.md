@@ -11,6 +11,24 @@ here as `#N`.
 
 ### Added
 
+- `MREPLACE`, a side replacement (#233): `MREPLACE <symbol> <exchange> <bid|ask> <n_levels>
+  [event_time_ns]` and its level lines, as `MINSERT` sends them, and the side becomes exactly those
+  levels. The node removes every price the side holds and the block does not name, under the lock
+  its write takes, and logs them in the same `DELTA` record as levels of quantity 0 in front of the
+  update's own - so a replica, a peer, a replay and history see an ordinary update, and no record
+  format changes. `n_levels` may be 0, which empties the side. `capabilities` announces
+  `replace_side`; the Python client's `replace_side()` and `BookUpdate(replace=True)`, the C++
+  client's `OrderbookClient::replace_side()` and the C API's `ob_replace_side()` send one, and
+  both clients refuse before sending to a server that does not announce it.
+  `ob_replace_side_removed_levels_total` counts the removals. Under `--auth-acl-file` it is a
+  write, and meets an identity's symbols like `MINSERT`.
+- Book summaries (#233): beside a symbol's segments, files `book.<time>.v1` hold its book by price
+  as of one instant, and a book read starts from the newest one at or before its instant. A seal
+  writes one every 65 536 rows of a symbol - more for a deep book - and a row that arrives later
+  with a time at or before a summary's removes that summary first. Snapshots, backups, migrations
+  and merges carry them. `ob_book_summaries_written_total` and `ob_book_summary_bytes_total` count
+  them.
+
 - Permissions per identity, opt-in with `--auth-acl-file` (#31). Each identity of the secret file
   gets a role:
   - `read` runs the queries;
@@ -85,6 +103,25 @@ here as `#N`.
 
 ### Changed
 
+- **A book at an instant is read by price** (#233, decision B'). `WHERE AT`, a `SNAPSHOT` and the
+  series of the book (`OPEN`, `HIGH`, `LOW`, `CLOSE` and `TWAP` of the bid, the ask, the mid and the
+  spread) apply every row up to their instant in time order, each setting its price's quantity and
+  a quantity of 0 removing the price - which is how the live book applies an update. A row's
+  `level` in the answer is its position in that book. They used to read the latest row of each
+  level, which is the live book only for a writer whose every update is the whole side from its
+  best level: a writer of the top N levels without removals, or of diffs, got a best price from
+  history that the live book did not hold. **History written by a writer of top levels without
+  removals reads differently now**: the prices that dropped out of its updates stay in the book,
+  as they did in the live one. Such a writer sends removals, or uses `MREPLACE`.
+- **A start rebuilds every live book** from the store, by price (#235): `BOOK` after a start is
+  `WHERE AT` the last instant, after a clean stop, a crash, a snapshot bootstrap or a store adopted.
+  A start used to replay the WAL's tail into the live book and nothing else, so after a clean stop
+  `BOOK` refused every symbol and after a crash held only what came after the last checkpoint.
+  The embedded engine of the C API rebuilds its live books when it opens, too: a side replacement
+  after a reopen - which the Python client's local `flush()` is - removed nothing, because it found
+  the side empty.
+- A level count `MINSERT` cannot read - 0, past 1000, a word - and level lines that never came are
+  refused by name, where they were answered `unknown command` (#222).
 - A pass of the client loop that nothing woke no longer reads the subscription hub's eventfd or
   takes its lock (#52): the polling loops of `boost` were paying both on every pass, and a round trip
   through TCP or the Unix socket is 0.08-0.15 us shorter for it on an EPYC 9R45 and 0.17-0.34 us on
@@ -119,6 +156,8 @@ here as `#N`.
 
 ### Fixed
 
+- The C++ client read an answer with a header and no rows - a query that matched nothing, `BOOK` of
+  an empty book - as an error, `missing header`; it is an empty answer now.
 - A device slower than the writes no longer refuses them before admission knows its rate (#190,
   step 9).
   - **Before:** the writers filled the pending queue's million rows, about 34 MB of WAL, and the sync

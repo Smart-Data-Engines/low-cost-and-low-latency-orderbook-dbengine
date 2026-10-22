@@ -11,7 +11,10 @@
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
+#include "orderbook/logger.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -19,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ── ob_engine (C++ side) ──────────────────────────────────────────────────────
@@ -71,6 +75,67 @@ struct ob_engine {
     {
         // Rebuild segment index from any previously persisted segments.
         combined_store.open_existing();
+        restore_live_books();
+    }
+
+    // Get or create the live buffer of "symbol.exchange", zero-initialised. `mtx` held, or the
+    // engine not yet reachable by anyone else.
+    ob::SoABuffer& buffer(const std::string& symbol, const std::string& exchange) {
+        const std::string key = symbol + "." + exchange;
+        auto it = buffers.find(key);
+        if (it == buffers.end()) {
+            auto buf = std::make_shared<ob::SoABuffer>();
+            // Zero-initialise plain data fields; atomics are default-constructed.
+            buf->bid.depth = 0;
+            buf->ask.depth = 0;
+            buf->bid.version.store(0, std::memory_order_relaxed);
+            buf->ask.version.store(0, std::memory_order_relaxed);
+            buf->sequence_number.store(0, std::memory_order_relaxed);
+            buf->last_timestamp_ns.store(0, std::memory_order_relaxed);
+            std::strncpy(buf->symbol,   symbol.c_str(),   sizeof(buf->symbol)   - 1);
+            std::strncpy(buf->exchange, exchange.c_str(), sizeof(buf->exchange) - 1);
+            it = buffers.emplace(key, std::move(buf)).first;
+        }
+        return *it->second;
+    }
+
+    // The live book of every symbol history holds, composed by price, as the server's engine
+    // restores it at a start (#235). A side replacement computes its removals from the live book,
+    // and a reopened engine without this held none - the Python client's local flush() reopens
+    // one - so a replacement after a reopen removed nothing it should have.
+    //
+    // The sequence label stays 0, unknown, as for a book no write has reached: this engine decides
+    // a gap from its caller's own numbering (apply_delta), which a reopen does not restore, and a
+    // client in a new process numbering from 1 again has not skipped anything.
+    void restore_live_books() {
+        const auto started = std::chrono::steady_clock::now();
+        size_t restored = 0;
+        size_t levels = 0;
+        for (const auto& [symbol, exchange] : combined_store.symbols()) {
+            const ob::ColumnarStore::PricedBook book =
+                combined_store.book_at_by_price(UINT64_MAX, symbol, exchange, ob::MAX_LEVELS);
+            if (!book.as_of) continue;
+            std::vector<ob::Level> bids, asks;
+            for (const ob::SnapshotRow& r : book.rows) {
+                ob::Level level{};
+                level.price = r.price;
+                level.qty   = r.quantity;
+                level.cnt   = r.order_count;
+                (r.side == ob::SIDE_BID ? bids : asks).push_back(level);
+            }
+            ob::install_book(buffer(symbol, exchange), bids.data(), bids.size(), asks.data(),
+                             asks.size(), /*sequence_number=*/0, book.as_of->timestamp_ns);
+            ++restored;
+            levels += book.rows.size();
+            OB_LOG_DEBUG("c_api", "live book of %s.%s restored from history: %zu bid and %zu ask "
+                                  "price(s), as of %llu",
+                         symbol.c_str(), exchange.c_str(), bids.size(), asks.size(),
+                         static_cast<unsigned long long>(book.as_of->timestamp_ns));
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+        OB_LOG_INFO("c_api", "live books restored from history: %zu symbol(s), %zu level(s), in %lld ms",
+                    restored, levels, static_cast<long long>(ms));
     }
 
     // Get or create the per-symbol ColumnarStore.
@@ -123,6 +188,95 @@ extern "C" void ob_engine_destroy(ob_engine_t* engine) {
 
 // ── Delta ingestion ───────────────────────────────────────────────────────────
 
+namespace {
+
+/// One write of the embedded engine, its lock held: the WAL first, then the book, the rows and the
+/// subscribers. `ob_apply_delta()` and `ob_replace_side()` are both this, the second with the
+/// removals it adds - so there is one write path here, as in the server's engine.
+ob_status_t apply_locked(ob_engine_t*    engine,
+                         const char*     symbol,
+                         const char*     exchange,
+                         uint64_t        seq,
+                         uint64_t        ts_ns,
+                         const int64_t*  prices,
+                         const uint64_t* qtys,
+                         const uint32_t* cnts,
+                         uint16_t        n_levels,
+                         int             side)
+{
+
+    // ── Build DeltaUpdate for WAL ─────────────────────────────────────────
+    ob::DeltaUpdate delta{};
+    std::strncpy(delta.symbol,   symbol,   sizeof(delta.symbol)   - 1);
+    std::strncpy(delta.exchange, exchange, sizeof(delta.exchange) - 1);
+    delta.sequence_number = seq;
+    delta.timestamp_ns    = ts_ns;
+    delta.side            = static_cast<uint8_t>(side);
+    delta.n_levels        = n_levels;
+
+    // Build Level array for WAL and SoA apply.
+    std::vector<ob::Level> levels(delta.n_levels);
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        levels[i].price = prices[i];
+        levels[i].qty   = qtys[i];
+        levels[i].cnt   = cnts[i];
+    }
+
+    // ── Write to WAL first (write-before-apply, Requirement 8.1) ─────────
+    engine->wal.append(delta, levels.data());
+
+    // ── Get or create SoABuffer for this symbol.exchange ──────────────────
+    ob::SoABuffer* buf = &engine->buffer(symbol, exchange);
+
+    // ── Apply to SoA buffer (seqlock protocol inside apply_delta) ─────────
+    bool gap_detected = false;
+    ob::ob_status_t apply_status = ob::apply_delta(*buf, delta, levels.data(), gap_detected);
+
+    if (gap_detected) {
+        engine->wal.append_gap(seq, ts_ns);
+    }
+
+    // ── Flush to columnar store (one SnapshotRow per level) ───────────────
+    // Use the per-symbol store so that segment metadata carries the correct
+    // symbol/exchange strings (needed for query engine scan filtering).
+    ob::ColumnarStore& sym_store = engine->get_store(symbol, exchange);
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        ob::SnapshotRow row{};
+        row.timestamp_ns    = ts_ns;
+        row.sequence_number = seq;
+        row.side            = static_cast<uint8_t>(side);
+        row.level_index     = i;
+        row.price           = prices[i];
+        row.quantity        = qtys[i];
+        row.order_count     = cnts[i];
+        sym_store.append(row);
+    }
+
+    // ── Notify subscribers ────────────────────────────────────────────────
+    // One call for the whole delta. Guarded, because a caller with no subscriptions - the
+    // common case, and every test that is not about subscriptions - should not build the array.
+    if (engine->query_engine->has_subscribers()) {
+        std::vector<ob::SnapshotRow> rows;
+        rows.reserve(delta.n_levels);
+        for (uint16_t i = 0; i < delta.n_levels; ++i) {
+            ob::SnapshotRow row{};
+            row.timestamp_ns    = ts_ns;
+            row.sequence_number = seq;
+            row.side            = static_cast<uint8_t>(side);
+            row.level_index     = i;
+            row.price           = prices[i];
+            row.quantity        = qtys[i];
+            row.order_count     = cnts[i];
+            rows.push_back(row);
+        }
+        engine->query_engine->notify_subscribers(symbol, exchange, rows);
+    }
+
+    return to_c_status(apply_status);
+}
+
+}  // namespace
+
 extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
                                        const char*     symbol,
                                        const char*     exchange,
@@ -140,91 +294,62 @@ extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
 
     try {
         std::lock_guard<std::mutex> lock(engine->mtx);
+        return apply_locked(engine, symbol, exchange, seq, ts_ns, prices, qtys, cnts,
+                            static_cast<uint16_t>(
+                                std::min(n_levels, static_cast<uint32_t>(ob::MAX_LEVELS))),
+                            side);
+    } catch (...) {
+        return OB_C_ERR_INTERNAL;
+    }
+}
 
-        // ── Build DeltaUpdate for WAL ─────────────────────────────────────────
-        ob::DeltaUpdate delta{};
-        std::strncpy(delta.symbol,   symbol,   sizeof(delta.symbol)   - 1);
-        std::strncpy(delta.exchange, exchange, sizeof(delta.exchange) - 1);
-        delta.sequence_number = seq;
-        delta.timestamp_ns    = ts_ns;
-        delta.side            = static_cast<uint8_t>(side);
-        delta.n_levels        = static_cast<uint16_t>(
-            std::min(n_levels, static_cast<uint32_t>(ob::MAX_LEVELS)));
+extern "C" ob_status_t ob_replace_side(ob_engine_t*    engine,
+                                        const char*     symbol,
+                                        const char*     exchange,
+                                        uint64_t        seq,
+                                        uint64_t        ts_ns,
+                                        const int64_t*  prices,
+                                        const uint64_t* qtys,
+                                        const uint32_t* cnts,
+                                        uint32_t        n_levels,
+                                        int             side)
+{
+    if (!engine || !symbol || !exchange)              return OB_C_ERR_INVALID_ARG;
+    if (n_levels > 0 && (!prices || !qtys || !cnts)) return OB_C_ERR_INVALID_ARG;
+    if (side != 0 && side != 1)                       return OB_C_ERR_INVALID_ARG;
+    // Refused rather than cut to the ceiling, as `ob_apply_delta()` cuts a write: a replacement cut
+    // short would remove prices it named.
+    if (n_levels > ob::MAX_LEVELS)                    return OB_C_ERR_INVALID_ARG;
 
-        // Build Level array for WAL and SoA apply.
-        std::vector<ob::Level> levels(delta.n_levels);
-        for (uint16_t i = 0; i < delta.n_levels; ++i) {
-            levels[i].price = prices[i];
-            levels[i].qty   = qtys[i];
-            levels[i].cnt   = cnts[i];
-        }
-
-        // ── Write to WAL first (write-before-apply, Requirement 8.1) ─────────
-        engine->wal.append(delta, levels.data());
-
-        // ── Get or create SoABuffer for this symbol.exchange ──────────────────
+    try {
+        std::lock_guard<std::mutex> lock(engine->mtx);
+        // A level of quantity 0 for every price the side holds and the update does not name - in
+        // the side's own order, so best first - then the update, under the lock the write takes.
+        // The removals first, as in the server's engine: a full side has no room for a new price
+        // until they are applied.
+        std::vector<int64_t>  p;
+        std::vector<uint64_t> q;
+        std::vector<uint32_t> c;
         const std::string key = std::string(symbol) + "." + exchange;
-        if (engine->buffers.find(key) == engine->buffers.end()) {
-            auto buf = std::make_shared<ob::SoABuffer>();
-            // Zero-initialise plain data fields; atomics are default-constructed.
-            buf->bid.depth = 0;
-            buf->ask.depth = 0;
-            buf->bid.version.store(0, std::memory_order_relaxed);
-            buf->ask.version.store(0, std::memory_order_relaxed);
-            buf->sequence_number.store(0, std::memory_order_relaxed);
-            buf->last_timestamp_ns.store(0, std::memory_order_relaxed);
-            std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
-            std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
-            engine->buffers[key] = std::move(buf);
-        }
-
-        ob::SoABuffer* buf = engine->buffers[key].get();
-
-        // ── Apply to SoA buffer (seqlock protocol inside apply_delta) ─────────
-        bool gap_detected = false;
-        ob::ob_status_t apply_status = ob::apply_delta(*buf, delta, levels.data(), gap_detected);
-
-        if (gap_detected) {
-            engine->wal.append_gap(seq, ts_ns);
-        }
-
-        // ── Flush to columnar store (one SnapshotRow per level) ───────────────
-        // Use the per-symbol store so that segment metadata carries the correct
-        // symbol/exchange strings (needed for query engine scan filtering).
-        ob::ColumnarStore& sym_store = engine->get_store(symbol, exchange);
-        for (uint16_t i = 0; i < delta.n_levels; ++i) {
-            ob::SnapshotRow row{};
-            row.timestamp_ns    = ts_ns;
-            row.sequence_number = seq;
-            row.side            = static_cast<uint8_t>(side);
-            row.level_index     = i;
-            row.price           = prices[i];
-            row.quantity        = qtys[i];
-            row.order_count     = cnts[i];
-            sym_store.append(row);
-        }
-
-        // ── Notify subscribers ────────────────────────────────────────────────
-        // One call for the whole delta. Guarded, because a caller with no subscriptions - the
-        // common case, and every test that is not about subscriptions - should not build the array.
-        if (engine->query_engine->has_subscribers()) {
-            std::vector<ob::SnapshotRow> rows;
-            rows.reserve(delta.n_levels);
-            for (uint16_t i = 0; i < delta.n_levels; ++i) {
-                ob::SnapshotRow row{};
-                row.timestamp_ns    = ts_ns;
-                row.sequence_number = seq;
-                row.side            = static_cast<uint8_t>(side);
-                row.level_index     = i;
-                row.price           = prices[i];
-                row.quantity        = qtys[i];
-                row.order_count     = cnts[i];
-                rows.push_back(row);
+        size_t removed = 0;
+        if (const auto it = engine->buffers.find(key); it != engine->buffers.end() && it->second) {
+            const ob::SoASide& held = side == 0 ? it->second->bid : it->second->ask;
+            const std::unordered_set<int64_t> named(prices, prices + n_levels);
+            for (uint32_t k = 0; k < held.depth; ++k) {
+                if (named.count(held.prices[k]) != 0) continue;
+                p.push_back(held.prices[k]);
+                q.push_back(0);
+                c.push_back(0);
+                ++removed;
             }
-            engine->query_engine->notify_subscribers(symbol, exchange, rows);
         }
-
-        return to_c_status(apply_status);
+        p.insert(p.end(), prices, prices + n_levels);
+        q.insert(q.end(), qtys, qtys + n_levels);
+        c.insert(c.end(), cnts, cnts + n_levels);
+        OB_LOG_DEBUG("c_api", "replace side %s %s: %u level(s) written, %zu removed", key.c_str(),
+                     side == 0 ? "bid" : "ask", n_levels, removed);
+        return apply_locked(engine, symbol, exchange, seq, ts_ns, p.data(), q.data(), c.data(),
+                            static_cast<uint16_t>(p.size()), side);
     } catch (...) {
         return OB_C_ERR_INTERNAL;
     }

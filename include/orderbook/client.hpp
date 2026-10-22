@@ -239,6 +239,19 @@ public:
                                 Side side, const Level* levels, size_t n_levels,
                                 std::optional<uint64_t> event_time_ns = std::nullopt);
 
+    /// Replace one side of a book (`MREPLACE`, #233): afterwards the side is exactly `levels`.
+    ///
+    /// The server removes every price the side holds and `levels` does not name, under the lock
+    /// its write takes, and logs the removals as quantity 0 in front of the levels - so replicas,
+    /// peers and history see an ordinary update. `n_levels` may be 0, which empties the side.
+    ///
+    /// Asks the server for `replace_side` first - once per connection, like the event time - and
+    /// fails without sending a byte if it is missing: an older server answers `MREPLACE` as an
+    /// unknown command, and a caller streaming books would learn that a book late.
+    Result<void>        replace_side(std::string_view symbol, std::string_view exchange,
+                                     Side side, const Level* levels, size_t n_levels,
+                                     std::optional<uint64_t> event_time_ns = std::nullopt);
+
     /// One write of `minsert_many()`.
     struct MinsertWrite {
         std::string_view        symbol;
@@ -302,6 +315,9 @@ public:
     size_t format_minsert(std::string_view symbol, std::string_view exchange,
                           Side side, const Level* levels, size_t n_levels,
                           std::optional<uint64_t> event_time_ns = std::nullopt);
+    size_t format_mreplace(std::string_view symbol, std::string_view exchange,
+                           Side side, const Level* levels, size_t n_levels,
+                           std::optional<uint64_t> event_time_ns = std::nullopt);
     size_t format_simple(std::string_view cmd);
     size_t format_query(std::string_view sql);
 
@@ -321,6 +337,12 @@ private:
     int          fd_ = -1;
     /// Refuse a write whose event time this server would discard, before a byte goes out (#105).
     Result<void> refuse_unsupported_event_time(const std::optional<uint64_t>& event_time_ns);
+
+    /// `MINSERT` and `MREPLACE` are one block with two keywords (#233): the header, then a line
+    /// per level. `keyword` includes its trailing space.
+    size_t format_levels_block(std::string_view keyword, std::string_view symbol,
+                               std::string_view exchange, Side side, const Level* levels,
+                               size_t n_levels, std::optional<uint64_t> event_time_ns);
 
     /// Filled by the first `capabilities()` call, never at connect: a caller who never asks about a
     /// capability should not pay a round trip for one (#105).
@@ -397,6 +419,10 @@ public:
     Result<void> minsert(std::string_view symbol, std::string_view exchange,
                          Side side, const Level* levels, size_t n_levels,
                          std::optional<uint64_t> event_time_ns = std::nullopt);
+    /// `OrderbookClient::replace_side()`, sent where `minsert()` would be (#233).
+    Result<void> replace_side(std::string_view symbol, std::string_view exchange,
+                              Side side, const Level* levels, size_t n_levels,
+                              std::optional<uint64_t> event_time_ns = std::nullopt);
     Result<void> flush();
 
     // ── Read operations (round-robin) ────────────────────────────────

@@ -31,6 +31,12 @@ inline constexpr std::string_view kCapabilities[] = {
     /// A server without it answers `BACKUP` as an unknown command, which a tool cannot tell from a
     /// typo, so `ob_backup` asks for this name first.
     "backup",
+
+    /// `MREPLACE` replaces one side of a book: the side becomes exactly its levels, and the engine
+    /// removes every price the side holds and the block does not name (#233, the incremental
+    /// books). A server without it answers `MREPLACE` as an unknown command, so a client asks for
+    /// this name before sending one rather than learning from a refusal mid-stream.
+    "replace_side",
 };
 
 } // namespace ob

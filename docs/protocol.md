@@ -33,8 +33,8 @@ it may send only `AUTH`, `PING` and `QUIT`.
 ## Commands
 
 A command is one line ending in `\n`. Its words are separated by spaces, and a quoted name keeps
-its spaces (`'BTC-USD'.'BINANCE'`). `MINSERT` is the one command that runs over several lines: its
-first line says how many levels follow, and each level is a line of its own.
+its spaces (`'BTC-USD'.'BINANCE'`). `MINSERT` and `MREPLACE` are the commands that run over several
+lines: the first line says how many levels follow, and each level is a line of its own.
 
 <!-- transcript: checked -->
 ```
@@ -46,6 +46,40 @@ S:
 C: MINSERT BTC-USD BINANCE ask 2 1700000000500000000
 C: 6500100 80 2
 C: 6500200 120 5
+S: OK
+S:
+```
+
+**A level sets its price.** A write's levels are applied by price: each sets the quantity of its
+price, inserts a price the side does not hold in order, and a quantity of 0 removes the price. A
+price the update does not name stays as it was. `MREPLACE` (#233) says that its levels are the whole
+side: the node removes every price the side holds and the update does not name, and logs those
+removals, as levels of quantity 0 in front of the update's own, in the same record. A `MREPLACE` of
+no levels is one line, and empties the side. A server announces it as `replace_side` in `STATUS`'s
+`capabilities:` line.
+
+<!-- transcript: checked -->
+```
+S: OK ob_tcp_server v<version>
+S:
+C: MINSERT BTC-USD BINANCE bid 3 1700000000000000000
+C: 6500000 150 3
+C: 6499900 80 1
+C: 6499800 40 2
+S: OK
+S:
+C: MREPLACE BTC-USD BINANCE bid 2 1700000001000000000
+C: 6500100 90 2
+C: 6499900 70 1
+S: OK
+S:
+C: BOOK BTC-USD BINANCE
+S: OK
+S: timestamp_ns	price	quantity	order_count	side	level	sequence_number
+S: 1700000001000000000	6500100	90	2	0	0	2
+S: 1700000001000000000	6499900	70	1	0	1	2
+S:
+C: MREPLACE BTC-USD BINANCE bid 0
 S: OK
 S:
 ```

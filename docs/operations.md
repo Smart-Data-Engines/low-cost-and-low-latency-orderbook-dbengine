@@ -1058,6 +1058,12 @@ Conflict detected: REMOTE wins for BTCUSDT/BINANCE/0/6500000 (origin 2 against 1
 1523 more conflict(s) between origins in the 12 s since the last line, and now: LOCAL wins for BTCUSDT/BINANCE/1/6500100 (origin 3 against 1)
 ```
 
+**A side replacement in a mesh** (`MREPLACE`, #233). The node that takes it computes the removals
+against its own live book and sends its peers an ordinary update: the update's levels and a quantity
+of 0 for each price it removed. A price that a peer holds and the writing node does not - a write of
+another origin still on its way - is not removed on that peer. Books written whole by one writer per
+symbol, which is how a mesh carries them, meet again at that writer's next replacement.
+
 A steady rate of these is the mesh doing what it is for - two writers of one instrument - and the
 counter is the thing to graph.
 
@@ -1881,7 +1887,17 @@ the last one.
 ## How long a start takes, and what makes it longer
 
 A start reads the `meta.json` of every segment in the data directory, and reads the WAL once - and
-then again what its last checkpoint does not cover - before it answers anything. Since part 2a of #165 a symbol gains a segment when it is **due** —
+then again what its last checkpoint does not cover - before it answers anything. Then it rebuilds
+every symbol's live book by price from the store (#235): from the symbol's newest book summary and
+the rows after it, at most 65 536 rows of the symbol, more for a deep book. The log says how many
+came from a summary:
+
+```
+live books restored: <symbols> symbol(s), <n> from a summary and <m> from the first row, <levels> level(s), in <ms> ms
+```
+
+A store written before #233 has no summaries until the first seal after the upgrade writes one, so
+its first start composes each symbol's book from its first row once. Since part 2a of #165 a symbol gains a segment when it is **due** —
 65 536 rows, or ten seconds after its oldest waiting row — rather than on every flush tick, so at a
 steady write rate a node gains about one segment per active symbol every ten seconds. Since part 2b
 the flush tick merges them ([merging segments](#merging-segments)), so the count follows the data

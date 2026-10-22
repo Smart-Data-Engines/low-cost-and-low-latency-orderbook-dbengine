@@ -127,7 +127,7 @@ TEST(AuthGateStatic, ExactlyFourCommandTypesAreAllowedBeforeAuthentication) {
 
 TEST(AuthGateStatic, EverySensitiveCommandRequiresAuthentication) {
     for (auto t : {ob::CommandType::SELECT, ob::CommandType::INSERT, ob::CommandType::MINSERT,
-                   ob::CommandType::FLUSH, ob::CommandType::STATUS, ob::CommandType::ROLE,
+                   ob::CommandType::MREPLACE, ob::CommandType::FLUSH, ob::CommandType::STATUS, ob::CommandType::ROLE,
                    ob::CommandType::FAILOVER, ob::CommandType::COMPRESS,
                    ob::CommandType::SHARD_MAP, ob::CommandType::SHARD_INFO,
                    ob::CommandType::MIGRATE, ob::CommandType::ADOPT, ob::CommandType::MM_PEERS,
@@ -386,6 +386,20 @@ TEST(AuthGateStatic, TheRoleTableHasNoDefaultLabel) {
         << "a default label would decide the next command's role by accident";
 }
 
+TEST(AuthGateStatic, TheSymbolCheckHasNoDefaultLabel) {
+    // The same rule as the role table's, for the switch that decides which commands name a symbol:
+    // with a `default:` there, MREPLACE (#233) first compiled as a write the lists did not reach.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    ASSERT_TRUE(in) << "cannot read src/tcp_server.cpp";
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto begin = src.find("std::string permission_refusal(const Command& cmd,");
+    ASSERT_NE(begin, std::string::npos) << "the symbol check not found - did it get renamed?";
+    const auto end = src.find("\n}\n", begin);
+    ASSERT_NE(end, std::string::npos);
+    EXPECT_EQ(src.substr(begin, end - begin).find("default:"), std::string::npos)
+        << "a default label would let the next command that names a symbol past the lists";
+}
+
 TEST(AuthGateStatic, EachRoleTakesEveryCommandOfTheOneBelowIt) {
     size_t read = 0, write = 0, admin = 0;
     for (int i = 0; i <= static_cast<int>(ob::CommandType::UNKNOWN); ++i) {
@@ -403,6 +417,8 @@ TEST(AuthGateStatic, EachRoleTakesEveryCommandOfTheOneBelowIt) {
     EXPECT_LT(read, write) << "the writes are write's";
     EXPECT_LT(write, admin) << "something is admin's alone";
     EXPECT_FALSE(ob::role_allows(ob::Role::Read, ob::CommandType::INSERT));
+    EXPECT_FALSE(ob::role_allows(ob::Role::Read, ob::CommandType::MREPLACE));
+    EXPECT_TRUE(ob::role_allows(ob::Role::Write, ob::CommandType::MREPLACE));
     EXPECT_FALSE(ob::role_allows(ob::Role::Read, ob::CommandType::FLUSH));
     EXPECT_FALSE(ob::role_allows(ob::Role::Write, ob::CommandType::FAILOVER));
     EXPECT_FALSE(ob::role_allows(ob::Role::Write, ob::CommandType::BACKUP));
@@ -418,6 +434,8 @@ TEST_F(AuthGateTest, AReaderMayNotWriteAndKeepsItsSession) {
     EXPECT_EQ(run(s, "INSERT BTCUSD BINANCE bid 50000 10 1"),
               "ERR forbidden: alice (read) may not run INSERT\n");
     EXPECT_EQ(run(s, "FLUSH"), "ERR forbidden: alice (read) may not run FLUSH\n");
+    EXPECT_EQ(run(s, "MREPLACE BTCUSD BINANCE ask 0"),
+              "ERR forbidden: alice (read) may not run MREPLACE\n");
     EXPECT_EQ(run(s, "FAILOVER node-2"), "ERR forbidden: alice (read) may not run FAILOVER\n");
     EXPECT_EQ(run(s, "PING"), "PONG\n") << "a refused permission is not a closed session";
     EXPECT_FALSE(ob::deferrable_write(ob::parse_command("INSERT BTCUSD BINANCE bid 50000 10 1"), s, &store_))
@@ -433,6 +451,15 @@ TEST_F(AuthGateTest, AListReachesItsSymbolsInEveryCommandThatNamesOne) {
     EXPECT_EQ(run(s, "SELECT * FROM 'ETHUSD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 1"),
               "ERR forbidden: alice may not SELECT 'ETHUSD'.'BINANCE'\n");
     EXPECT_EQ(run(s, "BOOK ETHUSD BINANCE"), "ERR forbidden: alice may not BOOK 'ETHUSD'.'BINANCE'\n");
+    // A side replacement is a write that names a symbol (#233): the one-line form, which empties the
+    // side, and the block both meet the list.
+    EXPECT_EQ(run(s, "MREPLACE ETHUSD BINANCE bid 0"),
+              "ERR forbidden: alice may not MREPLACE 'ETHUSD'.'BINANCE'\n");
+    EXPECT_FALSE(ob::deferrable_write(ob::parse_minsert("MREPLACE ETHUSD BINANCE bid 1\n3000 10 1"), s,
+                                      &store_))
+        << "a replacement the list refuses is not held for execute_writes(), which checks nothing";
+    EXPECT_TRUE(ob::deferrable_write(ob::parse_minsert("MREPLACE BTCUSD BINANCE bid 1\n50000 10 1"), s,
+                                     &store_));
     EXPECT_EQ(run(s, "SUBSCRIBE * FROM 'ETHUSD'.'BINANCE'"),
               "ERR forbidden: alice may not SUBSCRIBE 'ETHUSD'.'BINANCE'\n");
     // An admin with a list: the commands that name or move any symbol are not its.

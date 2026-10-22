@@ -67,23 +67,18 @@ std::vector<std::string> Session::feed(const char* data, size_t len) {
                     minsert_lines_.clear();
                 }
             } else {
-                // Check if this line starts with MINSERT (case-insensitive)
-                bool is_minsert = false;
-                if (line.size() >= 7) {
-                    // Check prefix "MINSERT" case-insensitively
-                    is_minsert = true;
-                    const char* minsert_kw = "MINSERT";
-                    for (int i = 0; i < 7; ++i) {
-                        if (std::toupper(static_cast<unsigned char>(line[i])) != minsert_kw[i]) {
-                            is_minsert = false;
-                            break;
-                        }
+                // Does this line open a block - MINSERT, or MREPLACE (#233), which frames its
+                // level lines the same way? Case-insensitive, and the keyword must be followed by
+                // a space or the end of the line.
+                const auto opens_block = [&line](std::string_view kw) {
+                    if (line.size() < kw.size()) return false;
+                    for (size_t i = 0; i < kw.size(); ++i) {
+                        if (std::toupper(static_cast<unsigned char>(line[i])) != kw[i]) return false;
                     }
-                    // Must be followed by space or end of line
-                    if (is_minsert && line.size() > 7 && line[7] != ' ' && line[7] != '\t') {
-                        is_minsert = false;
-                    }
-                }
+                    return line.size() == kw.size() || line[kw.size()] == ' ' ||
+                           line[kw.size()] == '\t';
+                };
+                const bool is_minsert = opens_block("MINSERT") || opens_block("MREPLACE");
 
                 if (is_minsert) {
                     // Parse n_levels from the header: tokenize, take token[4]
@@ -111,7 +106,8 @@ std::vector<std::string> Session::feed(const char* data, size_t len) {
                         minsert_header_ = std::move(line);
                         minsert_lines_.clear();
                     } else {
-                        // n_levels=0 or parse failure — pass through as-is
+                        // n_levels=0 or parse failure — pass through as-is. A MREPLACE of no levels
+                        // is this line and nothing else, and the parser reads it from here.
                         result.push_back(std::move(line));
                     }
                 } else {

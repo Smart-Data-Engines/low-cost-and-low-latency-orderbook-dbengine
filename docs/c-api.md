@@ -63,6 +63,18 @@ Insert one or more price levels. The update is:
 2. Applied to the in-memory SoA buffer
 3. Enqueued for background columnar flush
 
+### ob_replace_side
+
+```c
+ob_status_t ob_replace_side(/* the arguments of ob_apply_delta */);
+```
+
+The same write for an update that is the whole side (`MREPLACE`, #233): every price the side holds and
+the update does not name is removed, by a level of quantity 0 put in front of the update, before it is
+logged - so the WAL holds an ordinary update. `n_levels` may be 0, which empties the side. Above
+`MAX_LEVELS` (1000) it is refused with `OB_C_ERR_INVALID_ARG`, where `ob_apply_delta()` cuts a write to
+the ceiling: a replacement cut short would remove prices it named.
+
 An embedded engine writes its segments in segment format 3 with a seal's encodings - LZ4 or nothing
 (`docs/operations.md`, "Segment format 3"). Nothing merges an embedded store, so its segments keep
 those encodings rather than a merge's ZSTD, and there is no setting for format 2 yet.

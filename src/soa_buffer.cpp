@@ -237,4 +237,31 @@ SnapshotLabel read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out
     return label;
 }
 
+void install_book(SoABuffer& buf, const Level* bids, size_t n_bids, const Level* asks, size_t n_asks,
+                  uint64_t sequence_number, uint64_t timestamp_ns) {
+    const auto install = [&](SoASide& side, const Level* levels, size_t n, bool label) {
+        // ── Seqlock: begin write (version → odd) ──────────────────────────────
+        const uint64_t ver = side.version.load(std::memory_order_relaxed);
+        side.version.store(ver + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        const size_t depth = std::min(n, SoASide::MAX_LEVELS);
+        for (size_t i = 0; i < depth; ++i) {
+            side.prices[i]       = levels[i].price;
+            side.quantities[i]   = levels[i].qty;
+            side.order_counts[i] = levels[i].cnt;
+        }
+        side.depth = static_cast<uint32_t>(depth);
+        if (label) {
+            buf.sequence_number.store(sequence_number, std::memory_order_relaxed);
+            buf.last_timestamp_ns.store(timestamp_ns, std::memory_order_relaxed);
+        }
+        // ── Seqlock: end write (version → even) ───────────────────────────────
+        std::atomic_thread_fence(std::memory_order_release);
+        side.version.store(ver + 2, std::memory_order_relaxed);
+    };
+    install(buf.bid, bids, n_bids, /*label=*/true);
+    install(buf.ask, asks, n_asks, /*label=*/false);
+    // The engine logs each book it restores; this library has no logger to say it with.
+}
+
 } // namespace ob

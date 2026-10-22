@@ -4180,16 +4180,17 @@ Learned the hard way. Check here before debugging.
      history, then ask. Found when `ACatchupThatLosesGroundIsEnded` passed alone and failed after
      another test in the same process.
 
-568. **A book written one way can be read two ways.** The live book (`BOOK`, every aggregate without
-     `GROUP BY`) applies an update by price, and history (`WHERE AT`, the series) keys a row by its
-     position in the update (#233). A test that writes a book and reads only one of them proves one
-     model. Read the live book and `WHERE AT` the same instant, level by level, as
-     `test_example_binance_live.py` does; the writer it holds sends a side's levels best first, then
-     the prices that left it with a quantity of 0.
-569. **What survives a restart is history, not the live book.** A start replays the WAL's tail into
-     the live book and rebuilds nothing from the segments (#235): after a clean stop `BOOK` refuses
-     the symbol, after SIGKILL it holds the tail. A test of the live book that restarts a node is
-     testing that, not recovery.
+568. **A book written one way can be read two ways.** Until #233 closed, the live book (`BOOK`,
+     every aggregate without `GROUP BY`) applied an update by price, and history (`WHERE AT`, the
+     series) keyed a row by its position in the update. Both read by price now, and history starts
+     from a book summary. A test that writes a book and reads only one of them still proves one
+     reader. Read the live book and `WHERE AT` the same instant, level by level, as
+     `test_book_by_price.cpp`'s property and `test_example_binance_live.py` do.
+569. **What survives a restart was history, not the live book.** Until #235 closed, a start replayed
+     the WAL's tail into the live book and rebuilt nothing from the segments: after a clean stop
+     `BOOK` refused the symbol, and after SIGKILL it held the tail. A start rebuilds every live book
+     by price from the store now, from the newest summary. A test of the live book that restarts a
+     node tests that rebuild.
 570. **"Nothing has been flushed" is false on a node with a tick.** The default flush interval is
      100 ms, and the shared cluster runs it, so a control that history holds nothing until the test
      flushes races the tick - and loses where round trips are slowest, under TSan (PR #249's run).
@@ -4369,6 +4370,24 @@ Learned the hard way. Check here before debugging.
        a tick. It failed once, under ASan on CI, and in none of 40 runs on the laptop.
      - The test writes under `none` now, where the budget asks for nothing. A test that needs a
        tick not to happen has to rule out whatever can ask for one.
+598. **A record that adds and removes on a full side has to remove first.** A record is applied
+     in its order everywhere: the node, a replica, a replay. A side at its 1000 levels takes no price
+     worse than all it holds.
+     - `MREPLACE` (#233) first wrote the update's levels and then the removals. A full side replaced
+       by 1000 prices below all of its own took none of them, then removed the 1000 it had, and was
+       empty.
+     - The removals go in front now. Against the update's own levels their order changes nothing
+       else, because they name different prices.
+     - Every small test passed with the wrong order. Only a full side shows it, so a test of a
+       side's capacity has to write one.
+599. **A switch over a command with a default label decides the next command by accident.**
+     `permission_refusal()` (#31) chose which commands name a symbol with a default that returned
+     no refusal.
+     - `MREPLACE` compiled through it as a write that the symbol lists did not reach.
+     - The switch lists every command now and has no default label. A static test holds that, as
+       one already held it for the role table.
+     - The static test reads the source, and a comment that spelled the label out failed it on the
+       first run.
 
 ## Current state and open problems
 

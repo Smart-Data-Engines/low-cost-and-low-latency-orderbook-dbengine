@@ -34,6 +34,10 @@ enum class CommandType {
     BOOK,
     BACKUP,
     RINGS,
+    /// `MINSERT`'s block with another meaning (#233, the incremental books): the side becomes
+    /// exactly its levels, so the engine removes every price the side holds and the block does not
+    /// name. Last before `UNKNOWN`, so no command's number moves.
+    MREPLACE,
     UNKNOWN
 };
 
@@ -99,7 +103,7 @@ struct Command {
     CommandType type;
     std::string raw_sql;        // for SELECT
     InsertArgs  insert_args;    // for INSERT
-    MinsertArgs minsert_args;   // for MINSERT
+    MinsertArgs minsert_args;   // for MINSERT and MREPLACE
     BookArgs    book_args;      // for BOOK
     std::string target_node_id; // for FAILOVER
     std::string migrate_symbol;       // "symbol.exchange" for MIGRATE and ADOPT
@@ -184,7 +188,10 @@ std::span<const CommandGrammar> command_grammar();
 /// Parse a single command line. Returns Command with type=UNKNOWN on failure.
 Command parse_command(std::string_view line);
 
-/// Parse a multi-line MINSERT block. Returns Command with type=UNKNOWN on failure.
+/// Parse a multi-line MINSERT or MREPLACE block. Returns Command with type=UNKNOWN on failure.
+///
+/// Also the parser of a one-line `MREPLACE` of no levels, which `parse_command()` hands here: the
+/// session frames a block only around the level lines it announces, so that one arrives alone.
 Command parse_minsert(std::string_view block);
 
 /// Format a Command back to its wire representation (trailing \n included).

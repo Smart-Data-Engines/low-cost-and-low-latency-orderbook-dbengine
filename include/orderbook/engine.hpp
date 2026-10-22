@@ -88,6 +88,13 @@ struct ClientWrite {
     /// that reached the log after the adoption was abandoned would leave a row on a shard that
     /// neither owns nor adopts its symbol - which nothing drops again.
     uint64_t           adoption{0};
+    /// Whether the update is the whole side (`MREPLACE`, the incremental books' resynchronisation):
+    /// every price the side holds and the update does not name is removed. The engine adds those
+    /// removals to the update, as levels of quantity 0 in front of its own - a full side has no
+    /// room for a new price until they are applied - before the update is numbered and logged, so
+    /// the WAL record, the replicas, the peers and history all see an ordinary update, and no
+    /// record format changes.
+    bool               replace_side{false};
 };
 
 /// What happened to one write of a batch: the status `apply_delta()` returns for it, or - where
@@ -204,6 +211,11 @@ public:
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
 
+    /// `apply_delta()` for an update that is the whole side (`ClientWrite::replace_side`): the
+    /// side's prices it does not name are removed, by levels of quantity 0 the engine adds to it.
+    /// `delta.n_levels` may be 0, which empties the side.
+    ob_status_t replace_side(const DeltaUpdate& delta, const Level* levels);
+
     /// Apply a record streamed from a primary on the replication link.
     ///
     /// Identical to `apply_delta()` except that a record whose sequence number this node has
@@ -298,6 +310,19 @@ public:
     /// `--decoded-cache-mb`): 0 holds none, and every query decodes what it reads. Off unless set -
     /// the server sets it from its configuration, 256 MiB by default.
     void set_decoded_columns_budget(size_t bytes);
+
+    /// How many rows of a symbol a seal takes in before it writes a summary of its book (#233,
+    /// `book_summary.hpp`): the most rows a book read applies after one. 0 writes none, and every
+    /// read composes the symbol's rows from the first. A deep book waits longer, so that a summary
+    /// is never most of what it summarises: `kBookSummaryRowsPerPrice` rows a price it held last.
+    static constexpr uint64_t kDefaultBookSummaryRows = 65'536;
+    static constexpr uint64_t kBookSummaryRowsPerPrice = 32;
+    void set_book_summary_rows(uint64_t rows) { book_summary_rows_ = rows; }
+    uint64_t book_summary_rows() const { return book_summary_rows_; }
+    /// The store queries read, for what only it can say: the summaries a symbol has, what a read
+    /// started from.
+    const ColumnarStore& store() const { return combined_store_; }
+
     DecodedColumnsBudget::Stats decoded_columns_stats() const {
         return combined_store_.decoded_columns_stats();
     }
@@ -1394,7 +1419,8 @@ private:
     /// acquisition of `mtx_` either way: a wrapper that checked `has_seen()`, released the lock and
     /// delegated would leave a window between the check and the append.
     ob_status_t apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
-                                 DuplicatePolicy policy, bool multi_master);
+                                 DuplicatePolicy policy, bool multi_master,
+                                 bool replace_side = false);
 
     /// The one local write path: `apply_delta()`, `apply_delta_replicated()`, `apply_delta_mm()`
     /// and both batch entry points are this, with one write or with several. One acquisition of
@@ -1554,6 +1580,24 @@ private:
     /// Requires combined_store_.open_existing() to have run, and the segments no surviving
     /// checkpoint vouches for to have been removed (#160): a record a remaining segment already
     /// holds is skipped by the WAL position that segment recorded (#63), which needs the index.
+    /// The live book of every symbol in the store, rebuilt from history by price (#235): the book a
+    /// `WHERE AT` of the last instant answers. A start replayed the WAL's tail into the live book and
+    /// nothing else, so after a clean stop `BOOK` refused every symbol, and after a crash held only
+    /// what came after the last checkpoint. Called by `open()` once the recovered records are
+    /// history and before anything serves or writes.
+    void restore_live_books();
+    /// The same, with `mtx_` held: after a snapshot is installed or a store found on disk adopted,
+    /// whose live books were cleared with the rest of the state they described.
+    void restore_live_books_locked();
+
+    /// Rows sealed since a symbol's last summary, and the prices that summary held.
+    struct SummaryProgress {
+        uint64_t rows{0};
+        size_t prices{0};
+    };
+    std::unordered_map<std::string, SummaryProgress> summary_progress_;
+    uint64_t book_summary_rows_{kDefaultBookSummaryRows};
+
     uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
     void flush_drain_pending();
 
@@ -1635,6 +1679,9 @@ private:
     /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
     /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
     size_t merge_seals_locked(const std::vector<Seal>& seals);
+    /// Write the summaries a seal has made due (#233): one for each symbol that took in
+    /// `book_summary_rows_` rows - more for a deep book - since its last. Without `mtx_`.
+    void write_book_summaries(const std::vector<Seal>& seals);
     /// Where replay starts: the drain's position, or the oldest unsealed block's start if that is
     /// earlier - claiming a waiting block's rows would lose them in a crash. **With blocks waiting
     /// this position alone does not say which segments are durable** (#165 part 2a): a seal writes

@@ -199,6 +199,41 @@ TEST(Compaction, EightSealsOfASymbolMergeIntoOneAndEveryRowAnswersInOrder) {
     engine.close();
 }
 
+TEST(Compaction, AMergeCarriesTheBookSummariesOfItsInputs) {
+    // The summaries a read by price starts from (#233) are files in their segments' directories, and
+    // a merge's inputs are removed: the merged segment takes them, or reads start from the first row.
+    TempDir dir;
+    std::vector<uint64_t> summaries;
+    {
+        ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.set_book_summary_rows(1);
+        engine.open();
+        seal_n(engine, "A", 1, ob::compaction::kFanIn);
+        summaries = engine.store().book_summaries("A", "EX");
+        ASSERT_FALSE(summaries.empty()) << "a seal of 50 rows with a summary due every row wrote none";
+        ASSERT_TRUE(eventually([&] { return segments_on_disk(dir.path, "A") == 1; }));
+        EXPECT_EQ(engine.store().book_summaries("A", "EX"), summaries)
+            << "the merge lost a summary of its inputs";
+        const auto book = engine.store().book_at_by_price(UINT64_MAX, "A", "EX");
+        ASSERT_TRUE(book.from_summary.has_value());
+        EXPECT_EQ(*book.from_summary, summaries.back());
+        engine.close();
+    }
+    // And they are in the merged segment's directory, where a start finds them.
+    size_t files = 0;
+    for (const auto& meta : meta_files(dir.path)) {
+        if (meta.string().find("/A/") == std::string::npos) continue;
+        for (const auto& entry : fs::directory_iterator(meta.parent_path())) {
+            if (ob::is_book_summary_file(entry.path().filename().string())) ++files;
+        }
+    }
+    EXPECT_EQ(files, summaries.size());
+    ob::Engine reopened(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    reopened.open();
+    EXPECT_EQ(reopened.store().book_summaries("A", "EX"), summaries);
+    reopened.close();
+}
+
 TEST(Compaction, FewerThanTheFanInWaitWhileThePartitionMayGrow) {
     TempDir dir;
     ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);

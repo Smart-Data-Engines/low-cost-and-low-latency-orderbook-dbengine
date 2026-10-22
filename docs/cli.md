@@ -747,7 +747,7 @@ arrival time is the time of the import rather than the time of the market.
 ```
 C: STATUS
 S: ...
-S: capabilities: insert_event_time,strict_args,backup
+S: capabilities: insert_event_time,strict_args,backup,replace_side
 ```
 
 **Ask before you send.** A server that predates this field answers `OK` and stores the row with

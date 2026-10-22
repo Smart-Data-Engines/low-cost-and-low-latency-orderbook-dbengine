@@ -206,16 +206,19 @@ TEST(QueryConditions, TheCanonicalFormReadsBackAsTheSameRange) {
 }
 
 TEST(QueryConditions, ASnapshotKeepsTheLevelsOfItsBookPricedInRange) {
-    // The bid's best level moved from 100 to 150; its second level is at 90, the ask at 200.
+    // The bid's best level moved from 100 to 150 - an update setting 150 and removing 100, since the
+    // book is read by price (#233) - its second level is at 90, the ask at 200.
     Fixture f;
+    ob::SnapshotRow moved = row_at(kBase + 2000, 100, kBid, 1);
+    moved.quantity = 0;
     f.segment({row_at(kBase + 1000, 100, kBid, 0), row_at(kBase + 1000, 90, kBid, 1),
-               row_at(kBase + 1000, 200, kAsk, 0), row_at(kBase + 2000, 150, kBid, 0)});
+               row_at(kBase + 1000, 200, kAsk, 0), row_at(kBase + 2000, 150, kBid, 0), moved});
     const std::string at = "AT " + std::to_string(kBase + 5000);
     EXPECT_EQ(f.prices(at), (Prices{150, 90, 200}));
     EXPECT_EQ(f.prices(at + " AND price BETWEEN 95 AND 160"), (Prices{150}))
         << "the price condition was ignored";
-    // The level's latest price is out of range, and an older row of it is in: the book at that
-    // moment has no level in range, so nothing - not the older row.
+    // A price that was in the book and is not at that moment is not answered: 100 was removed when
+    // the best moved, so nothing is in range - not the older row.
     EXPECT_TRUE(f.prices(at + " AND price BETWEEN 95 AND 120").empty());
     // LIMIT counts what is answered, after the condition.
     EXPECT_EQ(f.prices(at + " AND price >= 160 LIMIT 1"), (Prices{200}));

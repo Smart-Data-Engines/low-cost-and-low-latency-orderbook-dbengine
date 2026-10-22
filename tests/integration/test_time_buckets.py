@@ -7,7 +7,7 @@ client had to do before, fetching every row to get a few hundred numbers.
 
 Step 2's series - OPEN, HIGH, LOW, CLOSE and TWAP of the bid, the ask, the mid and the spread -
 answer every bucket of the range, from the book at each instant; the last tests compute them on the
-client from the level-0 rows a SELECT returns, in the order it returns them.
+client from every row a SELECT returns, in the order it returns them, applied by price (#233).
 """
 from __future__ import annotations
 
@@ -170,8 +170,11 @@ def test_the_ceiling_is_in_the_printed_configuration(tmp_path):
 @pytest.fixture
 def book(primary_client: OrderbookEngine):
     """Both sides of a book, three levels each, rewritten 60 times over 40 seconds out of time order
-    - each write's time 0.733 s on from the last, modulo 40 s - in two flushes."""
+    - each write's time 0.733 s on from the last, modulo 40 s - in two flushes. Each write sets its
+    three prices and removes, with a quantity of 0, those of the side's last write it does not set,
+    as a client of whole sides sends them (#233)."""
     symbol = f"BKS-{free_port()}"
+    last = {"bid": [], "ask": []}
     for i in range(60):
         ts = BASE + (i * 733_000_000) % (40 * SEC)
         side = "bid" if i % 2 else "ask"
@@ -181,7 +184,10 @@ def book(primary_client: OrderbookEngine):
         else:
             top = 1_050 + (i * 17) % 40
             prices = [top, top + 1, top + 2]
-        primary_client.insert(symbol, "EX", side, prices, [1, 2, 3], timestamp_ns=ts)
+        gone = [p for p in last[side] if p not in prices]
+        primary_client.insert(symbol, "EX", side, prices + gone, [1, 2, 3] + [0] * len(gone),
+                              timestamp_ns=ts)
+        last[side] = prices
         if i == 30:
             primary_client.flush()
     primary_client.flush()
@@ -190,20 +196,25 @@ def book(primary_client: OrderbookEngine):
 
 def series_by_client(rows, width):
     """OPEN, HIGH, LOW, CLOSE and TWAP of the bid and the mid in each bucket, from the definition:
-    at each instant the latest level-0 row of each side, a tie to the one returned later."""
-    rows = [r for r in rows if r.level == 0]
+    at each instant the best price of each side of the book by price - every row up to it applied in
+    time order, a tie in the order returned, each setting its price's quantity and a quantity of 0
+    removing it (#233)."""
+    ordered = sorted(rows, key=lambda r: r.timestamp_ns)   # stable: a tie stays in the order returned
     lo = min(r.timestamp_ns for r in rows)
     hi = max(r.timestamp_ns for r in rows)
 
     def top_at(t):
-        best = {}
-        for order, r in enumerate(rows):
+        book = {"bid": {}, "ask": {}}
+        for r in ordered:
             if r.timestamp_ns > t:
-                continue
-            held = best.get(r.side)
-            if held is None or r.timestamp_ns >= held[0]:
-                best[r.side] = (r.timestamp_ns, order, r.price)
-        return best.get("bid", (0, 0, None))[2], best.get("ask", (0, 0, None))[2]
+                break
+            if r.quantity == 0:
+                book[r.side].pop(r.price, None)
+            else:
+                book[r.side][r.price] = r.quantity
+        bid = max(book["bid"]) if book["bid"] else None
+        ask = min(book["ask"]) if book["ask"] else None
+        return bid, ask
 
     def value(series, t):
         bid, ask = top_at(t)
@@ -239,7 +250,7 @@ def series_by_client(rows, width):
 
 @pytest.mark.parametrize("interval,width", [("1s", SEC), ("3s", 3 * SEC), ("1m", 60 * SEC)])
 def test_a_series_is_the_book_at_each_instant(primary_client, book, interval, width):
-    rows = primary_client.query(f"SELECT * FROM '{book}'.'EX' WHERE level = 0")
+    rows = primary_client.query(f"SELECT * FROM '{book}'.'EX'")
     want = series_by_client(rows, width)
     asked = [f"{fn}({series})" for series in ("bid", "mid") for fn in ("OPEN", "HIGH", "LOW", "CLOSE", "TWAP")]
     buckets = primary_client.query_buckets(
@@ -306,8 +317,8 @@ def test_a_rolling_window_is_the_clients_own_aggregation_over_it(primary_client,
 
 def test_a_rolling_series_is_the_series_of_a_bucket_as_wide_as_the_window(primary_client, book):
     """`ROLLING 4s` at one-second buckets: a window that starts on a multiple of four seconds is the
-    four-second bucket the client computes from the level-0 rows - requirement 9.4, over the wire."""
-    rows = primary_client.query(f"SELECT * FROM '{book}'.'EX' WHERE level = 0")
+    four-second bucket the client computes from the rows - requirement 9.4, over the wire."""
+    rows = primary_client.query(f"SELECT * FROM '{book}'.'EX'")
     want = series_by_client(rows, 4 * SEC)
     asked = [f"{fn}({series})" for series in ("bid", "mid") for fn in ("OPEN", "HIGH", "LOW", "CLOSE", "TWAP")]
     buckets = primary_client.query_buckets(

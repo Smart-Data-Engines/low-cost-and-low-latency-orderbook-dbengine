@@ -122,6 +122,38 @@ RC_GTEST_PROP(ClientProperty, prop_minsert_format_roundtrip, ()) {
     }
 }
 
+// MREPLACE (#233): the same block under its own keyword, and from 0 levels, which empties a side.
+RC_GTEST_PROP(ClientProperty, prop_mreplace_format_roundtrip, ()) {
+    auto symbol   = *genUpperAlpha(1, 31);
+    auto exchange = *genUpperAlpha(1, 31);
+    auto side     = *rc::gen::element(ob::Side::BID, ob::Side::ASK);
+    auto n_levels = *rc::gen::inRange<size_t>(0, 101);
+
+    std::vector<ob::Level> levels(n_levels);
+    for (size_t i = 0; i < n_levels; ++i) {
+        levels[i].price = *rc::gen::inRange<int64_t>(-1'000'000'000, 1'000'000'001);
+        levels[i].qty   = *rc::gen::inRange<uint64_t>(0, 1'000'000'001);
+        levels[i].count = *rc::gen::inRange<uint32_t>(0, 100'001);
+    }
+
+    ob::OrderbookClient client;
+    client.format_mreplace(symbol, exchange, side, levels.data(), levels.size());
+    std::string wire(client.send_buffer());
+
+    auto cmd = ob::parse_minsert(wire);
+    RC_ASSERT(cmd.type == ob::CommandType::MREPLACE);
+    RC_ASSERT(cmd.minsert_args.symbol == symbol);
+    RC_ASSERT(cmd.minsert_args.exchange == exchange);
+    RC_ASSERT(cmd.minsert_args.side == static_cast<uint8_t>(side));
+    RC_ASSERT(cmd.minsert_args.n_levels == static_cast<uint16_t>(n_levels));
+    RC_ASSERT(cmd.minsert_args.levels.size() == n_levels);
+    for (size_t i = 0; i < n_levels; ++i) {
+        RC_ASSERT(cmd.minsert_args.levels[i].price == levels[i].price);
+        RC_ASSERT(cmd.minsert_args.levels[i].qty == levels[i].qty);
+        RC_ASSERT(cmd.minsert_args.levels[i].count == levels[i].count);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Property 3: TSV query response parse round-trip
 // Feature: cpp-native-client, Property 3: TSV query response parse round-trip
@@ -313,6 +345,34 @@ TEST(ClientUnit, ParseOkResponse) {
     ob::OrderbookClient client;
     auto result = client.parse_ok_response("OK\n\n");
     EXPECT_TRUE(result.has_value());
+}
+
+// An answer with no rows: the header and nothing else, which is what the server answers a query
+// that matches nothing and `BOOK` of an empty book - these bytes are the server's, taken from a
+// node. The server's formatter cannot be called from here: this client's `Level` and `QueryResult`
+// are its own types with the engine's names. The live half is `replace_side` in
+// `tests/integration/ob_integration_test.cpp`, which empties a book and reads it back.
+//
+// It was refused as "missing header", so every empty result was an error to this client - found by
+// that live test, the first to read an empty answer through it (#233).
+TEST(ClientUnit, AHeaderWithNoRowsIsAnEmptyAnswer) {
+    ob::OrderbookClient client;
+    const std::string header =
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n";
+    auto rows = client.parse_query_response("OK\n" + header + "\n");
+    ASSERT_TRUE(rows.has_value()) << rows.error_message();
+    EXPECT_TRUE(rows.value().rows.empty());
+
+    // The control: the same answer with one row is read as one row.
+    auto one = client.parse_query_response("OK\n" + header + "1\t100\t5\t1\t0\t0\t7\n\n");
+    ASSERT_TRUE(one.has_value()) << one.error_message();
+    ASSERT_EQ(one.value().rows.size(), 1u);
+    EXPECT_EQ(one.value().rows[0].price, 100);
+
+    // And an aggregate answer with no aggregates is empty rather than refused.
+    auto no_aggs = client.parse_agg_response("OK\nname\tvalue\tscale\n\n");
+    ASSERT_TRUE(no_aggs.has_value()) << no_aggs.error_message();
+    EXPECT_TRUE(no_aggs.value().empty());
 }
 
 TEST(ClientUnit, ParseErrResponse) {

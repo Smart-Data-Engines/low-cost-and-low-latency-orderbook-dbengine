@@ -318,6 +318,7 @@ bool serialised_across_reactors(CommandType t) {
     case CommandType::BOOK:
     case CommandType::INSERT:
     case CommandType::MINSERT:
+    case CommandType::MREPLACE:
     case CommandType::FLUSH:     // the engine's flush_mtx_ already serialises it
     case CommandType::STATUS:
     case CommandType::ROLE:
@@ -356,6 +357,7 @@ bool allowed_before_authentication(CommandType t) {
     case CommandType::BOOK:
     case CommandType::INSERT:
     case CommandType::MINSERT:
+    case CommandType::MREPLACE:
     case CommandType::FLUSH:
     case CommandType::STATUS:
     case CommandType::ROLE:
@@ -521,7 +523,10 @@ thread_local WriteBatchScratch write_batch_scratch;
 
 bool deferrable_write(const Command& cmd, const Session& session,
                       const SecretStore* client_secrets) {
-    if (cmd.type != CommandType::INSERT && cmd.type != CommandType::MINSERT) return false;
+    if (cmd.type != CommandType::INSERT && cmd.type != CommandType::MINSERT &&
+        cmd.type != CommandType::MREPLACE) {
+        return false;
+    }
     // The gate `execute_command()` puts in front of its switch. A write it would refuse is left to
     // it, so the refusal is its answer and not a second spelling of it - the permissions' too
     // (#31): a write held back here is applied by execute_writes(), which checks nothing.
@@ -537,6 +542,7 @@ const char* command_verb(CommandType t) {
     case CommandType::SELECT:       return "SELECT";
     case CommandType::INSERT:       return "INSERT";
     case CommandType::MINSERT:      return "MINSERT";
+    case CommandType::MREPLACE:     return "MREPLACE";
     case CommandType::FLUSH:        return "FLUSH";
     case CommandType::PING:         return "PING";
     case CommandType::STATUS:       return "STATUS";
@@ -586,6 +592,7 @@ bool role_allows(Role role, CommandType t) {
     // Write and Admin: the writes, and the flush that makes them history.
     case CommandType::INSERT:
     case CommandType::MINSERT:
+    case CommandType::MREPLACE:
     case CommandType::FLUSH:
         return role != Role::Read;
     // Admin alone: what moves a cluster, copies a node or shows how symbols are placed.
@@ -623,6 +630,7 @@ std::string permission_refusal(const Command& cmd, const Session& session, Query
     case CommandType::INSERT:
         return reach(cmd.insert_args.symbol, cmd.insert_args.exchange);
     case CommandType::MINSERT:
+    case CommandType::MREPLACE:
         return reach(cmd.minsert_args.symbol, cmd.minsert_args.exchange);
     case CommandType::BOOK:
         return reach(cmd.book_args.symbol, cmd.book_args.exchange);
@@ -637,9 +645,28 @@ std::string permission_refusal(const Command& cmd, const Session& session, Query
         }
         return reach(ast.symbol, ast.exchange);
     }
-    default:
+    // Commands that name no symbol: the role above is their whole check. Listed rather than left to
+    // a default label, which is how MREPLACE (#233) first arrived here - a write naming a symbol,
+    // past the lists, with nothing to say so. Without the label a new command does not compile
+    // until somebody decides whether it names one.
+    case CommandType::FLUSH:
+    case CommandType::PING:
+    case CommandType::STATUS:
+    case CommandType::ROLE:
+    case CommandType::FAILOVER:
+    case CommandType::QUIT:
+    case CommandType::COMPRESS:
+    case CommandType::MM_PEERS:
+    case CommandType::MM_CONFLICTS:
+    case CommandType::UNSUBSCRIBE:
+    case CommandType::AUTH:
+    case CommandType::BACKUP:
+    case CommandType::RINGS:
+    case CommandType::UNKNOWN:
         return {};
     }
+    // Outside the enumeration: role_allows() refused it above already.
+    return who + " may not run " + verb;
 }
 
 void execute_writes(std::span<const Command> cmds,
@@ -664,7 +691,7 @@ void execute_writes(std::span<const Command> cmds,
     try {
         size_t total_levels = 0;
         for (const Command& cmd : cmds) {
-            total_levels += cmd.type == CommandType::MINSERT ? cmd.minsert_args.n_levels : 1;
+            total_levels += cmd.type == CommandType::INSERT ? 1 : cmd.minsert_args.n_levels;
         }
         s.deltas.reserve(n);
         s.writes.reserve(n);
@@ -686,9 +713,11 @@ void execute_writes(std::span<const Command> cmds,
         const std::string& symbol   = single ? cmd.insert_args.symbol   : cmd.minsert_args.symbol;
         const std::string& exchange = single ? cmd.insert_args.exchange : cmd.minsert_args.exchange;
 
+        const bool replace = cmd.type == CommandType::MREPLACE;
+        const char* const what = single ? "INSERT" : replace ? "MREPLACE" : "MINSERT";
         uint64_t adoption = 0;
-        std::string refusal = refuse_write(single ? "INSERT" : "MINSERT", symbol, exchange, engine,
-                                           read_only, shard_coord, session, adoption);
+        std::string refusal = refuse_write(what, symbol, exchange, engine, read_only, shard_coord,
+                                           session, adoption);
         if (!refusal.empty()) {
             answers[i] = std::move(refusal);
             continue;
@@ -721,7 +750,7 @@ void execute_writes(std::span<const Command> cmds,
             const auto& a = cmd.minsert_args;
             const StampedTime stamp = stamp_for(a.timestamp_ns);
             delta.timestamp_ns = stamp.ns;
-            OB_LOG_DEBUG("tcp_server", "MINSERT %s.%s levels=%u event time %" PRIu64 " (%s)",
+            OB_LOG_DEBUG("tcp_server", "%s %s.%s levels=%u event time %" PRIu64 " (%s)", what,
                          a.symbol.c_str(), a.exchange.c_str(), static_cast<unsigned>(a.n_levels),
                          stamp.ns, stamp.from_client ? "given by the client" : "stamped on arrival");
             delta.side     = a.side;
@@ -738,7 +767,10 @@ void execute_writes(std::span<const Command> cmds,
         }
         s.deltas.push_back(delta);
         ClientWrite write{};
-        write.adoption = adoption;
+        write.adoption     = adoption;
+        // The engine adds the removals under its lock, where the book it compares against is the
+        // book the write is applied to (#233).
+        write.replace_side = replace;
         s.writes.push_back(write);
         s.answer_of.push_back(i);
     }
@@ -1051,7 +1083,8 @@ std::string execute_command(const Command& cmd,
         });
     }
     case CommandType::INSERT:
-    case CommandType::MINSERT: {
+    case CommandType::MINSERT:
+    case CommandType::MREPLACE: {
         // A batch of one: the reactor holds the writes of a read back and answers them through
         // the same function, so a write's answer does not depend on which path it took (#155).
         std::vector<std::string> answers;
@@ -3483,7 +3516,8 @@ void Reactor::run_loop() {
                                     break;
                                 }
 
-                                // Multi-line blocks (containing \n) are MINSERT — use parse_minsert()
+                                // Multi-line blocks (containing \n) are MINSERT or MREPLACE —
+                                // use parse_minsert()
                                 Command cmd = (line.find('\n') != std::string::npos)
                                                   ? parse_minsert(line)
                                                   : parse_command(line);

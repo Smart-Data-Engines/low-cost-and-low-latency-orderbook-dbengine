@@ -521,6 +521,46 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
         fs::remove_all(dir, ec);
         return false;
     }
+    // The inputs' book summaries go with their rows (#233): the same files, linked into the merge's
+    // directory, which publish_merged_dir() renames, and replace_segments() then points the index at
+    // them there. Only the ones the index holds - a summary it let go of was falsified, and carried
+    // it would be believed by the next start. One that cannot be carried is left behind: a read then
+    // starts from an older one, or from the first row.
+    {
+        std::unordered_set<std::string> held;
+        for (const uint64_t as_of : combined_store_.book_summaries(first.symbol, first.exchange)) {
+            held.insert(book_summary_file(as_of));
+        }
+        size_t carried = 0;
+        for (const SegmentMeta& in : inputs) {
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(in.dir_path, ec)) {
+                const std::string fname = entry.path().filename().string();
+                if (held.count(fname) == 0) continue;
+                const fs::path to = fs::path(dir) / fname;
+                std::error_code lec;
+                fs::create_hard_link(entry.path(), to, lec);
+                if (lec) {
+                    lec.clear();
+                    // OB_DURABLE: the merge's directory is published only after a syncfs() that
+                    // started once it was written (publish_staged_merges()), this file with it.
+                    fs::copy_file(entry.path(), to, fs::copy_options::overwrite_existing, lec);
+                }
+                if (lec) {
+                    OB_LOG_WARN("engine", "compaction: book summary %s not carried into the merge of "
+                                          "%s.%s: %s", entry.path().c_str(), first.symbol.c_str(),
+                                first.exchange.c_str(), lec.message().c_str());
+                    continue;
+                }
+                ++carried;
+            }
+        }
+        if (carried > 0) {
+            OB_LOG_DEBUG("engine", "compaction: %zu book summar%s carried into the merge of %s.%s",
+                         carried, carried == 1 ? "y" : "ies", first.symbol.c_str(),
+                         first.exchange.c_str());
+        }
+    }
     if (const uint64_t ended = merge_failures_.end()) {
         OB_LOG_INFO("engine", "compaction: merges are written again after %llu failed attempt(s)",
                     static_cast<unsigned long long>(ended));

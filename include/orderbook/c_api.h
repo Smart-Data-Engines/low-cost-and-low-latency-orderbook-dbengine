@@ -51,6 +51,21 @@ ob_status_t ob_apply_delta(ob_engine_t*    engine,
                             uint32_t        n_levels,
                             int             side);  /* 0=bid, 1=ask */
 
+/* The same write for an update that is the whole side (MREPLACE): every price the side holds and
+   the update does not name is removed, by a level of quantity 0 put in front of the update - before
+   it is logged, so the WAL holds an ordinary update. n_levels may be 0, which empties the side; above
+   MAX_LEVELS (1000) it is refused, where ob_apply_delta() cuts a write to the ceiling. */
+ob_status_t ob_replace_side(ob_engine_t*    engine,
+                             const char*     symbol,
+                             const char*     exchange,
+                             uint64_t        seq,
+                             uint64_t        ts_ns,
+                             const int64_t*  prices,
+                             const uint64_t* qtys,
+                             const uint32_t* cnts,
+                             uint32_t        n_levels,
+                             int             side);  /* 0=bid, 1=ask */
+
 // ── Query ─────────────────────────────────────────────────────────────────────
 ob_result_t* ob_query(ob_engine_t* engine, const char* sql);
 void         ob_result_free(ob_result_t* result);

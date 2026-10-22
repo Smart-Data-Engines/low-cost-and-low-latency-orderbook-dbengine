@@ -562,6 +562,24 @@ Result<void> ShardRouter::minsert(std::string_view symbol,
                                    Side side, const Level* levels,
                                    size_t n_levels,
                                    std::optional<uint64_t> event_time_ns) {
+    return route_levels_write(symbol, exchange, [&](OrderbookClient& c) {
+        return c.minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
+    });
+}
+
+Result<void> ShardRouter::replace_side(std::string_view symbol,
+                                        std::string_view exchange,
+                                        Side side, const Level* levels,
+                                        size_t n_levels,
+                                        std::optional<uint64_t> event_time_ns) {
+    return route_levels_write(symbol, exchange, [&](OrderbookClient& c) {
+        return c.replace_side(symbol, exchange, side, levels, n_levels, event_time_ns);
+    });
+}
+
+template<typename F>
+Result<void> ShardRouter::route_levels_write(std::string_view symbol, std::string_view exchange,
+                                             F&& write) {
     std::string key = build_symbol_key(symbol, exchange);
 
     // Check if the shard has mm_nodes — use round-robin routing
@@ -579,16 +597,13 @@ Result<void> ShardRouter::minsert(std::string_view symbol,
         if (shard_it != shard_map_.shards.end() && !shard_it->second.mm_nodes.empty()) {
             OrderbookClient* mm_client = get_client_mm(shard_id);
             if (mm_client) {
-                return mm_client->minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
+                return write(*mm_client);
             }
             // Fall through to normal routing if mm_client unavailable
         }
     }
 
-    return execute_with_migration_retry(key,
-        [&](OrderbookClient& c) {
-            return c.minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
-        });
+    return execute_with_migration_retry(key, write);
 }
 
 // ── 11.4  flush() ────────────────────────────────────────────────────────────

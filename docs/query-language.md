@@ -261,12 +261,11 @@ WHERE timestamp BETWEEN 1700000000000000000 AND 1700003599999999999
 GROUP BY TIME_BUCKET(1m)
 ```
 
-- **The series** are read from level 0 of each side of the book at each instant - the book
-  `WHERE AT` answers, so the first level of each update that wrote the side (#233: the live book
-  agrees when updates are a side's levels best first, `docs/python.md`). `bid` and `ask` are their prices, `mid` is (bid + ask) / 2 at `MID_PRICE`'s
-  scale of 10^6, `spread` is ask - bid. A series changes only at an instant holding a row of level 0,
-  once every row of that instant is applied, so a row that loses a tie on the time is in force at no
-  instant. `mid` and `spread` have a value once both sides have a row.
+- **The series** are read from the best price of each side of the book at each instant - the book
+  `WHERE AT` answers, by price (#233). `bid` and `ask` are those prices, `mid` is (bid + ask) / 2 at
+  `MID_PRICE`'s scale of 10^6, `spread` is ask - bid. A series changes only at an instant holding a
+  row, once every row of that instant is applied, so a price set and removed at one instant is in
+  force at no instant. `mid` and `spread` have a value once both sides hold a price.
 - **Every bucket of the range is answered**, one without rows carrying what was in force. The range
   is the time conditions'; an end without one is the symbol's first or last stored row. The first and
   the last bucket's windows are cut to the range, so `OPEN` of the first is the value at the range's
@@ -278,11 +277,12 @@ GROUP BY TIME_BUCKET(1m)
   for the other three.
 - **Beside a series** the rows' aggregates are answered for every bucket too: `COUNT(*)` is 0 in a
   bucket without rows, and the others are `NULL`. A condition on price, side or level beside a series
-  is refused (`SERIES_FILTER`): a series reads level 0 of both sides whatever it says. `LIMIT n`
-  answers the first `n` buckets and stops reading there.
-- **What it reads**: the level-0 rows of the range in time order, each segment's sorted and merged as
-  the segments come - so what is held at once follows how segments overlap in time, not the length
-  of the range - and the book before the range from the newest segments holding level 0 (#47).
+  is refused (`SERIES_FILTER`): a series reads the best price of both sides whatever it says.
+  `LIMIT n` answers the first `n` buckets and stops reading there.
+- **What it reads**: the rows of the range in time order, each segment's sorted and merged as the
+  segments come - so what is held at once follows how segments overlap in time, not the length of the
+  range - and the book before the range by price, from the newest book summary before it and the rows
+  after that (#233).
 
 | Function | Value | Scale |
 |---|---|---|
@@ -350,7 +350,7 @@ an `AggValue` per aggregate (`.real` divides by the scale), the C++ client's `qu
 | `Parse error ... aggregates the live book` | `SPREAD`, `DEPTH` and the other functions of the live book under `GROUP BY` |
 | `Parse error ... takes` | A function given a column it does not aggregate - `COUNT(price)`, `SUM(price)`, `VWAP(quantity)` - or a side, `SUM(bid)`, which a bucket takes from `WHERE side = …` |
 | `Parse error ... bid, ask, mid or spread` | A series function given anything else - `OPEN(price)`, `TWAP(*)` |
-| `SERIES_FILTER` | A condition on price, side or level beside a series, which reads level 0 of both sides whatever it says: ask the rows' aggregates it would narrow in a query of their own |
+| `SERIES_FILTER` | A condition on price, side or level beside a series, which reads the best price of both sides whatever it says: ask the rows' aggregates it would narrow in a query of their own |
 | `BUCKETS_TOO_MANY` | The answer would have more buckets than the server allows (`--max-query-buckets`, 100 000 by default): narrow the time range or widen the interval. Refused rather than cut short. Beside a series every bucket of the range counts, so it is known - and refused - before anything is read; with `ROLLING`, so do the buckets the first window reaches back to |
 | `BUCKET_OVERFLOW` | An aggregate of one bucket that does not fit a 64-bit integer, named with the bucket |
 
@@ -362,18 +362,25 @@ Reconstruct the orderbook state at a specific timestamp:
 SELECT * FROM 'BTC-USD'.'BINANCE' WHERE AT 1700000000000000000
 ```
 
-For each side and level, the answer is the row with the **latest event time at or before** the
-one asked for - the level is the row's position in the update that wrote it, which is the book's
-level for a writer that sends a side's levels best first (`docs/python.md`, "How a side is written";
-#233); two rows of one level at one instant resolve to the one written later. Levels come
-bids first, then asks, each by level — the order `BOOK` answers in — so `LIMIT n` keeps the first
+The answer is **the book by price** at that instant (#233): every row at or before it applied in
+event-time order, each setting its price's quantity, a quantity of 0 removing the price - how the live
+book applies an update, so for writes in time order it is the book `BOOK` answered then. Two rows of
+one price at one instant resolve to the one written later. Each row of the answer is the one that set
+its price last, and its `level` is its position in the book. The best 1000 prices of each side come,
+bids first, then asks, each from the best - the order `BOOK` answers in - so `LIMIT n` keeps the first
 `n` of them. It answers the columns it names, like any row query (`SELECT price, quantity … WHERE
 AT …`), and reads the columnar store, so a row the flush tick has not yet written is not in it.
 
-It reads the store from the newest segment down, and a segment none of whose rows can still be the
-latest of its level is not read (#47): the cost follows the segments holding levels the newer ones
-do not, not the length of the history. A segment written by a build before #47 does not say which
-levels it holds, and is read always.
+It starts from the newest **book summary** at or before the instant - the book by price as of one
+time, written beside the segments every 65 536 rows of the symbol, more for a deep book - and applies
+only the rows after it, so its cost follows the rows since that summary, not the length of the
+history. A row that arrives later with a time at or before a summary's removes that summary first.
+
+**Until #233 it read the latest row of each level**, the level being the row's position in the update
+that wrote it. That is the live book only for a writer that sends a side's levels best first and the
+prices that left after them. History written otherwise reads differently now: a writer of a side's
+top levels without removals leaves the prices that dropped out in the book, as the live book always
+had them. `MREPLACE` sends a side whole ([Wire protocol](protocol.md#commands)).
 
 A price condition keeps the levels of that book priced within it - `WHERE AT t AND price BETWEEN lo
 AND hi` is the book at `t` inside a band - and it is applied to the book, so a level whose latest
@@ -386,9 +393,9 @@ conditions were accepted and ignored, and a second `AT` replaced the first.
 
 Two things this answered differently before, and both are fixed (#167, #168 in the roadmap): over
 the wire, from #139 on, it answered `OK` with an empty header and empty rows; and it kept the last
-row a scan *delivered* for each level rather than the latest, so a correction for an earlier
-instant that arrived later — a client's own event time, a mesh peer's backlog — replaced the book it
-came after. Its order was a hash map's.
+row a scan *delivered* rather than the latest, so a correction for an earlier instant that arrived
+later — a client's own event time, a mesh peer's backlog — replaced the book it came after. Its order
+was a hash map's.
 
 ## SUBSCRIBE Queries
 

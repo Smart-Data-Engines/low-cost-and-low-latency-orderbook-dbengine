@@ -83,6 +83,11 @@ public:
                          Side side, const Level* levels, size_t n_levels,
                          std::optional<uint64_t> event_time_ns = std::nullopt);
 
+    /// Routed exactly as `minsert()`: one side of one symbol's book, on the shard that owns it.
+    Result<void> replace_side(std::string_view symbol, std::string_view exchange,
+                              Side side, const Level* levels, size_t n_levels,
+                              std::optional<uint64_t> event_time_ns = std::nullopt);
+
     Result<void> flush();
 
     Result<QueryResult> query(std::string_view sql);
@@ -138,6 +143,11 @@ private:
     template<typename F>
     auto execute_with_migration_retry(const std::string& symbol_key, F&& fn)
         -> decltype(fn(std::declval<OrderbookClient&>()));
+
+    /// A write of one symbol's levels - `minsert()` and `replace_side()` - on the node it goes to:
+    /// a multi-master shard's node in turn, or the owner with the migration retry.
+    template<typename F>
+    Result<void> route_levels_write(std::string_view symbol, std::string_view exchange, F&& write);
 
     /// Assign an unknown symbol via consistent hashing.
     std::string assign_unknown_symbol(const std::string& symbol_key);

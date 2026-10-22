@@ -87,16 +87,46 @@ def _insert_command(symbol: str, exchange: str, side_lower: str,
             f"{prices[0]} {qtys[0]} {counts[0]}{wire_ts}")
 
 
+def _replace_command(symbol: str, exchange: str, side_lower: str,
+                     prices: List[int], qtys: List[int], counts: List[int],
+                     timestamp_ns: Optional[int]) -> str:
+    """The bytes of one side replacement (`MREPLACE`, #233), without sending them.
+
+    Always the block, for one level and for none as well: `MREPLACE` has no one-line twin the way
+    `MINSERT` has `INSERT`, and a replacement of no levels - which empties the side - is the header
+    alone. The event time follows the same rule as `_insert_command()`'s.
+    """
+    wire_ts = f" {timestamp_ns}" if timestamp_ns is not None else ""
+    header = f"MREPLACE {symbol} {exchange} {side_lower} {len(prices)}{wire_ts}"
+    if not prices:
+        return header
+    body = "\n".join(f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(len(prices)))
+    return header + "\n" + body
+
+
+def _side_of_a_replacement(side: str, where: str) -> str:
+    """`bid` or `ask`, or a refusal before anything is sent.
+
+    Checked here and not left to the server, because local mode reads anything but `ask` as the
+    bids - and a replacement aimed at a misspelt side would empty the bids.
+    """
+    side_lower = side.lower()
+    if side_lower not in ("bid", "ask"):
+        raise ValueError(f"{where}side must be 'bid' or 'ask', not {side!r}")
+    return side_lower
+
+
 def _normalise_levels(prices: List[int], qtys: List[int], counts: Optional[List[int]],
-                      where: str) -> List[int]:
+                      where: str, allow_empty: bool = False) -> List[int]:
     """Check the three parallel lists agree and fill in the default counts.
 
     Shared by `insert()` and `insert_batch()` because it is one rule, and two copies of one rule
     is how the same call becomes legal in one method and not in the other. `where` names the
     update inside a batch; for a single write it is empty and the message reads as it always did.
+    `allow_empty` is for a side replacement, where no levels means an empty side.
     """
     n = len(prices)
-    if n == 0:
+    if n == 0 and not allow_empty:
         raise ValueError(f"{where}no levels")
     if len(qtys) != n:
         raise ValueError(f"{where}prices and qtys must have the same length")
@@ -150,6 +180,10 @@ class BookUpdate:
     qtys: List[int]
     counts: Optional[List[int]] = None
     timestamp_ns: Optional[int] = None
+    #: The side becomes exactly these levels (`MREPLACE`, #233): the server removes every price
+    #: the side holds and this update does not name. `prices` may then be empty, which empties the
+    #: side. What `replace_side()` sends, in a batch.
+    replace: bool = False
 
 
 @dataclass
@@ -1003,6 +1037,11 @@ def _load_lib():
             ctypes.POINTER(ctypes.c_uint64),
         ]
         lib.ob_result_next_seq.restype = ctypes.c_int
+    # ob_replace_side() arrived with the incremental books (#233); bound only if present, for the
+    # reason ob_result_next_seq() is, and `_LocalBackend.replace_side()` says which is missing.
+    if hasattr(lib, "ob_replace_side"):
+        lib.ob_replace_side.argtypes = lib.ob_apply_delta.argtypes
+        lib.ob_replace_side.restype = ctypes.c_int
     return lib
 
 
@@ -1033,6 +1072,26 @@ class _LocalBackend:
         )
         if rc != OB_OK:
             raise OrderbookError(rc, f"insert failed for {symbol}@{exchange}")
+
+    def replace_side(self, symbol: str, exchange: str, side_int: int,
+                     prices: list, qtys: list, counts: list,
+                     seq: int, timestamp_ns: int) -> None:
+        if not hasattr(self._lib, "ob_replace_side"):
+            raise OrderbookError(-1, "the loaded engine library predates ob_replace_side (#233); "
+                                     "nothing was written. Rebuild or upgrade the library.")
+        n = len(prices)
+        c_prices = (ctypes.c_int64 * max(n, 1))(*prices)
+        c_qtys   = (ctypes.c_uint64 * max(n, 1))(*qtys)
+        c_cnts   = (ctypes.c_uint32 * max(n, 1))(*counts)
+        rc = self._lib.ob_replace_side(
+            self._engine,
+            symbol.encode("utf-8"), exchange.encode("utf-8"),
+            ctypes.c_uint64(seq), ctypes.c_uint64(timestamp_ns),
+            c_prices, c_qtys, c_cnts,
+            ctypes.c_uint32(n), ctypes.c_int(side_int),
+        )
+        if rc != OB_OK:
+            raise OrderbookError(rc, f"replace_side failed for {symbol}@{exchange}")
 
     def flush(self):
         self._lib.ob_engine_destroy(self._engine)
@@ -2192,6 +2251,79 @@ class OrderbookEngine:
 
         return seq
 
+    def replace_side(self,
+                     symbol: str,
+                     exchange: str,
+                     side: str,
+                     prices: List[int],
+                     qtys: List[int],
+                     counts: Optional[List[int]] = None,
+                     timestamp_ns: Optional[int] = None) -> int:
+        """Replace one side of a book: afterwards the side is exactly these levels (#233).
+
+        What `insert()` cannot say. An update by price sets the quantity of each price it names,
+        so a writer of whole books that sends the top N levels leaves every price that dropped out
+        of them in the book. This sends `MREPLACE`, and the server removes each price the side
+        holds and the call does not name - under the lock its write takes, against the book the
+        write is applied to. The log, the replicas and history see an ordinary update: a quantity
+        0 for each price removed, then these levels.
+
+        Empty lists empty the side. A price may appear once; the server applies the levels in
+        order, as it does for `insert()`, so a repeated price ends with its last quantity.
+
+        Refused **before anything is sent** by a server that does not announce `replace_side`:
+        it would answer `unknown command`, which a caller streaming books learns about only
+        after the book it meant to fix has gone on being wrong.
+
+        Returns the client's write counter, as `insert()` does.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+
+        side_lower = _side_of_a_replacement(side, "")
+        counts = _normalise_levels(prices, qtys, counts, "", allow_empty=True)
+        if self._mode in ("tcp", "pool"):
+            self._refuse_unreplaceable(True)
+            self._refuse_unstorable_event_time(timestamp_ns is not None)
+
+        self._seq += 1
+        seq = self._seq
+        logger.debug("replace_side %s.%s %s: %d level(s)", symbol, exchange, side_lower,
+                     len(prices))
+
+        if self._mode == "local":
+            ts = timestamp_ns if timestamp_ns is not None else int(time.time_ns())
+            self._local.replace_side(symbol, exchange, 1 if side_lower == "ask" else 0,
+                                     prices, qtys, counts, seq, ts)
+            return seq
+
+        cmd = _replace_command(symbol, exchange, side_lower, prices, qtys, counts, timestamp_ns)
+        if self._mode == "pool":
+            if self._pool.is_sharded:
+                raw = self._pool.execute_write_sharded(symbol, exchange, cmd)
+            else:
+                raw = self._pool.execute_write(cmd)
+        else:
+            raw = self._tcp.execute(cmd)
+        is_err, msg, _, _ = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"MREPLACE failed: {msg}")
+        return seq
+
+    def _refuse_unreplaceable(self, any_replace: bool) -> None:
+        """Refuse before sending if this server cannot replace a side (#233).
+
+        Asked of `capabilities` rather than learnt from a refusal, for the reason #105's field is:
+        the question is whether a command will be understood, and the answer must come before the
+        first one is sent - a batch of updates refused mid-stream is a stream nobody can resume
+        from a known book.
+        """
+        if any_replace and "replace_side" not in self.server_capabilities():
+            raise OrderbookError(-1,
+                "this server does not replace a side of a book (MREPLACE, capability "
+                "replace_side): it would answer unknown command. Nothing was sent. Upgrade the "
+                "server, or send the prices that left the book as quantity 0 with insert().")
+
     def _refuse_unstorable_event_time(self, any_given: bool) -> None:
         """Refuse before sending if the caller chose a time this server would drop (#105).
 
@@ -2249,15 +2381,20 @@ class OrderbookEngine:
 
         # Validated in full first: see the docstring. `insert()` performs the same refusals, and
         # they are the ones that must happen before a byte goes out (#105).
-        normalised = [(u, _normalise_levels(u.prices, u.qtys, u.counts, f"update {i}: "))
-                      for i, u in enumerate(updates)]
+        normalised = []
+        for i, u in enumerate(updates):
+            if u.replace:
+                _side_of_a_replacement(u.side, f"update {i}: ")
+            normalised.append((u, _normalise_levels(u.prices, u.qtys, u.counts, f"update {i}: ",
+                                                    allow_empty=u.replace)))
 
         if self._mode == "local":
             out = []
             for i, (u, counts) in enumerate(normalised):
                 try:
-                    self.insert(u.symbol, u.exchange, u.side, u.prices, u.qtys, counts,
-                                timestamp_ns=u.timestamp_ns)
+                    write = self.replace_side if u.replace else self.insert
+                    write(u.symbol, u.exchange, u.side, u.prices, u.qtys, counts,
+                          timestamp_ns=u.timestamp_ns)
                     out.append(BatchOutcome(index=i, ok=True))
                 except (OrderbookError, ValueError) as exc:
                     out.append(BatchOutcome(index=i, ok=False, message=str(exc)))
@@ -2270,10 +2407,12 @@ class OrderbookEngine:
                 "and which of them is one round trip is a decision nobody has measured. Nothing "
                 "was sent. Use insert(), or open a direct connection to the node you mean.")
 
+        self._refuse_unreplaceable(any(u.replace for u, _ in normalised))
         self._refuse_unstorable_event_time(any(u.timestamp_ns is not None for u, _ in normalised))
 
-        commands = [_insert_command(u.symbol, u.exchange, u.side.lower(), u.prices, u.qtys,
-                                    counts, u.timestamp_ns)
+        commands = [(_replace_command if u.replace else _insert_command)(
+                         u.symbol, u.exchange, u.side.lower(), u.prices, u.qtys, counts,
+                         u.timestamp_ns)
                     for u, counts in normalised]
         size = sum(len(c) + 1 for c in commands)
         if size > self.MAX_BATCH_BYTES:

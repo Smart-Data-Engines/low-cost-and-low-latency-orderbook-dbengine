@@ -93,21 +93,35 @@ Two things follow, and both are refusals rather than surprises:
   that is the server, which assigns one per symbol. The argument used to be accepted and discarded;
   it is now refused. In embedded mode you still choose it.
 
-**How a side is written, so that the live book and history name the same book** (#233). The engine
-reads one update two ways:
-- the live book - `book()`, and every aggregate without `GROUP BY` - applies it level by level **by
-  price**: a price it holds takes the new quantity, a new one is inserted in order, a quantity of 0
-  removes it;
-- history - `WHERE AT` and the series of `OPEN`, `HIGH`, `LOW`, `CLOSE`, `TWAP` - keys each row by
-  its **position in the update**, level 0 its first.
+**How an update is read** (#233). The live book - `book()`, and every aggregate without `GROUP BY`
+- and history - `WHERE AT` and the series of `OPEN`, `HIGH`, `LOW`, `CLOSE`, `TWAP` - read an update
+the same way, **by price**: a level sets its price's quantity, a price the side does not hold is
+inserted in order, a quantity of 0 removes it, and a price the update does not name stays. So a
+writer sends one of two things:
+- **the changes**, as an exchange's diff stream gives them, each removal a quantity of 0;
+- **the whole side**, with `replace_side()`: the server removes every price the side holds and the
+  update does not name.
 
-They agree for an update that is a side's levels **best first**, followed by every price that has
-left the side since it was last written, with a quantity of 0. Bids `[100, 99]` and then `[98, 97]`
-alone leave the live book's best bid at 100 and history's at 98; `[98, 97, 100, 99]` with quantities
-`[q, q, 0, 0]` leaves both at 98. An update of changed levels only, as an exchange's diff stream
-sends them, keeps the live book right and history wrong. Turn it into the side's levels first:
-`examples/binance-live/market.py` does it for Binance's depth20. #233 is open on what an update
-should mean; until it closes, this is the encoding both views are tested on.
+Until #233 history read an update by the position of each level in it, so the two agreed only for a
+side's levels best first followed by every price that had left it with a quantity of 0 - the encoding
+`examples/binance-live/market.py` writes, which both still read the same. A writer of a side's top
+levels without removals reads its history differently now: the prices that dropped out stay in the
+book, as they always did in the live one.
+
+#### engine.replace_side(symbol, exchange, side, prices, qtys, counts=None, timestamp_ns=None) → int
+
+The side becomes exactly these levels (`MREPLACE`): the server removes every price the side holds and
+the call does not name, under the lock its write takes, and logs them in the same record as levels of
+quantity 0. Empty lists empty the side. In a batch, `BookUpdate(..., replace=True)` does the same.
+
+```python
+engine.replace_side("BTC-USD", "BINANCE", "bid", [6_500_100, 6_499_900], [90, 70])
+engine.insert_batch([BookUpdate("BTC-USD", "BINANCE", "ask", [], [], replace=True)])   # no asks
+```
+
+Asked of the server's `capabilities` before the first is sent: a server without `replace_side`
+answers `MREPLACE` as an unknown command, so the call raises without sending a byte. A side other
+than `bid` or `ask` is refused before sending too: local mode would read it as the bids.
 
 #### engine.insert_batch(updates) → List[BatchOutcome]
 

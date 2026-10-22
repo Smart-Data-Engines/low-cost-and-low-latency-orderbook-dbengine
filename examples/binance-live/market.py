@@ -8,19 +8,16 @@ a value that is not a whole number of steps is refused with the symbol named rat
 it would mean the steps are not what the exchange said.
 
 How an update is written. `<symbol>@depth20@100ms` sends the best twenty levels of each side every
-100 ms. The engine keeps two views of what is written, and both have to come out right:
-- the live book (`BOOK`, `SPREAD(*)`, `MID_PRICE(*)`) applies an update level by level **by price**,
-  and a quantity of 0 removes the price;
-- history (`SELECT ... WHERE AT`, `OPEN(mid)` and the other series) keys a row by its **position in
-  the update**: level 0 is the first level written.
+100 ms. The engine reads an update **by price**, the live book (`BOOK`, `SPREAD(*)`, `MID_PRICE(*)`)
+and history (`SELECT ... WHERE AT`, `OPEN(mid)` and the other series) alike (#233): each level sets
+its price's quantity, and a quantity of 0 removes the price.
 
-So a side is written as its current levels, best first - positions 0 to 19 are the book's levels -
-followed by every price that was in the side the last time it was written and is not now, with a
-quantity of 0, so that the live book drops it. Without those the live book keeps every price it was
-ever sent, and its best bid stops being the market's. The removals come after the current levels -
-at position 20 and up while the side is full, which is where no reader of the top twenty looks
-(`level < 20`). Roadmap #233 is that disagreement between the two views; this example writes the one
-encoding on which they agree.
+So a side is written as its current levels, best first, followed by every price that was in the side
+the last time it was written and is not now, with a quantity of 0. Without those the book keeps every
+price it was ever sent, and its best bid stops being the market's. `MREPLACE` - `replace_side()` in
+the client - says the same in one word, the server computing the removals; this example computes them
+itself, which every server it may meet understands. Until #233 history read a level by its position
+in the update, and this was the one encoding on which the two views agreed.
 
 A side whose levels are the same as the last time is not written again: its rows would say nothing
 new, and history carries the value in force forward on its own.
