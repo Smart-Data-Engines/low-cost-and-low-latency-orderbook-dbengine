@@ -30,6 +30,12 @@ ob_engine_t* ob_engine_create(const char* base_dir);
 
 Create and open an engine instance. The directory is created if needed. Returns `NULL` on failure.
 
+Opening a directory that holds data composes each symbol's live book from its history by price, as
+the server does at a start (#235), so that a side replacement removes what the side held. The
+embedded engine writes no book summaries, so that reads each symbol's rows from the first: 112-290 ms
+at a million rows of one symbol on an i3-7100U, Release. Open an engine once and flush it with
+`ob_flush()`, rather than destroying and creating it again to make writes readable.
+
 ### ob_engine_destroy
 
 ```c
@@ -37,6 +43,23 @@ void ob_engine_destroy(ob_engine_t* engine);
 ```
 
 Flush all pending data, close the engine, and free memory. Safe to call with `NULL`.
+
+### ob_flush
+
+```c
+ob_status_t ob_flush(ob_engine_t* engine);
+```
+
+Make every write so far readable by `ob_query()`, keeping the engine open (#244): each symbol's
+open segment is written and indexed, with any segment a write rolled over into, as
+`ob_engine_destroy()` writes them. The live books stay in memory. `OB_C_ERR_INVALID_ARG` for `NULL`,
+`OB_C_ERR_INTERNAL` when a segment could not be written.
+
+Before it a caller flushed by destroying the engine and creating it again, as the Python client did
+in local mode. That costs whatever an open costs, and since #235 an open composes every book from
+history: a flush with nothing new took 94-146 ms at a million rows of one symbol, against 0.02 ms
+or less with `ob_flush()` (i3-7100U, Release; `evidence/2026-10-18-incremental-books/` in the
+workspace).
 
 ## Data Ingestion
 
@@ -61,7 +84,9 @@ Insert one or more price levels. The update is:
 1. Written to the WAL, and `fsync`ed here only under `--fsync-policy every` — where a failed
    `fsync` returns `OB_C_ERR_INTERNAL` rather than reporting success (#113)
 2. Applied to the in-memory SoA buffer
-3. Enqueued for background columnar flush
+3. Appended to its symbol's open segment, which `ob_flush()` or `ob_engine_destroy()` writes. There
+   is no background flush. **The embedded engine does not replay its WAL when it opens**, so a process
+   that ends without either loses every write since the last one (#245).
 
 ### ob_replace_side
 
@@ -179,9 +204,8 @@ int main() {
                    1, 1700000000000000000ULL,
                    prices, qtys, cnts, 2, 0);
 
-    // Flush (destroy + recreate)
-    ob_engine_destroy(engine);
-    engine = ob_engine_create("/tmp/ob_c_example");
+    // Make the write readable, keeping the engine open
+    ob_flush(engine);
 
     // Query
     ob_result_t* result = ob_query(engine,

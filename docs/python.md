@@ -189,7 +189,9 @@ can afford.
 
 #### engine.flush()
 
-Force-flush pending data so it becomes queryable.
+Force-flush pending data so it becomes queryable. Over TCP this is `FLUSH`. In local mode it is the
+C API's `ob_flush()`, which keeps the engine open; with a library from before #244, which has none,
+the client closes the engine and opens it again, and an open composes every book from history (#235).
 
 #### engine.query(sql) → List[OrderbookRow]
 

@@ -11,6 +11,8 @@ here as `#N`.
 
 ### Added
 
+- `ob_flush()` in the C API (#244): every write so far becomes readable, and the engine stays open
+  with its live books. The Python client's local `flush()` calls it when the library has it.
 - `MREPLACE`, a side replacement (#233): `MREPLACE <symbol> <exchange> <bid|ask> <n_levels>
   [event_time_ns]` and its level lines, as `MINSERT` sends them, and the side becomes exactly those
   levels. The node removes every price the side holds and the block does not name, under the lock
@@ -156,6 +158,9 @@ here as `#N`.
 
 ### Fixed
 
+- A local flush no longer reopens the embedded engine (#244). Since #235 an open composes every book
+  from history, so a flush with nothing new took 94-146 ms at a million rows of one symbol, where it
+  took 0.3-1.1 ms before; with `ob_flush()` it takes 0.02 ms or less (i3-7100U, Release).
 - The C++ client read an answer with a header and no rows - a query that matched nothing, `BOOK` of
   an empty book - as an error, `missing header`; it is an empty answer now.
 - A device slower than the writes no longer refuses them before admission knows its rate (#190,
@@ -206,13 +211,11 @@ here as `#N`.
 
 ### Known issues
 
-- The live book applies a write by price, and history keys it by its position in the update, so
-  the two can name different best prices for the same writes (#233). The example writes the one
-  encoding on which they agree: a side's levels best first, then the prices that left it with a
-  quantity of 0.
-- The live book does not come back with the node: after a clean stop `BOOK` refuses the symbol,
-  and after a crash it holds only what was written after the last checkpoint, while history holds
-  every row (#235).
+- The embedded engine of the C API, which the Python client's local mode loads, does not replay its
+  WAL when it opens: a process that ends without `ob_flush()` or `ob_engine_destroy()` loses every
+  write since the last of them (#245).
+- A series of the book reads every row of its range by price: 7-12 times what it cost before #233
+  for a writer of whole sides (#243).
 
 ## [0.1.0] - 2026-10-12
 
