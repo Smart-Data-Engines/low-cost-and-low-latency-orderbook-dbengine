@@ -4409,6 +4409,27 @@ Learned the hard way. Check here before debugging.
        that freezes nothing, and `OB_C_ERR_IO` answered as `OB_C_OK`.
      - Port a recovery together with the durability rule that makes its records true, not only the
        records.
+602. **A sync added beside a summary moved the reads that depend on where summaries fall.** #243's
+     first best track was written as its summary is, with two syncs of its own. On the x86 host, in
+     three rounds each:
+     - a FLUSH took 59-71 ms at 3 M rows against master's 22-36;
+     - `AT` in the middle of the load took 8.13-13.46 ms against 1.21-1.51.
+
+     The summaries were as many (run 2), so the slower read read more rows after the newest summary
+     before its instant. A fast load seals about 300 000 rows at a time, and the same build answered
+     8.16 and 1.29 ms in two rounds. Written unsynced before its summary, `AT` was master's again
+     (1.41-1.46 against 1.19-1.61).
+     - A file that only lets a read skip work needs no sync of its own: the read's fallback is its
+       durability. A track that does not read back is no track.
+     - Report a read whose cost follows where a summary falls together with the summaries' count
+       (`book_cost_ab.py` counts them now), or the rounds compare placements.
+603. **A flag that a mutant removes for nothing is a decision already made elsewhere.** A flag
+     stopped a series from reading best tracks after one failed to read. Removing it changed nothing
+     (mutant T10 survived): the stretch of rows after the failed track already ran to the range's
+     end, because the cut looked at the failed track itself. The fix makes an unreadable track cost
+     its own span, and a test of two tracks, the first unreadable, kills the mutant. Before
+     strengthening the tests against a surviving mutant, ask whether the code it removes did
+     anything.
 
 ## Current state and open problems
 
@@ -4448,7 +4469,9 @@ where one is before their instant; `MREPLACE` replaces a side whole; and a start
 book from the store (pitfalls 568, 569, 598). **#244** (PR #276): the C API has `ob_flush()`, so a
 local flush no longer reopens the engine. **#245 is closed** (PR #278): the embedded engine replays
 its WAL from its last checkpoint when it opens, and a flush syncs its segments before the checkpoint
-claims them (pitfall 601).
+claims them (pitfall 601). **#243 is closed**: a series of the book reads the best tracks written
+beside the book summaries, 0.08 ms over the last ten minutes of 3 M rows on the x86 host, against
+11.21-21.98 ms on master (pitfalls 602, 603).
 
 **#197 is closed**: a snapshot install and a discard begin a new WAL lineage, so a replica that had
 bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step

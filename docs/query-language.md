@@ -279,10 +279,16 @@ GROUP BY TIME_BUCKET(1m)
   bucket without rows, and the others are `NULL`. A condition on price, side or level beside a series
   is refused (`SERIES_FILTER`): a series reads the best price of both sides whatever it says.
   `LIMIT n` answers the first `n` buckets and stops reading there.
-- **What it reads**: the rows of the range in time order, each segment's sorted and merged as the
-  segments come - so what is held at once follows how segments overlap in time, not the length of the
-  range - and the book before the range by price, from the newest book summary before it and the rows
-  after that (#233).
+- **What it reads**: the best price of each side through the range.
+  - **Where best tracks cover the range** (#243), it reads their entries: one a change of the best
+    price, and no row. A track is written beside each book summary. It holds the best of each side
+    after every instant at which it changed, from the summary before it to its own.
+  - **Elsewhere it reads the rows in time order** and applies them by price. That means before the
+    first track, after the last one (at most the rows since the newest summary) and in the span of a
+    track whose file does not read back. Each segment's rows are sorted and merged as the segments
+    come, so what is held at once follows how segments overlap in time, not the length of the range.
+  - **The book those rows start from** is the summary a track ends at, or the book just before the
+    range by price: the newest summary before it and the rows after that (#233).
 
 | Function | Value | Scale |
 |---|---|---|

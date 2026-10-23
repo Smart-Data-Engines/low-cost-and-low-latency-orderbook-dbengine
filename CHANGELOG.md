@@ -30,6 +30,18 @@ here as `#N`.
   with a time at or before a summary's removes that summary first. Snapshots, backups, migrations
   and merges carry them. `ob_book_summaries_written_total` and `ob_book_summary_bytes_total` count
   them.
+- Best tracks (#243): beside each book summary, a file `best.<time>.v1` holds the best price of each
+  side after every instant at which it changed. The span runs from the summary the composition
+  started from to this one. A series of the book (`OPEN`, `HIGH`, `LOW`, `CLOSE`, `TWAP`, also in
+  rolling windows) reads one entry a change where tracks cover its range. Elsewhere it reads the
+  rows, from the summary a track ends at.
+  - A track is written with its summary, from the same composition, and kept true with it: the
+    late row that removes the summary removes the track.
+  - Snapshots, backups, migrations and merges carry tracks.
+  - A track that does not read back costs the series its own span, read from the rows.
+  - `ob_best_track_bytes_total` counts their bytes. A build before this ignores the files.
+  - On the x86 host, a series over the last ten minutes of 3 M rows took 0.08 ms, against
+    11.21-21.98 ms before tracks. A summary takes 5-10% longer to write with its track.
 
 - Permissions per identity, opt-in with `--auth-acl-file` (#31). Each identity of the secret file
   gets a role:
