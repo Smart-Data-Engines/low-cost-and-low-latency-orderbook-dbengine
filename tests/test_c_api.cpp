@@ -1,6 +1,7 @@
 // Feature: orderbook-dbengine — C API unit tests (Requirements 13.5)
 #include "orderbook/c_api.h"
 #include "orderbook/level_payload.hpp"
+#include "orderbook/logger.hpp"
 #include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
 #include <gtest/gtest.h>
@@ -569,6 +570,39 @@ TEST_F(CApiTest, AClosedEngineEndsItsWalWithACheckpoint) {
     engine = ob_engine_create(dir.c_str());
     ASSERT_NE(engine, nullptr);
     EXPECT_EQ(capi_history(engine, "CL"), (std::vector<PriceQty>{{100, 1}}));
+}
+
+TEST_F(CApiTest, AFlushTakesItsSegmentsToTheDeviceBeforeItsCheckpointClaimsThem) {
+    // #160's rule, which the server's flush keeps: a checkpoint claims only rows on the device. One
+    // that claimed rows still in the page cache - and a close syncs the WAL, so it would be on the
+    // device - would leave a power cut nothing to replay them from. What a sync does shows only when
+    // the power fails, so this reads the order in which a flush reports its steps.
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "SY", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    auto& logger = ob::StructuredLogger::instance();
+    const ob::LogLevel was = logger.level();
+    logger.set_level(ob::LogLevel::DEBUG);
+    testing::internal::CaptureStderr();
+    const ob_status_t flushed = ob_flush(engine);
+    const std::string said = testing::internal::GetCapturedStderr();
+    // With nothing new a flush claims nothing, and it waits for no device: what #244 measured.
+    testing::internal::CaptureStderr();
+    const ob_status_t again = ob_flush(engine);
+    const std::string said_again = testing::internal::GetCapturedStderr();
+    logger.set_level(was);
+    ASSERT_EQ(flushed, OB_C_OK);
+    ASSERT_EQ(again, OB_C_OK);
+    const auto synced = said.find("the segments and the WAL synced in");
+    const auto claimed = said.find("Checkpoint appended");
+    ASSERT_NE(synced, std::string::npos) << "the flush did not sync:\n" << said;
+    ASSERT_NE(claimed, std::string::npos) << "the flush appended no checkpoint:\n" << said;
+    EXPECT_LT(synced, claimed) << "the checkpoint came before the sync:\n" << said;
+    EXPECT_EQ(said_again.find("synced in"), std::string::npos)
+        << "a flush with nothing new synced:\n" << said_again;
+    EXPECT_EQ(said_again.find("Checkpoint appended"), std::string::npos)
+        << "a flush with nothing new appended a checkpoint:\n" << said_again;
 }
 
 TEST_F(CApiTest, ASegmentOfAnOlderBuildIsJudgedByTheTimeOfItsLastRow) {

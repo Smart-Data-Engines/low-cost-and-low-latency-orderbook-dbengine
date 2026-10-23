@@ -31,6 +31,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 // ── ob_engine (C++ side) ──────────────────────────────────────────────────────
 // Owns all subsystems.  The QueryEngine holds a reference to the store and the aggregation
 // engine, and a callable that resolves a live buffer, so those members must be constructed before
@@ -69,6 +72,23 @@ struct ob_engine {
     ob::WalPosition checkpointed_at{};
     bool has_checkpointed{false};
 
+    // The directory's descriptor, for the syncfs() that takes the segments to the device before a
+    // checkpoint claims their rows (#160, as the server's sync_segments() does). Owned, so that a
+    // constructor that throws leaks none; -1 when it could not be opened, and then every sync fails.
+    struct DirFd {
+        int fd{-1};
+        DirFd() = default;
+        DirFd(const DirFd&)            = delete;
+        DirFd& operator=(const DirFd&) = delete;
+        ~DirFd() {
+            if (fd >= 0) ::close(fd);
+        }
+    } dir_fd;
+    // Set by a sync that failed, the segments' or the WAL's. Linux reports a failed sync once and
+    // marks the pages it could not write clean, so no later sync vouches for them: from here no
+    // checkpoint is appended and no WAL file removed, until the engine is created again (#160).
+    bool checkpoints_frozen{false};
+
     explicit ob_engine(const char* dir)
         : base_dir(dir)
         , wal(dir)
@@ -87,6 +107,12 @@ struct ob_engine {
               },
               agg))
     {
+        dir_fd.fd = ::open(base_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd.fd < 0) {
+            OB_LOG_WARN("c_api", "cannot open %s for the sync before a checkpoint (%s) - every flush "
+                                 "that writes will report a failed sync and append no checkpoint",
+                        base_dir.c_str(), std::strerror(errno));
+        }
         load_or_create_wal_identity();
         // Rebuild segment index from any previously persisted segments.
         combined_store.open_existing();
@@ -98,7 +124,11 @@ struct ob_engine {
     // nothing it wrote (#245). The members' own destructors then find nothing left to write.
     ~ob_engine() {
         try {
-            flush_locked();
+            if (const int err = flush_locked(); err != 0) {
+                OB_LOG_ERROR("c_api", "close: the segments' sync failed (%s) - no checkpoint claims "
+                                      "them, and the next open replays the WAL from the one before",
+                             std::strerror(err));
+            }
         } catch (const std::exception& e) {
             OB_LOG_ERROR("c_api", "close: the last flush failed: %s - the next open replays the WAL "
                                   "from the checkpoint before it", e.what());
@@ -166,11 +196,12 @@ struct ob_engine {
         store.set_wal_position(wal_identity, at.file_index, static_cast<uint64_t>(at.offset) + 1);
     }
 
-    // Write each store's open segment, with any its writes rolled over into, index them, and append
-    // a checkpoint saying every record so far is in a segment (#245); then remove the WAL files
-    // wholly before it. ob_flush() and a close are this. `mtx` held, or the engine reachable by
-    // nobody else.
-    size_t flush_locked() {
+    // Write each store's open segment, with any its writes rolled over into, index them, take them
+    // to the device, and append a checkpoint saying every record so far is in a segment (#245); then
+    // remove the WAL files wholly before it. ob_flush() and a close are this. Returns 0, or the
+    // errno of this flush's sync, which failed: its segments are written and readable, and no
+    // checkpoint claims them. `mtx` held, or the engine reachable by nobody else.
+    int flush_locked() {
         // What the next open would have indexed: the segments the writes rolled over into as well,
         // which append() parks because it cannot reach the index (pitfall 13).
         std::vector<ob::SegmentMeta> metas;
@@ -192,18 +223,58 @@ struct ob_engine {
         const ob::WalPosition covered = wal.current_position();
         const bool moved = !has_checkpointed || covered.file_index != checkpointed_at.file_index ||
                            covered.offset != checkpointed_at.offset;
+        int sync_err = 0;
         size_t removed = 0;
+        const char* outcome = "no checkpoint, the WAL ends";
         if (moved) {
-            wal.append_checkpoint(ob::wall_clock_ns(), covered);
-            checkpointed_at  = wal.current_position();
-            has_checkpointed = true;
-            removed = wal.truncate_before(covered.file_index);
+            // On the device before a checkpoint claims them (#160): a checkpoint that claims more
+            // than is durable turns a power cut into lost rows, which no open would replay, and the
+            // WAL a close syncs carries the checkpoint with it. One syncfs() takes the segments and
+            // the WAL both, which share this directory's filesystem.
+            sync_err = sync_segments();
+            if (sync_err != 0) {
+                freeze_checkpoints(std::string("a flush's sync failed (") + std::strerror(sync_err) + ")");
+            } else if (wal.fsync_failures() > 0) {
+                // The WAL counts its own, whichever path made them (a rotation's, here).
+                freeze_checkpoints("a WAL sync failed");
+            }
+            if (!checkpoints_frozen) {
+                wal.append_checkpoint(ob::wall_clock_ns(), covered);
+                checkpointed_at  = wal.current_position();
+                has_checkpointed = true;
+                removed = wal.truncate_before(covered.file_index);
+                outcome = "synced, a checkpoint";
+            } else {
+                outcome = "no checkpoint, they are frozen";
+            }
         }
         OB_LOG_DEBUG("c_api", "flush: %zu segment(s) written and indexed from %zu store(s); %s at file "
                               "%u offset %u; %zu WAL file(s) before it removed",
-                     metas.size(), stores.size(), moved ? "a checkpoint" : "no checkpoint, the WAL ends",
-                     covered.file_index, covered.offset, removed);
-        return metas.size();
+                     metas.size(), stores.size(), outcome, covered.file_index, covered.offset, removed);
+        return sync_err;
+    }
+
+    // One syncfs() on the directory's filesystem: 0, or the errno. Timed, because it is the one step
+    // of a flush that waits for the device.
+    int sync_segments() {
+        if (dir_fd.fd < 0) return EBADF;
+        const auto started = std::chrono::steady_clock::now();
+        if (::syncfs(dir_fd.fd) != 0) return errno;
+        OB_LOG_DEBUG("c_api", "flush: the segments and the WAL synced in %.2f ms",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               started).count());
+        return 0;
+    }
+
+    // No checkpoint from here, said once (#160, as the server's freeze_checkpoints()).
+    void freeze_checkpoints(const std::string& what_failed) {
+        if (checkpoints_frozen) return;
+        checkpoints_frozen = true;
+        OB_LOG_ERROR("c_api", "%s. Linux reports a failed sync once and marks the pages it could not "
+                              "write clean, so no later sync can vouch for them: from here no "
+                              "checkpoint claims anything and no WAL file is removed. The rows are "
+                              "written and readable; the next open replays from the last checkpoint "
+                              "before the failure", what_failed.c_str());
     }
 
     // The records the last checkpoint does not cover, applied as a write applies them - the update
@@ -286,7 +357,8 @@ struct ob_engine {
             ++applied;
             rows += update.n_levels;
         });
-        if (applied > 0) flush_locked();
+        // A failed sync is the freeze's to report; the replayed rows are readable either way.
+        if (applied > 0) (void)flush_locked();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - started).count();
         OB_LOG_INFO("c_api", "WAL replay: %llu record(s) after the last checkpoint, %llu update(s) "
@@ -409,7 +481,13 @@ extern "C" ob_status_t ob_flush(ob_engine_t* engine) {
     if (!engine) return OB_C_ERR_INVALID_ARG;
     try {
         std::lock_guard<std::mutex> lock(engine->mtx);
-        engine->flush_locked();
+        // A caller asked for this one, so a caller is told: a flush answering OK over a failed sync
+        // is the lie the server's FLUSH stopped telling (#160).
+        if (const int err = engine->flush_locked(); err != 0) {
+            OB_LOG_WARN("c_api", "flush: the segments are written and readable, and their sync "
+                                 "failed (%s)", std::strerror(err));
+            return OB_C_ERR_IO;
+        }
         return OB_C_OK;
     } catch (const std::exception& e) {
         OB_LOG_ERROR("c_api", "flush failed: %s", e.what());
