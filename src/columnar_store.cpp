@@ -2833,15 +2833,15 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
 
 namespace {
 
-/// `bytes` at `path` through a temporary and a rename, with no sync of its own: a best track (#243),
-/// which nothing has to find after a power cut. One that does not read back - empty, cut short or
-/// garbage - fails its checks and is no track, and a series reads the rows instead. Written before
-/// its summary, whose directory sync then takes this rename to the device too: two syncs a summary
-/// rather than four. 0, or the errno, and then no file is left.
-int write_track_unsynced(const std::string& path, std::string_view bytes) {
+/// `bytes` at `path` through a temporary and a rename, with no sync of its own: a book summary (#233)
+/// and its best track (#243), which nothing has to find after a power cut. One that does not read
+/// back - empty, cut short or garbage - fails its checks and is not used: a read composes the book
+/// from the rows instead, and a series reads them. 0, or the errno, and then no file is left.
+int write_unsynced(const std::string& path, std::string_view bytes) {
     const std::string tmp = path + ".tmp";
-    // OB_DURABLE: nothing - a track that does not read back is no track (best_track.hpp), and its
-    // rename reaches the device with the directory sync of the summary written after it.
+    // OB_DURABLE: nothing - a summary or a track that does not read back is not used
+    // (book_summary.hpp, best_track.hpp), and the WAL holds every row a summary does: a seal takes
+    // only rows whose records a sync has already put on the device (#247).
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
     if (fd < 0) return errno;
     const char* p = bytes.data();
@@ -2910,13 +2910,16 @@ ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(std::string_view s
     summary.rows             = book.rows;
     const std::string bytes = encode_book_summary(summary);
     const std::string path = (fs::path(dir) / book_summary_file(as_of)).string();
-    // The track first, unsynced, so that the summary's directory sync takes it along; and only beside
-    // a summary that was written, since a series that leaves a track for the rows after it starts
-    // them from that summary's book.
+    // Neither is synced (#247). A summary falls due at nearly every seal of a busy symbol, and synced
+    // - the file, then its directory - it cost a writer on a capped device a journal force a tick and
+    // 2.7% of its levels a second. One that a power cut loses or cuts short is not used, and the read
+    // composes the book from further back. The track first, and kept only beside a summary that was
+    // written, since a series that leaves a track for the rows after it starts them from that
+    // summary's book.
     const std::string track_bytes = encode_best_track(track);
     const std::string track_path = (fs::path(dir) / best_track_file(as_of)).string();
-    const int track_err = write_track_unsynced(track_path, track_bytes);
-    const int err = write_file_atomically(path, bytes);
+    const int track_err = write_unsynced(track_path, track_bytes);
+    const int err = write_unsynced(path, bytes);
     if (err != 0 && track_err == 0) {
         std::error_code ec;
         fs::remove(track_path, ec);
@@ -3053,7 +3056,8 @@ void ColumnarStore::register_summaries_locked(const SegmentMeta& meta) {
         }
         if (!is_book_summary_file(name)) continue;
         BookSummaryHeader header;
-        if (const std::string err = read_book_summary_header(entry.path().string(), header);
+        // The whole file, not its header alone (#247): a summary is written with no sync of its own.
+        if (const std::string err = check_book_summary(entry.path().string(), header);
             !err.empty()) {
             OB_LOG_WARN("columnar", "book summary %s not used: %s", entry.path().c_str(), err.c_str());
             continue;

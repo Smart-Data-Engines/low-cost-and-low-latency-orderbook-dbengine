@@ -147,14 +147,14 @@ std::string decode_book_summary(std::string_view bytes, BookSummary& out) {
     return {};
 }
 
-std::string read_book_summary_header(const std::string& path, BookSummaryHeader& out) {
+std::string check_book_summary(const std::string& path, BookSummaryHeader& out) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return "cannot open " + path;
-    char buf[kHeaderBytes];
-    in.read(buf, static_cast<std::streamsize>(kHeaderBytes));
-    const auto got = static_cast<size_t>(in.gcount());
-    uint32_t payload_crc = 0;
-    return parse_header(std::string_view(buf, got), out, payload_crc);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    BookSummary summary;
+    std::string err = decode_book_summary(bytes, summary);
+    if (err.empty()) out = summary.header;
+    return err;
 }
 
 std::string read_book_summary(const std::string& path, BookSummary& out) {
