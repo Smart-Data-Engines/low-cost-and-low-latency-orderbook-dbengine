@@ -16,6 +16,8 @@
 #include "orderbook/crc32c.hpp"
 #include "orderbook/durable_file.hpp"
 #include "orderbook/logger.hpp"
+#include "orderbook/log_episode.hpp"
+#include "orderbook/loop_guard.hpp"
 
 #include <algorithm>
 #include <span>
@@ -36,6 +38,7 @@
 #include <unordered_set>
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -576,11 +579,91 @@ void Engine::open() {
         });
     }
 
+    // The WAL written back ahead of its sync (#242), under `interval` only: `every` has synced each
+    // write before answering it, and `none` promises nothing a sync would keep.
+    if (fsync_policy_ == FsyncPolicy::INTERVAL && !wal_writeback_thread_.joinable()) {
+        stop_wal_writeback_.store(false, std::memory_order_relaxed);
+        wal_writeback_thread_ = std::thread([this]() {
+            run_thread_body("engine", "wal_writeback_loop", [this] { wal_writeback_loop(); });
+        });
+        pthread_setname_np(wal_writeback_thread_.native_handle(), "ob-wal-writeback");
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+}
+
+void Engine::wal_writeback_loop() {
+    // Writers append the WAL to the page cache, and only a sync hands it to the device. Under the
+    // WAL's budget (#190 step 9) a slow device gets a sync at half the budget, each forcing the
+    // filesystem's journal; a sync once more than that, and nothing wrote the WAL meanwhile - a fifth
+    // of a 7 MB/s cap went unused (#242). Each megabyte appended goes to the kernel's writeback here,
+    // so the device writes the WAL as it grows and a sync finds the rest. Off every writer's path:
+    // `sync_file_range()` blocks when the device's queue is full, which is when it matters, and a
+    // writer holds the engine's lock.
+    constexpr uint64_t kChunk = kWalWritebackChunkBytes;
+    int fd = -1;
+    uint32_t file = std::numeric_limits<uint32_t>::max();
+    uint64_t asked = 0;
+    LogEpisode failing;
+    LoopGuard guard{"engine", "a WAL writeback pass", &registry_};
+    OB_LOG_INFO("engine", "WAL written back ahead of its sync: each %llu bytes appended (#242)",
+                static_cast<unsigned long long>(kChunk));
+    while (!stop_wal_writeback_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        try {
+            const WalPosition now = wal_.current_position();
+            if (now.file_index != file) {
+                // A rotation, or the first pass: a descriptor of the file being written, taken under
+                // the lock a rotation holds, so it is the file `now` names or a later one.
+                std::pair<int, WalPosition> got{-1, {}};
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    got = wal_.writeback_descriptor();
+                }
+                if (fd >= 0) ::close(fd);
+                fd = got.first;
+                file = got.second.file_index;
+                asked = got.second.offset;
+                OB_LOG_DEBUG("engine", "WAL writeback ahead follows file %u from offset %llu "
+                                       "(descriptor %d)",
+                             file, static_cast<unsigned long long>(asked), fd);
+                guard.ok();
+                continue;
+            }
+            if (fd < 0 || now.offset < asked + kChunk) {
+                guard.ok();
+                continue;
+            }
+            if (::sync_file_range(fd, static_cast<off_t>(asked), static_cast<off_t>(now.offset - asked),
+                                  SYNC_FILE_RANGE_WRITE) != 0) {
+                const int err = errno;
+                registry_.increment_counter("ob_wal_writeback_errors_total");
+                if (failing.begin()) {
+                    OB_LOG_WARN("engine", "WAL writeback ahead failed on file %u: %s; each sync writes "
+                                          "what it finds, as before #242",
+                                file, std::strerror(err));
+                }
+            } else {
+                registry_.increment_counter("ob_wal_writeback_requests_total");
+                if (const uint64_t failed = failing.end()) {
+                    OB_LOG_INFO("engine", "WAL writeback ahead works again on file %u, after %llu "
+                                          "failed request(s)",
+                                file, static_cast<unsigned long long>(failed));
+                }
+            }
+            asked = now.offset;
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
+    }
+    if (fd >= 0) ::close(fd);
+    OB_LOG_INFO("engine", "WAL writeback ahead stopped after %llu request(s)",
+                static_cast<unsigned long long>(registry_.counter_value("ob_wal_writeback_requests_total")));
 }
 
 void Engine::close() {
@@ -624,6 +707,8 @@ void Engine::close() {
     if (flush_thread_.joinable()) {
         flush_thread_.join();
     }
+    stop_wal_writeback_.store(true, std::memory_order_relaxed);
+    if (wal_writeback_thread_.joinable()) wal_writeback_thread_.join();
 
     // flush_mtx_ is taken after join(), never before: the flush thread holds it for
     // the duration of a tick, so taking it first would make this thread wait on the
@@ -3608,8 +3693,15 @@ void Engine::flush_loop() {
         // and tests that open and close an Engine per case paid it every time.
         {
             std::unique_lock<std::mutex> lock(flush_stop_mtx_);
+            // While the device is slower than the writes (#242): a tick when a writer asks for one, at
+            // half the WAL's budget, or after a second - not at every interval. Each tick's sync
+            // forces the filesystem's journal, and with the WAL written back ahead the device is busy
+            // between them anyway. A device that keeps up is ticked every interval, as before.
+            const auto wait = admission_.active() && fsync_policy_ == FsyncPolicy::INTERVAL
+                                  ? std::max<std::chrono::nanoseconds>(interval, std::chrono::seconds(1))
+                                  : interval;
             const bool woken = flush_stop_cv_.wait_for(
-                lock, interval,
+                lock, wait,
                 [this]() { return stop_flush_.load(std::memory_order_relaxed) ||
                                   flush_now_.load(std::memory_order_relaxed); });
             const bool stop_requested = stop_flush_.load(std::memory_order_relaxed);

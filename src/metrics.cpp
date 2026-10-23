@@ -111,6 +111,13 @@ MetricsRegistry::MetricsRegistry() {
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",
                                      "fsync calls on the WAL that failed"));
+    // The WAL written back ahead of its sync under `interval` (#242): requests to the kernel's
+    // writeback, a megabyte or more each, and the ones it refused - after which each sync writes
+    // what it finds, as before. A durability promise rests on the sync, never on these.
+    counters_.push_back(make_counter("ob_wal_writeback_requests_total",
+                                     "Requests to write the WAL back ahead of its sync"));
+    counters_.push_back(make_counter("ob_wal_writeback_errors_total",
+                                     "Requests to write the WAL back ahead of its sync that failed"));
     // Flushes whose segment sync failed (#160). Registered in the same change that writes it. Its
     // consequence is not a lost row but no checkpoint from here on: the first failure freezes them
     // for the rest of the process (`ob_checkpoints_frozen`), because no later sync can vouch for

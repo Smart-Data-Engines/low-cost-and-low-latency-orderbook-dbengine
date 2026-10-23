@@ -458,6 +458,11 @@ ob_add_engine_test(test_best_track
 )
 target_link_libraries(test_best_track PRIVATE rapidcheck rapidcheck_gtest)
 
+# The WAL written back ahead of its sync, and the flush loop while admission is in force (#242).
+ob_add_engine_test(test_wal_writeback_ahead
+    test_wal_writeback_ahead.cpp
+)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )

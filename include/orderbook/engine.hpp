@@ -1164,6 +1164,14 @@ private:
     // Background flush thread
     std::thread       flush_thread_;
     std::atomic<bool> stop_flush_{false};
+
+    /// The WAL written back ahead of its sync (#242): under `interval`, a thread hands each
+    /// `kWalWritebackChunkBytes` appended to the kernel's writeback, so that the device writes the
+    /// WAL as it grows and a sync finds little left to write. From `open()` to `close()`.
+    static constexpr uint64_t kWalWritebackChunkBytes = 1u << 20;
+    std::thread       wal_writeback_thread_;
+    std::atomic<bool> stop_wal_writeback_{false};
+    void wal_writeback_loop();
     std::mutex        mtx_;
 
     // Serialises every path that writes segments or mutates stores_.

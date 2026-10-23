@@ -527,6 +527,12 @@ public:
     /// sync newly covered - 0 on a failure - which is what the engine measures the device by.
     uint64_t complete_sync(const SyncTicket& ticket, int err);
 
+    /// A descriptor of the file being written and where the writer is in it, for writing the WAL
+    /// back ahead of its sync (#242): a `dup()` the caller closes, or -1 with no file open. Caller
+    /// holds the lock that serialises this writer, as for `prepare_sync()`, which is what keeps a
+    /// rotation from replacing the file meanwhile.
+    std::pair<int, WalPosition> writeback_descriptor() const;
+
     /// Number of records written since last sync.
     size_t pending_sync_count() const { return pending_sync_; }
 

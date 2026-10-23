@@ -972,6 +972,11 @@ uint64_t WALWriter::complete_sync(const SyncTicket& ticket, int err) {
     return covered;
 }
 
+std::pair<int, WalPosition> WALWriter::writeback_descriptor() const {
+    if (fd_ < 0) return {-1, current_position()};
+    return {::fcntl(fd_, F_DUPFD_CLOEXEC, 0), current_position()};
+}
+
 size_t WALWriter::truncate_before(uint32_t before_index) {
     size_t removed = 0;
     if (!std::filesystem::exists(dir_)) return 0;
