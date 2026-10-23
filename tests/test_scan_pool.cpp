@@ -10,6 +10,8 @@
 
 #include <gtest/gtest.h>
 
+#include <sched.h>
+
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
@@ -152,4 +154,25 @@ TEST(ScanPool, ManyQueriesAtOnceEachGetEveryTaskDone) {
         for (int k = 0; k < 8; ++k) expected += static_cast<uint64_t>(q * 100 + k) * 50;
     }
     EXPECT_EQ(sum.load(), expected);
+}
+
+TEST(ScanPool, ItsThreadsReadUnderSchedIdleBelowTheClientLoops) {
+    // A task only a pool thread can run - nothing here runs or waits for it until it is done - says
+    // which policy it ran under.
+    ob::ScanPool pool(1, nullptr);
+    std::atomic<int> policy{-1};
+    auto task = pool.submit([&] { policy = ::sched_getscheduler(0); });
+    for (int i = 0; i < 5000 && !task->done(); ++i) std::this_thread::sleep_for(1ms);
+    ASSERT_TRUE(task->done()) << "no pool thread ran the task";
+    pool.run_or_wait(*task);
+    EXPECT_EQ(policy.load(), SCHED_IDLE);
+}
+
+TEST(ScanPool, OneScanAtATimeHoldsTheClaim) {
+    ob::ScanPool pool(2, nullptr);
+    ASSERT_TRUE(pool.claim());
+    EXPECT_FALSE(pool.claim()) << "a second scan divided while one held the pool";
+    pool.release();
+    EXPECT_TRUE(pool.claim());
+    pool.release();
 }

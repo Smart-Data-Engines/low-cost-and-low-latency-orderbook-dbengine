@@ -26,12 +26,14 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -482,4 +484,71 @@ TEST(ScanParts, AScanAPoolCannotSpeedUpIsReadOnItsQuerysThread) {
         << "4 000 rows in range were divided";
     EXPECT_EQ(parts_made(at(0), at(first_of[2] - 1)), 0) << "a range mostly in one segment was divided";
     EXPECT_EQ(g_parts_alive.load(), 0);
+}
+
+TEST(ScanParts, AScanFindingThePoolDividedAlreadyReadsOnItsOwnThread) {
+    // One scan divides at a time: a second query that came while the first held the pool reads on
+    // its own thread rather than queueing behind the first one's parts.
+    Store s;
+    ten_segments(s);
+    ob::ScanPool pool(2, nullptr);
+    std::atomic<bool> first_out{false};
+    std::atomic<bool> release{false};
+
+    class HeldPart final : public ob::ScanPart {
+    public:
+        HeldPart(std::atomic<bool>& out, std::atomic<bool>& release) : out_(out), release_(release) {}
+        ob::BatchVerdict take(const ob::RowBatch& b) override {
+            out_ = true;
+            while (!release_) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            rows_ += b.rows.size();
+            return {};
+        }
+        uint64_t rows() const override { return rows_; }
+
+    private:
+        std::atomic<bool>& out_;
+        std::atomic<bool>& release_;
+        uint64_t rows_{0};
+    };
+
+    uint64_t first_rows = 0;
+    std::thread first([&] {
+        ob::PartsScan how;
+        how.pool = &pool;
+        how.divide_small = true;
+        how.make_part = [&]() -> std::unique_ptr<ob::ScanPart> {
+            return std::make_unique<HeldPart>(first_out, release);
+        };
+        how.fold = [&first_rows](ob::ScanPart& p) {
+            first_rows += p.rows();
+            return true;
+        };
+        s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    });
+    for (int i = 0; i < 5000 && !first_out; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ASSERT_TRUE(first_out.load()) << "the first scan never handed a part out";
+
+    int made = 0;
+    uint64_t direct = 0;
+    ob::PartsScan how;
+    how.pool = &pool;
+    how.divide_small = true;
+    how.direct = [&direct](const ob::RowBatch& b) -> ob::BatchVerdict {
+        direct += b.rows.size();
+        return {};
+    };
+    how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+        ++made;
+        return std::make_unique<CountingPart>(false);
+    };
+    how.fold = [](ob::ScanPart&) { return true; };
+    s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    release = true;
+    first.join();
+    EXPECT_EQ(made, 0) << "the second scan divided while the first held the pool";
+    EXPECT_EQ(direct, 5000u);
+    EXPECT_EQ(first_rows, 5000u);
+    EXPECT_TRUE(pool.claim()) << "the first scan kept the pool after it ended";
+    pool.release();
 }

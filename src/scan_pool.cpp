@@ -5,6 +5,9 @@
 #include "orderbook/thread_boundary.hpp"
 
 #include <pthread.h>
+#include <sched.h>
+
+#include <cstring>
 
 #include <string>
 
@@ -48,13 +51,27 @@ ScanPool::ScanPool(unsigned threads, MetricsRegistry* registry)
     threads_.reserve(threads);
     for (unsigned i = 0; i < threads; ++i) {
         threads_.emplace_back([this] {
+            // Below the client loops (#246): the pool reads on the CPU the loops leave, and gives it
+            // up between batches (`scan_parts()`). Neither half was enough alone, measured on the
+            // x86 host beside a writer: at the normal policy, at nice 19 and under SCHED_IDLE the
+            // writer's p99 was 0.4-1.3 ms, a loop woken onto a CPU a pool thread held waiting for
+            // the scheduler's tick; under SCHED_IDLE with the yield, 50-54 us beside the bucket
+            // query against 38-44 without a pool. Lowering a thread's own policy needs no privilege.
+            sched_param idle{};
+            idle.sched_priority = 0;
+            if (const int err = ::pthread_setschedparam(::pthread_self(), SCHED_IDLE, &idle); err != 0) {
+                OB_LOG_WARN("scan_pool", "a scan pool thread could not take SCHED_IDLE: %s; it reads "
+                                         "at the client loops' priority",
+                            std::strerror(err));
+            }
             run_thread_body("scan_pool", "a scan pool thread", [this] { worker_loop(); });
         });
         const std::string name = "ob-scan-" + std::to_string(i);
         pthread_setname_np(threads_.back().native_handle(), name.c_str());
     }
     OB_LOG_INFO("scan_pool", "scan pool: %u thread(s)%s", threads,
-                threads == 0 ? "; every part of a scan runs on its query's thread" : "");
+                threads == 0 ? "; every part of a scan runs on its query's thread"
+                             : ", under SCHED_IDLE below the client loops");
 }
 
 ScanPool::~ScanPool() { stop(); }
@@ -81,6 +98,13 @@ void ScanPool::run_or_wait(Task& task) {
     }
     if (task.error_) std::rethrow_exception(task.error_);
 }
+
+bool ScanPool::claim() {
+    bool free = false;
+    return claimed_.compare_exchange_strong(free, true, std::memory_order_acq_rel);
+}
+
+void ScanPool::release() { claimed_.store(false, std::memory_order_release); }
 
 void ScanPool::ran_here() {
     by_queries_.fetch_add(1, std::memory_order_relaxed);

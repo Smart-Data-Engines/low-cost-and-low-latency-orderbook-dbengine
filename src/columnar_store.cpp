@@ -7,6 +7,7 @@
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -2567,11 +2568,15 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
     const bool divide = how.pool != nullptr && how.pool->threads() > 0 && segment_slots > 1 &&
                         (how.limit_rows == UINT64_MAX || how.limit_rows > slots[0].rows_at_most) &&
                         worth;
-    if (!divide) {
+    if (!divide || !how.pool->claim()) {
         return read_in_order(set, symbol, exchange, columns, start_ns, end_ns, filter, how.direct,
                              cost);
     }
     ScanPool* const pool = how.pool;
+    struct Release {
+        ScanPool* pool;
+        ~Release() { pool->release(); }
+    } const released{pool};
     if (!set.blocks.empty()) {
         Slot s;
         for (const auto& b : set.blocks) s.rows_at_most += b->rows.size();
@@ -2591,6 +2596,9 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         s.part = how.make_part();
         const BatchReader into = [&s, &stop](const RowBatch& b) -> BatchVerdict {
             if (stop.load(std::memory_order_relaxed)) return {true, 0};
+            // A pool thread gives its CPU up between batches, so a client loop woken onto it waits
+            // for one batch at most rather than for the scheduler's tick (`ScanPool`'s threads).
+            if (s.on_pool) ::sched_yield();
             return s.part->take(b);
         };
         if (s.meta != nullptr) {

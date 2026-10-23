@@ -75,6 +75,12 @@ public:
     /// counted with the parts queries ran.
     void ran_here();
 
+    /// Whether this scan may divide: one scan at a time does, and a scan that finds the pool divided
+    /// already reads on its own thread, so queries that run at once are not all queued behind one
+    /// another's parts. `release()` gives it back.
+    bool claim();
+    void release();
+
     /// Stop the threads and join them. A task still queued stays with whoever waits for it, and
     /// run_or_wait() runs a task nobody took, so a stop strands no query.
     void stop();
@@ -89,6 +95,7 @@ private:
     std::deque<std::shared_ptr<Task>> queue_;
     bool stopping_{false};
     std::vector<std::thread> threads_;
+    std::atomic<bool> claimed_{false};
     std::atomic<uint64_t> pooled_{0};
     std::atomic<uint64_t> by_queries_{0};
 };
