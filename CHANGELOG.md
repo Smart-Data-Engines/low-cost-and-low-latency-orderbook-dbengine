@@ -143,6 +143,13 @@ here as `#N`.
 
 ### Changed
 
+- **A book summary is written with no sync of its own** (#247). Since #233 a busy symbol's summary
+  fell due at nearly every seal, and each was synced, the file and then its directory: on a device
+  capped at 7 MB/s that was a journal force a tick more, and a writer to a few symbols took 2.7%
+  fewer levels a second. A summary is checked where it is read and a read that cannot use one
+  composes the book from the rows, as with the best track beside it, so it is written unsynced; a
+  start checks a summary's whole file rather than its header, since a power cut can now cut its
+  prices short.
 - **A scan hands its rows over a batch at a time** (#246, stage 1 of a scan on several cores): a
   candidate's columns and the rows chosen from them, rather than a row and two calls through
   `std::function` each. The server formats a row answer from the columns into its reply, and

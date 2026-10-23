@@ -811,7 +811,9 @@ public:
     /// and put it in the index (#233). It is the book by price as of the latest time of a row the
     /// symbol's segments hold, with every row at or before it - in a block too - applied. Not
     /// written when there is nothing newer to say, and not put in the index when rows arrived while
-    /// it was written: such a summary could lack one, and its file is removed.
+    /// it was written: such a summary could lack one, and its file is removed. Not synced (#247): a
+    /// summary that a power cut loses or cuts short is not used, and a read composes the book from
+    /// further back.
     struct SummaryWrite {
         bool written{false};
         uint64_t as_of_ts{0};

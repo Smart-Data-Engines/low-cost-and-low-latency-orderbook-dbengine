@@ -68,9 +68,12 @@ std::string encode_book_summary(const BookSummary& summary);
 /// that does not match, a count the bytes do not hold. Empty on success.
 std::string decode_book_summary(std::string_view bytes, BookSummary& out);
 
-/// The header alone, checked by its own CRC: what a store reads of every summary when it opens, so
-/// that opening does not read every price of every summary. Empty on success.
-std::string read_book_summary_header(const std::string& path, BookSummaryHeader& out);
+/// The header of the summary at `path`, once the whole file has been read and checked as a read
+/// checks it: what a store asks of every summary when it opens. A summary is written with no sync of
+/// its own (#247), so a power cut can leave its header whole and its prices cut short, and one an open
+/// took on its header alone would be tried first, and logged, by every read after its time. Logs
+/// nothing; empty on success.
+std::string check_book_summary(const std::string& path, BookSummaryHeader& out);
 
 /// The whole file, checked. Empty on success.
 std::string read_book_summary(const std::string& path, BookSummary& out);

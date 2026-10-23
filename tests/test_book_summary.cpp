@@ -327,6 +327,26 @@ TEST(BookSummaryStore, ASummaryThatDoesNotReadBackIsNotStartedFrom) {
     EXPECT_EQ(levels_of(book.rows), composed(*s.store, kBase + 2));
 }
 
+TEST(BookSummaryStore, ASummaryAPowerCutCutShortIsNotUsedAfterAStart) {
+    // #247: a summary is written with no sync of its own, so a power cut can leave its name with
+    // none of its bytes, or with part of them. Either way the start does not use it, and the book is
+    // composed from the rows - the same book.
+    for (const bool empty : {true, false}) {
+        Store s;
+        s.segment({row(kBase + 1, ob::SIDE_BID, 100, 1), row(kBase + 2, ob::SIDE_ASK, 101, 2)});
+        const std::string dir = s.segment({row(kBase + 3, ob::SIDE_BID, 100, 5)});
+        ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+        const fs::path file = fs::path(dir) / ob::book_summary_file(kBase + 3);
+        fs::resize_file(file, empty ? 0 : fs::file_size(file) / 2);
+        s.reopen();
+        EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty())
+            << (empty ? "an empty" : "a half") << " summary was put in the index at the start";
+        const auto book = s.at(kBase + 3);
+        EXPECT_FALSE(book.from_summary.has_value());
+        EXPECT_EQ(levels_of(book.rows), composed(*s.store, kBase + 3));
+    }
+}
+
 TEST(BookSummaryStore, ASegmentLeavingTakesItsSummariesWithIt) {
     // Another segment of the symbol stays, so the symbol's entry in the index stays too: what goes
     // is the summary whose file went with its directory, and the read does not start from it.
