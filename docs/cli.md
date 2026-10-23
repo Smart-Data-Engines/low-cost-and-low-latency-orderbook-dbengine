@@ -360,10 +360,9 @@ and `--print-config` says which values the profile set and why, under the machin
 
 ```
 # machine: 4 usable CPUs: affinity 4, no cgroup v2 CPU limit
-# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window; a scan pool of 4 threads, one per usable CPU
+# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window
   io-spin-us                       10  (profile)
   io-threads                       4  (profile)
-  scan-threads                     4  (profile)
   profile                          boost  (default)
 ```
 
@@ -444,11 +443,20 @@ loop puts the parts together in the segments' order (#246). The answer is the sa
 a `LIMIT` included: a `LIMIT` the first segment may meet is not divided, and under a larger one a
 segment goes to the pool only while the answer may still need its rows. A scan of fewer than 32 768
 rows in range, or one whose rows are mostly in one segment, is read on the query's loop, where a
-pool would add its queue and win nothing. Under `boost` N is one per usable CPU where there are two
-or more, since the query's loop folds the parts rather than reads them, and under `eco` it is 0. `SNAPSHOT`, `WHERE AT` and the series of the book read in
-time order on the query's loop whatever N is. The pool's threads are `ob-scan-0` … `ob-scan-N-1`;
-`ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on them and
-on the queries' loops, and `ob_scan_threads` is N.
+pool would add its queue and win nothing; and one query divides at a time - another that comes
+meanwhile reads on its own loop. The pool's threads, `ob-scan-0` … `ob-scan-N-1`, run under
+`SCHED_IDLE` and give their CPU up between batches, so a client loop woken onto one waits for a
+batch at most.
+
+**It is off under every profile**, and that is a measured choice (x86 test host, 4 vCPU, a 1.9 M-row
+store in ten segments). With four threads a query alone took half the time - 80 one-minute buckets
+of all of it 3.3 ms against 6.5, all of it in one column 14.8 ms against 25.5 - but **beside a writer
+it cost the writer 10-17% of its rate and its batch p99 went from about 40 µs to 50-160 µs** while
+the query ran, and four connections asking the bucket query at once answered 4% fewer of them. A
+node that takes writes should choose that rather than be given it; a node that mostly answers big
+queries - a replica kept for them - is where to turn it on, at one thread per CPU.
+`ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on the pool
+and on the queries' loops, and `ob_scan_threads` is N.
 
 ## Client event loops: `--io-threads`
 
@@ -631,7 +639,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: the profile's — 10 under `boost` where the process has a CPU to spare, 0 under `eco`). Costs up to one core per loop while traffic flows and takes ~18% off the loopback round trip |
 | `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: the profile's — one per usable CPU under `boost`, 1 under `eco`). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
-| `--scan-threads` | `<N>` | Threads a query's segments are read on, 0 to 64 (default: the profile's — one per usable CPU under `boost` where there are two or more, 0 under `eco`). A query whose rows in range are many and spread over two segments or more divides them among these, and its loop folds what each made in the segments' order, so the answer is the same bytes; 0 reads every segment on the query's loop ("A query on several cores: `--scan-threads`" below) |
+| `--scan-threads` | `<N>` | Threads a query's segments are read on, 0 to 64 (default: 0, under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, and its loop folds what each made in the segments' order, so the answer is the same bytes; 0 reads every segment on the query's loop. Beside writes it costs them, which is why it is off ("A query on several cores: `--scan-threads`" below) |
 | `--profile` | `<NAME>` | `boost` (default: one client event loop per usable CPU, and a 10 µs spin where it cannot starve anything) or `eco` (one loop, blocking between events). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |

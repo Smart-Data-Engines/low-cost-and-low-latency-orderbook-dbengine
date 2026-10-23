@@ -393,8 +393,7 @@ TEST(IoProfile, PrintConfigSaysWhatTheProfileChoseAndWhy) {
     EXPECT_LT(printed.find("# machine: "), printed.find("# profile boost: ")) << printed;
 
     const auto eco = resolve({"--profile", "eco"});
-    EXPECT_NE(ob::format_config(eco).find("# profile eco: 1 client event loop, blocking between events; "
-                                          "no scan pool\n"),
+    EXPECT_NE(ob::format_config(eco).find("# profile eco: 1 client event loop, blocking between events\n"),
               std::string::npos)
         << ob::format_config(eco);
 }
@@ -449,8 +448,7 @@ TEST(BoostRule, SpinsWhereTheProcessHasACpuToSpare) {
     EXPECT_EQ(c.io_threads, 4u);
     EXPECT_EQ(c.io_spin_us, ob::kBoostSpinUs);
     EXPECT_EQ(c.reason, "4 client event loops, one per usable CPU, and a " +
-                            std::to_string(ob::kBoostSpinUs) +
-                            " µs spin window; a scan pool of 4 threads, one per usable CPU");
+                            std::to_string(ob::kBoostSpinUs) + " µs spin window");
 }
 
 TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
@@ -461,36 +459,22 @@ TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
     EXPECT_EQ(c.io_spin_us, 0u);
     EXPECT_EQ(c.reason, "1 client event loop, one per usable CPU, and no spin: the only CPU this "
                         "process may run on is shared with its flush, the kernel and any client on "
-                        "this machine; no scan pool, as one usable CPU leaves none to read on");
+                        "this machine");
 }
 
-TEST(BoostRule, TheProfileSetsTheScanPoolUnlessTheOperatorDoes) {
-    // Applied as the loops are: what the operator gave wins, and what the profile set is the
-    // profile's in --print-config.
+TEST(BoostRule, NoProfileSetsAScanPool) {
+    // #246, stage 2: the pool is the operator's to ask for - measured beside a writer, a query on it
+    // cost the writer a tenth of its rate and more of its tail - so boost and eco leave it at 0, and
+    // a value given is the operator's.
     const auto silent = resolve({});
-    EXPECT_EQ(silent.config.scan_threads, ob::choose_boost(silent.machine).scan_threads);
-    EXPECT_EQ(silent.origin.at("scan-threads"), ob::Origin::Profile);
+    EXPECT_EQ(silent.config.scan_threads, 0u);
+    EXPECT_EQ(silent.origin.count("scan-threads"), 0u);
+    const auto eco = resolve({"--profile", "eco"});
+    EXPECT_EQ(eco.config.scan_threads, 0u);
     const auto given = resolve({"--scan-threads", "2"});
     EXPECT_EQ(given.config.scan_threads, 2u);
     EXPECT_EQ(given.origin.at("scan-threads"), ob::Origin::CommandLine);
-    EXPECT_NE(given.profile_choice.find("(scan-threads set by the operator)"), std::string::npos)
-        << given.profile_choice;
-    const auto eco = resolve({"--profile", "eco"});
-    EXPECT_EQ(eco.config.scan_threads, 0u);
-}
-
-TEST(BoostRule, AScanPoolOfOneThreadPerUsableCpuWhereThereAreTwo) {
-    // The loop a query runs on folds the parts and waits for the next (#246, stage 2), so the pool
-    // reads on every usable CPU; on one there is nothing for a pool to read on.
-    for (unsigned cpus : {1u, 2u, 3u, 4u, 8u, 16u}) {
-        EXPECT_EQ(ob::choose_boost(machine_of(cpus, std::nullopt, cpus)).scan_threads,
-                  cpus >= 2 ? cpus : 0u)
-            << cpus << " usable CPUs";
-    }
-    // Below the mask a cgroup limit decides, as for the loops.
-    EXPECT_EQ(ob::choose_boost(machine_of(4, 1.5, 1)).scan_threads, 0u);
-    EXPECT_EQ(ob::choose_boost(machine_of(8, 2.5, 2)).scan_threads, 2u);
-    EXPECT_EQ(ob::choose_boost(machine_of(200, std::nullopt, 200)).scan_threads, ob::kMaxScanThreads);
+    EXPECT_NE(ob::format_config(given).find("scan-threads"), std::string::npos);
 }
 
 TEST(BoostRule, NoSpinUnderALimitThatBinds) {

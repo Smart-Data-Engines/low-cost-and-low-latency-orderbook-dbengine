@@ -185,8 +185,10 @@ struct ServerConfig {
     uint32_t    io_threads{1};
     /// --scan-threads: the pool a query's segments are read on (#246, stage 2). A query whose rows
     /// in range are many and spread over two segments or more divides them among the pool's
-    /// threads, and its loop folds what they made in order. 0 reads every segment on the query's
-    /// loop, which is what this server always did.
+    /// threads, and its loop folds what they made in order. 0 - the default under every profile -
+    /// reads every segment on the query's loop, which is what this server always did: measured
+    /// beside a writer, a query on the pool cost the writer 10-17% of its rate and up to three
+    /// times its p99 while it ran, which a node taking writes should choose rather than be given.
     uint32_t    scan_threads{0};
 
     // Replication (primary)
@@ -456,7 +458,6 @@ inline constexpr uint32_t kMaxScanThreads = 64;
 struct BoostChoice {
     uint32_t    io_threads{1};
     uint64_t    io_spin_us{0};
-    uint32_t    scan_threads{0};
     std::string reason;
 };
 
@@ -473,11 +474,9 @@ struct BoostChoice {
 ///   process may run on, a spinning loop holds it from everything else there: a client sharing it
 ///   measured a p99 of 5.9 µs without the spin and 13.7 µs with it. Under a limit, spinning spends
 ///   the limit, and a cgroup over it stops every thread until the next period.
-/// - **a scan pool of one thread per usable CPU** (#246, stage 2), where there are two or more. The
-///   loop a query runs on folds the parts and waits for the next one, so it reads none: on the x86
-///   host four threads took 80 buckets of 1.9 M rows in 3.30-3.32 ms where three took 4.13-4.19,
-///   and a query that read a part of its own while it waited was slower still (3.80-3.82). On one
-///   CPU there is nothing for a pool to read on.
+///
+/// It sets no scan pool (#246, stage 2): `--scan-threads` is 0 under every profile, for the reason
+/// given beside `ServerConfig::scan_threads`.
 ///
 /// Pure, like `detect_machine()`: the same machine gives the same choice.
 BoostChoice choose_boost(const MachineResources& machine);
