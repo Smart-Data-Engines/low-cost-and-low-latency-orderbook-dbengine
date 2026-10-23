@@ -285,6 +285,28 @@ private:
     uint64_t rows_{0};
 };
 
+/// A part that records the rows of each step it is handed and stops at the batch's row `stop_at`.
+class SteppedPart final : public ob::ScanPart {
+public:
+    explicit SteppedPart(uint64_t stop_at) : stop_at_(stop_at) {}
+    ob::BatchVerdict take(const ob::RowBatch& b) override {
+        steps.push_back(b.rows.size());
+        for (size_t k = 0; k < b.rows.size(); ++k) {
+            seen.push_back(b.rows[k]);
+            if (rows_++ == stop_at_) return {true, k};
+        }
+        return {};
+    }
+    uint64_t rows() const override { return rows_; }
+
+    std::vector<size_t> steps;
+    std::vector<uint32_t> seen;
+
+private:
+    uint64_t stop_at_;
+    uint64_t rows_{0};
+};
+
 void ten_segments(Store& s) {
     for (uint64_t g = 0; g < 10; ++g) {
         std::vector<ob::SnapshotRow> rows;
@@ -294,6 +316,29 @@ void ten_segments(Store& s) {
 }
 
 }  // namespace
+
+TEST(ScanParts, APoolThreadHandsAPartItsBatchAStepAtATimeAndKeepsItsStop) {
+    // A batch of 1 000 chosen rows, every third row of the candidate's: on a pool thread the part is
+    // handed 128 rows at a time (#248), and a stop at the batch's row 700 - row 60 of the sixth step -
+    // is the batch's row 700, after which nothing more of the batch is handed over.
+    std::vector<uint32_t> chosen;
+    for (uint32_t i = 0; i < 1000; ++i) chosen.push_back(3 * i);
+    ob::RowBatch batch{};
+    batch.rows = chosen;
+
+    SteppedPart whole(UINT64_MAX);
+    EXPECT_FALSE(ob::take_in_steps(whole, batch).stop);
+    EXPECT_EQ(whole.steps, (std::vector<size_t>{128, 128, 128, 128, 128, 128, 128, 104}));
+    EXPECT_EQ(whole.seen, chosen);
+
+    SteppedPart stopping(700);
+    const ob::BatchVerdict v = ob::take_in_steps(stopping, batch);
+    EXPECT_TRUE(v.stop);
+    EXPECT_EQ(v.at, 700u) << "a stop in a later step was not said of the batch";
+    EXPECT_EQ(stopping.steps, (std::vector<size_t>{128, 128, 128, 128, 128, 128}));
+    ASSERT_EQ(stopping.seen.size(), 701u);
+    EXPECT_EQ(stopping.seen.back(), chosen[700]);
+}
 
 TEST(ScanParts, ALimitReadsNoCandidateItWillNotNeed) {
     // Ten segments of 500 rows. A LIMIT the first one's rows may meet is read on the query's
