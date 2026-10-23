@@ -531,6 +531,10 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
         for (const uint64_t as_of : combined_store_.book_summaries(first.symbol, first.exchange)) {
             held.insert(book_summary_file(as_of));
         }
+        // And the best tracks beside them (#243), on the same rule.
+        for (const uint64_t as_of : combined_store_.best_tracks(first.symbol, first.exchange)) {
+            held.insert(best_track_file(as_of));
+        }
         size_t carried = 0;
         for (const SegmentMeta& in : inputs) {
             std::error_code ec;
@@ -547,8 +551,8 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
                     fs::copy_file(entry.path(), to, fs::copy_options::overwrite_existing, lec);
                 }
                 if (lec) {
-                    OB_LOG_WARN("engine", "compaction: book summary %s not carried into the merge of "
-                                          "%s.%s: %s", entry.path().c_str(), first.symbol.c_str(),
+                    OB_LOG_WARN("engine", "compaction: %s not carried into the merge of %s.%s: %s",
+                                entry.path().c_str(), first.symbol.c_str(),
                                 first.exchange.c_str(), lec.message().c_str());
                     continue;
                 }
@@ -556,7 +560,8 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
             }
         }
         if (carried > 0) {
-            OB_LOG_DEBUG("engine", "compaction: %zu book summar%s carried into the merge of %s.%s",
+            OB_LOG_DEBUG("engine", "compaction: %zu book summar%s and best track(s) carried into the "
+                                   "merge of %s.%s",
                          carried, carried == 1 ? "y" : "ies", first.symbol.c_str(),
                          first.exchange.c_str());
         }

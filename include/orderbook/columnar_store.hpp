@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/best_track.hpp"
 #include "orderbook/book_summary.hpp"
 #include "orderbook/column_codec.hpp"
 #include "orderbook/data_model.hpp"
@@ -7,6 +8,7 @@
 #include "orderbook/query_columns.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -45,13 +47,14 @@ inline constexpr bool columnar_format_readable(uint32_t version) {
 /// The file a version-3 segment holds its columns in.
 inline constexpr const char* kColumnsV3File = "columns.v3";
 /// Whether `filename` is one of a segment's files, in either format: its `meta.json`, format 2's
-/// column files (`*.col`) or format 3's `columns.v3` - what a snapshot, a backup and a shard
-/// migration carry. One definition: a snapshot that matched `*.col` alone shipped format-3
-/// segments without their data, and a replica bootstrapped from it held none of their rows.
+/// column files (`*.col`) or format 3's `columns.v3`, and the book summaries and best tracks beside
+/// them - what a snapshot, a backup and a shard migration carry. One definition: a snapshot that
+/// matched `*.col` alone shipped format-3 segments without their data, and a replica bootstrapped
+/// from it held none of their rows.
 inline bool is_segment_file(std::string_view filename) {
     return filename == "meta.json" || filename == kColumnsV3File ||
            (filename.size() > 4 && filename.substr(filename.size() - 4) == ".col") ||
-           is_book_summary_file(filename);
+           is_book_summary_file(filename) || is_best_track_file(filename);
 }
 
 /// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets a
@@ -711,12 +714,41 @@ public:
         size_t bytes{0};
         uint64_t rows_read{0};          ///< rows applied after the summary it started from
         std::string why_not;            ///< empty when written
+        /// The best track written beside it (#243): its entries and bytes, or why there is none.
+        size_t track_entries{0};
+        size_t track_bytes{0};
+        std::string track_why_not;
     };
     SummaryWrite write_book_summary(std::string_view symbol, std::string_view exchange,
                                     const std::string& dir);
 
     /// The times of a symbol's summaries, oldest first: what a read can start from.
     std::vector<uint64_t> book_summaries(std::string_view symbol, std::string_view exchange) const;
+    /// The times of a symbol's best tracks, oldest first (#243): each is as of the summary it ends at.
+    std::vector<uint64_t> best_tracks(std::string_view symbol, std::string_view exchange) const;
+
+    /// What tops_by_time() read.
+    struct TopsCost {
+        size_t before_read{0};        ///< candidates of a book composed before `lo`, when one was
+        size_t before_skipped{0};
+        TimeOrderedCost rows{};       ///< the rows read, over every stretch read by rows
+        size_t row_stretches{0};
+        size_t tracks{0};             ///< best tracks read
+        uint64_t track_entries{0};    ///< their entries handed over
+        bool stopped{false};          ///< whether `on_instant` ended it
+    };
+    /// The best of each side of a symbol's book through [lo, read_to], for a series (#243):
+    /// `on_start` gets the best in force just before `lo`, then `on_instant` the best after each
+    /// instant of the range at which it changed, in time order - false from it ends the read. Read
+    /// from the best tracks where they cover the range, and from the rows by price elsewhere, which
+    /// answer the same: a track is what composing those rows yielded when it was written.
+    TopsCost tops_by_time(uint64_t lo, uint64_t read_to, std::string_view symbol,
+                          std::string_view exchange,
+                          const std::function<void(const BookTop&)>& on_start,
+                          const std::function<bool(uint64_t, const BookTop&)>& on_instant) const;
+    /// Whether tops_by_time() reads the best tracks. On; a test turns it off to compare the rows'
+    /// answer with the tracks'.
+    void set_read_best_tracks(bool on) { read_best_tracks_.store(on, std::memory_order_relaxed); }
 
     /// Every symbol the index holds, with its exchange: the ones holding a segment or a published
     /// block. For a start that rebuilds what is kept per symbol (#235).
@@ -897,6 +929,9 @@ private:
     SegmentFormat segment_format_{};
     uint32_t segments_since_search_{0};
     bool has_last_choice_{false};
+    // Whether a series reads the best tracks (#243): set_read_best_tracks(). Atomic, because a test
+    // may turn it while queries run.
+    std::atomic<bool> read_best_tracks_{true};
     std::array<column_codec::Encoding, 7> last_choice_{};
 
     // Accumulation buffers for the active segment
@@ -955,6 +990,14 @@ private:
         /// time it is as of. A summary leaves this map before any row it does not hold, at or before
         /// that time, can be read - `publish_blocks()` - and with the segment it is in.
         std::map<uint64_t, std::string> summaries;
+        /// The best tracks of this symbol (#243, `best_track.hpp`), by the time each is as of - that
+        /// of the summary it ends at - with the time it starts from. A track leaves this map with
+        /// its summary: the same late row falsifies both, and the same segment carries both.
+        struct TrackRef {
+            uint64_t from_ts{0};
+            std::string path;
+        };
+        std::map<uint64_t, TrackRef> tracks;
         /// The time a summary being written is as of, and whether a row at or before it was
         /// published while it was: such a summary could lack that row (`write_book_summary()`).
         std::optional<uint64_t> pending_summary;
@@ -975,6 +1018,11 @@ private:
     void gather_locked(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
                        std::string_view exchange, std::optional<uint64_t> summary_at,
                        Gathered& out) const;
+    /// book_at_by_price(), and with `track` - when given - the best of each side at the instant the
+    /// composition started from and after every instant at which it changed (#243): what
+    /// write_book_summary() writes beside the summary. The caller sets the track's `as_of_ts`.
+    PricedBook compose_by_price(uint64_t at, std::string_view symbol, std::string_view exchange,
+                                size_t depth, BestTrack* track) const;
     /// scan_by_time() over what gather_locked() took.
     TimeOrderedCost scan_gathered(const Gathered& g, uint64_t start_ns, uint64_t end_ns,
                                   std::string_view symbol, std::string_view exchange,
