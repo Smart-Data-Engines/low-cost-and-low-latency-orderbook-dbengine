@@ -98,7 +98,9 @@ def ask(port: int, sql: str) -> bytes:
 
 
 def load(port: int) -> None:
-    """Eight segments, each its own hour and its own FLUSH, prices and quantities moving."""
+    """Eight segments, each its own hour and its own FLUSH, prices and quantities moving - and each
+    segment's from its own start, or a bucket's FIRST and LAST would read the same from any of
+    them and the merge of parts could take the wrong one unseen."""
     with socket.create_connection(("127.0.0.1", port), timeout=patience(60)) as sock:
         sock.recv(4096)                           # the banner
         for segment in range(SEGMENTS):
@@ -108,8 +110,9 @@ def load(port: int) -> None:
                 side = "bid" if u % 2 == 0 else "ask"
                 lines.append(f"MINSERT SP EX {side} {LEVELS} {ts}")
                 for level in range(LEVELS):
-                    price = 100_000 + (u % 37) * 10 + (-level if side == "bid" else level + 1)
-                    lines.append(f"{price} {1 + (u * 7 + level) % 50}")
+                    price = (100_000 + segment * 100 + (u % 37) * 10
+                             + (-level if side == "bid" else level + 1))
+                    lines.append(f"{price} {1 + (u * 7 + level + segment * 3) % 50}")
             sock.sendall(("\n".join(lines) + "\nFLUSH\n").encode())
             want = b"OK\n\n" * (UPDATES + 1)
             got = bytearray()
