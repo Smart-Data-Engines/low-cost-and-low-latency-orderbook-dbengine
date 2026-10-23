@@ -2880,7 +2880,7 @@ file: they rotate at 512 MB and stay.
 replays at an open the records after the last one into the stores and the books, then flushes them.
 Files wholly before the last checkpoint can then go.
 
-**Closed** (23 October 2026), as the fix above says, with three more rules from the server:
+**Closed in PR #278** (23 October 2026), as the fix above says, with three more rules from the server:
 - **The position a segment records.** A segment records the WAL identity and where its last record
   starts, and the replay skips a record a segment holds by that position. That closes the window
   between a flush's segments and its checkpoint (#63). A segment of an older build records none and

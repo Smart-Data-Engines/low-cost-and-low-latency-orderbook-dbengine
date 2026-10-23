@@ -4445,10 +4445,10 @@ warns about it.
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)
 where one is before their instant; `MREPLACE` replaces a side whole; and a start rebuilds every live
-book from the store (pitfalls 568, 569, 598). **#244**: the C API has `ob_flush()`, so a local flush
-no longer reopens the engine. **#245 is closed**: the embedded engine replays its WAL from its last
-checkpoint when it opens, and a flush syncs its segments before the checkpoint claims them (pitfall
-601).
+book from the store (pitfalls 568, 569, 598). **#244** (PR #276): the C API has `ob_flush()`, so a
+local flush no longer reopens the engine. **#245 is closed** (PR #278): the embedded engine replays
+its WAL from its last checkpoint when it opens, and a flush syncs its segments before the checkpoint
+claims them (pitfall 601).
 
 **#197 is closed**: a snapshot install and a discard begin a new WAL lineage, so a replica that had
 bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step
