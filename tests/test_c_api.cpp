@@ -572,6 +572,22 @@ TEST_F(CApiTest, AClosedEngineEndsItsWalWithACheckpoint) {
     EXPECT_EQ(capi_history(engine, "CL"), (std::vector<PriceQty>{{100, 1}}));
 }
 
+namespace {
+
+/// What one `ob_flush()` logs, at DEBUG.
+std::string flush_logged(ob_engine_t* engine, ob_status_t& status) {
+    auto& logger = ob::StructuredLogger::instance();
+    const ob::LogLevel was = logger.level();
+    logger.set_level(ob::LogLevel::DEBUG);
+    testing::internal::CaptureStderr();
+    status = ob_flush(engine);
+    const std::string said = testing::internal::GetCapturedStderr();
+    logger.set_level(was);
+    return said;
+}
+
+}  // namespace
+
 TEST_F(CApiTest, AFlushTakesItsSegmentsToTheDeviceBeforeItsCheckpointClaimsThem) {
     // #160's rule, which the server's flush keeps: a checkpoint claims only rows on the device. One
     // that claimed rows still in the page cache - and a close syncs the WAL, so it would be on the
@@ -581,17 +597,11 @@ TEST_F(CApiTest, AFlushTakesItsSegmentsToTheDeviceBeforeItsCheckpointClaimsThem)
     uint64_t q[] = {1};
     uint32_t c[] = {1};
     ASSERT_EQ(ob_apply_delta(engine, "SY", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
-    auto& logger = ob::StructuredLogger::instance();
-    const ob::LogLevel was = logger.level();
-    logger.set_level(ob::LogLevel::DEBUG);
-    testing::internal::CaptureStderr();
-    const ob_status_t flushed = ob_flush(engine);
-    const std::string said = testing::internal::GetCapturedStderr();
+    ob_status_t flushed = OB_C_ERR_INTERNAL;
+    const std::string said = flush_logged(engine, flushed);
     // With nothing new a flush claims nothing, and it waits for no device: what #244 measured.
-    testing::internal::CaptureStderr();
-    const ob_status_t again = ob_flush(engine);
-    const std::string said_again = testing::internal::GetCapturedStderr();
-    logger.set_level(was);
+    ob_status_t again = OB_C_ERR_INTERNAL;
+    const std::string said_again = flush_logged(engine, again);
     ASSERT_EQ(flushed, OB_C_OK);
     ASSERT_EQ(again, OB_C_OK);
     const auto synced = said.find("the segments and the WAL synced in");
@@ -603,6 +613,46 @@ TEST_F(CApiTest, AFlushTakesItsSegmentsToTheDeviceBeforeItsCheckpointClaimsThem)
         << "a flush with nothing new synced:\n" << said_again;
     EXPECT_EQ(said_again.find("Checkpoint appended"), std::string::npos)
         << "a flush with nothing new appended a checkpoint:\n" << said_again;
+}
+
+TEST_F(CApiTest, TheFirstFlushAfterAnOpenSyncsOnlyWhatNoCheckpointClaims) {
+    // A fresh directory, and one a close ended with a checkpoint, hold nothing a checkpoint has to
+    // claim: the first flush after the open, with nothing written, waits for no device.
+    ob_status_t status = OB_C_ERR_INTERNAL;
+    std::string said = flush_logged(engine, status);
+    ASSERT_EQ(status, OB_C_OK);
+    EXPECT_EQ(said.find("synced in"), std::string::npos) << "a fresh directory:\n" << said;
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "FF", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+    said = flush_logged(engine, status);
+    ASSERT_EQ(status, OB_C_OK);
+    EXPECT_EQ(said.find("synced in"), std::string::npos) << "after a close:\n" << said;
+    EXPECT_EQ(said.find("Checkpoint appended"), std::string::npos) << "after a close:\n" << said;
+    EXPECT_EQ(capi_history(engine, "FF"), (std::vector<PriceQty>{{100, 1}}));
+
+    // Records after the last checkpoint that the segments already hold are another matter: the
+    // first flush checkpoints them, so that the next open does not read them again.
+    p[0] = 101;
+    ASSERT_EQ(ob_apply_delta(engine, "FF", "EX", 2, 2000ULL, p, q, c, 1, 0), OB_C_OK);
+    const auto files = wal_files(dir);
+    ASSERT_FALSE(files.empty());
+    const auto before_flush = fs::file_size(files.back());
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    const CrashImage image(dir, "held");
+    fs::resize_file(fs::path(image.path) / fs::path(files.back()).filename(), before_flush);
+    ob_engine_t* reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    said = flush_logged(reopened, status);
+    EXPECT_EQ(status, OB_C_OK);
+    EXPECT_NE(said.find("Checkpoint appended"), std::string::npos)
+        << "records the segments hold were left for the next open to read again:\n" << said;
+    EXPECT_EQ(sorted(capi_history(reopened, "FF")), (std::vector<PriceQty>{{100, 1}, {101, 1}}));
+    ob_engine_destroy(reopened);
 }
 
 TEST_F(CApiTest, ASegmentOfAnOlderBuildIsJudgedByTheTimeOfItsLastRow) {

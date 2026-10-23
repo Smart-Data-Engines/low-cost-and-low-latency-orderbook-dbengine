@@ -357,8 +357,17 @@ struct ob_engine {
             ++applied;
             rows += update.n_levels;
         });
-        // A failed sync is the freeze's to report; the replayed rows are readable either way.
-        if (applied > 0) (void)flush_locked();
+        if (applied > 0) {
+            // A failed sync is the freeze's to report; the replayed rows are readable either way.
+            (void)flush_locked();
+        } else if (records == 0) {
+            // Nothing after the last checkpoint, or no record at all: the WAL as it ends needs no
+            // checkpoint, so a flush with nothing new claims nothing and waits for no device. With
+            // records the segments already hold, the first flush checkpoints them, so that the next
+            // open does not read them again.
+            checkpointed_at  = wal.current_position();
+            has_checkpointed = true;
+        }
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - started).count();
         OB_LOG_INFO("c_api", "WAL replay: %llu record(s) after the last checkpoint, %llu update(s) "
