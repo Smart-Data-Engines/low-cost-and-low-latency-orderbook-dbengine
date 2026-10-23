@@ -189,7 +189,11 @@ jobs:
   integration-tests:
     name: integration-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The battery took 37:39-37:58 on the runs of 5dc1faa, ddb8a0d and 6685016, and the job 40-41
+    # minutes with its build. PR #276's run was canceled at 85%, every test so far passing, after its
+    # apt step took 5:44 on a mirror serving 45 kB/s, where it takes ten seconds. The margin, not a
+    # slower suite, as the TSan job's was after PR #200.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -807,9 +811,13 @@ jobs:
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
           OB_KEEP_FAILED_NODE_LOGS: ${{ github.workspace }}/failed-node-logs
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
+        # The limit of each test is three times pytest.ini's, as every wait in the suite is under a
+        # sanitizer (patience()). At 120 s a test was cut before its own tripled wait could end, and
+        # a replica that had not caught up read as a timeout rather than as the assertion saying how
+        # many rows it held (test_compaction.py, on PR #277).
         run: |
           set -o pipefail
-          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs \
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs --timeout=360 \
             --ignore=tests/integration/test_binance_live.py \
             --ignore=tests/integration/test_binance_failover_sync.py \
             --junitxml=tsan-integration-report.xml \

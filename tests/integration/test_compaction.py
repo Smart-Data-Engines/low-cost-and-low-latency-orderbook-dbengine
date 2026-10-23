@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
-from conftest import free_port, patience, server_binary_path
+from conftest import FAILED_TESTS, free_port, keep_logs_of, patience, server_binary_path
 
 pytestmark = pytest.mark.crash_recovery
 
@@ -198,9 +201,38 @@ def lowest_wal_file(data_dir: str) -> int:
     return min(indices)
 
 
+@contextmanager
+def node_dirs(*prefixes: str) -> Iterator[list[str]]:
+    """Data directories for this module's own nodes, removed at the end.
+
+    When the test failed, the nodes' logs are copied to `OB_KEEP_FAILED_NODE_LOGS` first, as a
+    cluster's are (`keep_logs_of`). A failure shows here two ways: as an exception through the
+    `with` in a test's body, and as a report already made, in a fixture's teardown. These nodes are
+    not a cluster's, so before this a failure here kept nothing of theirs. A replica that did not
+    hold the primary's rows in the TSan battery left no trace of why.
+    """
+    dirs = [tempfile.mkdtemp(prefix=p) for p in prefixes]
+    raised = False
+    try:
+        yield dirs
+    except BaseException:
+        raised = True
+        raise
+    finally:
+        test = os.environ.get("PYTEST_CURRENT_TEST", "test_compaction.py").rsplit(" ", 1)[0]
+        keep = os.environ.get("OB_KEEP_FAILED_NODE_LOGS")
+        if keep and (raised or test in FAILED_TESTS):
+            try:
+                print(f"\nNode logs of {test} kept in {keep_logs_of(dirs, [test], keep)}")
+            except Exception as exc:  # noqa: BLE001 - keeping logs must not fail the test's end
+                print(f"\nNode logs of {test} could not be kept: {exc!r}")
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 @pytest.fixture
 def node():
-    with tempfile.TemporaryDirectory(prefix="ob_compaction_") as d:
+    with node_dirs("ob_compaction_") as (d,):
         n = Node(d)
         try:
             n.start()
@@ -302,8 +334,7 @@ def test_queries_while_merges_run_see_each_row_once_and_in_order(node):
 
 
 def test_a_replica_bootstrapped_while_the_primary_merges_holds_every_row_once():
-    with tempfile.TemporaryDirectory(prefix="ob_compaction_p_") as pdir, \
-            tempfile.TemporaryDirectory(prefix="ob_compaction_r_") as rdir:
+    with node_dirs("ob_compaction_p_", "ob_compaction_r_") as (pdir, rdir):
         repl_port = free_port()
         # Small WAL files, so retention has taken the first ones by the time the replica asks, and
         # the primary answers WAL_TRUNCATED: the replica bootstraps from a snapshot.

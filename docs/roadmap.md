@@ -2965,8 +2965,8 @@ whole sides.
 written at the seal beside the book summaries, would be kept true the same way: a row published
 later at or before a track's time removes the track.
 
-**Closed** (23 October 2026), with the track beside each book summary rather than each segment (spec
-`specs/best-price-track/` in the workspace).
+**Closed in PR #279** (23 October 2026), with the track beside each book summary rather than each
+segment (spec `specs/best-price-track/` in the workspace).
 - **What a track is.** `best.<as_of>.v1` holds the best of each side after every instant at which it
   changed, from the summary the composition started from to its own. It is written from the
   composition that writes the summary, without a second pass over the rows.
