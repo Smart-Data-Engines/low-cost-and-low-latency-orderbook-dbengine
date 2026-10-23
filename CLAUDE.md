@@ -4498,8 +4498,8 @@ Learned the hard way. Check here before debugging.
 614. **A pool measured alone is half of what it costs.** On the x86 host #246's query was 1.6-1.8
      times as fast on four threads, and the same query cost a writer on the same node 8-20% of its
      levels a second and four query connections 8-10% of their answers: where the connections' loops
-     already use every CPU, the pool's threads only compete with them. The spec had `boost` turn the pool on; measured
-     beside other work, it is off under every profile and an operator's choice.
+     already use every CPU, the pool's threads only compete with them. The spec had `boost` turn the
+     pool on; measured beside other work, it is off under every profile and an operator's choice.
 615. **A test of what writeback cleans passes for nothing on a tmpfs.** #242's test that the WAL a
      thread hands to writeback is dirty no longer read the file's dirty pages with `cachestat(2)` -
      in `/tmp`, a tmpfs on the machines here, which has no backing store, so none of its pages is ever
@@ -4511,6 +4511,12 @@ Learned the hard way. Check here before debugging.
      30 MB/s where master's syncs kept it at 98-99%, and the node 13-19% fewer levels a second.
      #190's `d6` had done the same with fewer ticks alone. Why the device idles is not established;
      a design that syncs less is measured against the cap before anything else is built on it.
+618. **Code scanning reads a static function called only from a lambda behind `std::function` as
+     unreachable.** #246's `merge_later()`, a function of the file, had one caller, the fold's lambda,
+     which `scan_parts()` calls through `PartsScan::fold`: CodeQL's `cpp/unused-static-function`
+     raised alert 113 on it, and its review thread held the pull request, which requires threads
+     resolved. Made a member of the struct it merges, as `BucketFiller::take()` is, the next analysis
+     closed the alert and its thread - nothing dismissed.
 
 ## Current state and open problems
 
@@ -4544,13 +4550,14 @@ carries no count, because the previous version of this sentence said "four" abov
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
 
-**#246's stage 1**: a scan hands its rows over a batch at a time - a candidate's columns and the
-rows chosen from them - and the server formats a row answer from the columns (`RowAnswer`); a
-190 000-row answer and a bucket query take 1.46 and 1.93 times less on one core, with the same
-bytes (pitfalls 609, 610). **Stage 2**: with `--scan-threads N` a query of many rows over several
-segments reads them on N threads and folds the parts in order, the same bytes, 1.6-2.9 times as fast
-on four; it is off under every profile, because on the x86 test host it cost a writer on the same
-node 8-20% of its rate, where on the ARM host it cost nothing measurable (pitfalls 611-614).
+**#246 is closed by its two stages** (PR #281, PR #287). Stage 1: a scan hands its rows over a
+batch at a time - a candidate's columns and the rows chosen from them - and the server formats a
+row answer from the columns (`RowAnswer`); a 190 000-row answer and a bucket query take 1.46 and
+1.93 times less on one core, with the same bytes (pitfalls 609, 610). Stage 2: with
+`--scan-threads N` a query of many rows over several segments reads them on N threads and folds the
+parts in order, the same bytes, 1.6-2.9 times as fast on four. It is off under every profile,
+because on the x86 test host it cost a writer on the same node 8-20% of its rate, where on the ARM
+host it cost nothing measurable; making it cheap on the first is #248 (pitfalls 611-614, 618).
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)
