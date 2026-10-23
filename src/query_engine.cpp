@@ -1817,19 +1817,24 @@ struct PartBucket {
         const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
         if (__builtin_add_overflow(abs_px_qty, size, &abs_px_qty)) abs_overflow = true;
     }
+
+    /// This part's rows after those `into` holds, as one bucket: what adding them one by one in
+    /// that order would have left. FIRST keeps the earlier part's unless this one's time is strictly
+    /// earlier, LAST takes this part's at an equal time or a later one - the tie broken by the order
+    /// the scan delivers rows in, as a row's own add() breaks it (#168).
+    ///
+    /// False when that cannot be told from the two states. The sum of price times quantity refuses
+    /// VWAP once any sum on the way left 128 bits, so where in this part a sum strayed is part of
+    /// the answer; a part's own sums start at zero. When the sizes of this part's products, added to
+    /// the size of the sum it starts from, stay inside 128 bits, no sum on the way can have left
+    /// them, and the sum is exact. Otherwise - only with prices and quantities near 2^63 and 2^64 -
+    /// it is not told. A member rather than a function of the file: called only from the fold's
+    /// lambda, a static function read as unreachable to code scanning (alert 113).
+    bool merge_into(BucketState& into) const;
 };
 
-/// `later`'s rows after those `into` holds, as one bucket: what adding them one by one in that
-/// order would have left. FIRST keeps the earlier part's unless the later one's time is strictly
-/// earlier, LAST takes the later part's at an equal time or a later one - the tie broken by the
-/// order the scan delivers rows in, as a row's own add() breaks it (#168).
-///
-/// False when that cannot be told from the two states. The sum of price times quantity refuses
-/// VWAP once any sum on the way left 128 bits, so where in `later` a sum strayed is part of the
-/// answer; a part's own sums start at zero. When the sizes of `later`'s products, added to the size
-/// of the sum it starts from, stay inside 128 bits, no sum on the way can have left them, and the
-/// sum is exact. Otherwise - only with prices and quantities near 2^63 and 2^64 - it is not told.
-bool merge_later(BucketState& into, const PartBucket& later) {
+bool PartBucket::merge_into(BucketState& into) const {
+    const PartBucket& later = *this;
     const BucketState& l = later.state;
     if (l.count == 0) return true;
     if (into.count == 0) {
@@ -1926,8 +1931,8 @@ struct BucketFiller {
 };
 
 /// One candidate's buckets (#246, stage 2), filled where the candidate is read and merged into the
-/// query's in the candidates' order by `merge_later()`. A part past the ceiling on its own ends the
-/// scan as the query's map past it would.
+/// query's in the candidates' order by `PartBucket::merge_into()`. A part past the ceiling on its
+/// own ends the scan as the query's map past it would.
 class BucketPart final : public ScanPart {
 public:
     BucketPart(uint64_t width, size_t ceiling) : filler_{width, ceiling, buckets} {}
@@ -1949,7 +1954,8 @@ private:
 /// With a pool of threads, each candidate's buckets are filled where it is read and merged here in
 /// the candidates' order (#246, stage 2): the same buckets one thread would have filled. Where a
 /// merge cannot tell that - a sum of price times quantity whose size could have left 128 bits part
-/// way, which `merge_later()` explains - the rows are read again on this thread, and that is said.
+/// way, which `PartBucket::merge_into()` explains - the rows are read again on this thread, and
+/// that is said.
 bool bucket_rows(const ColumnarStore& store, ScanPool* pool, bool divide_small, const QueryAST& ast,
                  uint64_t from, uint64_t to, size_t ceiling,
                  std::unordered_map<uint64_t, BucketState>& buckets, uint64_t& rows) {
@@ -1998,7 +2004,7 @@ bool bucket_rows(const ColumnarStore& store, ScanPool* pool, bool divide_small, 
                 too_many = true;
                 return false;
             }
-            if (!merge_later(it->second, later)) {
+            if (!later.merge_into(it->second)) {
                 untold = true;
                 return false;
             }
