@@ -348,7 +348,7 @@ TEST(ScanParts, WithNothingToDivideTheScanIsTheDirectReaderAndNoPartIsMade) {
     s.segment({row(kBase, 0, 0, 7, 1, 1), row(kBase + 1, 0, 0, 8, 1, 2)});
     ob::ScanPool pool(2, nullptr), none(0, nullptr);
     for (ob::ScanPool* p : {static_cast<ob::ScanPool*>(nullptr), &none, &pool}) {
-        int made = 0;
+        std::atomic<int> made{0};
         uint64_t direct = 0;
         ob::PartsScan how;
         how.pool = p;
@@ -363,7 +363,7 @@ TEST(ScanParts, WithNothingToDivideTheScanIsTheDirectReaderAndNoPartIsMade) {
         };
         how.fold = [](ob::ScanPart&) { return true; };
         s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
-        EXPECT_EQ(made, 0) << "one candidate was divided";
+        EXPECT_EQ(made.load(), 0) << "one candidate was divided";
         EXPECT_EQ(direct, 2u);
     }
 }
@@ -467,7 +467,7 @@ TEST(ScanParts, AScanAPoolCannotSpeedUpIsReadOnItsQuerysThread) {
     const auto at = [](uint64_t index) { return kBase + index * 1000; };
     ob::ScanPool pool(2, nullptr);
     const auto parts_made = [&](uint64_t from, uint64_t to) {
-        int made = 0;
+        std::atomic<int> made{0};
         ob::PartsScan how;
         how.pool = &pool;
         how.direct = [](const ob::RowBatch&) -> ob::BatchVerdict { return {}; };
@@ -477,7 +477,7 @@ TEST(ScanParts, AScanAPoolCannotSpeedUpIsReadOnItsQuerysThread) {
         };
         how.fold = [](ob::ScanPart&) { return true; };
         s.store.scan_parts(from, to, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
-        return made;
+        return made.load();
     };
     EXPECT_EQ(parts_made(at(first_of[2]), at(next - 1)), 8);
     EXPECT_EQ(parts_made(at(first_of[2] - 2000), at(first_of[2] + 1999)), 0)
@@ -529,7 +529,7 @@ TEST(ScanParts, AScanFindingThePoolDividedAlreadyReadsOnItsOwnThread) {
     for (int i = 0; i < 5000 && !first_out; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     ASSERT_TRUE(first_out.load()) << "the first scan never handed a part out";
 
-    int made = 0;
+    std::atomic<int> made{0};
     uint64_t direct = 0;
     ob::PartsScan how;
     how.pool = &pool;
@@ -546,7 +546,7 @@ TEST(ScanParts, AScanFindingThePoolDividedAlreadyReadsOnItsOwnThread) {
     s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
     release = true;
     first.join();
-    EXPECT_EQ(made, 0) << "the second scan divided while the first held the pool";
+    EXPECT_EQ(made.load(), 0) << "the second scan divided while the first held the pool";
     EXPECT_EQ(direct, 5000u);
     EXPECT_EQ(first_rows, 5000u);
     EXPECT_TRUE(pool.claim()) << "the first scan kept the pool after it ended";
