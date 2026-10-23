@@ -5,11 +5,9 @@
 #include "orderbook/logger.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/wal.hpp"
-#include "orderbook/wall_clock.hpp"
 
 #include <fcntl.h>
 #include <pthread.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -188,7 +186,7 @@ void WalArchiver::run() {
     std::unique_lock<std::mutex> lock(mtx_);
     while (!stop_) {
         lock.unlock();
-        if (!refused()) {
+        {
             // The bound before the lineage. A new lineage begins in the file the writer is in, so a
             // bound read before `set_lineage()` is at most that file's index and names only files of
             // the old lineage; read the other way round, an old lineage could be paired with a bound
@@ -208,8 +206,11 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
     std::lock_guard<std::mutex> pass_lock(pass_mtx_);
     Pass out;
     if (refused()) {
+        // Counted at every pass for as long as it lasts, so that an alert on the counter stays on
+        // until an operator puts the archive right and restarts the node. Said once, when found.
         out.refused = true;
         out.failure = "archiving stopped at a file in the archive with other contents";
+        if (registry_) registry_->increment_counter("ob_wal_archive_failures_total");
         return out;
     }
 
@@ -353,21 +354,10 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
         }
     }
 
-    // What is left, for the gauges: the closed files from the held_from on, and how long the oldest has
-    // waited since it was last written.
-    int64_t oldest_s = 0;
+    // What is left: the closed files from the floor on. The gauges are the engine's flush tick's,
+    // from `archived_before()` - a pass that never ends could not report itself.
     for (const auto& [index, name] : files) {
-        if (index < held_from) continue;
-        ++out.pending;
-        struct stat st{};
-        if (oldest_s == 0 && ::stat((wal_dir_ + "/" + name).c_str(), &st) == 0) {
-            const auto now_s = static_cast<int64_t>(wall_clock_ns() / 1'000'000'000ULL);
-            oldest_s = std::max<int64_t>(0, now_s - static_cast<int64_t>(st.st_mtime));
-        }
-    }
-    if (registry_) {
-        registry_->set_gauge("ob_wal_archive_pending_files", static_cast<int64_t>(out.pending));
-        registry_->set_gauge("ob_wal_archive_oldest_pending_seconds", oldest_s);
+        if (index >= held_from) ++out.pending;
     }
     archived_before_.store(held_from, std::memory_order_release);
     OB_LOG_DEBUG("wal_archive", "pass over %zu closed file(s) of lineage %llu: %zu archived, %zu "

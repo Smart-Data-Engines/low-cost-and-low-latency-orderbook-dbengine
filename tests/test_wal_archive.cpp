@@ -131,7 +131,6 @@ TEST_F(WalArchiveTest, CopiesEveryClosedFileByteForByteAndNoOther) {
     EXPECT_EQ(registry_.counter_value("ob_wal_archived_files_total"), 3u);
     EXPECT_EQ(registry_.counter_value("ob_wal_archived_bytes_total"), total);
     EXPECT_EQ(registry_.counter_value("ob_wal_archive_failures_total"), 0u);
-    EXPECT_EQ(registry_.gauge_value("ob_wal_archive_pending_files"), 0);
     EXPECT_EQ(registry_.unknown_metric_writes(), 0u);
 }
 
@@ -175,10 +174,12 @@ TEST_F(WalArchiveTest, AFileThereWithOtherContentsIsRefusedAndNeverOverwritten) 
     EXPECT_EQ(a->archived_before(), 2u) << "retention keeps the refused file and every one after it";
     EXPECT_EQ(registry_.counter_value("ob_wal_archive_failures_total"), 1u);
 
-    // Stopped: a later pass copies nothing, and the floor stays.
+    // Stopped: a later pass copies nothing, the floor stays, and the failure is counted again - an
+    // alert on the counter stays on for as long as the refusal does.
     const auto later = a->archive_closed(kLineage, 4);
     EXPECT_TRUE(later.refused);
     EXPECT_EQ(later.archived, 0u);
+    EXPECT_EQ(registry_.counter_value("ob_wal_archive_failures_total"), 2u);
     EXPECT_FALSE(fs::exists(in_archive(3)));
     EXPECT_EQ(read(in_archive(2)), theirs);
     EXPECT_EQ(a->archived_before(), 2u);
@@ -211,14 +212,13 @@ TEST_F(WalArchiveTest, AnArchiveThatCannotBeMadeHoldsRetentionAtTheFirstClosedFi
     EXPECT_EQ(pass.pending, 3u);
     EXPECT_EQ(a->archived_before(), 1u);
     EXPECT_EQ(registry_.counter_value("ob_wal_archive_failures_total"), 1u);
-    EXPECT_EQ(registry_.gauge_value("ob_wal_archive_pending_files"), 3);
 
     fs::remove(archive_);
     const auto retried = a->archive_closed(kLineage, 4);
     EXPECT_TRUE(retried.failure.empty()) << retried.failure;
     EXPECT_EQ(retried.archived, 3u);
+    EXPECT_EQ(retried.pending, 0u);
     EXPECT_EQ(a->archived_before(), 4u);
-    EXPECT_EQ(registry_.gauge_value("ob_wal_archive_pending_files"), 0);
 }
 
 TEST_F(WalArchiveTest, ACopyThatFailsStopsThePassAtItsFile) {
@@ -276,21 +276,6 @@ TEST_F(WalArchiveTest, TheThreadArchivesAClosedFileWhenWoken) {
     a->stop();
     EXPECT_EQ(a->archived_before(), 2u);
     EXPECT_EQ(read(in_archive(1)), read(in_wal(1)));
-}
-
-TEST_F(WalArchiveTest, PendingFilesAndTheAgeOfTheOldestAreReported) {
-    close_files(1, 2);
-    const auto now = fs::file_time_type::clock::now();
-    fs::last_write_time(in_wal(1), now - std::chrono::seconds(300));
-    fs::last_write_time(in_wal(2), now - std::chrono::seconds(100));
-    write(archive_, "a file where the archive's directory should be");
-    auto a = archiver();
-
-    (void)a->archive_closed(kLineage, 3);
-    EXPECT_EQ(registry_.gauge_value("ob_wal_archive_pending_files"), 2);
-    const int64_t oldest = registry_.gauge_value("ob_wal_archive_oldest_pending_seconds");
-    EXPECT_GE(oldest, 299);
-    EXPECT_LT(oldest, 400);
 }
 
 TEST(WalFileNames, TheNameRoundTripsAndNearMissesAreNotWalFiles) {
@@ -414,6 +399,32 @@ TEST_F(WalArchiveEngineTest, RetentionKeepsEveryFileTheArchiveDoesNotHold) {
     for (uint32_t i = 0; i < left.front(); ++i) {
         EXPECT_TRUE(fs::exists(in_archive(i, engine->wal_identity()))) << "file " << i << " removed unarchived";
     }
+    engine->close();
+}
+
+TEST_F(WalArchiveEngineTest, TheTickSaysHowManyFilesWaitAndHowLongTheOldestHas) {
+    write(archive_, "a file where the archive's directory should be");
+    auto engine = engine_at(data(), kSmallFiles);
+    engine->set_wal_archive(archive_.string(), 3600);
+    engine->open();
+    write_rows(*engine, 0, 200);
+    const uint32_t current = engine->get_wal_position().first;
+    ASSERT_GT(current, 2u);
+    // Closed five minutes ago, as far as its time says.
+    fs::last_write_time(data() / ob::wal_file_basename(0),
+                        fs::file_time_type::clock::now() - std::chrono::seconds(300));
+    engine->flush_tick_for_test();
+    EXPECT_EQ(engine->registry().gauge_value("ob_wal_archive_pending_files"),
+              static_cast<int64_t>(current));
+    const int64_t oldest = engine->registry().gauge_value("ob_wal_archive_oldest_pending_seconds");
+    EXPECT_GE(oldest, 299);
+    EXPECT_LT(oldest, 400);
+
+    fs::remove(archive_);
+    ASSERT_TRUE(tick_until(*engine, [&] {
+        return engine->registry().gauge_value("ob_wal_archive_pending_files") == 0;
+    }));
+    EXPECT_EQ(engine->registry().gauge_value("ob_wal_archive_oldest_pending_seconds"), 0);
     engine->close();
 }
 

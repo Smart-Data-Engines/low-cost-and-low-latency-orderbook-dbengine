@@ -56,7 +56,8 @@ public:
     WalArchiver(const WalArchiver&)            = delete;
     WalArchiver& operator=(const WalArchiver&) = delete;
 
-    /// The thread `ob-wal-archive`: a pass every second, and at once when woken.
+    /// The thread `ob-wal-archive`: a pass every second, and at once when woken. A refused archive
+    /// still passes, to count the failure each time; it copies nothing.
     void start();
     void stop();
     /// A file was closed: archive it now rather than within the second.

@@ -1142,6 +1142,27 @@ void Engine::begin_wal_lineage_locked(const char* why) {
                 static_cast<unsigned long long>(old_identity), first.file_index, removed);
 }
 
+void Engine::publish_wal_archive_gauges() {
+    // From the flush thread rather than the archiver's, and from two atomics: a pass that never
+    // ends - a copy hung on its device - shows here as files waiting, which its own thread could
+    // not say. The closed files the archive lacks are the ones from its floor to the writer's file,
+    // all still here, since retention keeps them.
+    const uint32_t current = wal_.current_file_index();
+    const uint32_t held = wal_archiver_->archived_before();
+    const uint32_t pending = current > held ? current - held : 0;
+    int64_t oldest_s = 0;
+    if (pending > 0) {
+        // The oldest has waited since it was last written, which is when it was closed.
+        struct stat st{};
+        if (::stat((wal_dir_ + "/" + wal_file_basename(held)).c_str(), &st) == 0) {
+            const auto now_s = static_cast<int64_t>(wall_clock_ns() / 1'000'000'000ULL);
+            oldest_s = std::max<int64_t>(0, now_s - static_cast<int64_t>(st.st_mtime));
+        }
+    }
+    registry_.set_gauge("ob_wal_archive_pending_files", static_cast<int64_t>(pending));
+    registry_.set_gauge("ob_wal_archive_oldest_pending_seconds", oldest_s);
+}
+
 void Engine::rotate_for_the_archive_locked() {
     // Caller holds mtx_, from the flush tick.
     const WalPosition at = wal_.current_position();
@@ -3918,6 +3939,7 @@ void Engine::flush_tick() {
         if (safe_truncate > 0) {
             wal_.truncate_before(safe_truncate);
         }
+        if (wal_archiver_) publish_wal_archive_gauges();
 
         // TTL retention scan: delete expired segments periodically.
         //

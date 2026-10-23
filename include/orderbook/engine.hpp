@@ -1505,6 +1505,9 @@ private:
     /// Rotate the WAL when its file has held a record for the archive's interval (#34, 1.3), and
     /// wake the archiver whenever a file was closed since the last tick. Caller holds `mtx_`.
     void rotate_for_the_archive_locked();
+    /// `ob_wal_archive_pending_files` and `ob_wal_archive_oldest_pending_seconds`, from the flush
+    /// tick (#34). Without `mtx_`: it reads two atomics and stats one file.
+    void publish_wal_archive_gauges();
 
     /// What a start takes from the whole WAL besides its last checkpoint, gathered in the pass that
     /// finds it (#174). The vector, the held numbers and the epoch were a pass each, and a pass over

@@ -197,6 +197,37 @@ groups:
             backup with room - change it to the schedule. A node that never took one is not paged.
             docs/operations.md, "Backing up and restoring a node".
 
+  - name: orderbook-engine-wal-archive
+    rules:
+      - alert: OrderbookWalArchiveFailing
+        expr: sum by (instance) (increase(ob_wal_archive_failures_total[15m])) > 0 and max by (instance) (ob_wal_archive_pending_files) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: closed WAL files are not reaching the WAL archive"
+          description: >-
+            Archive passes have failed for five minutes with closed WAL files waiting. The node's log
+            says why: "cannot archive" for a directory it cannot write or a full disk, which it
+            retries every second, and "is in the archive with other contents" for a file it will not
+            overwrite, which stops archiving until the archive is put right and the node restarted.
+            Retention keeps every file the archive lacks, so the WAL directory grows meanwhile.
+            docs/operations.md, "Restoring to a moment".
+      - alert: OrderbookWalArchiveBehind
+        expr: max by (instance) (ob_wal_archive_oldest_pending_seconds) > 180
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a closed WAL file has waited more than three minutes for the WAL archive"
+          description: >-
+            A restore to a moment can no longer reach the node's last minutes: the oldest closed WAL
+            file the archive lacks has waited more than three times the default
+            --wal-archive-interval-s of 60 seconds - change 180 to three times yours. With failures
+            OrderbookWalArchiveFailing fires too; without them the archive's device takes the WAL
+            slower than it is written, or a copy hangs on it. docs/operations.md, "Restoring to a
+            moment".
+
   - name: orderbook-engine-tls
     rules:
       - alert: OrderbookCertificateExpiring
