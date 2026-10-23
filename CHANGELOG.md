@@ -151,6 +151,14 @@ here as `#N`.
   keeps a port on IPv4 as it was ("Listeners after v0.1.0" in `docs/upgrading.md`).
 - A replica's connection to its primary gives up an address after 5 s, where a blocking `connect()`
   waited out the kernel's SYN retries - minutes - before the replica's own retry could begin (#236).
+- `ob_flush()` and `ob_engine_destroy()` take the embedded engine's segments and WAL to the device,
+  with one `syncfs()`, before the checkpoint that claims them (#245, the server's rule from #160).
+  Nothing had synced an embedded segment.
+  - A flush after a write waits for the device: 2.79-3.03 ms median after one update of 100 levels,
+    where it took 0.11-0.19 ms (i3-7100U, ext4 over LUKS on NVMe). A flush with nothing new does
+    not wait.
+  - `ob_flush()` answers `OB_C_ERR_IO` when the sync fails. The rows are written and readable, and
+    from then on no checkpoint claims anything until the engine is created again.
 - Between releases the version is the next one as a development version: `0.1.1.dev0` now, in
   `ob_tcp_server --version`, `STATUS` and the wheel, and `0.1.1~dev0` in the packages, which pip,
   dpkg and rpm all order after 0.1.0 and before 0.1.1. Everything built from `master` after v0.1.0
@@ -158,6 +166,16 @@ here as `#N`.
 
 ### Fixed
 
+- The embedded engine of the C API, which the Python client's local mode loads, replays its WAL
+  when it opens (#245). A process that ended without `ob_flush()` or `ob_engine_destroy()` lost
+  every write since the last of them, because an open read no record of the WAL.
+  - A flush and a close now append a checkpoint, and an open applies the records after the last one
+    again, into the live books and the segments, and flushes them.
+  - A record a segment already holds is skipped by the WAL position the segment records. A segment
+    of an older build records none, and is judged by the time of its last row.
+  - WAL files wholly before the last checkpoint are removed; nothing removed them before.
+  - An open after a process ended at a million unflushed rows of one symbol took 662-708 ms, and
+    found every update, where before it found none (i3-7100U, Release, ext4 over LUKS on NVMe).
 - A local flush no longer reopens the embedded engine (#244). Since #235 an open composes every book
   from history, so a flush with nothing new took 94-146 ms at a million rows of one symbol, where it
   took 0.3-1.1 ms before; with `ob_flush()` it takes 0.02 ms or less (i3-7100U, Release).
@@ -211,9 +229,9 @@ here as `#N`.
 
 ### Known issues
 
-- The embedded engine of the C API, which the Python client's local mode loads, does not replay its
-  WAL when it opens: a process that ends without `ob_flush()` or `ob_engine_destroy()` loses every
-  write since the last of them (#245).
+- The embedded engine syncs its WAL at a flush and a close, not at each write: a power cut or a
+  kernel crash loses what was written since the last of them. Nothing in the C API asks for a sync
+  of each write, as the server's `--fsync-policy every` does.
 - A series of the book reads every row of its range by price: 7-12 times what it cost before #233
   for a writer of whole sides (#243).
 

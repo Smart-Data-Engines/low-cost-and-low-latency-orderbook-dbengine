@@ -4398,6 +4398,17 @@ Learned the hard way. Check here before debugging.
      - `ob_flush()` writes and indexes the open segments and keeps the engine.
      - Before adding work to an open, find who opens and how often: a close-and-open in a loop pays it
        every time.
+601. **A checkpoint ported without its sync claims what nothing kept.** #245 gave the embedded
+     engine the server's checkpoints, and nothing had ever synced an embedded segment. A close syncs
+     the WAL, so its checkpoint would reach the device over segments still in the page cache. After
+     a power cut the next open would replay nothing. That is #160, found again in a second writer.
+     - A flush now syncs with one `syncfs()` before the checkpoint, and a failed sync freezes the
+       checkpoints for the engine's life, as the server does.
+     - What a sync does shows only when the power fails or a sync fails. The test reads the order of
+       the flush's log lines. Three mutants survive it: a `syncfs()` that does nothing, a failure
+       that freezes nothing, and `OB_C_ERR_IO` answered as `OB_C_OK`.
+     - Port a recovery together with the durability rule that makes its records true, not only the
+       records.
 
 ## Current state and open problems
 
@@ -4435,8 +4446,9 @@ warns about it.
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)
 where one is before their instant; `MREPLACE` replaces a side whole; and a start rebuilds every live
 book from the store (pitfalls 568, 569, 598). **#244**: the C API has `ob_flush()`, so a local flush
-no longer reopens the engine. **#245 is an open P1**: the embedded engine never replays its WAL, so
-a process that dies loses what it wrote since its last flush.
+no longer reopens the engine. **#245 is closed**: the embedded engine replays its WAL from its last
+checkpoint when it opens, and a flush syncs its segments before the checkpoint claims them (pitfall
+601).
 
 **#197 is closed**: a snapshot install and a discard begin a new WAL lineage, so a replica that had
 bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step

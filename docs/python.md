@@ -193,6 +193,12 @@ Force-flush pending data so it becomes queryable. Over TCP this is `FLUSH`. In l
 C API's `ob_flush()`, which keeps the engine open; with a library from before #244, which has none,
 the client closes the engine and opens it again, and an open composes every book from history (#235).
 
+In local mode a flush that follows a write also takes it to the device before its checkpoint, and a
+sync that fails raises `OrderbookError` with status `OB_ERR_IO`: the rows are written and readable,
+and no checkpoint claims them. A process that ends without `flush()` or `close()` loses none of its
+writes, because the next open replays them from the WAL. A power cut loses those since the last
+flush or close (#245, `docs/c-api.md`).
+
 #### engine.query(sql) → List[OrderbookRow]
 
 Execute a SQL query.

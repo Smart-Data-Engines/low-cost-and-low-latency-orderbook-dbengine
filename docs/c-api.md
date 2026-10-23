@@ -36,13 +36,30 @@ embedded engine writes no book summaries, so that reads each symbol's rows from 
 at a million rows of one symbol on an i3-7100U, Release. Open an engine once and flush it with
 `ob_flush()`, rather than destroying and creating it again to make writes readable.
 
+An open also replays the WAL after its last checkpoint (#245). The writes of a process that ended
+without `ob_flush()` or `ob_engine_destroy()` are applied again, into the live book and into the
+symbol's segment, and flushed, so the next open replays none of them.
+- A write a segment already holds is skipped, by the WAL position the segment records.
+- A segment of a build before #245 records none, and is judged by the time of its last row. That
+  is exact only while a symbol's times rise.
+
+Measured on an i3-7100U, Release, ext4 over LUKS on NVMe, one symbol of 100-level updates, the
+process ended before a flush (`evidence/2026-10-23-embedded-wal-replay/` in the workspace):
+
+| rows written | the open before #245 | the open now |
+|---|---|---|
+| 10 000 | 2.4-3.5 ms, and no update found | 21.7-35.4 ms, and every update found |
+| 100 000 | 2.6-2.8 ms, and no update found | 54.5-60.2 ms, and every update found |
+| 1 000 000 | 2.4-3.8 ms, and no update found | 662-708 ms, and every update found |
+
 ### ob_engine_destroy
 
 ```c
 void ob_engine_destroy(ob_engine_t* engine);
 ```
 
-Flush all pending data, close the engine, and free memory. Safe to call with `NULL`.
+Flush as `ob_flush()` does, close the engine, and free memory. Its checkpoint ends the WAL, so the
+next open replays nothing. Safe to call with `NULL`.
 
 ### ob_flush
 
@@ -54,6 +71,24 @@ Make every write so far readable by `ob_query()`, keeping the engine open (#244)
 open segment is written and indexed, with any segment a write rolled over into, as
 `ob_engine_destroy()` writes them. The live books stay in memory. `OB_C_ERR_INVALID_ARG` for `NULL`,
 `OB_C_ERR_INTERNAL` when a segment could not be written.
+
+When anything was written since the last checkpoint, a flush then does three things (#245):
+1. It takes the segments and the WAL to the device with one `syncfs()`.
+2. It appends a checkpoint, where the next open starts replaying.
+3. It removes the WAL files wholly before the checkpoint.
+
+The sync comes before the checkpoint, as in the server's flush: a checkpoint claims only rows that
+are on the device (#160). A flush with nothing new waits for no device.
+
+`OB_C_ERR_IO` when the sync failed. The segments are written and readable, and no checkpoint claims
+them. Linux reports a failed sync once, and may have dropped what it could not write. From then on,
+until the engine is created again, no checkpoint is appended and no WAL file removed. The next open
+replays from the last checkpoint before the failure.
+
+What the sync costs, measured as above: a flush after one update of 100 levels took 2.79-3.03 ms
+(median of 300, three runs) and 4.99-6.16 ms at the 90th percentile, where it took 0.11-0.19 ms
+and 0.15-0.26 ms before #245. The SDK's adapter flushes before a read that follows a write, so a
+read after a write pays it in local mode, as a `FLUSH` pays the server's sync over TCP.
 
 Before it a caller flushed by destroying the engine and creating it again, as the Python client did
 in local mode. That costs whatever an open costs, and since #235 an open composes every book from
@@ -81,12 +116,14 @@ ob_status_t ob_apply_delta(
 ```
 
 Insert one or more price levels. The update is:
-1. Written to the WAL, and `fsync`ed here only under `--fsync-policy every` — where a failed
-   `fsync` returns `OB_C_ERR_INTERNAL` rather than reporting success (#113)
+1. Written to the WAL, at once and without a sync: `ob_flush()` and `ob_engine_destroy()` sync it
 2. Applied to the in-memory SoA buffer
 3. Appended to its symbol's open segment, which `ob_flush()` or `ob_engine_destroy()` writes. There
-   is no background flush. **The embedded engine does not replay its WAL when it opens**, so a process
-   that ends without either loses every write since the last one (#245).
+   is no background flush.
+
+A process that ends without either loses none of these writes: the next `ob_engine_create()` replays
+them from the WAL (#245). **A power cut or a kernel crash can lose them**, since the last flush or
+close. There is no setting that syncs each write, as the server's `--fsync-policy every` does.
 
 ### ob_replace_side
 
