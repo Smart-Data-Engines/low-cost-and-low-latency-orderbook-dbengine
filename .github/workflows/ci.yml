@@ -189,7 +189,11 @@ jobs:
   integration-tests:
     name: integration-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The battery took 37:39-37:58 on the runs of 5dc1faa, ddb8a0d and 6685016, and the job 40-41
+    # minutes with its build. PR #276's run was canceled at 85%, every test so far passing, after its
+    # apt step took 5:44 on a mirror serving 45 kB/s, where it takes ten seconds. The margin, not a
+    # slower suite, as the TSan job's was after PR #200.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
