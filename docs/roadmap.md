@@ -2905,9 +2905,10 @@ builds rotating:
   no build before it did.
 - **It needs neither sync.** A summary is checked by its CRCs where it is read, and a read that cannot
   use one composes the book from the rows; the best track beside it (#243) is written unsynced for
-  that reason. And a summary holds no row the WAL does not: a seal takes only rows whose records a
-  sync has put on the device, so a summary that a power cut loses, or cuts short, is a read that
-  composes from further back.
+  that reason. And a summary holds no row the WAL does not: a tick drains, and a seal takes, only
+  rows whose records its sync has put on the device (under `none` nothing is synced, and nothing is
+  promised), so a summary that a power cut loses, or cuts short, is a read that composes from
+  further back.
 - **The measure of a fix**: PR #272's merge's levels a second at 7 MB/s, with the summaries still
   written.
 
