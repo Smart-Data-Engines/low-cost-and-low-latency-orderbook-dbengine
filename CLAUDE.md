@@ -4452,6 +4452,14 @@ Learned the hard way. Check here before debugging.
      too: the failure was counted once, and `OrderbookWalArchiveFailing` would have resolved fifteen
      minutes later with nothing archived. A refused archive still passes every second, copies
      nothing and counts each pass.
+608. **A second copy of the WAL on the WAL's own device shows in the tail.** The archive's first build
+     copied every closed file. On the x86 host, at one connection's ceiling with 64 MB WAL files, a
+     batch's p99.9 went from 897-926 us to 1029-1109 us in four rounds each way; the p50, the p99 and
+     the worst batch did not move, and on the Graviton host nothing did. A closed WAL file is never
+     written again, so on the WAL's filesystem the archive links it now - the same bytes under a
+     second name, no I/O - and copies only to another filesystem, as backups do. Linked, the rounds
+     overlap on both hosts; copied to tmpfs, they overlap too. Measure a change that writes beside
+     the WAL at the ceiling's p99.9, on more than one host: the cost hid on one of the two.
 
 ## Current state and open problems
 
@@ -4509,7 +4517,7 @@ a node"). With `--wal-archive-dir` a node copies every WAL file it closes into
 archive lacks, a file held for `--wal-archive-interval-s` is rotated for it, and a new lineage
 archives the old one's files before it removes them. `ob_restore --wal-archive --until` replays the
 archived records from a backup's cut through `apply_delta()` to the last checkpoint at or before the
-moment (pitfalls 604-607; `docs/operations.md`, "Restoring to a moment"). **#35 is closed**: a dashboard and alert rules in `packaging/`, held against the registry
+moment (pitfalls 604-608; `docs/operations.md`, "Restoring to a moment"). **#35 is closed**: a dashboard and alert rules in `packaging/`, held against the registry
 and `promtool test rules` in CI.
 
 **#165 is closed, in three parts**: the segment index is per symbol and in width tiers, so a flush

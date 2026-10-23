@@ -824,11 +824,16 @@ ob_restore --backup /var/lib/orderbook-backups/20260928T093000.123Z --data-dir /
            --wal-archive /var/lib/orderbook-wal-archive --until 20260928T101500.000Z
 ```
 
-- **What the archive holds.** `<archive>/<WAL identity>/wal_NNNNNN.bin`, each a copy byte for byte of
-  a WAL file the node closed, and beside it `wal_NNNNNN.bin.crc32c`, its size and CRC32C. A copy
-  counts once it is synced, renamed into place and read back with the source's CRC32C, the source
-  synced before it is read. A WAL identity is a lineage: a snapshot installed or a resync begins a new
-  one, in a directory of its own, and first copies the old one's last files.
+- **What the archive holds.** `<archive>/<WAL identity>/wal_NNNNNN.bin`, each the bytes of a WAL file
+  the node closed, and beside it `wal_NNNNNN.bin.crc32c`, its size and CRC32C. The source is synced
+  first. A WAL identity is a lineage: a snapshot installed or a resync begins a new one, in a
+  directory of its own, and first archives the old one's last files.
+- **Linked or copied.** On the WAL's filesystem a file is a hard link: a closed WAL file is never
+  written again, so a second name holds its bytes, with no I/O - and on the same device as the WAL.
+  On another filesystem it is copied, synced, renamed into place and read back with the source's
+  CRC32C - which is what survives the loss of the WAL's device. The log says which, `linked` or
+  `copied`. Copied on the WAL's own device, the archive writes every byte of the WAL twice: measured
+  below.
 - **Retention waits for it.** No WAL file the archive does not hold is removed, so an archive that
   fails grows the WAL directory rather than losing a record. `ob_wal_archive_pending_files` and
   `ob_wal_archive_oldest_pending_seconds` say how much waits and for how long, the log says why in a
@@ -865,6 +870,22 @@ The restore:
 
 A mesh node's backup is refused: its records' origins and hybrid clocks are the mesh's, and replayed as
 the node's own writes they would be numbered again. Restore it, and let its peers catch it up.
+
+Measured on 23 October 2026 on the x86 and the ARM test host - an m8a.xlarge with ext4 and an
+m9g.xlarge with XFS, both on NVMe - four rounds each way (`evidence/2026-10-23-point-in-time-recovery/`
+in the workspace):
+
+- **A writer.** One connection at its ceiling, 64 MB WAL files, 62 of them archived a round: with the
+  archive linked on the WAL's filesystem, a batch's p50, p99 and p99.9 stayed within the rounds
+  without the archive on both hosts - p99.9 943-990 us against 892-1204 us on x86, 66-67 us against
+  68-78 us on ARM. Copied to another filesystem (tmpfs, on x86), the same: 899-947 us against
+  908-929 us. Copied on the WAL's own NVMe, in the build before the archive linked, the x86 host's
+  p99.9 went from 897-926 us to 1029-1109 us, and the ARM host's did not move.
+- **RPO** at the default `--wal-archive-interval-s 60`: 60.12-60.19 s on both hosts, from one write
+  on a quiet node to its file in the archive.
+- **The replay**, 2 M records of 10 levels from an archive read from the device: 2.58-2.80 s on x86,
+  0.72-0.77 M records a second, and 3.73-3.74 s on ARM, 0.53-0.54 M. **RTO** is a restore's (above)
+  plus the replay.
 
 ### Not in this release
 

@@ -683,7 +683,7 @@ node that is merely listening can accept a write and have nobody to send it to.
 - Effort: M, done except the SSH script | Impact: Time-to-first-run drops from an hour to minutes,
   without a container layer between the engine and the hardware
 
-### 34. Backup, restore, point-in-time recovery
+### 34. Backup, restore, point-in-time recovery ✅
 - `ob_backup` / `ob_restore` tooling on top of existing snapshots plus WAL
 - Documented recovery procedure with RPO/RTO numbers
 - Effort: M | Impact: Nobody runs a database they cannot restore
@@ -710,12 +710,31 @@ node that is merely listening can accept a write and have nobody to send it to.
   - a log in which none of the restored rows is a record. The restored WAL begins at its second file
   now, so a replica asking for it from the start is told `WAL_TRUNCATED` and bootstraps from a
   snapshot, as it would after retention.
-- **Not yet: point-in-time recovery.** The point a restore returns to is a backup's cut; RPO is the
-  interval between backups. A restore to a moment between two needs the WAL replayed from a backup's
-  position to a chosen record, past checkpoints that claim segments the backup does not hold - a
-  change to the start's replay, and the rest of this item. Incremental backups are not planned: a
-  segment's directory name comes back once a merge removed it, so path, size and CRC do not prove the
-  same contents.
+- **Point-in-time recovery shipped** (23 October 2026; spec `specs/point-in-time-recovery/` in the
+  workspace, procedure in `docs/operations.md`, "Restoring to a moment"). With `--wal-archive-dir` a
+  node puts every WAL file it closes into `<archive>/<WAL identity>/` - linked on the WAL's
+  filesystem, copied, synced and read back on another - with its size and CRC32C beside it.
+  Retention removes no file the archive lacks; `--wal-archive-interval-s` (60) rotates a file that
+  has held a record that long; a new lineage archives the old one's last files before it removes
+  them. A file already there with other contents is never overwritten: archiving stops, with an
+  `ERROR` and a failure counted at every pass. `ob_restore --wal-archive --until <ns|time|end>`
+  checks the archive before it creates anything - the backup's lineage, the files from its cut
+  without a hole, each against its sum - and replays the `DELTA` records from the cut through
+  `apply_delta()` to the last checkpoint at or before the moment. Metrics, two alerts, a dashboard
+  row.
+- **Measured** (`evidence/2026-10-23-point-in-time-recovery/` in the workspace): a writer at one
+  connection's ceiling unmoved with the archive linked, on both test hosts; RPO 60.12-60.19 s at the
+  default interval; a replay of 0.72-0.77 M records a second on the x86 host and 0.53-0.54 M on the
+  ARM host. Copied on the WAL's own device, the archive took the x86 host's p99.9 from 897-926 us to
+  1029-1109 us, which is why it links (pitfall 608).
+- **Found on the way**, each with a pitfall: a rotation leaves its file for the next flush tick to
+  sync, so the archive syncs a source before it reads it (604); records that check do not prove a
+  file whole, so each archived file has a sum (605); a hung copy could not report itself, so the
+  flush tick computes the archive's gauges (606); and a refused archive counts every pass, so an
+  alert on the counter lasts as long as the refusal (607). `ThreadBoundaries` found the archiver's
+  thread without #112's boundary.
+- Incremental backups are not planned: a segment's directory name comes back once a merge removed
+  it, so path, size and CRC do not prove the same contents.
 
 ### 35. Grafana dashboard and alert rules ✅
 - Shipped dashboard JSON and Prometheus alert rules (replica lag, failover events, backpressure,
@@ -15742,7 +15761,6 @@ The capability items are in the table below.
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
 | **P3** | The WAL's budget keeps the device busy with fewer syncs (#242) | M | On a device slower than the writes, at 7 - 10 MB/s, its syncs' journal costs 1 - 2% of the levels a second |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
-| **P3** | Point-in-time recovery (#34, what is left of it) | M | A restore to a moment between two backups; backup and restore themselves shipped |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
 ## Known gaps and honest caveats

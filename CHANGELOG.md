@@ -12,10 +12,10 @@ here as `#N`.
 ### Added
 
 - A restore to a moment after the backup (#34, point-in-time recovery). With `--wal-archive-dir
-  <DIR>` a node copies every WAL file it closes into `<DIR>/<WAL identity>/`, with its size and
-  CRC32C beside it; a copy counts once it is synced and read back, retention removes no WAL file the
-  archive does not hold, and a file already there with other contents is never overwritten - it
-  stops archiving with an `ERROR`. `--wal-archive-interval-s` (default 60) rotates a WAL file that
+  <DIR>` a node puts every WAL file it closes into `<DIR>/<WAL identity>/`, with its size and CRC32C
+  beside it: linked on the WAL's filesystem, copied, synced and read back on another. Retention
+  removes no WAL file the archive does not hold, and a file already there with other contents is
+  never overwritten - it stops archiving with an `ERROR`. `--wal-archive-interval-s` (default 60) rotates a WAL file that
   has held a record that long, so a quiet node's records reach the archive too. `ob_restore
   --wal-archive <DIR> --until <ns|time|end>` restores a backup and replays the archived records from
   its cut through the write path, up to the last checkpoint at or before the moment; it checks the
