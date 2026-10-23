@@ -55,7 +55,10 @@ The engine is composed of six subsystems, each responsible for a specific concer
 
 4. **Aggregate** — For aggregation queries (VWAP, spread, etc.), the live SoA buffer is read using the seqlock reader protocol, and the aggregation engine computes the result.
 
-5. **Return** — Results are delivered via a callback function, one row at a time.
+5. **Return** — A scan hands its rows over a batch at a time (#246): a candidate's columns and the
+   rows chosen from them, up to 2 048. The server formats a row answer from the columns straight
+   into its reply, and `GROUP BY TIME_BUCKET` sums them; every other answer, and every row for a
+   caller that takes rows one at a time - the C API - arrives through a callback.
 
 ### Startup (open)
 
