@@ -2907,7 +2907,7 @@ store runs on the pool, three rounds:
 - Effort: M | Impact: the scan pool stays off by default, so a query of many rows reads on one core
   unless an operator turns the pool on
 
-### 247. A busy symbol's book summary is written at nearly every seal, and synced twice **P3**
+### 247. A busy symbol's book summary is written at nearly every seal, and synced twice ✅ **P3**
 
 **Found bisecting #242** (`evidence/2026-10-23-wal-budget-syncs/`, `run242c.sh`, in the workspace).
 On the m9g.xlarge with its writes capped at 7 MB/s, #190's 36 M-level rounds, four a build, the
@@ -2937,6 +2937,29 @@ builds rotating:
   further back.
 - **The measure of a fix**: PR #272's merge's levels a second at 7 MB/s, with the summaries still
   written.
+
+**Closed in PR #290** (23 October 2026). A summary is written as its track is, through a temporary
+and a rename with no sync (`write_unsynced()`, which the track's writer becomes). A start checks a
+summary's whole file, `check_book_summary()` decoding it, since a power cut can leave its header
+whole and its prices cut short; `read_book_summary_header()` read the 40 bytes of the header alone.
+Removing a summary that a late row falsifies still syncs its directory: that one must not come back.
+
+Measured on the m9g.xlarge in the same rounds at 7 MB/s, four a build, rotating (`run242d.sh`, its
+harness counting the summaries a round writes):
+
+| build | levels/s | journal forces a tick | journal a round | summaries a round |
+|---|---|---|---|---|
+| master, `b117668` | 174.5-175.6 k | 3.09 | 71.7 MB | 474-481 |
+| the fix, `41e398b` | 180.4-180.8 k | 1.98 | 51.4 MB | 487-491 |
+
+- The journal is PR #272's merge's again - 1.97 forces a tick in the bisect - and the summaries are
+  all still written.
+- The levels a second are 0.4% below the merge's of the bisect, run an hour earlier, in which master
+  took 0.5% more than here: within what separates the two runs.
+- Tests: a summary cut to nothing and to half is not in the index after a start, and the book is the
+  rows'. Mutations: a start that takes a summary on its header, a summary not written and a track
+  not written are killed; the syncs put back survive, which only the measurement shows, and so does
+  the control.
 
 - Effort: S | Impact: 2.7% of the levels a second of a writer to a few symbols on a device capped at
   7 MB/s; a book composed and a file synced twice at nearly every seal of such a symbol
@@ -15864,7 +15887,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #242, #247, #248.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #242, #248.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

@@ -4511,6 +4511,12 @@ Learned the hard way. Check here before debugging.
      30 MB/s where master's syncs kept it at 98-99%, and the node 13-19% fewer levels a second.
      #190's `d6` had done the same with fewer ticks alone. Why the device idles is not established;
      a design that syncs less is measured against the cap before anything else is built on it.
+617. **A threshold below what one seal takes in fires at every seal.** #233's book summary waits for
+     65 536 rows of a symbol, and a seal of one of the eight symbols a writer was writing took in some
+     74 000: every seal of it wrote a summary, synced twice, a journal force a tick and 2.7% of the
+     levels a second at 7 MB/s (#247). Nothing in the tests showed it, as each wrote its summaries by
+     hand; the bisect of an unrelated item did. A cost a writer pays per event of the write path is
+     measured with the write path's own load, at a cap.
 618. **Code scanning reads a static function called only from a lambda behind `std::function` as
      unreachable.** #246's `merge_later()`, a function of the file, had one caller, the fold's lambda,
      which `scan_parts()` calls through `PartsScan::fold`: CodeQL's `cpp/unused-static-function`
