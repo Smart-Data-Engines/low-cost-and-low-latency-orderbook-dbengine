@@ -582,6 +582,12 @@ void Engine::open() {
     // The WAL written back ahead of its sync (#242), under `interval` only: `every` has synced each
     // write before answering it, and `none` promises nothing a sync would keep.
     if (fsync_policy_ == FsyncPolicy::INTERVAL && !wal_writeback_thread_.joinable()) {
+        // The first file's descriptor here rather than at the thread's first pass, so that an open
+        // engine holds what it goes on holding: one more descriptor, from the moment open() returns.
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            wal_writeback_first_ = wal_.writeback_descriptor();
+        }
         stop_wal_writeback_.store(false, std::memory_order_relaxed);
         wal_writeback_thread_ = std::thread([this]() {
             run_thread_body("engine", "wal_writeback_loop", [this] { wal_writeback_loop(); });
@@ -605,9 +611,12 @@ void Engine::wal_writeback_loop() {
     // `sync_file_range()` blocks when the device's queue is full, which is when it matters, and a
     // writer holds the engine's lock.
     constexpr uint64_t kChunk = kWalWritebackChunkBytes;
-    int fd = -1;
-    uint32_t file = std::numeric_limits<uint32_t>::max();
-    uint64_t asked = 0;
+    // What open() took, handed over by the thread's creation; the thread owns it from here.
+    int fd = wal_writeback_first_.first;
+    uint32_t file = fd >= 0 ? wal_writeback_first_.second.file_index
+                            : std::numeric_limits<uint32_t>::max();
+    uint64_t asked = wal_writeback_first_.second.offset;
+    wal_writeback_first_ = {-1, {}};
     LogEpisode failing;
     LoopGuard guard{"engine", "a WAL writeback pass", &registry_};
     OB_LOG_INFO("engine", "WAL written back ahead of its sync: each %llu bytes appended (#242)",

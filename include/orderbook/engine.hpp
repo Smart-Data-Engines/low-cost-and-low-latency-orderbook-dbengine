@@ -1171,6 +1171,9 @@ private:
     static constexpr uint64_t kWalWritebackChunkBytes = 1u << 20;
     std::thread       wal_writeback_thread_;
     std::atomic<bool> stop_wal_writeback_{false};
+    /// The descriptor and position of the file being written, taken by `open()` - so that an open
+    /// engine holds the descriptor from the moment open() returns - and handed to the thread.
+    std::pair<int, WalPosition> wal_writeback_first_{-1, {}};
     void wal_writeback_loop();
     std::mutex        mtx_;
 

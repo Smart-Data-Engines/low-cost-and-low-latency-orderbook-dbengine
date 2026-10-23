@@ -242,6 +242,9 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
         {"Engine::seal_sync_loop",
          "no seal's sync completes again, so no checkpoint is appended, WAL retention stops and a "
          "FLUSH waits for it for good (#190)"},
+        {"Engine::wal_writeback_loop",
+         "the WAL is no longer written back ahead of its sync: each sync writes what it finds, as "
+         "before #242, and a device slower than the writes sits idle between them"},
         {"FailoverManager::monitor_loop",
          "the node never learns about a role change (#82's shape), and a half-finished promotion "
          "leaves it a replica of itself (#130)"},
