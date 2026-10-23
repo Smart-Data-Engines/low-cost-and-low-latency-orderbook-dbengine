@@ -1575,6 +1575,7 @@ _CATEGORIES = [
     # an error: those tests fall into "uncategorized" in the report and quietly stop
     # being counted as coverage of anything.
     "aggregations", "multi_master", "large_response", "binance", "crash_recovery",
+    "subscriptions",
 ]
 
 

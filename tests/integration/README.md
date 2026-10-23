@@ -1,6 +1,8 @@
 # Integration Test Suite
 
-Automated integration tests for orderbook-dbengine. The framework manages the full cluster lifecycle (a native etcd process + 2 ob_tcp_server nodes), runs 9 test categories, and produces a colored console report.
+Automated integration tests for orderbook-dbengine. The framework manages the clusters' lifecycle (a
+native etcd process and the nodes a fixture asks for), reports the tests by the categories
+`conftest.py` registers, and produces a colored console report.
 
 ## Prerequisites
 
@@ -50,44 +52,126 @@ OB_INTEGRATION_TESTS=1 pytest tests/integration/ -m smoke -v
 
 ## Directory Structure
 
-This list is complete as of #101, and it is worth keeping that way: it read as ten modules for
-months while the directory held twenty-six, which understates the suite to anyone deciding whether
-to trust it.
+Every file of this directory, by what it tests. `scripts/check_integration_readme.py` holds the list
+to the directory in both directions, in the `docs-integrity` job: the list used to say it was
+complete as of #101, and by #281 it named 31 of 93 files.
 
 ```
 tests/integration/
-├── conftest.py                     # ClusterManager, fixtures, report plugin, env gate
-├── pytest.ini                      # Markers, testpaths, timeout config
-├── binance_support.py              # Shared depth-feed client for the two opt-in modules
-├── test_smoke.py                   # Basic single-node operations
-├── test_startup_refusal.py         # A node that cannot listen exits 1 with a message, not -6
-├── test_replication.py             # WAL replication primary → replica
-├── test_replica_restart.py         # A restarted replica keeps its store and resumes (#101)
-├── test_sequence_numbers.py        # Per-origin sequence numbers on the wire and in SELECT
-├── test_crash_recovery.py          # WAL replay after a kill, and what the startup log says
-├── test_failover.py                # Automatic failover after primary kill
-├── test_failover_dead_state.py     # A node that lost the election race is not left inert
-├── test_mm_convergence.py          # Three-node mesh: convergence and LWW
-├── test_mm_failover.py             # Mesh: node loss and rejoin
-├── test_mm_snapshot_bootstrap.py   # Mesh: a joining node bootstrapped by snapshot
-├── test_mm_stats.py                # Mesh: STATUS and MM_PEERS on every node
-├── test_auth.py                    # Challenge-response on all three surfaces
-├── test_tls.py                     # TLS on the client port, chain *and* name
-├── test_tls_cluster.py             # TLS on the node links, mutual by construction
-├── test_tls_reload.py              # SIGHUP reads the certificate again, on every surface
-├── test_subscriptions.py           # SUBSCRIBE / PUSH / UNSUBSCRIBE
-├── test_aggregations.py            # Aggregates over the wire, including refusals
-├── test_compression.py             # LZ4 compression negotiation and data integrity
-├── test_large_response.py          # Responses above the socket buffer, slow readers
-├── test_stress.py                  # Sustained throughput and concurrent read/write
-├── test_edge_cases.py              # Invalid inputs, oversized lines, read-only writes
-├── test_metrics.py                 # Prometheus /metrics endpoint and STATUS command
-├── test_pool.py                    # _ClientPool discovery, routing, failover
-├── test_cpp_client.py              # Native C++ client binary (optional)
-├── test_binance_live.py            # Live depth feed — opt-in (OB_BINANCE_TESTS=1)
-├── test_binance_failover_sync.py   # Live feed across a failover — opt-in
-├── ob_integration_test.cpp         # C++ test binary source (compiled by CMake)
-└── README.md                       # This file
+├── conftest.py                       # ClusterManager, the fixtures, the report plugin, the env gate
+├── pytest.ini                        # markers, testpaths, the timeout
+├── binance_support.py                # the gate and helpers of the live Binance modules
+├── mesh_proxy.py                     # a TCP proxy between two mesh peers, to break a link
+├── ob_integration_test.cpp           # the C++ client harness test_cpp_client.py runs
+├── README.md                         # this file
+│
+│   # One node: start, stop, the wire, its clients
+├── test_smoke.py                     # the basics, before anything else is worth checking
+├── test_startup_refusal.py           # how a node refuses to start (#102)
+├── test_shutdown.py                  # a node stops when asked, with a client attached (#106)
+├── test_bind_addresses.py            # the address each listener binds, read from the kernel (#203)
+├── test_ipv6.py                      # IPv6 on every listener and every dialler of a node
+├── test_unix_socket.py               # the Unix socket, through the binary and the clients (#52)
+├── test_rings.py                     # a Unix-socket session moved to shared-memory rings (#52)
+├── test_io_profile.py                # the boost and eco profiles on a live node (#144, #151)
+├── test_io_reactors.py               # more than one client event loop, --io-threads N
+├── test_pipelined_answers.py         # every command of one read answered with one send (#146)
+├── test_wire_nodelay.py              # a pipelining client pays no delayed-ACK timer (#140)
+├── test_reply_attribution.py         # a reply goes to the command that asked for it (#170, #171)
+├── test_recv_buffer_ceiling.py       # one session may not hold unbounded unparsed input (#143)
+├── test_edge_cases.py                # input the server should refuse
+├── test_large_response.py            # responses larger than the socket send buffer
+├── test_compression.py               # LZ4 session compression, negotiated and lossless
+├── test_cli_tool.py                  # the interactive CLI refuses what it does not understand (#110)
+├── test_cpp_client.py                # the native C++ client against a running server
+├── test_pool.py                      # the Python client's pool: discovery and routing
+├── test_client_batch.py              # insert_batch(): several updates in one round trip (#141)
+├── test_capabilities_are_read.py     # every capability announced has something that reads it (#105)
+├── test_docs_transcripts.py          # what the documentation shows a server answer, it answers (#40)
+├── test_mixed_versions.py            # the previous version and this one, side by side (#56)
+│
+│   # Writes and what they become
+├── test_write_batches.py             # the writes of one read are one batch (#151, #155)
+├── test_event_time.py                # a write keeps the time its sender gave it (#105)
+├── test_sequence_numbers.py          # sequence numbers, off disk and off the wire
+├── test_live_book.py                 # the live book, through the client somebody has (#145)
+├── test_replace_side.py              # MREPLACE replaces one side of a book (#233)
+├── test_book_huge_pages.py           # books on huge pages (#51)
+├── test_pending_ceiling.py           # crossing the pending-row ceiling costs a flush (#137)
+├── test_lazy_flush.py                # a tick seals a store when it is due; a crash loses nothing (#165)
+├── test_compaction.py                # a symbol's segments merged; a crash in any step keeps each row once
+├── test_segment_identity.py          # the same event-time span written twice (#136)
+├── test_segment_time_range.py        # a segment's time range is its rows' (#166)
+├── test_ttl.py                       # --ttl-hours expires what is older, and nothing else (#163)
+├── test_wal_rotation.py              # writes that cross a WAL file boundary (#124)
+│
+│   # Queries
+├── test_aggregations.py              # aggregates over the wire, including refusals
+├── test_column_projection.py         # the response carries the columns the query asked for (#139)
+├── test_where_conditions.py          # what a WHERE condition answers (#199)
+├── test_time_buckets.py              # aggregates over time buckets, server and Python client (#44)
+├── test_snapshot_query.py            # what a SNAPSHOT answers (#167, #168)
+├── test_scan_pool.py                 # a node reading on the scan pool answers the same bytes (#246)
+├── test_subscriptions.py             # pushed streaming subscriptions (#45)
+│
+│   # Durability, faults and recovery
+├── test_crash_recovery.py            # SIGKILL, restart, count the rows
+├── test_power_cut.py                 # what an acknowledged write survives when the power goes (#160)
+├── test_storage_faults.py            # the disk refusing a WAL write (#54)
+├── test_fault_injector.py            # the fault injector's own tests
+├── test_death_report.py              # what the harness says when a node dies unasked (#86)
+├── test_backup.py                    # a backup on a running server, restored offline (#34)
+├── test_pitr.py                      # a restore to a moment after the backup (#34)
+│
+│   # Replication and failover
+├── test_replication.py               # what the primary accepts, the replica ends up holding
+├── test_replica_restart.py           # a restarted replica keeps what it holds (#101)
+├── test_replica_lineage.py           # a replica promoted after a snapshot gives every row (#197)
+├── test_joining_replica.py           # a joining replica does not stand for election (#215)
+├── test_read_only.py                 # --read-only refuses writes from the first one (#241)
+├── test_failover.py                  # the primary role handed over, and lost unexpectedly
+├── test_failover_dead_state.py       # failover on a cluster nobody started politely
+├── test_failover_follows_successor.py  # a primary that gives the role up follows its successor (#201)
+├── test_failover_storage_faults.py   # the disk refusing the record a promotion writes (#112)
+├── test_handover.py                  # a planned FAILOVER loses no acknowledged write (#204)
+├── test_coordinator_endpoint_order.py  # which coordinator endpoint the peer registry talks to (#135)
+├── test_coordinator_unavailable.py   # a node whose coordinator is unreachable (#54)
+├── test_peer_lease_lost.py           # a node whose mesh registration lease is gone (#132, #133)
+│
+│   # The multi-master mesh
+├── test_mm_convergence.py            # three nodes that all accept writes, and converge
+├── test_mm_failover.py               # a mesh with a node missing
+├── test_mm_restart.py                # what a restarted mesh node holds, and how soon (#179, #180)
+├── test_mm_multi_writer.py           # a symbol several nodes write (#184, #185)
+├── test_mm_catchup_ceiling.py        # a node that missed more than a catch-up round reads (#178)
+├── test_mm_snapshot_bootstrap.py     # a node added to a running mesh bootstraps from a snapshot
+├── test_mm_snapshot_many_files.py    # more files than a 16-bit index can name (#176)
+├── test_mm_version_vector_scale.py   # a version vector past what one frame carries (#177)
+├── test_mm_stats.py                  # STATUS and /metrics on a mesh node
+├── test_mesh_link_faults.py          # the link to a peer breaking under a node (#54)
+├── test_mesh_storage_faults.py       # the disk refusing the WAL write a peer's record needs (#112)
+├── test_mesh_proxy.py                # mesh_proxy.py's own tests
+│
+│   # Shards
+├── test_shard_control_plane.py       # shards that find each other in etcd, and clients (#175)
+├── test_shard_migration.py           # a symbol moved between shards with its rows (#196)
+├── test_sharded_pool.py              # the Python client's sharded pool on a real shard map (#172)
+│
+│   # Security
+├── test_auth.py                      # challenge-response authentication on a live server (#30)
+├── test_access_control.py            # permissions per identity (#31)
+├── test_tls.py                       # TLS on the client port, chain and name (#30)
+├── test_tls_cluster.py               # TLS on the replication link and the mesh (#30)
+├── test_tls_reload.py                # SIGHUP reads the certificate again, on every surface (#238)
+│
+│   # Observability
+├── test_metrics.py                   # /metrics and STATUS: what an operator would page on
+├── test_stress.py                    # sustained throughput, concurrency, what breaks under both
+│
+│   # Opt-in, over the network
+├── test_binance_live.py              # live Binance depth data through the engine
+├── test_binance_failover_sync.py     # the live feed through a mesh losing and regaining a node
+└── test_example_binance_live.py      # examples/binance-live/, without the network (#43)
 ```
 
 ## Test Categories
@@ -106,6 +190,8 @@ tests/integration/
 | aggregations | `@pytest.mark.aggregations` | Aggregates over the wire: values, scale factors, NULL for empty, refusals |
 | large_response | `@pytest.mark.large_response` | Responses above the socket send buffer, slow readers, clients vanishing mid-response |
 | multi_master | `@pytest.mark.multi_master` | Three-node mesh: convergence, LWW, node loss and rejoin (own cluster) |
+| crash_recovery | `@pytest.mark.crash_recovery` | SIGKILL and restart: the WAL replayed on its own node |
+| subscriptions | `@pytest.mark.subscriptions` | Pushed streaming subscriptions over the wire (#45) |
 | binance | `@pytest.mark.binance` | Live Binance depth feed — **opt-in**, see below |
 
 ## Adding New Tests
@@ -142,7 +228,7 @@ The report includes per-category sections, total passed/failed/skipped counts, e
 
 ## Cluster fixtures
 
-Three cluster fixtures, because one shared cluster cannot serve every kind of test:
+Four kinds of cluster fixture, because one shared cluster cannot serve every kind of test:
 
 | Fixture | Scope | For |
 |---|---|---|

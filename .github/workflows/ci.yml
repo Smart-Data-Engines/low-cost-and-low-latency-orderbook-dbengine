@@ -39,6 +39,11 @@ jobs:
       - name: Check every metric written by name is registered
         run: python3 scripts/check_metrics.py
 
+      - name: The integration battery's README lists every file it has
+        # The list said it was complete as of #101, and by #281 it named 31 of the directory's 93
+        # files. A module nobody lists is a module nobody reading the README knows the battery has.
+        run: python3 scripts/check_integration_readme.py
+
       - name: What the documents say about coverage is what this workflow enforces
         run: python3 scripts/check_coverage_claim.py
 
