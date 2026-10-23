@@ -1373,6 +1373,160 @@
     },
     {
       "type": "row",
+      "title": "WAL archive",
+      "id": 40,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Closed WAL files the archive lacks",
+      "id": 41,
+      "description": "With --wal-archive-dir: closed WAL files not yet in the archive, from its floor to the file the writer is in. Retention keeps every one of them, so a number that grows is a WAL directory that grows. Computed by the flush tick, so a copy that hangs shows here too.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 87
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (instance) (ob_wal_archive_pending_files{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest of them has waited",
+      "id": 42,
+      "description": "Seconds since the oldest closed WAL file the archive lacks was written: what a restore to a moment cannot reach yet. Near zero while the archive keeps up; OrderbookWalArchiveBehind past 180.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 87
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (instance) (ob_wal_archive_oldest_pending_seconds{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Files archived and failed passes",
+      "id": 43,
+      "description": "Closed WAL files copied into the archive, and archive passes that stopped short, in the last 15 minutes. A refused file - one in the archive with other contents - fails every pass until the archive is put right; the node's log says which.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 87
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (increase(ob_wal_archived_files_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "archived {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instance) (increase(ob_wal_archive_failures_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "failed {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes archived",
+      "id": 44,
+      "description": "Bytes of closed WAL files copied into the archive: about the WAL's own rate, read once more and written once more.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 87
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(ob_wal_archived_bytes_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
       "title": "TLS",
       "id": 37,
       "collapsed": false,
@@ -1380,7 +1534,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 86
+        "y": 95
       },
       "panels": []
     },
@@ -1397,7 +1551,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 87
+        "y": 96
       },
       "fieldConfig": {
         "defaults": {
@@ -1430,7 +1584,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 87
+        "y": 96
       },
       "fieldConfig": {
         "defaults": {

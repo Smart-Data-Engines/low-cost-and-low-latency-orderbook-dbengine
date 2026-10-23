@@ -458,6 +458,13 @@ ob_add_engine_test(test_best_track
 )
 target_link_libraries(test_best_track PRIVATE rapidcheck rapidcheck_gtest)
 
+# The WAL archive of point-in-time recovery (#34): closed files copied and checked, a file with other
+# contents refused and never overwritten, and the retention floor never above a file the archive
+# does not hold.
+ob_add_engine_test(test_wal_archive
+    test_wal_archive.cpp
+)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )

@@ -807,15 +807,90 @@ the filesystem's journal (its `syncfs()`); a WAL on a device of its own takes th
 the data directory's journal. Evidence: `evidence/2026-09-28-backup/` and
 `evidence/2026-09-28-sync-outside-the-lock/`.
 
-**RPO** is the interval between backups: the WAL written since the last one is not in any backup, and
-this release has no restore to a point between two (below). **RTO** is `ob_restore` - the check, the
-copy, the start - plus the server's own start on the restored directory, measured above.
+**RPO** is the interval between backups: the WAL written since the last one is not in any backup -
+unless the node archives its WAL, and a restore goes on past the backup (below). **RTO** is
+`ob_restore` - the check, the copy, the start - plus the server's own start on the restored directory,
+measured above.
+
+### Restoring to a moment
+
+With `--wal-archive-dir` a node copies every WAL file it closes into an archive, and `ob_restore`
+carries a restore on past the backup to a chosen moment (#34):
+
+```bash
+ob_tcp_server --data-dir /var/lib/orderbook --backup-dir /var/lib/orderbook-backups \
+              --wal-archive-dir /var/lib/orderbook-wal-archive ...
+ob_restore --backup /var/lib/orderbook-backups/20260928T093000.123Z --data-dir /var/lib/orderbook-2 \
+           --wal-archive /var/lib/orderbook-wal-archive --until 20260928T101500.000Z
+```
+
+- **What the archive holds.** `<archive>/<WAL identity>/wal_NNNNNN.bin`, each the bytes of a WAL file
+  the node closed, and beside it `wal_NNNNNN.bin.crc32c`, its size and CRC32C. The source is synced
+  first. A WAL identity is a lineage: a snapshot installed or a resync begins a new one, in a
+  directory of its own, and first archives the old one's last files.
+- **Linked or copied.** On the WAL's filesystem a file is a hard link: a closed WAL file is never
+  written again, so a second name holds its bytes, with no I/O - and on the same device as the WAL.
+  On another filesystem it is copied, synced, renamed into place and read back with the source's
+  CRC32C - which is what survives the loss of the WAL's device. The log says which, `linked` or
+  `copied`. Copied on the WAL's own device, the archive writes every byte of the WAL twice: measured
+  below.
+- **Retention waits for it.** No WAL file the archive does not hold is removed, so an archive that
+  fails grows the WAL directory rather than losing a record. `ob_wal_archive_pending_files` and
+  `ob_wal_archive_oldest_pending_seconds` say how much waits and for how long, the log says why in a
+  line `cannot archive ...`, and the node tries again every second.
+- **A file already there with other contents is never overwritten.** The node logs `ERROR ... is in
+  the archive with other contents`, counts every pass after it as a failure, and archives nothing
+  more until the archive is put right and the node restarted: it is another node's file, or this
+  node's file damaged. `OrderbookWalArchiveFailing` fires, and `OrderbookWalArchiveBehind` once a
+  file has waited three minutes.
+- **`--wal-archive-interval-s`** (default 60) rotates a WAL file that has held a record that long, so
+  a quiet node's records reach the archive too, not only a busy node's 512 MB files: what a restore
+  can lose with the node is about the interval and a flush tick. A file nothing was written into is
+  not rotated.
+- **Shipping the archive off the host and removing old files** are the operator's, as for backups:
+  it is a plain directory. A restore of a backup needs the files from the one its cut is in on -
+  `ob_restore --verify` prints `cut at WAL <file>:<offset>`.
+- **Not the data or the WAL directory, nor inside either**: a replica's bootstrap removes every
+  directory of the data directory but its own, and the server refuses to start with that layout.
+
+The restore:
+
+1. Before anything is created, the archive is checked: that it has the backup's WAL identity and the
+   file its cut is in, that the files from there to the moment follow one another without a hole, and
+   that each is what its sum says. A refusal names the file or the condition and writes nothing.
+2. The backup is restored as without an archive.
+3. The archived records from the backup's cut are replayed through the engine's write path - into the
+   restored node's own new WAL - up to the last checkpoint the node wrote at or before `--until`. A
+   checkpoint follows a `FLUSH` and every flush tick that sealed something, so the moment is reached
+   to the last such tick before it; a quiet node's checkpoints are further apart. `--until` takes
+   nanoseconds since the epoch, or a time as backups are named, both on the node's clock. `--until
+   end` replays every record the archive holds, past its last checkpoint.
+4. The report gives the records and rows replayed, the files they came from, and the time of the
+   checkpoint the replay reached.
+
+A mesh node's backup is refused: its records' origins and hybrid clocks are the mesh's, and replayed as
+the node's own writes they would be numbered again. Restore it, and let its peers catch it up.
+
+Measured on 23 October 2026 on the x86 and the ARM test host - an m8a.xlarge with ext4 and an
+m9g.xlarge with XFS, both on NVMe - four rounds each way (`evidence/2026-10-23-point-in-time-recovery/`
+in the workspace):
+
+- **A writer.** One connection at its ceiling, 64 MB WAL files, 62 of them archived a round: with the
+  archive linked on the WAL's filesystem, a batch's p50, p99 and p99.9 stayed within the rounds
+  without the archive on both hosts - p99.9 943-990 us against 892-1204 us on x86, 66-67 us against
+  68-78 us on ARM. Copied to another filesystem (tmpfs, on x86), the same: 899-947 us against
+  908-929 us. Copied on the WAL's own NVMe, in the build before the archive linked, the x86 host's
+  p99.9 went from 897-926 us to 1029-1109 us, and the ARM host's did not move.
+- **RPO** at the default `--wal-archive-interval-s 60`: 60.12-60.19 s on both hosts, from one write
+  on a quiet node to its file in the archive.
+- **The replay**, 2 M records of 10 levels from an archive read from the device: 2.58-2.80 s on x86,
+  0.72-0.77 M records a second, and 3.73-3.74 s on ARM, 0.53-0.54 M. **RTO** is a restore's (above)
+  plus the replay.
 
 ### Not in this release
 
-- **Restoring to a moment between two backups** from the WAL. It needs the WAL replayed from a
-  backup's position to a chosen record, past checkpoints that claim segments the backup does not hold
-  - a change to the start's replay, with a specification of its own.
+- **An archive of the file being written.** A record reaches the archive when its file is closed:
+  rotated at its size, or after `--wal-archive-interval-s`. Nothing streams the file in between.
 - **Incremental backups.** A segment has no identity that lasts: its directory's name comes back once a
   merge has removed it, so "the same path, size and CRC" is not proof of the same contents.
 - **Scheduling, retention of old backups, shipping off the host.** Cron with `ob_backup`, and any tool
@@ -850,7 +925,8 @@ logger, to confirm a start.
 Two files ship with the engine (#35):
 
 - `packaging/grafana/orderbook-engine.json` — a Grafana dashboard: writes and queries, flush and
-  durability, storage, replication and failover, the multi-master mesh. Import it and pick the
+  durability, storage, replication and failover, the multi-master mesh, backups, the WAL archive and
+  TLS. Import it and pick the
   Prometheus data source; the `job` and `instance` variables come from `ob_build_info`, which every
   node exports with its version and its role.
 - `packaging/prometheus/orderbook-engine-alerts.yml` — alert rules, to load with `rule_files:`.
@@ -872,6 +948,8 @@ Two files ship with the engine (#35):
 | `OrderbookSubscribersDisconnected` | warning | subscribers closed for reading too slowly | below, `ob_subscription_queued_bytes` |
 | `OrderbookBackupFailed` | warning | a backup failed; it left nothing that looks like one | "Backing up and restoring a node" |
 | `OrderbookBackupStale` | warning | a node that has taken backups has no complete one from the last 26 hours; one that never took any is not paged | "Backing up and restoring a node" |
+| `OrderbookWalArchiveFailing` | warning | for five minutes archive passes failed with closed WAL files waiting; the WAL directory grows meanwhile | "Restoring to a moment" |
+| `OrderbookWalArchiveBehind` | warning | a closed WAL file has waited more than three minutes for the archive - three default `--wal-archive-interval-s` | "Restoring to a moment" |
 | `OrderbookCertificateExpiring` | warning | the TLS certificate in force ends within 14 days, or has ended; a node without TLS is not paged | "Replacing a certificate" |
 | `OrderbookTlsReloadFailed` | warning | a TLS reload was refused, and the node still presents the certificate it had | "Replacing a certificate" |
 

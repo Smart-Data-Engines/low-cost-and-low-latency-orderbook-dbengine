@@ -6,11 +6,13 @@
 #include "orderbook/crc32c.hpp"
 #include "orderbook/durable_file.hpp"
 #include "orderbook/engine.hpp"
+#include "orderbook/level_payload.hpp"
 #include "orderbook/logger.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/version.hpp"
 #include "orderbook/wal.hpp"
+#include "orderbook/wal_archive.hpp"
 #include "orderbook/wall_clock.hpp"
 
 #include <nlohmann/json.hpp>
@@ -318,18 +320,24 @@ bool backup_path_is_contained(std::string_view rel) {
     return true;
 }
 
-std::string backup_dir_problem(const std::string& backup_dir, const std::string& data_dir,
-                               const std::string& wal_dir) {
-    if (backup_dir.empty()) return "--backup-dir is empty";
+namespace {
+
+/// Why `dir`, given as `--<flag>`, cannot be an operator's directory beside the node's: created when
+/// missing, a writable directory, and neither the data nor the WAL directory, inside either or
+/// holding either. `inside` says what goes wrong when it is inside one of them.
+std::string operator_dir_problem(const char* flag, const std::string& dir, const std::string& data_dir,
+                                 const std::string& wal_dir, const char* inside) {
+    const std::string name = std::string("--") + flag;
+    if (dir.empty()) return name + " is empty";
     std::error_code ec;
-    fs::create_directories(backup_dir, ec);
-    if (ec) return "cannot create " + backup_dir + ": " + ec.message();
-    if (!fs::is_directory(backup_dir, ec)) return backup_dir + " is not a directory";
-    if (::access(backup_dir.c_str(), W_OK | X_OK) != 0) {
-        return "cannot write to " + backup_dir + ": " + errno_text(errno);
+    fs::create_directories(dir, ec);
+    if (ec) return "cannot create " + dir + ": " + ec.message();
+    if (!fs::is_directory(dir, ec)) return dir + " is not a directory";
+    if (::access(dir.c_str(), W_OK | X_OK) != 0) {
+        return "cannot write to " + dir + ": " + errno_text(errno);
     }
-    const fs::path b = fs::weakly_canonical(backup_dir, ec);
-    if (ec) return "cannot resolve " + backup_dir + ": " + ec.message();
+    const fs::path b = fs::weakly_canonical(dir, ec);
+    if (ec) return "cannot resolve " + dir + ": " + ec.message();
     struct Named { const char* what; std::string path; };
     for (const Named& other : {Named{"data directory", data_dir}, Named{"WAL directory", wal_dir}}) {
         if (other.path.empty()) continue;
@@ -337,16 +345,31 @@ std::string backup_dir_problem(const std::string& backup_dir, const std::string&
         if (ec) return std::string("cannot resolve the ") + other.what + " " + other.path + ": " +
                        ec.message();
         if (within(b, o)) {
-            return "--backup-dir " + b.string() + " is in the " + other.what + " " + o.string() +
-                   ": the engine would read the backups' segments as its own, and a snapshot "
-                   "install would remove them";
+            return name + " " + b.string() + " is in the " + other.what + " " + o.string() + ": " +
+                   inside;
         }
         if (within(o, b)) {
-            return std::string("the ") + other.what + " " + o.string() + " is in --backup-dir " +
+            return std::string("the ") + other.what + " " + o.string() + " is in " + name + " " +
                    b.string();
         }
     }
     return {};
+}
+
+}  // namespace
+
+std::string backup_dir_problem(const std::string& backup_dir, const std::string& data_dir,
+                               const std::string& wal_dir) {
+    return operator_dir_problem("backup-dir", backup_dir, data_dir, wal_dir,
+                                "the engine would read the backups' segments as its own, and a "
+                                "snapshot install would remove them");
+}
+
+std::string wal_archive_dir_problem(const std::string& archive_dir, const std::string& data_dir,
+                                    const std::string& wal_dir) {
+    return operator_dir_problem("wal-archive-dir", archive_dir, data_dir, wal_dir,
+                                "a replica's bootstrap would remove it, and a new WAL lineage the "
+                                "files it holds");
 }
 
 // ── The description ──────────────────────────────────────────────────────────
@@ -633,13 +656,201 @@ std::vector<std::string> verify_backup(const std::string& backup, const BackupDe
     return problems;
 }
 
+// ── To a moment (#34, point-in-time recovery) ────────────────────────────────
+
+namespace {
+
+/// What a restore to a moment replays, decided before anything is created.
+struct ReplayPlan {
+    std::string lineage;             // <archive>/<the backup's WAL identity>
+    WalPosition from{};              // the backup's cut
+    uint32_t    last_file{0};        // the last archived file the replay reads
+    bool        whole{false};        // --until end: every record from the cut on
+    bool        stop_found{false};   // otherwise: a checkpoint at or before T after the cut
+    WalPosition stop{};              // which the records before are replayed
+    uint64_t    reached_ns{0};       // its time; with `whole`, the last checkpoint's; 0 for none
+    size_t      files{0};            // archived files checked against their sums
+};
+
+/// Plan a restore to `pit` from backup `d`: refused - with the file or the condition in `error` -
+/// for a mesh node's backup, a moment before the cut, an archive without the backup's lineage or
+/// without the cut's file, a gap before the moment, and a file that is not what its sum says.
+bool plan_point_in_time(const BackupDescription& d, const PointInTime& pit, ReplayPlan& plan,
+                        std::string& error) {
+    plan = ReplayPlan{};
+    if (d.role == "multi_master") {
+        error = "a mesh node's backup cannot be carried on to a moment: its records' origins and "
+                "hybrid clocks are the mesh's, and replayed as this node's writes they would be "
+                "numbered again. Restore the backup and let the node catch up from its peers";
+        return false;
+    }
+    if (d.wal_identity == 0) {
+        error = "the backup names no WAL identity, so no archived WAL can be shown to follow it";
+        return false;
+    }
+    if (!pit.to_end && pit.until_ns < d.cut_at_ns) {
+        error = "--until " + std::to_string(pit.until_ns) + " is before the backup's cut at " +
+                std::to_string(d.cut_at_ns) + ": restore an earlier backup";
+        return false;
+    }
+    plan.lineage = wal_archive_lineage_dir(pit.archive, d.wal_identity);
+    std::error_code ec;
+    if (!fs::is_directory(plan.lineage, ec)) {
+        error = "the WAL archive " + pit.archive + " has no " + std::to_string(d.wal_identity) +
+                ", the WAL identity the backup's cut is in: it holds another node's WAL, or this "
+                "node archived none after the backup";
+        return false;
+    }
+    std::vector<uint32_t> indexes;
+    for (const auto& entry : fs::directory_iterator(plan.lineage, ec)) {
+        uint32_t index = 0;
+        if (parse_wal_file_basename(entry.path().filename().string(), index)) indexes.push_back(index);
+    }
+    if (ec) {
+        error = "cannot list " + plan.lineage + ": " + ec.message();
+        return false;
+    }
+    std::sort(indexes.begin(), indexes.end());
+    const uint32_t first = d.wal_file_index;
+    if (!std::binary_search(indexes.begin(), indexes.end(), first)) {
+        error = plan.lineage + " has no " + wal_file_basename(first) + ", the file the backup's cut " +
+                "is in: the node had not closed it, or the archive lost it";
+        return false;
+    }
+    // The files from the cut's on, as far as none is missing.
+    uint32_t run_end = first;
+    while (std::binary_search(indexes.begin(), indexes.end(), run_end + 1)) ++run_end;
+    const bool gap = indexes.back() > run_end;
+    plan.from = WalPosition{first, static_cast<uint32_t>(d.wal_byte_offset)};
+
+    // The checkpoints of that run: the last at or before T, and the first after it, which ends the
+    // search - the moment is where the log passed T.
+    struct Mark {
+        WalPosition at;
+        uint64_t    ns;
+    };
+    std::optional<Mark> last_le, first_gt, last_any;
+    WALReplayer scan(plan.lineage);
+    scan.replay_v2_from(plan.from, [&](const WALReplayContext& ctx) {
+        if (ctx.wal_file_index > run_end || ctx.header.record_type != WAL_RECORD_CHECKPOINT) return;
+        const Mark m{WalPosition{ctx.wal_file_index, static_cast<uint32_t>(ctx.wal_byte_offset)},
+                     ctx.header.timestamp_ns};
+        last_any = m;
+        if (pit.to_end || first_gt) return;
+        if (m.ns <= pit.until_ns) {
+            last_le = m;
+        } else {
+            first_gt = m;
+        }
+    });
+
+    const auto missing = [&](const char* consequence) {
+        error = plan.lineage + " has no " + wal_file_basename(run_end + 1) + " between " +
+                wal_file_basename(run_end) + " and " + wal_file_basename(indexes.back()) + ": " +
+                consequence;
+        return false;
+    };
+    if (pit.to_end) {
+        if (gap) return missing("--until end would stop at the hole rather than at the archive's end");
+        plan.whole = true;
+        plan.last_file = run_end;
+        plan.reached_ns = last_any ? last_any->ns : 0;
+    } else {
+        if (!first_gt && gap) return missing("the moment may be in it, or after it");
+        // The file of the first checkpoint after T too: what shows the one before it is the last.
+        plan.last_file = first_gt ? first_gt->at.file_index : run_end;
+        if (last_le) {
+            plan.stop_found = true;
+            plan.stop = last_le->at;
+            plan.reached_ns = last_le->ns;
+        }
+    }
+    for (uint32_t i = first; i <= plan.last_file; ++i) {
+        if (std::string why = verify_archived_file(plan.lineage, i); !why.empty()) {
+            error = std::move(why);
+            return false;
+        }
+        ++plan.files;
+    }
+    OB_LOG_INFO("restore", "The WAL archive %s holds the backup's log from file %u offset %u to file %u, "
+                           "%zu file(s) matching their sums; %s",
+                plan.lineage.c_str(), plan.from.file_index, plan.from.offset, plan.last_file, plan.files,
+                plan.whole        ? "the replay reads every record"
+                : plan.stop_found ? "the replay stops at the last checkpoint at or before the moment"
+                                  : "no checkpoint after the cut is at or before the moment, so "
+                                    "nothing is replayed");
+    return true;
+}
+
+/// Apply the DELTA records the plan names to `engine`, through `apply_delta()` - so that they are in
+/// the restored node's own WAL too, and a crash before its first checkpoint loses none. Throws what
+/// `apply_delta()` throws.
+bool replay_plan(Engine& engine, const ReplayPlan& plan, RestoreReport& report, std::string& error) {
+    if (!plan.whole && !plan.stop_found) return true;
+    std::vector<Level> scratch;
+    std::string refused;
+    WALReplayer replayer(plan.lineage);
+    replayer.replay_v2_from(plan.from, [&](const WALReplayContext& ctx) {
+        if (!refused.empty() || ctx.wal_file_index > plan.last_file) return;
+        const WalPosition at{ctx.wal_file_index, static_cast<uint32_t>(ctx.wal_byte_offset)};
+        if (!plan.whole && !wal_position_before(at, plan.stop)) return;
+        if (ctx.header.record_type != WAL_RECORD_DELTA) return;
+        // The two checks a start makes of a DELTA, and what it does when one fails: the record is
+        // skipped, as the node itself would have skipped it.
+        if (ctx.payload_len < sizeof(DeltaUpdate)) {
+            OB_LOG_WARN("restore", "A DELTA at file %u offset %u is too short (%zu < %zu), skipped",
+                        at.file_index, at.offset, ctx.payload_len, sizeof(DeltaUpdate));
+            ++report.skipped_records;
+            return;
+        }
+        DeltaUpdate delta{};
+        std::memcpy(&delta, ctx.payload, sizeof(DeltaUpdate));
+        const size_t levels_bytes = static_cast<size_t>(delta.n_levels) * sizeof(Level);
+        if (sizeof(DeltaUpdate) + levels_bytes > ctx.payload_len) {
+            OB_LOG_WARN("restore", "A DELTA at file %u offset %u holds %zu bytes and %u levels need %zu, "
+                                   "skipped",
+                        at.file_index, at.offset, ctx.payload_len, delta.n_levels,
+                        sizeof(DeltaUpdate) + levels_bytes);
+            ++report.skipped_records;
+            return;
+        }
+        const Level* levels = levels_from_payload(ctx.payload, delta.n_levels, scratch);
+        if (const ob_status_t status = engine.apply_delta(delta, levels); status != OB_OK) {
+            refused = "the restored node refused the record at file " + std::to_string(at.file_index) +
+                      " offset " + std::to_string(at.offset) + " with status " +
+                      std::to_string(static_cast<int>(status));
+            return;
+        }
+        ++report.replayed_records;
+        report.replayed_rows += delta.n_levels;
+    });
+    if (!refused.empty()) {
+        error = refused;
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 // ── Restore ──────────────────────────────────────────────────────────────────
 
 bool restore_backup(const std::string& backup, const std::string& data_dir,
-                    const std::string& wal_dir_in, RestoreReport& report, std::string& error) {
+                    const std::string& wal_dir_in, RestoreReport& report, std::string& error,
+                    const PointInTime* point_in_time) {
     report = RestoreReport{};
     BackupDescription d;
     if (!read_backup_description(backup, d, error)) return false;
+    // To a moment: the archive is checked before anything is created, as the backup is below.
+    ReplayPlan plan;
+    if (point_in_time != nullptr) {
+        report.point_in_time = true;
+        if (!plan_point_in_time(d, *point_in_time, plan, error)) {
+            OB_LOG_WARN("restore", "Restore of %s to a moment refused, nothing was written: %s",
+                        backup.c_str(), error.c_str());
+            return false;
+        }
+    }
     if (d.role == "multi_master" && d.vector_truncated) {
         error = "the backup's version vector was past the entries a node can state, so a mesh node "
                 "restored from it could declare no frontier and would take every row again: bootstrap "
@@ -765,6 +976,24 @@ bool restore_backup(const std::string& backup, const std::string& data_dir,
             OB_LOG_WARN("backup", "Restore of %s: the backup's vector was truncated; the frontiers are "
                                   "the ones the start declared from the segments",
                         backup.c_str());
+        }
+        if (point_in_time != nullptr) {
+            const auto began = std::chrono::steady_clock::now();
+            if (!replay_plan(engine, plan, report, error)) {
+                engine.close();
+                return left_behind(error);
+            }
+            report.replay_ms = ms_since(began);
+            report.archived_files = plan.files;
+            report.reached_ns = plan.reached_ns;
+            report.reached_end = plan.whole;
+            report.rows += report.replayed_rows;
+            OB_LOG_INFO("restore", "replayed %llu record(s), %llu row(s) from %zu archived file(s) to %s "
+                                   "%llu, in %.1f ms",
+                        static_cast<unsigned long long>(report.replayed_records),
+                        static_cast<unsigned long long>(report.replayed_rows), plan.files,
+                        plan.whole ? "the archive's end, its last checkpoint at" : "the checkpoint at",
+                        static_cast<unsigned long long>(plan.reached_ns), report.replay_ms);
         }
         engine.close();
     } catch (const std::exception& e) {

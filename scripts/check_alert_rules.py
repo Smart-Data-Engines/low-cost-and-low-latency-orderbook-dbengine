@@ -54,6 +54,11 @@ FAULTS = {
     # A certificate that ends ten days after t=0.
     "OrderbookCertificateExpiring": ([("ob_tls_certificate_not_after_seconds", "864000x20")], 10),
     "OrderbookTlsReloadFailed": ([("ob_tls_reload_failures_total", "0 0 0 1 1 1")], 4),
+    # Every pass fails from minute 2, with three files waiting.
+    "OrderbookWalArchiveFailing": ([("ob_wal_archive_failures_total", "0 0 60+60x12"),
+                                    ("ob_wal_archive_pending_files", "0 0 3x12")], 10),
+    # A file closed at minute 2 that the archive never takes.
+    "OrderbookWalArchiveBehind": ([("ob_wal_archive_oldest_pending_seconds", "0 0 0+60x10")], 7),
 }
 
 # alert -> (input series, minute) at which it must **not** fire: the cases a fault's shape could be
@@ -63,6 +68,9 @@ QUIET = {
     "OrderbookBackupStale": ([("ob_backup_last_success_timestamp_seconds", "0x1700")], 27 * 60),
     # A node without TLS exports 0, which is not a certificate that expired in 1970.
     "OrderbookCertificateExpiring": ([("ob_tls_certificate_not_after_seconds", "0x20")], 10),
+    # One failed pass, retried a second later: nothing waits, and nobody is paged for it.
+    "OrderbookWalArchiveFailing": ([("ob_wal_archive_failures_total", "0 0 1x12"),
+                                    ("ob_wal_archive_pending_files", "0 0 1 0x11")], 10),
 }
 
 # What a healthy primary with two replicas and two mesh peers exports for twenty minutes.
@@ -80,6 +88,9 @@ HEALTHY = [
     ("ob_backup_failures_total", "0x20"), ("ob_backup_last_success_timestamp_seconds", "600x20"),
     # A certificate with thirty days left, and no refused reload.
     ("ob_tls_certificate_not_after_seconds", "2592000x20"), ("ob_tls_reload_failures_total", "0x20"),
+    # An archive keeping up: nothing waits, and no pass fails.
+    ("ob_wal_archive_failures_total", "0x20"), ("ob_wal_archive_pending_files", "0x20"),
+    ("ob_wal_archive_oldest_pending_seconds", "0x20"),
 ]
 
 

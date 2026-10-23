@@ -381,6 +381,26 @@ TEST(BackupDir, TheDataAndWalDirectoriesAndEverythingNestedEitherWayAreRefused) 
     EXPECT_TRUE(fs::is_directory(root.path + "/backups/node-1"));
 }
 
+// The WAL archive's directory (#34, point-in-time recovery) is held to the backup directory's rule,
+// and its refusal names its own flag and what would go wrong.
+TEST(WalArchiveDir, TheDataAndWalDirectoriesAndEverythingNestedEitherWayAreRefused) {
+    TempDir root;
+    const std::string data = root.path + "/data", wal = root.path + "/wal";
+    fs::create_directories(data);
+    fs::create_directories(wal);
+    const std::string inside = ob::wal_archive_dir_problem(data + "/archive", data, wal);
+    EXPECT_NE(inside.find("--wal-archive-dir"), std::string::npos) << inside;
+    EXPECT_NE(inside.find("bootstrap would remove it"), std::string::npos) << inside;
+    EXPECT_FALSE(ob::wal_archive_dir_problem(wal, data, wal).empty());
+    EXPECT_FALSE(ob::wal_archive_dir_problem(wal + "/archive", data, wal).empty());
+    EXPECT_FALSE(ob::wal_archive_dir_problem(root.path, data, wal).empty()) << "holding the data";
+    // The backup directory's own message is unchanged by the sharing.
+    EXPECT_NE(ob::backup_dir_problem(data + "/b", data, "").find("--backup-dir"), std::string::npos);
+    // Control: a sibling of both, created when missing.
+    EXPECT_EQ(ob::wal_archive_dir_problem(root.path + "/wal-archive", data, wal), "");
+    EXPECT_TRUE(fs::is_directory(root.path + "/wal-archive"));
+}
+
 // ── Taking one ───────────────────────────────────────────────────────────────
 
 TEST(BackupRunner, ALinkedBackupHoldsEveryFileOfTheCutAndVerifies) {

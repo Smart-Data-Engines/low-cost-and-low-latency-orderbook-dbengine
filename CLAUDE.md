@@ -4430,6 +4430,36 @@ Learned the hard way. Check here before debugging.
      its own span, and a test of two tracks, the first unreadable, kills the mutant. Before
      strengthening the tests against a surviving mutant, ask whether the code it removes did
      anything.
+604. **A closed WAL file is not a synced one.** Since stage 5 of #151 a rotation leaves its file for
+     the next flush tick to sync, so a reader that copies every file below the writer's can copy
+     bytes a power cut then takes from the source. The WAL archive of #34 would hold them, the source
+     would come back shorter, and the next pass would refuse the file as "other contents" - an
+     archive stopped at a file nobody damaged.
+     - The archiver syncs each source before it reads it: a file the tick has synced costs a call,
+       and the bound stays the writer's file, with no record of which files a sync has covered.
+     - Anything else that reads a closed WAL file to keep it - a copy, a checksum taken to compare
+       later - has to ask the same question.
+605. **Records that check do not make a file that is whole.** A WAL file cut off exactly at a record
+     boundary reads as a shorter log: every record passes its CRC, and the replay moves on to the
+     next file. Before the archive's restore trusts a file it did not write itself, the file is held
+     to `wal_NNNNNN.bin.crc32c`, its size and CRC32C written once the copy read back.
+606. **A thread cannot report its own hang.** The archiver set the gauges of the files waiting for
+     it, so a copy hung on its device would have frozen them at whatever the last pass said - zero,
+     on a healthy node. The flush tick computes them now, from the archiver's published
+     `archived_before()` and the writer's file, and a pass that never ends shows as files waiting.
+607. **An alert on `increase()` of a counter needs the counter to rise for as long as the fault
+     lasts.** A refused archive stops copying for good, and the first version stopped its passes
+     too: the failure was counted once, and `OrderbookWalArchiveFailing` would have resolved fifteen
+     minutes later with nothing archived. A refused archive still passes every second, copies
+     nothing and counts each pass.
+608. **A second copy of the WAL on the WAL's own device shows in the tail.** The archive's first build
+     copied every closed file. On the x86 host, at one connection's ceiling with 64 MB WAL files, a
+     batch's p99.9 went from 897-926 us to 1029-1109 us in four rounds each way; the p50, the p99 and
+     the worst batch did not move, and on the Graviton host nothing did. A closed WAL file is never
+     written again, so on the WAL's filesystem the archive links it now - the same bytes under a
+     second name, no I/O - and copies only to another filesystem, as backups do. Linked, the rounds
+     overlap on both hosts; copied to tmpfs, they overlap too. Measure a change that writes beside
+     the WAL at the ceiling's p99.9, on more than one host: the cost hid on one of the two.
 
 ## Current state and open problems
 
@@ -4477,12 +4507,17 @@ against 11.21-21.98 ms on master (pitfalls 602, 603).
 bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step
 4**: FLUSH and a snapshot's cut sync the WAL without the engine's lock, as the tick does.
 
-**Backup and restore (#34) shipped; point-in-time recovery, the rest of #34, has not**: `BACKUP` on a
+**Backup and restore (#34) shipped, and point-in-time recovery with them**: `BACKUP` on a
 server with `--backup-dir` is a cut from the snapshot path, hard-linked or copied, published by a
 rename only when it is all on the device; `ob_restore` checks the whole backup before it writes, and
 opens it through the engine's own start with the WAL begun at its second file, so a replica asking
 from the start is sent a snapshot (pitfalls 523-526; `docs/operations.md`, "Backing up and restoring
-a node"). **#35 is closed**: a dashboard and alert rules in `packaging/`, held against the registry
+a node"). With `--wal-archive-dir` a node copies every WAL file it closes into
+`<archive>/<WAL identity>/`, with a size and CRC32C sum beside each; retention removes none the
+archive lacks, a file held for `--wal-archive-interval-s` is rotated for it, and a new lineage
+archives the old one's files before it removes them. `ob_restore --wal-archive --until` replays the
+archived records from a backup's cut through `apply_delta()` to the last checkpoint at or before the
+moment (pitfalls 604-608; `docs/operations.md`, "Restoring to a moment"). **#35 is closed**: a dashboard and alert rules in `packaging/`, held against the registry
 and `promtool test rules` in CI.
 
 **#165 is closed, in three parts**: the segment index is per symbol and in width tiers, so a flush

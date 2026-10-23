@@ -111,6 +111,16 @@ MetricsRegistry::MetricsRegistry() {
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",
                                      "fsync calls on the WAL that failed"));
+    // The WAL archive (#34, point-in-time recovery), with `--wal-archive-dir`: closed WAL files
+    // copied into it, their bytes, and the passes that stopped short - a copy that failed, or a file
+    // already in the archive with other contents, which stops archiving until an operator looks.
+    // While a pass stops short, retention keeps every file from the first one it did not archive.
+    counters_.push_back(make_counter("ob_wal_archived_files_total",
+                                     "Closed WAL files copied into the WAL archive"));
+    counters_.push_back(make_counter("ob_wal_archived_bytes_total",
+                                     "Bytes of closed WAL files copied into the WAL archive"));
+    counters_.push_back(make_counter("ob_wal_archive_failures_total",
+                                     "Archive passes that stopped before the last closed WAL file"));
     // Flushes whose segment sync failed (#160). Registered in the same change that writes it. Its
     // consequence is not a lost row but no checkpoint from here on: the first failure freezes them
     // for the rest of the process (`ob_checkpoints_frozen`), because no later sync can vouch for
@@ -287,6 +297,10 @@ MetricsRegistry::MetricsRegistry() {
                                  "Bytes of WAL that may wait for a sync before a writer waits for "
                                  "one; 0 when the fsync policy is not interval (#190)"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
+    gauges_.push_back(make_gauge("ob_wal_archive_pending_files",
+                                 "Closed and synced WAL files the WAL archive does not hold yet (#34)"));
+    gauges_.push_back(make_gauge("ob_wal_archive_oldest_pending_seconds",
+                                 "Seconds since the oldest of them was last written; 0 with none (#34)"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
     gauges_.push_back(make_gauge("ob_decoded_columns_bytes",
                                  "Bytes of decoded columns held between queries (#220)"));
