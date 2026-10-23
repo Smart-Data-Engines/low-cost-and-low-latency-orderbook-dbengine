@@ -276,11 +276,17 @@ void Engine::write_book_summaries(const std::vector<Seal>& seals) {
             p.prices = w.prices;
             registry_.increment_counter("ob_book_summaries_written_total");
             registry_.increment_counter("ob_book_summary_bytes_total", w.bytes);
+            registry_.increment_counter("ob_best_track_bytes_total", w.track_bytes);
             OB_LOG_DEBUG("engine", "book summary %s.%s: %zu price(s) as of %llu, %zu bytes, from %llu "
-                                   "row(s) read, in %.2f ms",
+                                   "row(s) read, in %.2f ms; best track: %s",
                          symbol.c_str(), exchange.c_str(), w.prices,
                          static_cast<unsigned long long>(w.as_of_ts), w.bytes,
-                         static_cast<unsigned long long>(w.rows_read), ms);
+                         static_cast<unsigned long long>(w.rows_read), ms,
+                         w.track_why_not.empty()
+                             ? (std::to_string(w.track_entries) + " entr" +
+                                (w.track_entries == 1 ? "y, " : "ies, ") +
+                                std::to_string(w.track_bytes) + " bytes").c_str()
+                             : w.track_why_not.c_str());
         } else {
             OB_LOG_DEBUG("engine", "book summary %s.%s not written: %s", symbol.c_str(),
                          exchange.c_str(), w.why_not.c_str());

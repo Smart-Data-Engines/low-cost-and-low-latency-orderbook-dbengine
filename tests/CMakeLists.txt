@@ -451,6 +451,13 @@ ob_add_engine_test(test_book_summary
 )
 target_link_libraries(test_book_summary PRIVATE rapidcheck rapidcheck_gtest)
 
+# The best tracks a series of the book reads (#243): the file, and a store that writes, falsifies,
+# carries and reads them back, against a series composed from every row.
+ob_add_engine_test(test_best_track
+    test_best_track.cpp
+)
+target_link_libraries(test_best_track PRIVATE rapidcheck rapidcheck_gtest)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )

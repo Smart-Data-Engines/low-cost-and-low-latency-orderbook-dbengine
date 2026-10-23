@@ -2948,7 +2948,7 @@ the library has it, and closes and opens one that does not.
 - Effort: S | Impact: a read after a write in local mode paid an open of the engine: 94-146 ms with a
   million rows of one symbol
 
-### 243. A series of the book reads every row of its range **P2**
+### 243. A series of the book reads every row of its range ✅ **P2**
 
 **Found measuring #233's reading by price** (`evidence/2026-10-18-incremental-books/` in the workspace).
 A series applies every row of its range to a book kept by price, because any row can set a better
@@ -2964,6 +2964,54 @@ whole sides.
 **A fix reads one row a change of the best price.** A track of the best bid and ask per segment,
 written at the seal beside the book summaries, would be kept true the same way: a row published
 later at or before a track's time removes the track.
+
+**Closed** (23 October 2026), with the track beside each book summary rather than each segment (spec
+`specs/best-price-track/` in the workspace).
+- **What a track is.** `best.<as_of>.v1` holds the best of each side after every instant at which it
+  changed, from the summary the composition started from to its own. It is written from the
+  composition that writes the summary, without a second pass over the rows.
+- **How it is kept true.** The late row that removes the summary removes the track. Snapshots,
+  backups, migrations and merges carry it, and a segment that leaves the index takes it along.
+- **How a series reads it.** `ColumnarStore::tops_by_time()` hands a series the best in force before
+  its range, then each change. The changes come from the tracks where they cover the range.
+  Elsewhere they come from the rows by price, starting from the summary a track ends at. A track
+  that does not read back costs the series its own span.
+- **It is not synced.** A track that does not read back is no track. It is written before its
+  summary, whose directory sync takes it along. Written with syncs of its own, two more a summary,
+  a FLUSH took 59-71 ms at 3 M rows against master's 22-36 ms.
+
+Measured on the x86 host, three Release builds and the reads of the load above, three rounds
+(`evidence/2026-10-23-best-price-track/` in the workspace). Every answer was the same in every
+build:
+
+| rows | series before #233 | series on master | series with tracks |
+|---|---|---|---|
+| 1 000 000 | 0.22-0.36 ms | 2.87-14.80 ms | 0.40-0.61 ms |
+| 3 000 000 | 1.04-1.10 ms | 11.21-21.98 ms | 0.08 ms |
+
+- At 1 M rows the series reads the rows after the newest summary, which here fell well before the
+  end. Run 1 of the same measurement, where it fell nearer, took 0.05 ms.
+- `AT` was as on master. A summary with its track took 5-10% longer to write: 58.2-61.6 ns a row
+  read, against 55.2-58.7 ns. A track held 639-5 710 entries in 515-3 345 bytes.
+
+Tests, in `test_best_track.cpp`:
+- the file;
+- a track equal to the rows' composition between two summaries;
+- falsified by a late row, registered at an open, refused when it does not read back, gone with its
+  segment;
+- a series from tracks equal to one from the rows, and to an oracle, over random writers, seals,
+  late rows and ranges, rolling windows included;
+- the rows read where tracks do not cover the range, and no further.
+
+`test_compaction` checks that a merge carries tracks, and the backup test of the integration
+battery that a backup and a restore do and that the series answers the same after them.
+
+Mutations, all killed: an entry after every row; the entry in force taken at or before the range's
+start; the rows after a track from a composed book or from an empty one; a late row that leaves
+the tracks; entry 0 without the starting book; no track registered at an open; a merge that carries
+none or leaves them at their inputs' paths; a stretch of rows not cut where a track starts; an
+unreadable track's span not skipped; a segment that leaves keeping its track; a snapshot that does
+not know the file. The control, a reworded warning, survived.
 
 - Effort: M | Impact: a series over a long range costs 7-12 times what it did before #233, for a
   writer of whole sides; a writer of diffs got a wrong answer before
@@ -15549,7 +15597,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #242, #243.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #242.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -15688,7 +15736,6 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
-| **P2** | A series of the book reads one row a change of the best price (#243) | M | Since #233 a series applies every row of its range by price: 7-12 times the time it took for a writer of whole sides |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P3** | Signed release tags (#42, what is left of it) | S | v0.1.0 went out unsigned; a signed tag lets a user check it is ours without trusting the host it came from |

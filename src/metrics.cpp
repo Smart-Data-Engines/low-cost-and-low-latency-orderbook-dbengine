@@ -193,6 +193,9 @@ MetricsRegistry::MetricsRegistry() {
                                      "segments, each the start of the book reads after it"));
     counters_.push_back(make_counter("ob_book_summary_bytes_total",
                                      "Bytes of the book summaries written"));
+    // Best tracks (#243): the best of each side beside each summary, which a series reads.
+    counters_.push_back(make_counter("ob_best_track_bytes_total",
+                                     "Bytes of the best tracks written beside the book summaries"));
     // Mesh events whose handling threw and which the io loop abandoned (#112). Registered in the
     // same change that writes it: measured, an ENOSPC on a peer's delta used to end that thread
     // outright, and every outside signal - PING, MM_PEERS, the peer's `connected` row - stayed

@@ -1837,49 +1837,9 @@ std::string bucket_overflow(const QueryAST& ast, const BucketAgg& agg, uint64_t 
 
 // ── Series of the book (#44 step 2) ──────────────────────────────────────────
 
-/// The best level of each side at an instant - level 0 of the book `AT` answers - as a series
-/// reads it.
-struct Top {
-    bool    has_bid{false};
-    bool    has_ask{false};
-    int64_t bid{0};
-    int64_t ask{0};
-};
-
-/// The book a series reads, by price (#233, decision B'): each side's prices and quantities, so the
-/// best is the first key once a removal takes the one before it. A series used to read level 0 of
-/// each update as the best, which it is only for a writer whose every update is the whole side.
-struct PriceBook {
-    std::map<int64_t, uint64_t, std::greater<>> bids;
-    std::map<int64_t, uint64_t> asks;
-    void apply(const SnapshotRow& row) {
-        if (row.side == SIDE_BID) {
-            if (row.quantity == 0) {
-                bids.erase(row.price);
-            } else {
-                bids.insert_or_assign(row.price, row.quantity);
-            }
-        } else if (row.side == SIDE_ASK) {
-            if (row.quantity == 0) {
-                asks.erase(row.price);
-            } else {
-                asks.insert_or_assign(row.price, row.quantity);
-            }
-        }
-    }
-    Top top() const {
-        Top t;
-        if (!bids.empty()) {
-            t.has_bid = true;
-            t.bid = bids.begin()->first;
-        }
-        if (!asks.empty()) {
-            t.has_ask = true;
-            t.ask = asks.begin()->first;
-        }
-        return t;
-    }
-};
+/// The best of each side at an instant, as a series reads it: what the store hands over, from a
+/// best track or from the rows by price (`ColumnarStore::tops_by_time()`, #243).
+using Top = BookTop;
 
 /// (bid + ask) * 10^6 / 2 as MID_PRICE computes it, which is exactly (bid + ask) * this.
 constexpr int64_t kMidHalf = kBucketScale / 2;
@@ -2123,9 +2083,7 @@ std::vector<Series> used_series(const QueryAST& ast) {
 
 /// What a sweep of the series read, for the query's log line.
 struct SeriesSweep {
-    size_t before_read{0};
-    size_t before_skipped{0};
-    ColumnarStore::TimeOrderedCost cost{};
+    ColumnarStore::TopsCost tops{};
 };
 
 /// The series `used` through consecutive buckets of `width` from the one starting at `first`, in
@@ -2134,23 +2092,17 @@ struct SeriesSweep {
 /// `on_window(bucket, windows)`, in order; false from it ends the sweep, and it must eventually
 /// return false, since the windows after the last row carry what it left in force.
 ///
-/// The book just before `lo` is read by price with `book_at_by_price()`, every price of it, and the
-/// rows from `lo` to `read_to` with `scan_by_time()`, every row: under #233's decision any row can
-/// change the best price, by setting a better one or by removing the one that was.
+/// The best of each side comes from `tops_by_time()` (#243): the best in force just before `lo`, then
+/// after each instant of [lo, read_to] at which it changed - from the best tracks where they cover
+/// the range, and from the rows by price elsewhere, since under #233's decision any row can change
+/// the best price, by setting a better one or by removing the one that was. An instant at which it
+/// did not change would leave every window as it was, so none is handed over.
 template <typename OnWindow>
 SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64_t lo, uint64_t hi,
                          uint64_t read_to, uint64_t first, uint64_t width,
                          const std::vector<Series>& used, OnWindow&& on_window) {
     SeriesSweep out;
-    // The book just before the range, every price of it.
-    PriceBook book;
-    if (lo > 0) {
-        const ColumnarStore::PricedBook before = store.book_at_by_price(lo - 1, ast.symbol, ast.exchange);
-        for (const SnapshotRow& r : before.rows) book.apply(r);
-        out.before_read = before.cost.candidates;
-        out.before_skipped = before.cost.skipped;
-    }
-    Top top = book.top();
+    Top top;
 
     SeriesWindows windows{};
     const auto window_of = [&](Series s) -> SeriesWindow& { return windows[static_cast<size_t>(s)]; };
@@ -2180,14 +2132,10 @@ SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64
         we = std::min(hi, bucket_last_ns(bucket, width));
         start_window();
     };
-    start_window();
 
-    // The rows of one instant are applied together - the best after all of them is the one in
-    // force - and then the windows before that instant are closed, and the value it brings is
-    // observed.
+    // The best after an instant's rows is the one in force from it: the windows before that instant
+    // are closed, and the value it brings is observed.
     Top next = top;
-    uint64_t at_ts = 0;
-    bool pending = false;
     const auto apply_instant = [&](uint64_t t) {
         while (t > we) {
             if (!finish_window()) return false;
@@ -2206,31 +2154,18 @@ SeriesSweep sweep_series(const ColumnarStore& store, const QueryAST& ast, uint64
         return true;
     };
 
-    ColumnSet columns;
-    columns.add(QueryColumn::TimestampNs);
-    columns.add(QueryColumn::Side);
-    columns.add(QueryColumn::Price);
-    columns.add(QueryColumn::Quantity);
     bool going = true;
-    out.cost = store.scan_by_time(
-        lo, read_to, ast.symbol, ast.exchange, columns, RowFilter{},
-        [&](const SnapshotRow& r) {
-            if (pending && r.timestamp_ns != at_ts) {
-                pending = false;
-                next = book.top();
-                if (!apply_instant(at_ts)) return going = false;
-            }
-            if (!pending) {
-                at_ts = r.timestamp_ns;
-                pending = true;
-            }
-            book.apply(r);
-            return true;
+    out.tops = store.tops_by_time(
+        lo, read_to, ast.symbol, ast.exchange,
+        [&](const BookTop& before) {
+            top = before;
+            start_window();
+        },
+        [&](uint64_t t, const BookTop& after) {
+            next = after;
+            going = apply_instant(t);
+            return going;
         });
-    if (going && pending) {
-        next = book.top();
-        going = apply_instant(at_ts);
-    }
     // The buckets after the last row: what it left in force, carried to the last one wanted.
     while (going) {
         if (!finish_window()) break;
@@ -2355,16 +2290,19 @@ std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& 
     if (!refusal.empty()) return refusal;
 
     OB_LOG_DEBUG("query", "GROUP BY %s.%s with %zu series: [%llu, %llu], %llu bucket(s) of %llu ns "
-                          "in range, %zu answered; the book before it from %zu segment(s), %zu "
-                          "skipped; %llu best-level row(s) of %zu segment(s) and %zu block(s), at most "
-                          "%llu held%s; %llu row(s) for the rows' aggregates",
+                          "in range, %zu answered; %zu best track(s), %llu entr(ies); the book "
+                          "before a stretch of rows from %zu segment(s), %zu skipped; %llu row(s) in "
+                          "%zu stretch(es) of %zu segment(s) and %zu block(s), at most %llu held%s; "
+                          "%llu row(s) for the rows' aggregates",
                  ast.symbol.c_str(), ast.exchange.c_str(), used.size(),
                  static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
                  static_cast<unsigned long long>(in_range), static_cast<unsigned long long>(width),
-                 answer.size(), sweep.before_read, sweep.before_skipped,
-                 static_cast<unsigned long long>(sweep.cost.kept), sweep.cost.candidates,
-                 sweep.cost.blocks, static_cast<unsigned long long>(sweep.cost.max_held),
-                 sweep.cost.stopped ? ", the read ended by LIMIT" : "",
+                 answer.size(), sweep.tops.tracks,
+                 static_cast<unsigned long long>(sweep.tops.track_entries), sweep.tops.before_read,
+                 sweep.tops.before_skipped, static_cast<unsigned long long>(sweep.tops.rows.kept),
+                 sweep.tops.row_stretches, sweep.tops.rows.candidates, sweep.tops.rows.blocks,
+                 static_cast<unsigned long long>(sweep.tops.rows.max_held),
+                 sweep.tops.stopped ? ", the read ended by LIMIT" : "",
                  static_cast<unsigned long long>(rows));
     for (const QueryResult& qr : answer) cb(qr);
     return {};
@@ -2472,12 +2410,14 @@ std::string QueryEngine::execute_rolling(const QueryAST& ast, const RowCallback&
 
     OB_LOG_DEBUG("query", "GROUP BY %s.%s ROLLING: windows of %llu bucket(s) of %llu ns, %zu series; "
                           "[%llu, %llu] answered from %llu, %zu bucket(s); %llu row(s) for the rows' "
-                          "aggregates, %llu best-level row(s) for the series",
+                          "aggregates; for the series %zu best track(s), %llu entr(ies) and %llu row(s)",
                  ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(k),
                  static_cast<unsigned long long>(width), used.size(),
                  static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
                  static_cast<unsigned long long>(back), answer.size(),
-                 static_cast<unsigned long long>(rows), static_cast<unsigned long long>(sweep.cost.kept));
+                 static_cast<unsigned long long>(rows), sweep.tops.tracks,
+                 static_cast<unsigned long long>(sweep.tops.track_entries),
+                 static_cast<unsigned long long>(sweep.tops.rows.kept));
     for (const QueryResult& qr : answer) cb(qr);
     return {};
 }
