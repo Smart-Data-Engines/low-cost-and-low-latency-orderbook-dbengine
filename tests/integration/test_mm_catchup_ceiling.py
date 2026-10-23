@@ -18,7 +18,7 @@ import time
 import pytest
 
 from conftest import ClusterManager, node_log_since, node_log_size
-from orderbook_engine import BookUpdate, OrderbookEngine
+from orderbook_engine import BookUpdate, OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.multi_master
 
@@ -55,10 +55,22 @@ def write(node, first_ts: int, per_symbol: int) -> None:
 
 
 def rows_per_symbol(node) -> dict:
+    """The rows `node` holds of each symbol. A symbol it has no row of yet counts as none: the wait
+    below polls the returning node right after the first write to the writer, before the mesh has
+    delivered it, and under ThreadSanitizer the query raised `NOT_FOUND` there instead of polling
+    again (pitfall 576's race, in this module)."""
     client = client_for(node)
     try:
         client.flush()
-        return {symbol(s): len(client.query_all(symbol(s), EXCHANGE)) for s in range(SYMBOLS)}
+        held = {}
+        for s in range(SYMBOLS):
+            try:
+                held[symbol(s)] = len(client.query_all(symbol(s), EXCHANGE))
+            except OrderbookError as e:
+                if "OB_ERR_NOT_FOUND" not in str(e):
+                    raise
+                held[symbol(s)] = 0
+        return held
     finally:
         client.close()
 
