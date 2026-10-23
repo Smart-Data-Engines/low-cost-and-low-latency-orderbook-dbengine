@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "orderbook/crc32c.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/metrics.hpp"
@@ -125,7 +126,10 @@ TEST_F(WalArchiveTest, CopiesEveryClosedFileByteForByteAndNoOther) {
     EXPECT_FALSE(fs::exists(in_archive(4))) << "file 4 is the bound: not closed";
     EXPECT_EQ(a->archived_before(), 4u);
     for (const auto& entry : fs::directory_iterator(archive_ / std::to_string(kLineage))) {
-        EXPECT_EQ(entry.path().extension(), ".bin") << entry.path() << " left behind";
+        EXPECT_NE(entry.path().extension(), ".tmp") << entry.path() << " left behind";
+    }
+    for (uint32_t i = 1; i <= 3; ++i) {
+        EXPECT_EQ(ob::verify_archived_file((archive_ / std::to_string(kLineage)).string(), i), "") << i;
     }
 
     EXPECT_EQ(registry_.counter_value("ob_wal_archived_files_total"), 3u);
@@ -155,6 +159,38 @@ TEST_F(WalArchiveTest, AFileThereUnchangedIsLeftAloneAcrossPassesAndRestarts) {
     EXPECT_EQ(restarted->archived_before(), 3u);
     EXPECT_EQ(inode(in_archive(1)), before_restart) << "a matching file is never copied again";
     EXPECT_EQ(registry_.counter_value("ob_wal_archived_files_total"), 2u);
+}
+
+TEST_F(WalArchiveTest, EachFileHasASumThatTellsAFileThatLostItsEnd) {
+    close_files(1, 2);
+    const std::string dir = (archive_ / std::to_string(kLineage)).string();
+    const fs::path sum1 = fs::path(dir) / ob::wal_archive_sum_basename(1);
+    const fs::path sum2 = fs::path(dir) / ob::wal_archive_sum_basename(2);
+    {
+        auto a = archiver();
+        ASSERT_EQ(a->archive_closed(kLineage, 3).archived, 2u);
+    }
+    const std::string one = bytes_of(1);
+    EXPECT_EQ(read(sum1), ob::wal_archive_sum_text(one.size(), ob::crc32c(one.data(), one.size())));
+    EXPECT_EQ(ob::verify_archived_file(dir, 1), "");
+    EXPECT_EQ(ob::verify_archived_file(dir, 2), "");
+
+    // A sum lost, and one that is not a sum: a restart finds the file there unchanged and writes it.
+    fs::remove(sum1);
+    EXPECT_NE(ob::verify_archived_file(dir, 1).find("has no sum"), std::string::npos);
+    write(sum2, "3001 xyz\n");
+    EXPECT_NE(ob::verify_archived_file(dir, 2).find("is not a size and a CRC32C"), std::string::npos);
+    auto restarted = archiver();
+    const auto pass = restarted->archive_closed(kLineage, 3);
+    EXPECT_EQ(pass.present, 2u);
+    EXPECT_TRUE(pass.failure.empty()) << pass.failure;
+    EXPECT_EQ(ob::verify_archived_file(dir, 1), "");
+    EXPECT_EQ(ob::verify_archived_file(dir, 2), "");
+
+    // A file that lost its end - at a record boundary, which its records could not show.
+    fs::resize_file(in_archive(2), 3000);
+    EXPECT_NE(ob::verify_archived_file(dir, 2).find("its sum says 3001 bytes"), std::string::npos)
+        << ob::verify_archived_file(dir, 2);
 }
 
 TEST_F(WalArchiveTest, AFileThereWithOtherContentsIsRefusedAndNeverOverwritten) {

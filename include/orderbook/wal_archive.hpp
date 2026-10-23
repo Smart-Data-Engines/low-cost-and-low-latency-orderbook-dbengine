@@ -17,8 +17,13 @@
 // not match is never overwritten. That is someone else's file, or this lineage's file damaged, and
 // archiving stops there, with retention, until an operator looks.
 //
-// It holds no state on disk: after a start it walks the closed files from the oldest and skips each
-// one the archive holds unchanged.
+// Beside each file goes its sum, `wal_NNNNNN.bin.crc32c`: its size and CRC32C, written once the
+// copy has read back, so that a restore - perhaps of an archive an operator copied elsewhere - can
+// tell a file that is whole from one that lost its end at a record boundary, which its records alone
+// cannot show (#34, 2.3).
+//
+// It holds no other state: after a start it walks the closed files from the oldest and skips each one
+// the archive holds unchanged.
 
 #include <atomic>
 #include <condition_variable>
@@ -33,6 +38,17 @@
 namespace ob {
 
 class MetricsRegistry;
+
+/// `<root>/<identity>`: where a WAL lineage's files are archived, the identity in decimal as the
+/// `wal_identity` file and `backup.json` give it.
+std::string wal_archive_lineage_dir(const std::string& root, uint64_t identity);
+/// The sum beside archived file `index`, `wal_NNNNNN.bin.crc32c`.
+std::string wal_archive_sum_basename(uint32_t index);
+/// What a sum holds: `<size> <crc32c as eight hex digits>` and a newline.
+std::string wal_archive_sum_text(uint64_t size, uint32_t crc);
+/// Why archived file `index` of `lineage_dir` is not the file its sum describes - no sum, a sum that
+/// does not parse, another size or another CRC32C - or empty when it is.
+std::string verify_archived_file(const std::string& lineage_dir, uint32_t index);
 
 class WalArchiver {
 public:

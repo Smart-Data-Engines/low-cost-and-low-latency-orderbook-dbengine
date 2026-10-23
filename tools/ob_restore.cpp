@@ -2,11 +2,18 @@
 //
 //   ob_restore --verify <backup>
 //   ob_restore --backup <backup> --data-dir <DIR> [--wal-dir <DIR>] [--log-level <LEVEL>]
+//              [--wal-archive <DIR> --until <NS|TIME|end>]
 //
 // A backup is a directory a server with --backup-dir wrote on BACKUP: <backup-dir>/<name>. The whole
 // backup is verified before anything is created in the target, and the target must be empty. What
 // the restore leaves is a data directory a server starts on as on any other: the backup's rows, a new
 // WAL, and the sequence state the backup carried.
+//
+// With --wal-archive, the directory a server with --wal-archive-dir copied its closed WAL files to,
+// the restore goes on past the backup: the archived records from its cut are replayed up to the last
+// checkpoint the node wrote at or before --until - nanoseconds since the epoch, or a time as backups
+// are named, 20261023T100000.000Z, both on the node's clock - or to the archive's end. The archive is
+// checked before anything is created, as the backup is.
 //
 // Exit status: 0 done, 1 the backup does not verify or the restore failed, 2 usage.
 
@@ -15,6 +22,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <optional>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -22,22 +30,38 @@
 
 namespace {
 
+/// `--until`: nanoseconds since the epoch, or a time as backups are named (to the millisecond).
+bool parse_moment(const std::string& text, uint64_t& ns) {
+    if (!text.empty() && text.find_first_not_of("0123456789") == std::string::npos) {
+        if (text.size() > 19) return false;
+        ns = std::stoull(text);
+        return true;
+    }
+    return ob::parse_backup_name(text, &ns);
+}
+
 void usage(std::FILE* to) {
     std::fprintf(to,
                  "usage: ob_restore --verify <backup>\n"
                  "       ob_restore --backup <backup> --data-dir <DIR> [--wal-dir <DIR>]\n"
+                 "                  [--wal-archive <DIR> --until <MOMENT>]\n"
                  "\n"
                  "  --verify <backup>    check every file of a backup against its description\n"
                  "  --backup <backup>    the backup to restore: <backup-dir>/<name>\n"
                  "  --data-dir <DIR>     an empty data directory to restore into\n"
                  "  --wal-dir <DIR>      an empty WAL directory, for a server started with --wal-dir\n"
+                 "  --wal-archive <DIR>  a server's --wal-archive-dir: go on past the backup by replaying\n"
+                 "                       the WAL it archived after the backup's cut\n"
+                 "  --until <MOMENT>     with --wal-archive: to the last checkpoint at or before MOMENT,\n"
+                 "                       nanoseconds since the epoch or 20261023T100000.000Z on the\n"
+                 "                       node's clock; or 'end', every record the archive holds\n"
                  "  --log-level <LEVEL>  the engine's log on stderr: error (default), warn, info, debug\n");
 }
 
 }  // namespace
 
 static int run(int argc, char** argv) {
-    std::string verify, backup, data_dir, wal_dir, level = "error";
+    std::string verify, backup, data_dir, wal_dir, wal_archive, until, level = "error";
     // A cursor over the arguments rather than a for loop's counter moved in its body (#36).
     const std::vector<std::string> args(argv + 1, argv + argc);
     size_t at = 0;
@@ -51,6 +75,8 @@ static int run(int argc, char** argv) {
                           : flag == "--backup"    ? &backup
                           : flag == "--data-dir"  ? &data_dir
                           : flag == "--wal-dir"   ? &wal_dir
+                          : flag == "--wal-archive" ? &wal_archive
+                          : flag == "--until"     ? &until
                           : flag == "--log-level" ? &level
                                                   : nullptr;
         if (!into) {
@@ -73,7 +99,8 @@ static int run(int argc, char** argv) {
     ob::StructuredLogger::instance().set_level(*parsed);
 
     if (!verify.empty()) {
-        if (!backup.empty() || !data_dir.empty() || !wal_dir.empty()) {
+        if (!backup.empty() || !data_dir.empty() || !wal_dir.empty() || !wal_archive.empty() ||
+            !until.empty()) {
             std::fprintf(stderr, "ob_restore: --verify takes no other directory\n");
             return 2;
         }
@@ -104,9 +131,27 @@ static int run(int argc, char** argv) {
         usage(stderr);
         return 2;
     }
+    // To a moment: both or neither.
+    std::optional<ob::PointInTime> pit;
+    if (wal_archive.empty() != until.empty()) {
+        std::fprintf(stderr, "ob_restore: --wal-archive and --until go together\n");
+        return 2;
+    }
+    if (!wal_archive.empty()) {
+        pit.emplace();
+        pit->archive = wal_archive;
+        if (until == "end") {
+            pit->to_end = true;
+        } else if (!parse_moment(until, pit->until_ns)) {
+            std::fprintf(stderr, "ob_restore: --until '%s' is not 'end', nanoseconds since the epoch "
+                                 "or a time such as 20261023T100000.000Z\n",
+                         until.c_str());
+            return 2;
+        }
+    }
     ob::RestoreReport report;
     std::string error;
-    if (!ob::restore_backup(backup, data_dir, wal_dir, report, error)) {
+    if (!ob::restore_backup(backup, data_dir, wal_dir, report, error, pit ? &*pit : nullptr)) {
         std::fprintf(stderr, "ob_restore: %s\n", error.c_str());
         return 1;
     }
@@ -118,6 +163,23 @@ static int run(int argc, char** argv) {
                 static_cast<unsigned long long>(report.wal_identity),
                 report.sequence_adopted ? "restored" : "from the segments (the backup's was truncated)",
                 report.verify_ms, report.copy_ms, report.open_ms);
+    if (report.point_in_time) {
+        const std::string reached = report.reached_ns > 0
+            ? std::to_string(report.reached_ns) + " (" + ob::backup_name_for(report.reached_ns) + ")"
+            : std::string("none");
+        std::printf("replayed %llu record(s), %llu row(s) from %zu archived file(s) of %s in %.0f ms; %s "
+                    "%s%s\n",
+                    static_cast<unsigned long long>(report.replayed_records),
+                    static_cast<unsigned long long>(report.replayed_rows), report.archived_files,
+                    wal_archive.c_str(), report.replay_ms,
+                    report.reached_end ? "every record the archive holds, its last checkpoint at"
+                                       : "to the checkpoint at",
+                    reached.c_str(),
+                    report.skipped_records > 0
+                        ? ("; " + std::to_string(report.skipped_records) +
+                           " record(s) skipped as a start skips them").c_str()
+                        : "");
+    }
     return 0;
 }
 

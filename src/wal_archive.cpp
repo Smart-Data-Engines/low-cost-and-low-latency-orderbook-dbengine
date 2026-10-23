@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <vector>
@@ -137,7 +139,113 @@ bool copy_synced(const std::string& src, const std::string& dst, std::vector<uin
     return true;
 }
 
+/// A file of at most `limit` bytes, whole. False when it cannot be read or is longer.
+bool read_small_file(const std::string& path, size_t limit, std::string& out) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    out.assign(limit + 1, '\0');
+    size_t got = 0;
+    bool ok = true;
+    while (got < out.size()) {
+        const ssize_t n = ::read(fd, out.data() + got, out.size() - got);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (n == 0) break;
+        got += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    if (!ok || got > limit) return false;
+    out.resize(got);
+    return true;
+}
+
+constexpr size_t kSumLimit = 64;
+
+bool parse_sum(std::string_view text, uint64_t& size, uint32_t& crc) {
+    const size_t space = text.find(' ');
+    if (space == 0 || space == std::string_view::npos || text.size() != space + 1 + 8 + 1 ||
+        text.back() != '\n' || space > 20) {
+        return false;
+    }
+    uint64_t s = 0;
+    for (const char c : text.substr(0, space)) {
+        if (c < '0' || c > '9') return false;
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (s > (UINT64_MAX - digit) / 10) return false;
+        s = s * 10 + digit;
+    }
+    uint32_t v = 0;
+    for (const char c : text.substr(space + 1, 8)) {
+        uint32_t nibble = 0;
+        if (c >= '0' && c <= '9') {
+            nibble = static_cast<uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            nibble = static_cast<uint32_t>(c - 'a' + 10);
+        } else {
+            return false;
+        }
+        v = (v << 4) | nibble;
+    }
+    size = s;
+    crc = v;
+    return true;
+}
+
+/// The sum beside archived file `index` says `size` and `crc`, written when it does not. False and
+/// why when it cannot be.
+bool ensure_sum(const std::string& dir, uint32_t index, uint64_t size, uint32_t crc, std::string& error) {
+    const std::string path = dir + "/" + wal_archive_sum_basename(index);
+    const std::string want = wal_archive_sum_text(size, crc);
+    std::string have;
+    if (read_small_file(path, kSumLimit, have) && have == want) return true;
+    if (const int err = write_file_atomically(path, want); err != 0) {
+        error = "cannot write " + path + ": " + std::strerror(err);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+std::string wal_archive_lineage_dir(const std::string& root, uint64_t identity) {
+    return root + "/" + std::to_string(identity);
+}
+
+std::string wal_archive_sum_basename(uint32_t index) { return wal_file_basename(index) + ".crc32c"; }
+
+std::string wal_archive_sum_text(uint64_t size, uint32_t crc) {
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%llu %08x\n", static_cast<unsigned long long>(size), crc);
+    return buf;
+}
+
+std::string verify_archived_file(const std::string& lineage_dir, uint32_t index) {
+    const std::string path = lineage_dir + "/" + wal_file_basename(index);
+    const std::string sum_path = lineage_dir + "/" + wal_archive_sum_basename(index);
+    std::string text;
+    if (!read_small_file(sum_path, kSumLimit, text)) {
+        return "the archive has no sum for " + path + " (" + sum_path + ")";
+    }
+    uint64_t want_size = 0;
+    uint32_t want_crc = 0;
+    if (!parse_sum(text, want_size, want_crc)) return sum_path + " is not a size and a CRC32C";
+    std::vector<uint8_t> buf(kBufferBytes);
+    uint64_t size = 0;
+    uint32_t crc = 0;
+    std::string why;
+    if (!size_and_crc(path, buf, size, crc, why)) return why;
+    if (size != want_size || crc != want_crc) {
+        char line[160];
+        std::snprintf(line, sizeof(line), " is %llu bytes with CRC32C %08x, and its sum says %llu bytes with %08x",
+                      static_cast<unsigned long long>(size), crc,
+                      static_cast<unsigned long long>(want_size), want_crc);
+        return path + line;
+    }
+    return {};
+}
 
 WalArchiver::WalArchiver(std::string wal_dir, std::string root, uint64_t identity,
                          std::function<uint32_t()> current_file, MetricsRegistry* registry)
@@ -150,7 +258,7 @@ WalArchiver::WalArchiver(std::string wal_dir, std::string root, uint64_t identit
 WalArchiver::~WalArchiver() { stop(); }
 
 std::string WalArchiver::lineage_dir(uint64_t identity) const {
-    return root_ + "/" + std::to_string(identity);
+    return wal_archive_lineage_dir(root_, identity);
 }
 
 void WalArchiver::start() {
@@ -284,6 +392,13 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                     break;
                 }
                 if (src_size == dst_size && src_crc == dst_crc) {
+                    // Its sum too, which a stop between the copy and the sum left unwritten.
+                    if (!ensure_sum(dir, index, src_size, src_crc, why)) {
+                        out.failure = why;
+                        held_from = index;
+                        failed_name = name;
+                        break;
+                    }
                     known_[key] = {src_size, src_crc};
                     ++out.present;
                     continue;
@@ -329,6 +444,13 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                 back_crc != copy_crc) {
                 fs::remove(dst, ec);
                 out.failure = why.empty() ? "the copy of " + name + " does not read back as written" : why;
+                held_from = index;
+                failed_name = name;
+                break;
+            }
+            // And its sum, after the file: a sum names a file that is whole.
+            if (!ensure_sum(dir, index, copied, copy_crc, why)) {
+                out.failure = why;
                 held_from = index;
                 failed_name = name;
                 break;

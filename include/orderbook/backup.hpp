@@ -108,13 +108,39 @@ struct RestoreReport {
     double   open_ms{0};
     uint64_t wal_identity{0};        // the restored node's new WAL
     bool     sequence_adopted{false};
+
+    // A restore to a moment (`PointInTime`):
+    bool     point_in_time{false};
+    uint64_t replayed_records{0};    // DELTA records applied, as a client's writes
+    uint64_t replayed_rows{0};       // their levels
+    uint64_t skipped_records{0};     // DELTA records a start would skip too: too short a payload
+    size_t   archived_files{0};      // archived WAL files read, each checked against its sum
+    uint64_t reached_ns{0};          // the server time of the checkpoint the replay reached; 0: none
+    bool     reached_end{false};     // every record the archive holds from the cut on
+    double   replay_ms{0};
+};
+
+/// A restore carried on past the backup (#34, point-in-time recovery; spec
+/// `point-in-time-recovery`): the records of a WAL archive (`--wal-archive-dir`) from the backup's
+/// cut on are replayed into the restored node through `Engine::apply_delta()`, up to the last
+/// checkpoint the node wrote at or before `until_ns` on its clock - so to the moment of a flush tick
+/// - or, with `to_end`, every record the archive holds.
+struct PointInTime {
+    std::string archive;             // the archive: a directory a WAL identity
+    bool        to_end{false};
+    uint64_t    until_ns{0};         // nanoseconds since the epoch, on the node's clock
 };
 
 /// Restore a backup into an empty data directory (and an empty WAL directory, when `wal_dir` is
 /// not empty and not the data directory). The whole backup is verified before anything is created;
 /// a failure after that says in `error` what is left, and removes nothing.
+///
+/// With `point_in_time`, the archive is checked before anything is created as well - its lineage,
+/// its files from the cut on without a gap, each against its sum - and the restore refuses a mesh
+/// node's backup and a moment before the backup's cut.
 bool restore_backup(const std::string& backup, const std::string& data_dir,
-                    const std::string& wal_dir, RestoreReport& report, std::string& error);
+                    const std::string& wal_dir, RestoreReport& report, std::string& error,
+                    const PointInTime* point_in_time = nullptr);
 
 /// Where a backup is, for `BACKUP STATUS`.
 struct BackupProgress {
