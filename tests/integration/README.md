@@ -111,6 +111,7 @@ tests/integration/
 ├── test_where_conditions.py          # what a WHERE condition answers (#199)
 ├── test_time_buckets.py              # aggregates over time buckets, server and Python client (#44)
 ├── test_snapshot_query.py            # what a SNAPSHOT answers (#167, #168)
+├── test_scan_pool.py                 # a node reading on the scan pool answers the same bytes (#246)
 ├── test_subscriptions.py             # pushed streaming subscriptions (#45)
 │
 │   # Durability, faults and recovery
