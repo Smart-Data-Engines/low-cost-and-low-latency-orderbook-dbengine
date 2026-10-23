@@ -17,6 +17,9 @@
 
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <linux/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -97,6 +100,38 @@ uint64_t requests(ob::Engine& engine) {
 
 uint64_t ticks(ob::Engine& engine) { return engine.registry().counter_value("ob_flush_ticks_total"); }
 
+/// Pages of the file `fd` names that are dirty in the page cache, from the kernel (cachestat(2),
+/// Linux 6.5): what writeback has not taken yet.
+uint64_t dirty_pages(int fd) {
+    struct cachestat_range range{0, 0};   // the whole file
+    struct cachestat cs{};
+    if (::syscall(__NR_cachestat, fd, &range, &cs, 0) != 0) {
+        ADD_FAILURE() << "cachestat: " << std::strerror(errno);
+        return UINT64_MAX;
+    }
+    return cs.nr_dirty;
+}
+
+/// `records` records of 100 levels, 2.4 kB each.
+void write_records(ob::Engine& engine, int records, uint64_t first_ts) {
+    std::vector<ob::Level> levels(100);
+    for (size_t i = 0; i < levels.size(); ++i) {
+        levels[i].price = static_cast<int64_t>(1'000 + i);
+        levels[i].qty   = 1;
+        levels[i].cnt   = 1;
+        levels[i]._pad  = 0;
+    }
+    for (int i = 0; i < records; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "WB", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
+        d.timestamp_ns = first_ts + static_cast<uint64_t>(i);
+        d.side         = ob::SIDE_BID;
+        d.n_levels     = static_cast<uint16_t>(levels.size());
+        ASSERT_EQ(engine.apply_delta(d, levels.data()), ob::OB_OK);
+    }
+}
+
 size_t open_descriptors() {
     size_t n = 0;
     for (const auto& e : fs::directory_iterator("/proc/self/fd")) {
@@ -127,6 +162,41 @@ TEST(WalWritebackAhead, AWalUnderIntervalIsHandedToWritebackAsItGrows) {
     write_megabytes(*engine, 4, 2'000'000'000ULL);
     EXPECT_TRUE(eventually([&] { return requests(*engine) > first; }))
         << "what was appended later was not handed to writeback";
+    engine->close();
+}
+
+TEST(WalWritebackAhead, WhatIsHandedToWritebackIsDirtyNoLonger) {
+    // No tick runs under this test, so nothing syncs the WAL: below the kernel's background
+    // threshold its pages stay dirty for dirty_expire_centisecs, 30 s by default, unless something
+    // asks for their writeback. The tail under a megabyte is not asked for yet.
+    TempDir dir;
+    auto engine = engine_at(dir.path, ob::FsyncPolicy::INTERVAL);
+    write_megabytes(*engine, 4, 1'000'000'000ULL);
+    const std::string wal = dir.path + "/wal_000000.bin";
+    const int fd = ::open(wal.c_str(), O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << wal;
+    const uint64_t page = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+    uint64_t dirty = 0;
+    EXPECT_TRUE(eventually([&] {
+        dirty = dirty_pages(fd);
+        return dirty * page <= (1u << 20) + page;
+    })) << dirty << " page(s) of " << page << " bytes of the WAL still dirty";
+    ::close(fd);
+    engine->close();
+}
+
+TEST(WalWritebackAhead, OneRequestAMegabyteHoweverTheWritesArrive) {
+    // Sixty small writes a few milliseconds apart, so the thread sees the WAL grow at nearly every
+    // pass: it asks once a megabyte, not once a pass.
+    TempDir dir;
+    auto engine = engine_at(dir.path, ob::FsyncPolicy::INTERVAL);
+    for (int i = 0; i < 60; ++i) {
+        write_records(*engine, 43, 1'000'000'000ULL + static_cast<uint64_t>(i) * 1000);   // ~0.1 MB
+        std::this_thread::sleep_for(std::chrono::milliseconds(6));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_GE(requests(*engine), 4u);
+    EXPECT_LE(requests(*engine), 7u) << "about 6 MB was asked for in more than one request a megabyte";
     engine->close();
 }
 
