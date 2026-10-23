@@ -332,8 +332,8 @@ TEST(DecodedColumnsStore, ReadsWithAndWithoutHoldingAnswerTheSame) {
     // The book at an instant, and the rows in time order.
     const uint64_t at = kBase + 10'500 * kSec;
     for (int pass = 0; pass < 2; ++pass) {
-        EXPECT_TRUE(same_rows(holding.latest_per_level(at, "A", "EX").rows,
-                              plain.latest_per_level(at, "A", "EX").rows));
+        EXPECT_TRUE(same_rows(holding.book_at_by_price(at, "A", "EX").rows,
+                              plain.book_at_by_price(at, "A", "EX").rows));
         std::vector<ob::SnapshotRow> a, b;
         const ob::RowFilter keep{};
         holding.scan_by_time(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), keep,
@@ -683,8 +683,8 @@ TEST(DecodedColumnsArena, ReadsFromColumnsInTheArenaAnswerAsReadsWithoutHolding)
         EXPECT_TRUE(same_rows(read(holding, columns, "A", lo, hi), read(plain, columns, "A", lo, hi)));
     }
     const uint64_t instant = kBase + 7'000'000'000ULL;
-    EXPECT_TRUE(same_rows(holding.latest_per_level(instant, "A", "EX").rows,
-                          plain.latest_per_level(instant, "A", "EX").rows));
+    EXPECT_TRUE(same_rows(holding.book_at_by_price(instant, "A", "EX").rows,
+                          plain.book_at_by_price(instant, "A", "EX").rows));
     std::vector<ob::SnapshotRow> a, b;
     holding.scan_by_time(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), ob::RowFilter{},
                          [&](const ob::SnapshotRow& r) { a.push_back(r); return true; });

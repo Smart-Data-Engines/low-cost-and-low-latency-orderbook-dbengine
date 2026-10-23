@@ -1042,6 +1042,10 @@ def _load_lib():
     if hasattr(lib, "ob_replace_side"):
         lib.ob_replace_side.argtypes = lib.ob_apply_delta.argtypes
         lib.ob_replace_side.restype = ctypes.c_int
+    # ob_flush() arrived with #244: a library before it is flushed by closing and opening it.
+    if hasattr(lib, "ob_flush"):
+        lib.ob_flush.argtypes = [ctypes.c_void_p]
+        lib.ob_flush.restype = ctypes.c_int
     return lib
 
 
@@ -1094,6 +1098,15 @@ class _LocalBackend:
             raise OrderbookError(rc, f"replace_side failed for {symbol}@{exchange}")
 
     def flush(self):
+        # ob_flush() writes and indexes each symbol's open segment and keeps the engine open, with
+        # its live books (#244). Closing and opening it again does that too, and an open composes
+        # every book from history (#235): 94 ms a flush at a million rows on an i3-7100U, where
+        # ob_flush() takes what writing the segments takes. A library before #244 has no other way.
+        if hasattr(self._lib, "ob_flush"):
+            rc = self._lib.ob_flush(self._engine)
+            if rc != OB_OK:
+                raise OrderbookError(rc, "flush failed: a segment could not be written")
+            return
         self._lib.ob_engine_destroy(self._engine)
         self._engine = self._lib.ob_engine_create(self._data_dir.encode("utf-8"))
         if not self._engine:
@@ -2194,10 +2207,9 @@ class OrderbookEngine:
                timestamp_ns: Optional[int] = None,
                seq: Optional[int] = None) -> int:
         """
-        Insert price levels into the orderbook.
+        Insert price levels into the orderbook: one update.
 
-        In TCP mode, each level is sent as a separate INSERT command
-        (the wire protocol is single-level per INSERT).
+        Over TCP it is one `MINSERT` carrying every level, or an `INSERT` for a single level.
         """
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")

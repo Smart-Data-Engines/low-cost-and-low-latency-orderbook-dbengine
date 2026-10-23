@@ -2861,6 +2861,50 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 245. The embedded engine never replays its WAL: a process that dies loses what it wrote since its last flush **P1**
+
+**Found writing #244's documentation.** The C API's engine writes an update to its WAL and appends its
+rows to the symbol's open segment, which only `ob_flush()` or `ob_engine_destroy()` writes.
+`ob_engine_create()` indexes the segments and composes the books from them, and reads no record of
+the WAL.
+- Measured through the Python client in local mode: ten acknowledged inserts, then a process that
+  exited without closing the engine. 1 360 bytes of WAL were left, and no rows: a query refused the
+  symbol as unknown.
+- With a flush after the ten, the insert written after the flush was lost the same way.
+
+The server replays from its last checkpoint (#62, #159, #160). The embedded engine writes no
+checkpoint, so it cannot tell which records its segments already hold, and nothing removes a WAL
+file: they rotate at 512 MB and stay.
+
+**A fix writes a checkpoint at `ob_flush()` and `ob_engine_destroy()`**, after their segments, and
+replays at an open the records after the last one into the stores and the books, then flushes them.
+Files wholly before the last checkpoint can then go.
+
+- Effort: M | Impact: every write the embedded engine acknowledged since its last flush is lost when
+  its process dies; the Python client's local mode flushes before a read, not after a write
+
+### 244. A local flush reopened the embedded engine, and since #235 an open composes every book ✅ **P2**
+
+**Found measuring the SDK's book stream in local mode.** The C API had no flush, so the Python
+client's local `flush()` destroyed the embedded engine and created it again, and the SDK's adapter
+flushes before every read that follows a write. #235 made an open compose each symbol's live book
+from history by price. The embedded engine writes no book summaries, so that reads every row.
+Measured on the i3-7100U, Release, a flush with nothing new (`laptop/local-flush-abc.log` in
+`evidence/2026-10-18-incremental-books/` in the workspace):
+- before #235: 0.30-1.10 ms at every size;
+- after it: 1.2-1.5 ms at 10 000 rows of one symbol, 17.8-19.9 ms at 100 000, and 94-146 ms at a
+  million, over two runs.
+
+**Closed in PR #276** (23 October 2026): `ob_flush()` writes and indexes each symbol's open
+segment, with any segment a write rolled over into, and keeps the engine open with its live books. The Python client calls it when
+the library has it, and closes and opens one that does not.
+- A flush with nothing new takes 0.02 ms or less at every size.
+- An open still composes every book: 112-290 ms at a million rows of one symbol, once a process
+  rather than once a flush. The slowest opens were each process's first composition.
+
+- Effort: S | Impact: a read after a write in local mode paid an open of the engine: 94-146 ms with a
+  million rows of one symbol
+
 ### 243. A series of the book reads every row of its range **P2**
 
 **Found measuring #233's reading by price** (`evidence/2026-10-18-incremental-books/` in the workspace).
@@ -15462,7 +15506,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #242, #243.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #242, #243, #245.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -15601,6 +15645,7 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
+| **P1** | The embedded engine replays its WAL from a checkpoint when it opens (#245) | M | A process using the C API or the Python client's local mode loses every write since its last flush when it dies |
 | **P2** | A series of the book reads one row a change of the best price (#243) | M | Since #233 a series applies every row of its range by price: 7-12 times the time it took for a writer of whole sides |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

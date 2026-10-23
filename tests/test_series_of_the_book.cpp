@@ -1,7 +1,6 @@
 // #44 step 2: series of the book through time buckets - OPEN, HIGH, LOW, CLOSE and TWAP of the bid,
 // the ask, the mid and the spread - and the two reads under them: a symbol's rows in event-time order
-// (`ColumnarStore::scan_by_time()`) and the book of its best levels just before the range
-// (`latest_per_level()` with the levels wanted).
+// (`ColumnarStore::scan_by_time()`) and the book just before the range (`book_at_by_price()`).
 //
 // A series is a value of the book `AT` answers - the best price of each side, the book read by price
 // (#233, decision B') - at every instant: a step function that changes only at the instants with a
@@ -483,57 +482,6 @@ TEST(ScanByTime, ABlocksRowAtTheNextSegmentsStartWaitsForIt) {
                          ob::RowFilter{},
                          [&](const ob::SnapshotRow& r) { prices.push_back(r.price); return true; });
     EXPECT_EQ(prices, (std::vector<int64_t>{1, 2, 3, 4, 5}));
-}
-
-// ── latest_per_level() with the levels wanted ──────────────────────────────────
-
-TEST(BookOfTheBestLevels, ASegmentHoldingNoWantedLevelIsNotRead) {
-    // The newest segment holds only a deep level; the best levels are in the one before it.
-    Fixture f;
-    f.segment({row(kBase + 1 * kSec, 0, 0, 100), row(kBase + 1 * kSec, 1, 0, 101)});
-    f.segment({row(kBase + 2 * kSec, 0, 5, 90)});
-    ob::LevelSet best{};
-    best.bid[0] = 1;
-    best.ask[0] = 1;
-    const auto book = f.store.latest_per_level(kBase + 10 * kSec, "BK", "EX", &best);
-    ASSERT_EQ(book.rows.size(), 2u) << describe(book.rows);
-    EXPECT_EQ(book.rows[0].price, 100);
-    EXPECT_EQ(book.rows[1].price, 101);
-    EXPECT_EQ(book.segments_read, 1u);
-    EXPECT_EQ(book.segments_skipped, 1u);
-    EXPECT_EQ(f.store.latest_per_level(kBase + 10 * kSec, "BK", "EX").rows.size(), 3u);
-}
-
-RC_GTEST_PROP(BookOfTheBestLevelsProperty, TheBookOfTheWantedLevelsIsTheBookRestrictedToThem, ()) {
-    Fixture f;
-    int64_t price = 1;
-    const int segments = *rc::gen::inRange(1, 7);
-    for (int s = 0; s < segments; ++s) {
-        std::vector<ob::SnapshotRow> rows;
-        const int n = *rc::gen::inRange(1, 10);
-        for (int i = 0; i < n; ++i) {
-            rows.push_back(row(kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 30)) * kSec,
-                               static_cast<uint8_t>(*rc::gen::inRange(0, 2)),
-                               static_cast<uint16_t>(*rc::gen::inRange(0, 4)), price++));
-        }
-        f.segment(rows);
-    }
-    ob::LevelSet wanted{};
-    for (uint8_t side = 0; side < 2; ++side) {
-        for (uint16_t level = 0; level < 4; ++level) {
-            if (*rc::gen::inRange(0, 2) == 0) {
-                (side == 0 ? wanted.bid : wanted.ask)[0] |= uint64_t{1} << level;
-            }
-        }
-    }
-    const uint64_t at = kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 32)) * kSec;
-    std::vector<ob::SnapshotRow> expected;
-    for (const auto& r : f.store.latest_per_level(at, "BK", "EX").rows) {
-        if (wanted.has(r.side, r.level_index)) expected.push_back(r);
-    }
-    const auto book = f.store.latest_per_level(at, "BK", "EX", &wanted);
-    RC_ASSERT(book.rows.size() == expected.size());
-    for (size_t i = 0; i < expected.size(); ++i) RC_ASSERT(same_row(book.rows[i], expected[i]));
 }
 
 // ── The parser ─────────────────────────────────────────────────────────────────

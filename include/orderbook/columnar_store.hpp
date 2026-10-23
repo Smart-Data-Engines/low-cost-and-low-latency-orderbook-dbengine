@@ -54,10 +54,10 @@ inline bool is_segment_file(std::string_view filename) {
            is_book_summary_file(filename);
 }
 
-/// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets
-/// the book at an instant skip a segment none of whose rows can be the latest of its level - the
-/// book is the latest row of each level, so a segment whose every level already has a later row
-/// cannot change it.
+/// Which (side, level) pairs a segment holds a row of (#47): a bit a level, bids and asks. What lets a
+/// scan whose filter names sides or levels skip a segment holding none of them (`cannot_hold()`).
+/// It let the book at an instant skip segments too, while the book was the latest row of each
+/// level; since #233 the book is read by price, where any row of the range can change it.
 ///
 /// A row of another side, or of a level past the book's capacity, is not representable, and a set
 /// that could not hold every row is no set at all: `from_columns()` answers null for it, and a
@@ -642,29 +642,6 @@ public:
     /// levels allow. False whenever what it would need is unknown; `by_price` says which proof it was.
     static bool cannot_hold(const SegmentMeta& meta, const RowFilter& filter, bool* by_price = nullptr);
 
-    /// The book of one symbol at `at` (#47): for each (side, level), the row with the latest
-    /// timestamp at or before `at`, a tie going to the row `scan()` delivers later - the answer of
-    /// a `scan()` of [0, `at`] that keeps, for each level, any row whose timestamp is at least the
-    /// one it holds, which is what the book at an instant was until this read it instead.
-    ///
-    /// Read from the newest segment down. A segment whose rows are all at or before some time and
-    /// whose every level already has a row it cannot beat - a later one, or one at that time that
-    /// `scan()` delivers after it - is not read: its `LevelSet` says which levels it has, and a
-    /// segment without one is read always. Rows in the order `scan()` delivers them otherwise:
-    /// bids, then asks, each by level.
-    ///
-    /// With `wanted`, the book of those (side, level) pairs only (#44 step 2): a row of any other is
-    /// not the answer's, and a segment none of whose wanted levels can change is not read - so the
-    /// best levels of a deep book are read from the newest segment holding them, not from the
-    /// oldest holding some level.
-    struct BookAt {
-        std::vector<SnapshotRow> rows;
-        size_t segments_read{0};
-        size_t segments_skipped{0};
-        size_t blocks{0};
-    };
-    BookAt latest_per_level(uint64_t at, std::string_view symbol, std::string_view exchange,
-                            const LevelSet* wanted = nullptr) const;
 
     /// The rows of one symbol in [start_ns, end_ns] that `keep` accepts, in the order the book at an
     /// instant decides by (#44 step 2): by timestamp, and at one timestamp in the order scan()

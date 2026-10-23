@@ -362,6 +362,75 @@ TEST_F(CApiTest, TheFirstWriteAfterAReopenIsNotAGap) {
     ASSERT_NE(engine, nullptr);
 }
 
+// ── ob_flush (#244) ────────────────────────────────────────────────────────────
+//
+// A flush writes and indexes each symbol's open segment and keeps the engine. Before it the Python
+// client flushed by closing and opening the engine, and an open composes every book from history.
+
+TEST_F(CApiTest, AFlushMakesTheWritesReadableWithoutClosingTheEngine) {
+    int64_t  p[] = {100, 99};
+    uint64_t q[] = {1, 2};
+    uint32_t c[] = {1, 1};
+    ASSERT_EQ(ob_apply_delta(engine, "FL", "EX", 1, 1000ULL, p, q, c, 2, 0), OB_C_OK);
+    ASSERT_TRUE(capi_history(engine, "FL").empty())
+        << "a write was readable before any flush, so nothing here would show what a flush does";
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    EXPECT_EQ(capi_history(engine, "FL"), (std::vector<PriceQty>{{100, 1}, {99, 2}}));
+
+    // A flush with nothing new changes nothing, and a write after it is read after the next one.
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    int64_t  later_p[] = {101};
+    uint64_t later_q[] = {3};
+    uint32_t later_c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "FL", "EX", 2, 1001ULL, later_p, later_q, later_c, 1, 0), OB_C_OK);
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    EXPECT_EQ(capi_history(engine, "FL"), (std::vector<PriceQty>{{100, 1}, {99, 2}, {101, 3}}));
+    EXPECT_EQ(ob_flush(nullptr), OB_C_ERR_INVALID_ARG);
+}
+
+TEST_F(CApiTest, AFlushIndexesTheSegmentsAWriteRolledOver) {
+    // A segment covers an hour, so the second write closes the first hour's segment inside append(),
+    // which cannot reach the index: the flush has to collect it.
+    const uint64_t hour = 3600ULL * 1'000'000'000ULL;
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "ROLL", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    q[0] = 2;
+    ASSERT_EQ(ob_apply_delta(engine, "ROLL", "EX", 2, hour + 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    EXPECT_EQ(capi_history(engine, "ROLL"), (std::vector<PriceQty>{{100, 1}, {100, 2}}))
+        << "the first hour's segment, closed by the write that began the second, is not read";
+}
+
+TEST_F(CApiTest, AFlushKeepsTheLiveBookAndItsLabel) {
+    // The engine is not reopened, so the book a write is applied to is the one before the flush,
+    // label included: a write numbered past the next one after a flush is a gap, as without one.
+    // An engine opened again would hold its books with no number, and see no gap.
+    int64_t  p[] = {100, 99};
+    uint64_t q[] = {1, 1};
+    uint32_t c[] = {1, 1};
+    ASSERT_EQ(ob_apply_delta(engine, "LB", "EX", 5, 1000ULL, p, q, c, 2, 0), OB_C_OK);
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    int64_t  next_p[] = {101};
+    uint64_t next_q[] = {2};
+    uint32_t next_c[] = {1};
+    ASSERT_EQ(ob_replace_side(engine, "LB", "EX", 7, 1001ULL, next_p, next_q, next_c, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    size_t gaps = 0;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_GAP) ++gaps;
+    });
+    EXPECT_EQ(gaps, 1u) << "the write numbered 7 after 5 was not a gap: the flush lost the book's label";
+    const auto records = capi_delta_records(dir, "LB");
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[1], (std::vector<PriceQty>{{100, 0}, {99, 0}, {101, 2}}))
+        << "the replacement after the flush did not remove what the side held before it";
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+}
+
 TEST_F(CApiTest, ReplaceSideWithNoLevelsEmptiesTheSide) {
     int64_t  p[] = {10300, 10200};
     uint64_t q[] = {100, 200};

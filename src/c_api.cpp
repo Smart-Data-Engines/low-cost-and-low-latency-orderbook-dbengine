@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -184,6 +185,39 @@ extern "C" ob_engine_t* ob_engine_create(const char* base_dir) {
 
 extern "C" void ob_engine_destroy(ob_engine_t* engine) {
     delete engine;
+}
+
+extern "C" ob_status_t ob_flush(ob_engine_t* engine) {
+    if (!engine) return OB_C_ERR_INVALID_ARG;
+    try {
+        std::lock_guard<std::mutex> lock(engine->mtx);
+        // What ob_engine_destroy() writes - each store's open segment - and what the next open would
+        // have indexed: the segments those writes rolled over into as well, which append() parks
+        // because it cannot reach the index (pitfall 13).
+        std::vector<ob::SegmentMeta> metas;
+        for (auto& [key, store] : engine->stores) {
+            for (ob::SegmentMeta& meta : store->take_rolled_segments()) metas.push_back(std::move(meta));
+            if (std::optional<ob::SegmentMeta> meta = store->flush_segment()) {
+                metas.push_back(std::move(*meta));
+            }
+        }
+        const size_t refused = engine->combined_store.merge_segments(metas);
+        if (refused != 0) {
+            // Their rows are in the segments the index already holds under those directories, so
+            // a query misses nothing; that two writes produced one directory is the defect to find.
+            OB_LOG_ERROR("c_api", "flush: the index refused %zu of %zu segment(s) as already held",
+                         refused, metas.size());
+        }
+        OB_LOG_DEBUG("c_api", "flush: %zu segment(s) written and indexed from %zu store(s)",
+                     metas.size(), engine->stores.size());
+        return OB_C_OK;
+    } catch (const std::exception& e) {
+        OB_LOG_ERROR("c_api", "flush failed: %s", e.what());
+        return OB_C_ERR_INTERNAL;
+    } catch (...) {
+        OB_LOG_ERROR("c_api", "flush failed with an exception that is not a std::exception");
+        return OB_C_ERR_INTERNAL;
+    }
 }
 
 // ── Delta ingestion ───────────────────────────────────────────────────────────

@@ -4388,6 +4388,16 @@ Learned the hard way. Check here before debugging.
        one already held it for the role table.
      - The static test reads the source, and a comment that spelled the label out failed it on the
        first run.
+600. **A flush built as a close and an open pays whatever an open costs, and an open grows.** The C
+     API had no flush, so the Python client's local `flush()` destroyed the embedded engine and
+     created it again. #235 made an open compose every book from history, and a flush with nothing
+     new went from 0.3-1.1 ms to 94-146 ms at a million rows of one symbol (#244). Pitfall 9 says the
+     same of the server's `FLUSH`.
+     - The SDK's adapter flushes before every read that follows a write, so the cost reached every
+       read-after-write in local mode.
+     - `ob_flush()` writes and indexes the open segments and keeps the engine.
+     - Before adding work to an open, find who opens and how often: a close-and-open in a loop pays it
+       every time.
 
 ## Current state and open problems
 
@@ -4420,6 +4430,13 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
+`SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)
+where one is before their instant; `MREPLACE` replaces a side whole; and a start rebuilds every live
+book from the store (pitfalls 568, 569, 598). **#244**: the C API has `ob_flush()`, so a local flush
+no longer reopens the engine. **#245 is an open P1**: the embedded engine never replays its WAL, so
+a process that dies loses what it wrote since its last flush.
 
 **#197 is closed**: a snapshot install and a discard begin a new WAL lineage, so a replica that had
 bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step

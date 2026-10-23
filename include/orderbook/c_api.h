@@ -39,6 +39,13 @@ typedef struct ob_result ob_result_t;
 ob_engine_t* ob_engine_create(const char* base_dir);
 void         ob_engine_destroy(ob_engine_t* engine);
 
+/* Make every write so far readable by ob_query() without closing the engine (#244): each symbol's
+   open segment is written and indexed, as ob_engine_destroy() writes them, and the live books stay
+   in memory. Closing and opening again does the same work and more, because an open composes every
+   book from history (#235). OB_C_OK; OB_C_ERR_INVALID_ARG for NULL; OB_C_ERR_INTERNAL when a
+   segment could not be written. */
+ob_status_t  ob_flush(ob_engine_t* engine);
+
 // ── Delta ingestion ───────────────────────────────────────────────────────────
 ob_status_t ob_apply_delta(ob_engine_t*    engine,
                             const char*     symbol,
