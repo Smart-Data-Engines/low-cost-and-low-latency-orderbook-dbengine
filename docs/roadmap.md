@@ -710,8 +710,9 @@ node that is merely listening can accept a write and have nobody to send it to.
   - a log in which none of the restored rows is a record. The restored WAL begins at its second file
   now, so a replica asking for it from the start is told `WAL_TRUNCATED` and bootstraps from a
   snapshot, as it would after retention.
-- **Point-in-time recovery shipped** (23 October 2026; spec `specs/point-in-time-recovery/` in the
-  workspace, procedure in `docs/operations.md`, "Restoring to a moment"). With `--wal-archive-dir` a
+- **Point-in-time recovery shipped, closed in PR #280** (23 October 2026; spec
+  `specs/point-in-time-recovery/` in the workspace, procedure in `docs/operations.md`, "Restoring to a
+  moment"). With `--wal-archive-dir` a
   node puts every WAL file it closes into `<archive>/<WAL identity>/` - linked on the WAL's
   filesystem, copied, synced and read back on another - with its size and CRC32C beside it.
   Retention removes no file the archive lacks; `--wal-archive-interval-s` (60) rotates a file that
