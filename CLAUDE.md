@@ -4500,6 +4500,17 @@ Learned the hard way. Check here before debugging.
      levels a second and four query connections 8-10% of their answers: where the connections' loops
      already use every CPU, the pool's threads only compete with them. The spec had `boost` turn the pool on; measured
      beside other work, it is off under every profile and an operator's choice.
+615. **A test of what writeback cleans passes for nothing on a tmpfs.** #242's test that the WAL a
+     thread hands to writeback is dirty no longer read the file's dirty pages with `cachestat(2)` -
+     in `/tmp`, a tmpfs on the machines here, which has no backing store, so none of its pages is ever
+     dirty. The mutant that handed nothing to writeback survived four runs of the table, until the
+     test ran in the build's directory and refused a tmpfs by its `statfs` magic.
+616. **Writing the WAL back ahead did not keep a capped device busy in the syncs' place.** #242's
+     branch handed every megabyte appended to writeback ahead of its sync and ticked a quarter as
+     often as master while admission was in force: the device took 80-84% of its cap at 7, 10 and
+     30 MB/s where master's syncs kept it at 98-99%, and the node 13-19% fewer levels a second.
+     #190's `d6` had done the same with fewer ticks alone. Why the device idles is not established;
+     a design that syncs less is measured against the cap before anything else is built on it.
 
 ## Current state and open problems
 

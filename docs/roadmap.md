@@ -2881,6 +2881,39 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 247. A busy symbol's book summary is written at nearly every seal, and synced twice **P3**
+
+**Found bisecting #242** (`evidence/2026-10-23-wal-budget-syncs/`, `run242c.sh`, in the workspace).
+On the m9g.xlarge with its writes capped at 7 MB/s, #190's 36 M-level rounds, four a build, the
+builds rotating:
+
+| build | levels/s | durable levels/s | journal forces a tick |
+|---|---|---|---|
+| PR #272's merge, `f8238be` | 181.2-181.5 k | 180.9 k | 1.97 |
+| master before PR #275, `5dc1faa` | 181.2-181.4 k | 180.9 k | 1.97 |
+| PR #275, `6685016` | 174.9-179.0 k | 175.7 k | 3.15 |
+| PR #276, `7e11522` | 175.9-177.1 k | 176.0 k | 3.11 |
+| master, `46a5086` | 175.4-176.6 k | 175.6 k | 3.13 |
+
+- **What PR #275 does a seal.** It writes a symbol's book summary (#233) once that symbol's seals have
+  taken in 65 536 rows since its last. The harness's writer, `pipelined_ingest`, writes eight
+  symbols, so a seal of one takes in some 74 000 rows and nearly every seal writes a summary: on the
+  i3-7100U, 96 summaries for 97 seals of 7.2 M levels.
+- **What a summary costs it.** The book is composed from the last summary, and the file is written
+  through a temporary, synced, and its directory synced. Against the master before it, a journal force
+  a tick more and 17.5 MB more journal a round; and the column arena decodes during the ingest, which
+  no build before it did.
+- **It needs neither sync.** A summary is checked by its CRCs where it is read, and a read that cannot
+  use one composes the book from the rows; the best track beside it (#243) is written unsynced for
+  that reason. And a summary holds no row the WAL does not: a seal takes only rows whose records a
+  sync has put on the device, so a summary that a power cut loses, or cuts short, is a read that
+  composes from further back.
+- **The measure of a fix**: PR #272's merge's levels a second at 7 MB/s, with the summaries still
+  written.
+
+- Effort: S | Impact: 2.7% of the levels a second of a writer to a few symbols on a device capped at
+  7 MB/s; a book composed and a file synced twice at nearly every seal of such a symbol
+
 ### 246. A query ran on one core, and most of it was the hand-over of each row **P3**
 
 **Stage 6 of `specs/uses-the-whole-machine/`, measured before its design** (OB-12; spec
@@ -3207,6 +3240,35 @@ only at half the budget while admission was in force, a fifth of the cap went un
   against this.
 - Its measure is `run190d5L.sh`'s rounds: durable levels a second within master's range at 7 and
   10 MB/s, with step 9's worst batch and its refusals kept.
+
+**Tried on 23 October, and slower: the WAL written back ahead, with fewer ticks** (branch
+`perf/wal-budget-fewer-syncs`, kept for this item; spec `specs/wal-budget-fewer-syncs/` and
+`evidence/2026-10-23-wal-budget-syncs/` in the workspace).
+- A thread hands each megabyte appended to the WAL to the kernel's writeback ahead of its sync
+  (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, ported from `perf/wal-writeback-ahead`). While
+  admission is in force, the flush loop ticks when a writer asks, at half the budget, or after a
+  second.
+- Measured on the m9g.xlarge in #190's 36 M-level rounds, eight a build, the builds rotating: master
+  before the budget (`0442ed5`), master (`46a5086`) and the branch (`4b21ae1`).
+
+| | before the budget | master | the branch |
+|---|---|---|---|
+| 7 MB/s: levels/s, share of the cap used | 186.0-186.6 k, 99.8% | 174.7-176.3 k, 98.8% | 143.6-154.7 k, 82.0% |
+| 10 MB/s | 263.8-267.0 k, 99.7% | 248.6-255.9 k, 97.6% | 187.8-227.7 k, 83.8% |
+| 30 MB/s | 790.0-802.4 k, 99.6% | 781.6-788.4 k, 99.4% | 609.0-751.2 k, 80.4% |
+| no limit | 7.58-7.75 M | 7.78-7.90 M | 7.89-8.04 M |
+
+- **It synced less, as designed**: at 7 MB/s a quarter of master's ticks and half its journal
+  forces, and its writeback thread asked for a megabyte 1 238 times a round.
+- **And the device waited between the syncs anyway**: 16-20% of the cap unused at every limit,
+  13-19% fewer levels a second than master at the medians. Fewer ticks alone had left a fifth of the
+  cap unused in #190 (`d6`), so writing the WAL back ahead did not keep the device busy in the syncs'
+  place. Why it idles is not established. With no limit the branch was 1-2% faster. It is not merged.
+- **Master since PR #272 costs more than PR #272 measured, and the rest is PR #275's.** `46a5086`
+  took 174.7-176.3 k levels a second at 7 MB/s where PR #272 had measured its budget at
+  181.1-181.6 k, against the same master before the budget. Bisected at 7 MB/s, four rounds a build
+  (`run242c.sh`): PR #272's merge and the master before PR #275 took 181.2-181.5 k, and PR #275 on
+  174.9-179.0 k, with a journal force a tick more. That is #247.
 
 - Effort: M | Impact: 1 - 2% of the levels a second while a device slower than the writes is the
   limit, at 7 - 10 MB/s on this host
@@ -15769,7 +15831,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #242, #246.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #242, #246, #247.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
