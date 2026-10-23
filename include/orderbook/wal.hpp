@@ -192,15 +192,15 @@ inline bool wal_position_before(WalPosition a, WalPosition b) {
 }
 
 static_assert(sizeof(WalPosition) == 8, "WalPosition must fit a lock-free atomic");
+static_assert(std::atomic<WalPosition>::is_always_lock_free,
+              "std::atomic<WalPosition> must be lock-free: an atomic that quietly takes a lock "
+              "would put that lock on the WAL write path, which is the cost this exists to avoid");
 
 /// A WAL file's name in its directory, `wal_NNNNNN.bin`: one definition for the writer, the
 /// replayer and the archive (#34, point-in-time recovery).
 std::string wal_file_basename(uint32_t index);
 /// Whether `name` is a WAL file's, and its index when it is.
 bool parse_wal_file_basename(std::string_view name, uint32_t& index);
-static_assert(std::atomic<WalPosition>::is_always_lock_free,
-              "std::atomic<WalPosition> must be lock-free: an atomic that quietly takes a lock "
-              "would put that lock on the WAL write path, which is the cost this exists to avoid");
 
 /// A CHECKPOINT's payload since #159: the position its flush drained up to, as two little-endian
 /// 32-bit words - the file index, then the offset. Eight bytes, and a checkpoint written before

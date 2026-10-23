@@ -219,14 +219,9 @@ WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
     // Find the highest existing WAL file index so we continue from there.
     uint32_t highest = 0;
     for (auto& entry : std::filesystem::directory_iterator(dir_)) {
-        const std::string name = entry.path().filename().string();
-        if (name.size() == 14 &&
-            name.substr(0, 4) == "wal_" &&
-            name.substr(10) == ".bin") {
-            uint32_t idx = static_cast<uint32_t>(std::stoul(name.substr(4, 6)));
-            if (idx >= highest) {
-                highest = idx;
-            }
+        uint32_t idx = 0;
+        if (parse_wal_file_basename(entry.path().filename().string(), idx) && idx >= highest) {
+            highest = idx;
         }
     }
     // One publish, with both halves already known.
@@ -992,15 +987,10 @@ size_t WALWriter::truncate_before(uint32_t before_index) {
     if (!std::filesystem::exists(dir_)) return 0;
 
     for (auto& entry : std::filesystem::directory_iterator(dir_)) {
-        const std::string name = entry.path().filename().string();
-        if (name.size() == 14 &&
-            name.substr(0, 4) == "wal_" &&
-            name.substr(10) == ".bin") {
-            uint32_t idx = static_cast<uint32_t>(std::stoul(name.substr(4, 6)));
-            if (idx < before_index) {
-                std::filesystem::remove(entry.path());
-                ++removed;
-            }
+        uint32_t idx = 0;
+        if (parse_wal_file_basename(entry.path().filename().string(), idx) && idx < before_index) {
+            std::filesystem::remove(entry.path());
+            ++removed;
         }
     }
     return removed;
@@ -1158,11 +1148,8 @@ uint64_t WALReplayer::replay_v2_from(WalPosition from, WALReplayCallbackV2 cb)
     }
 
     for (auto& entry : std::filesystem::directory_iterator(dir_)) {
-        const std::string name = entry.path().filename().string();
-        if (name.size() == 14 &&
-            name.substr(0, 4) == "wal_" &&
-            name.substr(10) == ".bin") {
-            uint32_t idx = static_cast<uint32_t>(std::stoul(name.substr(4, 6)));
+        uint32_t idx = 0;
+        if (parse_wal_file_basename(entry.path().filename().string(), idx)) {
             files.emplace_back(idx, entry.path().string());
         }
     }
@@ -1310,18 +1297,8 @@ std::optional<uint32_t> WALRecordCursor::first_file_from(uint32_t from) const {
     std::error_code ec;
     for (auto it = std::filesystem::directory_iterator(dir_, ec);
          !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
-        const std::string name = it->path().filename().string();
-        if (name.size() != 14 || name.compare(0, 4, "wal_") != 0 ||
-            name.compare(10, 4, ".bin") != 0) {
-            continue;
-        }
         uint32_t idx = 0;
-        bool digits = true;
-        for (size_t i = 4; i < 10; ++i) {
-            if (name[i] < '0' || name[i] > '9') { digits = false; break; }
-            idx = idx * 10 + static_cast<uint32_t>(name[i] - '0');
-        }
-        if (!digits || idx < from) continue;
+        if (!parse_wal_file_basename(it->path().filename().string(), idx) || idx < from) continue;
         if (!best || idx < *best) best = idx;
     }
     return best;

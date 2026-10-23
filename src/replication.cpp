@@ -203,9 +203,7 @@ static std::FILE* open_temp_file_private(const std::string& dir,
 
 /// Build WAL filename for a given index: wal_000000.bin
 static std::string wal_filename(const std::string& dir, uint32_t index) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "wal_%06u.bin", index);
-    return dir + "/" + buf;
+    return dir + "/" + wal_file_basename(index);
 }
 
 /// Send all bytes on a **blocking** socket, handling partial writes. True on success.

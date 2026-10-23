@@ -5,6 +5,7 @@
 #include "orderbook/logger.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/wal.hpp"
+#include "orderbook/wall_clock.hpp"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -178,7 +179,16 @@ void WalArchiver::run() {
     std::unique_lock<std::mutex> lock(mtx_);
     while (!stop_) {
         lock.unlock();
-        if (!refused()) (void)archive_closed(lineage(), current_file_());
+        if (!refused()) {
+            // The bound before the lineage. A new lineage begins in the file the writer is in, so a
+            // bound read before `set_lineage()` is at most that file's index and names only files of
+            // the old lineage; read the other way round, an old lineage could be paired with a bound
+            // a sync after the change has moved into the new one, and its files would go to the old
+            // lineage's directory.
+            const uint32_t before = current_file_();
+            const uint64_t identity = lineage();
+            (void)archive_closed(identity, before);
+        }
         lock.lock();
         cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_ || woken_; });
         woken_ = false;
@@ -220,11 +230,19 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
 
     const std::string dir = lineage_dir(identity);
     uint32_t held_from = before_file;   // the lowest index the archive does not hold
+    std::string failed_name;           // the file a failure stopped at
     std::vector<uint8_t> buf(kBufferBytes);
+    // Synced once a pass, before its first copy: the lineage's directory into the archive's, and the
+    // archive's into its parent. Retention removes a WAL file once its copy is in the archive, and a
+    // copy whose directory a power cut takes is no copy - whichever process made the directory.
+    bool dirs_synced = false;
     fs::create_directories(dir, ec);
     if (ec) {
         out.failure = "cannot create " + dir + ": " + ec.message();
-        if (!files.empty()) held_from = files.front().first;
+        if (!files.empty()) {
+            held_from = files.front().first;
+            failed_name = files.front().second;
+        }
     } else {
         for (const auto& [index, name] : files) {
             const auto key = std::make_pair(identity, name);
@@ -242,6 +260,7 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                     !size_and_crc(dst, buf, dst_size, dst_crc, why)) {
                     out.failure = why;
                     held_from = index;
+                    failed_name = name;
                     break;
                 }
                 if (src_size == dst_size && src_crc == dst_crc) {
@@ -253,6 +272,7 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                 out.refused = true;
                 out.failure = dst + " is in the archive with other contents";
                 held_from = index;
+                failed_name = name;
                 OB_LOG_ERROR("wal_archive", "%s is in the archive with other contents (%llu bytes, crc "
                                             "%08x; this file %llu bytes, crc %08x): archiving stops, "
                                             "and WAL retention with it, until the archive is put right",
@@ -260,12 +280,28 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                              static_cast<unsigned long long>(src_size), src_crc);
                 break;
             }
+            if (!dirs_synced) {
+                for (const std::string& d : {root_, fs::path(root_).parent_path().string()}) {
+                    if (const int err = sync_directory(d.empty() ? "." : d); err != 0) {
+                        why = "cannot sync the directory " + d + ": " + std::strerror(err);
+                        break;
+                    }
+                }
+                if (!why.empty()) {
+                    out.failure = why;
+                    held_from = index;
+                    failed_name = name;
+                    break;
+                }
+                dirs_synced = true;
+            }
             const auto started = std::chrono::steady_clock::now();
             uint64_t copied = 0, back_size = 0;
             uint32_t copy_crc = 0, back_crc = 0;
             if (!copy_synced(src, dst, buf, copied, copy_crc, why)) {
                 out.failure = why;
                 held_from = index;
+                failed_name = name;
                 break;
             }
             // Read back: a copy is believed once it reads as the bytes that went into it.
@@ -274,6 +310,7 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                 fs::remove(dst, ec);
                 out.failure = why.empty() ? "the copy of " + name + " does not read back as written" : why;
                 held_from = index;
+                failed_name = name;
                 break;
             }
             known_[key] = {copied, copy_crc};
@@ -289,10 +326,12 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                                                                   started).count());
         }
     }
-    if (!out.failure.empty() && !out.refused) {
+    if (!out.failure.empty()) {
         if (registry_) registry_->increment_counter("ob_wal_archive_failures_total");
-        OB_LOG_WARN("wal_archive", "cannot archive: %s - WAL retention waits at file %u",
-                    out.failure.c_str(), held_from);
+        if (!out.refused) {
+            OB_LOG_WARN("wal_archive", "cannot archive %s: %s - WAL retention waits at file %u",
+                        failed_name.c_str(), out.failure.c_str(), held_from);
+        }
     }
 
     // What is left, for the gauges: the closed files from the held_from on, and how long the oldest has
@@ -303,9 +342,8 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
         ++out.pending;
         struct stat st{};
         if (oldest_s == 0 && ::stat((wal_dir_ + "/" + name).c_str(), &st) == 0) {
-            const auto now = std::chrono::system_clock::now().time_since_epoch();
-            oldest_s = std::max<int64_t>(
-                0, std::chrono::duration_cast<std::chrono::seconds>(now).count() - st.st_mtime);
+            const auto now_s = static_cast<int64_t>(wall_clock_ns() / 1'000'000'000ULL);
+            oldest_s = std::max<int64_t>(0, now_s - static_cast<int64_t>(st.st_mtime));
         }
     }
     if (registry_) {
