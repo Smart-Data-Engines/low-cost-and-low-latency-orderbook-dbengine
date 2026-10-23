@@ -158,20 +158,23 @@ TEST(QueryResponseBuilder, APartTakesNoMoreRowsThanItsLimitAndGivesUpItsFirstOne
     }
     ob::QueryShape shape;
     shape.columns = {ob::QueryColumn::TimestampNs, ob::QueryColumn::Price, ob::QueryColumn::Quantity};
-    ob::QueryResponseBuilder parts(shape);
-    auto part = parts.part(10);
     const ob::RowBatch batch{ts, price, qty, cnt, side, level, seq, std::span<const uint32_t>(all)};
-    const ob::BatchVerdict verdict = part->take(batch);
-    EXPECT_EQ(part->rows(), 10u);
-    EXPECT_TRUE(verdict.stop);
-    EXPECT_EQ(verdict.at, 9u);
-    parts.add_part(*part, 7);
+    // Every count of rows a reply can take of a part, the part's own rows and all but one included.
+    for (uint64_t n = 0; n <= 10; ++n) {
+        ob::QueryResponseBuilder parts(shape);
+        auto part = parts.part(10);
+        const ob::BatchVerdict verdict = part->take(batch);
+        EXPECT_EQ(part->rows(), 10u);
+        EXPECT_TRUE(verdict.stop);
+        EXPECT_EQ(verdict.at, 9u);
+        parts.add_part(*part, n);
 
-    ob::QueryResponseBuilder direct(shape);
-    ob::RowBatch seven = batch;
-    seven.rows = seven.rows.first(7);
-    direct.add_rows(seven);
-    EXPECT_EQ(parts.finish(), direct.finish());
+        ob::QueryResponseBuilder direct(shape);
+        ob::RowBatch first = batch;
+        first.rows = first.rows.first(static_cast<size_t>(n));
+        direct.add_rows(first);
+        EXPECT_EQ(parts.finish(), direct.finish()) << n << " rows of the part";
+    }
 }
 
 TEST(QueryResponseBuilder, NoRowIsTheHeaderAndTheTerminator) {

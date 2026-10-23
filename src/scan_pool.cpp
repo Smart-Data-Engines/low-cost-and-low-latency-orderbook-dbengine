@@ -87,6 +87,14 @@ void ScanPool::ran_here() {
     if (registry_ != nullptr) registry_->increment_counter("ob_scan_parts_inline_total");
 }
 
+bool ScanPool::run_here_if_untaken(Task& task) {
+    if (!task.take()) return false;
+    by_queries_.fetch_add(1, std::memory_order_relaxed);
+    if (registry_ != nullptr) registry_->increment_counter("ob_scan_parts_inline_total");
+    task.run();
+    return true;
+}
+
 void ScanPool::drop_or_wait(Task& task) {
     if (task.take()) {
         task.drop();

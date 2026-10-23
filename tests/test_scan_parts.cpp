@@ -204,17 +204,23 @@ TEST(ScanParts, ATieOnATimeAcrossTwoSegmentsGoesToTheOrderTheScanDeliversIn) {
 
 TEST(ScanParts, ASumTooLargeForTheMergeIsReadAgainOnOneThread) {
     // Prices and quantities near 2^63 and 2^64: one product P is about 2^127, so whether a sum part
-    // way left 128 bits depends on where it fell. Across two segments of one bucket:
+    // way left 128 bits depends on where it fell. Across two segments of one bucket, both ending at
+    // a sum of 1, whose VWAP would be answered:
     // - P, then -P and 1: the sums are P, 0, 1, and none left 128 bits - VWAP is answered;
-    // - P, then P and -P: the sums are P, 2P - which left them - and P: VWAP is refused.
+    // - P, then 2^100, -P, -2^100 and 1: the sums are P, P + 2^100 - which left them - and on to 1,
+    //   and VWAP is refused. The sizes of the second part's products stay inside 128 bits, so it is
+    //   the bound that says the merge cannot tell, not their overflow.
     // A merge cannot tell either from the parts' sums, so both are read again on one thread.
     constexpr int64_t kP = std::numeric_limits<int64_t>::max();
     constexpr uint64_t kQ = std::numeric_limits<uint64_t>::max();
+    constexpr int64_t k40 = int64_t{1} << 40;
+    constexpr uint64_t k60 = uint64_t{1} << 60;
     for (const bool overflows : {false, true}) {
         Store s;
         s.segment({row(kBase + 1, 0, 0, kP, kQ, 1)});
         if (overflows) {
-            s.segment({row(kBase + 2, 0, 0, kP, kQ, 2), row(kBase + 3, 0, 0, -kP, kQ, 3)});
+            s.segment({row(kBase + 2, 0, 0, k40, k60, 2), row(kBase + 3, 0, 0, -kP, kQ, 3),
+                       row(kBase + 4, 0, 0, -k40, k60, 4), row(kBase + 5, 0, 0, 1, 1, 5)});
         } else {
             s.segment({row(kBase + 2, 0, 0, -kP, kQ, 2), row(kBase + 3, 0, 0, 1, 1, 3)});
         }
@@ -259,29 +265,50 @@ void ten_segments(Store& s) {
 
 }  // namespace
 
-TEST(ScanParts, ALimitOfOneReadsOneCandidateOfTen) {
+TEST(ScanParts, ALimitReadsNoCandidateItWillNotNeed) {
+    // Ten segments of 500 rows. A LIMIT the first one's rows may meet is read on the query's
+    // thread, through the direct reader, with no part made; one of 600 has two candidates handed
+    // out - the first may fall short, the two cannot - where the pool of four would read five.
     Store s;
     ten_segments(s);
     ob::ScanPool pool(4, nullptr);
-    std::atomic<int> made{0};
-    uint64_t folded = 0;
-    ob::PartsScan how;
-    how.pool = &pool;
-    how.limit_rows = 1;
-    how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
-        ++made;
-        return std::make_unique<CountingPart>(false);
-    };
-    how.fold = [&folded](ob::ScanPart& p) {
-        folded += p.rows();
-        return folded < 1;
-    };
-    const auto cost = s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
-                                         ob::RowFilter{}, how);
-    EXPECT_EQ(made.load(), 1) << "a candidate the LIMIT did not need was read";
-    EXPECT_TRUE(cost.stopped);
-    EXPECT_EQ(cost.segments_read, 1u);
-    EXPECT_EQ(g_parts_alive.load(), 0);
+    for (const uint64_t limit : {uint64_t{1}, uint64_t{500}, uint64_t{600}}) {
+        std::atomic<int> made{0};
+        uint64_t folded = 0;
+        uint64_t direct = 0;
+        ob::PartsScan how;
+        how.pool = &pool;
+        how.limit_rows = limit;
+        how.direct = [&direct, limit](const ob::RowBatch& b) -> ob::BatchVerdict {
+            const uint64_t room = limit - direct;
+            if (b.rows.size() >= room) {
+                direct = limit;
+                return {true, static_cast<size_t>(room - 1)};
+            }
+            direct += b.rows.size();
+            return {};
+        };
+        how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+            ++made;
+            return std::make_unique<CountingPart>(false);
+        };
+        how.fold = [&folded, limit](ob::ScanPart& p) {
+            folded += p.rows();
+            return folded < limit;
+        };
+        const auto cost = s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
+                                             ob::RowFilter{}, how);
+        EXPECT_TRUE(cost.stopped) << "LIMIT " << limit;
+        if (limit <= 500) {
+            EXPECT_EQ(made.load(), 0) << "LIMIT " << limit << " was divided";
+            EXPECT_EQ(direct, limit);
+            EXPECT_EQ(cost.segments_read, 1u);
+        } else {
+            EXPECT_EQ(made.load(), 2) << "LIMIT " << limit << ": a candidate it did not need was read";
+            EXPECT_EQ(cost.segments_read, 2u);
+        }
+        EXPECT_EQ(g_parts_alive.load(), 0);
+    }
 }
 
 TEST(ScanParts, APartThatThrowsReachesTheQueryWithEveryOtherPartSettled) {

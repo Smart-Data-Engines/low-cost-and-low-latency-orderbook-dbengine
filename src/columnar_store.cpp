@@ -2538,13 +2538,16 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         slots.push_back(std::move(s));
     }
     const size_t segment_slots = slots.size();
-    ScanPool* const pool =
-        how.pool != nullptr && how.pool->threads() > 0 && segment_slots > 1 ? how.pool : nullptr;
-    if (pool == nullptr) {
-        // Nothing to divide: one thread's scan, the scan_batches() this replaces when it can.
+    // Nothing to divide - no pool, no threads, one candidate - or a LIMIT the first candidate's rows
+    // may meet on their own, as a small one does: one thread's scan, the scan_batches() this
+    // replaces when it can, and no queue to pass through on the way.
+    const bool divide = how.pool != nullptr && how.pool->threads() > 0 && segment_slots > 1 &&
+                        (how.limit_rows == UINT64_MAX || how.limit_rows > slots[0].rows_at_most);
+    if (!divide) {
         return read_in_order(set, symbol, exchange, columns, start_ns, end_ns, filter, how.direct,
                              cost);
     }
+    ScanPool* const pool = how.pool;
     if (!set.blocks.empty()) {
         Slot s;
         for (const auto& b : set.blocks) s.rows_at_most += b->rows.size();
@@ -2608,6 +2611,12 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
             hand_out(k);
             Slot& s = slots[k];
             if (s.task) {
+                // While a thread reads the part the fold needs next, this one reads another of
+                // this scan's parts no thread has taken yet - the last one out, which the threads
+                // reach last - rather than wait idle.
+                for (size_t j = handed; !s.task->done() && j > k + 1; --j) {
+                    if (slots[j - 1].task) pool->run_here_if_untaken(*slots[j - 1].task);
+                }
                 const auto t0 = std::chrono::steady_clock::now();
                 pool->run_or_wait(*s.task);
                 waited += std::chrono::steady_clock::now() - t0;
