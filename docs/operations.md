@@ -318,8 +318,8 @@ gives it two loops.
 
 A node that mostly answers big queries can give them the scan pool (#246, `--scan-threads N`,
 threads named `ob-scan-0` …): a query of many rows spread over several segments is then read on N
-threads at once, about twice as fast on four. It is off under every profile because the pool's reads
-cost a writer on the same node a tenth or more of its rate while they run - measured in
+threads at once, 1.6-1.8 times as fast on four. It is off under every profile because the pool's
+reads cost a writer on the same node 8-20% of its rate while they run - measured in
 `docs/cli.md`, "A query on several cores" - so on a node taking writes it is a choice to make, not a
 default; on a replica kept for queries, one thread per CPU.
 

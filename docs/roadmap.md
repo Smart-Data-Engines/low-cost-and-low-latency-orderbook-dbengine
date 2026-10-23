@@ -2918,8 +2918,75 @@ one settled copy of the data directory (pitfall 609). Every answer had one SHA-2
 - The prediction registered before the run was 3.0-4.5 ms and 4-7 ms. The buckets landed inside it
   and the row answer above it: formatting three integers costs 20 ns a row, and is now 77% of that
   answer's samples (`add_narrow_rows`). The buckets are 83% the bucket's own state.
-- Both are what stage 2 divides: a candidate's whole work on a pool sized to the machine, folded in
-  the index's order. Open.
+- Both are what stage 2 divides: a candidate's whole work on a pool, folded in the index's order.
+
+**Stage 2: a candidate's whole work on a pool** (`ScanPool`, `ColumnarStore::scan_parts()`).
+- A query whose rows in range are many and spread out is divided: 32 768 rows or more, read from
+  each candidate's metadata as if spread evenly over its time, and no candidate holding more than
+  three quarters of them. Each candidate is read, its rows chosen and formatted into a part of the
+  reply - or added to a part's buckets - on one of `--scan-threads` threads, and the query's loop
+  folds the parts in the candidates' order, running any part no thread has taken. A scan of fewer
+  rows, or mostly in one segment, reads on the query's loop: there a pool adds its queue and the
+  copy of a part, and wins nothing.
+- **The same bytes.** Rows and their order, `LIMIT`, every refusal, and `FIRST` and `LAST` tied at
+  one instant across two parts (#168): `FIRST` stays with the earlier part unless the later one's
+  time is strictly earlier, `LAST` goes to the later part at an equal time or later. A part's sum of
+  price times quantity is added while the sizes of its products, added to the sum it starts from,
+  fit 128 bits; otherwise the buckets are read again on one thread, and that is logged.
+- **What is out is bounded.** At most the pool's threads and one more parts are out ahead of the
+  fold. Under a `LIMIT` a candidate goes out only while the answer may still need its rows, and a
+  `LIMIT` the first candidate may meet is not divided. A part that is not needed is dropped unread,
+  and a query waits for each of its parts before it answers - after a `LIMIT`, a refusal or a part
+  that threw.
+- **Beside the client loops.** The threads, `ob-scan-0` ..., run under `SCHED_IDLE` and give their
+  CPU up between batches. One scan divides at a time; another that comes meanwhile reads on its own
+  loop. Metrics `ob_scan_parts_pooled_total`, `ob_scan_parts_inline_total` and `ob_scan_threads`.
+
+Measured on the x86 host, from the same template, the stage-1 build (`b`) against the final tree
+with no pool (`f0`) and with four threads (`f4`), four interleaved rounds alone and three under
+load; every answer had one SHA-256 across the three:
+
+| | stage 1 | no pool | four threads |
+|---|---|---|---|
+| 1 904 640 rows of one column, alone | 25.10-26.09 ms | 25.68-26.23 ms | 14.39-15.31 ms |
+| 80 one-minute buckets of them, alone | 6.46-6.50 ms | 6.07-6.10 ms | 3.33-3.70 ms |
+| 4 000 rows of three columns, alone | 0.119-0.120 ms | 0.120-0.121 ms | 0.122 ms |
+| four connections asking the buckets at once | 610.6-612.3 q/s | 648.7-652.9 q/s | 587.2-593.5 q/s |
+| a writer beside the buckets: levels/s, batch p99 | 5.79-6.02 M, 38.1-42.5 us | 5.81-6.14 M, 37.0-40.7 us | 5.22-5.36 M, 47.5-55.8 us |
+| a writer beside the 1.9 M rows | 5.53-5.79 M, 40.8-46.3 us | 5.67-5.86 M, 39.0-44.6 us | 4.67-5.06 M, 141.6-205.2 us |
+
+- **Alone, four threads make a query 1.6-1.8 times as fast.** The prediction registered before the
+  first measurement was 1.5-2.5 ms for the buckets and 1.2-2.0 ms for the 190 360-row answer. The buckets
+  landed above it. The 190 360 rows lie in one or two segments, the larger with more than three
+  quarters of them, so they are not divided at all; the table measures the whole store instead.
+- **Beside a writer the pool costs the writer.** Against the same build without it, a writer on the
+  same node wrote 8-15% fewer levels a second beside the buckets and 11-20% fewer beside the row
+  answer, with a p99 of 48-56 and 142-205 us against 37-45. Four connections answered 8-10% fewer
+  buckets: where every CPU already runs a connection's loop, the pool only competes with them.
+- **So the pool is off under every profile** (`--scan-threads 0`), and requirement 3.1 of the spec,
+  which had `boost` set it to the machine, is changed. A node whose queries matter more than the
+  writes beside them - a replica kept for reads - is where to turn it on.
+- **How the cost came down to that.** Measured under load first, the pool cost the writer most of
+  its tail - a p99 of 0.5-1.2 ms and 2.98-4.60 M levels a second - and four connections 22% of their
+  queries.
+  - Nice 19 and `SCHED_IDLE` did not bring it down. Under `SCHED_IDLE` the writer's p99 was
+    0.91-1.00 ms in 17 rounds of 18: a tick of that kernel (7.0, `CONFIG_PREEMPT_LAZY`, `HZ` 1000),
+    which marks a waking task to run at the next tick rather than stop the one running.
+  - One dividing scan at a time brought the four connections back to 3-7% fewer.
+  - A pool thread giving its CPU up after each batch of up to 2 048 rows brought the writer's p99
+    to 50-54 us beside the buckets.
+- **Two designs measured slower:**
+  - the query's own thread reading its queued parts while it waited held up the fold: 24.0-25.0 ms
+    where 17.0-18.1 without it;
+  - three threads, `boost`'s first choice of the CPUs less one, were slower than four.
+- `f0` against `b` is stage 2's code with no pool: the row answer 2% slower at the low end of each
+  range, the buckets 6% faster.
+
+Tests: `test_scan_pool.cpp` and `test_scan_parts.cpp` - answers on pools of one to four threads held
+byte for byte to the scan without one, rows and buckets, with ties, sums too large to merge, the
+ceiling, `LIMIT`s, a part that throws, the claim and `SCHED_IDLE` - and
+`tests/integration/test_scan_pool.py`: a node with `--scan-threads 2` answers the bytes of a node
+without it, buckets merged across parts included, and its `/metrics` shows the parts it divided.
 
 - Effort: M | Impact: a query of many rows used one core of the machine, and spent most of it
   handing rows over one at a time

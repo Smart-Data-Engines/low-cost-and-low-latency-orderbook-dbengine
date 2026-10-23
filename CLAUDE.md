@@ -4475,6 +4475,29 @@ Learned the hard way. Check here before debugging.
      faster at most. Pitfall 366's lesson, which was about the write path, held on the read path too:
      the per-row cost had to come down on one core (1.46-1.93 times, #246's stage 1) before there was
      anything worth dividing among cores.
+611. **A thread below the client loops in priority can still hold a loop off its CPU for a tick.**
+     #246's pool threads at nice 19, then under `SCHED_IDLE`, left the batch p99 of a writer on the
+     same node near a millisecond - under `SCHED_IDLE` 0.91-1.00 ms in 17 rounds of 18. The x86
+     host's kernel (7.0, `CONFIG_PREEMPT_LAZY`, `HZ` 1000) marks a waking task to run at the next
+     tick rather than stop the one running, whatever their policies. What brought the p99 to 50 us
+     was the pool thread giving its CPU up after each batch (`sched_yield()`), so that a woken loop
+     waits for a batch rather than a tick. A policy decides who runs next; when the running thread
+     stops is the kernel's preemption model's.
+612. **A query that helps its own pool can slow it down.** #246's query thread read its own queued
+     parts while it waited, from the far end of what was out, so as not to take the one the fold
+     needed next. It held up the fold all the same, and with it the parts handed to the threads that
+     had finished: 1.9 M rows on four threads took 24.0-25.0 ms with it and 17.0-18.1 without. The
+     thread that folds should fold.
+613. **Test data alike in every partition cannot see a bug in the order between partitions.** The
+     integration test of #246's pool wrote eight segments with one price pattern, so a bucket's
+     `FIRST` was the same price whichever segment it came from, and a merge taking `FIRST` from the
+     later part answered the same bytes and survived (mutation run 5 of the multicore-scan
+     evidence). Each segment's prices now start from an offset of its own.
+614. **A pool measured alone is half of what it costs.** #246's query was 1.6-1.8 times as fast on
+     four threads, and the same query cost a writer on the same node 8-20% of its levels a second and
+     four query connections 8-10% of their answers: where the connections' loops already use every
+     CPU, the pool's threads only compete with them. The spec had `boost` turn the pool on; measured
+     beside other work, it is off under every profile and an operator's choice.
 
 ## Current state and open problems
 
@@ -4511,7 +4534,10 @@ warns about it.
 **#246's stage 1**: a scan hands its rows over a batch at a time - a candidate's columns and the
 rows chosen from them - and the server formats a row answer from the columns (`RowAnswer`); a
 190 000-row answer and a bucket query take 1.46 and 1.93 times less on one core, with the same
-bytes. Stage 2, a candidate's work on a pool, is open (pitfalls 609, 610).
+bytes (pitfalls 609, 610). **Stage 2**: with `--scan-threads N` a query of many rows over several
+segments reads them on N threads and folds the parts in order, the same bytes, 1.6-1.8 times as fast
+on four; it is off under every profile, because beside a writer on the same node it cost the writer
+8-20% of its rate (pitfalls 611-614).
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)

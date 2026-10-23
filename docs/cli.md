@@ -449,12 +449,13 @@ meanwhile reads on its own loop. The pool's threads, `ob-scan-0` … `ob-scan-N-
 batch at most.
 
 **It is off under every profile**, and that is a measured choice (x86 test host, 4 vCPU, a 1.9 M-row
-store in ten segments). With four threads a query alone took half the time - 80 one-minute buckets
-of all of it 3.3 ms against 6.5, all of it in one column 14.8 ms against 25.5 - but **beside a writer
-it cost the writer 10-17% of its rate and its batch p99 went from about 40 µs to 50-160 µs** while
-the query ran, and four connections asking the bucket query at once answered 4% fewer of them. A
-node that takes writes should choose that rather than be given it; a node that mostly answers big
-queries - a replica kept for them - is where to turn it on, at one thread per CPU.
+store in ten segments, the same build with and without four threads). A query alone took 55-61% of
+the time - 80 one-minute buckets of all of it 3.3-3.7 ms against 6.1, all of it in one column
+14.4-15.3 ms against 25.7-26.2 - but **beside a writer it cost the writer 8-20% of its rate and its
+batch p99 went from about 40 µs to 48-205 µs** while the query ran, and four connections asking the
+bucket query at once answered 8-10% fewer of them. A node that takes writes should choose that
+rather than be given it; a node that mostly answers big queries - a replica kept for them - is where
+to turn it on, at one thread per CPU.
 `ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on the pool
 and on the queries' loops, and `ob_scan_threads` is N.
 

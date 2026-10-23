@@ -11,6 +11,17 @@ here as `#N`.
 
 ### Added
 
+- `--scan-threads N`: a query's segments read on N threads at once (#246, stage 2 of a scan on
+  several cores). A query of 32 768 rows in range or more, spread over two segments or more, is
+  divided: each segment is read, its rows chosen and formatted - or added to their time buckets - on
+  one of the pool's threads, and the query's loop puts the parts together in the segments' order, so
+  the answer is the same bytes, `LIMIT`s and refusals included. **Off under every profile:** on the
+  x86 test host four threads answered 1.9 M rows of one column in 14.4-15.3 ms where the same build
+  took 25.7-26.2 without them, and their 80 one-minute buckets in 3.3-3.7 ms where 6.1, but a writer
+  on the same node wrote 8-20% fewer levels a second while they ran. The threads, `ob-scan-N`, run
+  under `SCHED_IDLE` and give their CPU up between batches, and one query divides at a time. Metrics
+  `ob_scan_parts_pooled_total`, `ob_scan_parts_inline_total` and `ob_scan_threads`;
+  `docs/cli.md`, "A query on several cores".
 - A restore to a moment after the backup (#34, point-in-time recovery). With `--wal-archive-dir
   <DIR>` a node puts every WAL file it closes into `<DIR>/<WAL identity>/`, with its size and CRC32C
   beside it: linked on the WAL's filesystem, copied, synced and read back on another. Retention
