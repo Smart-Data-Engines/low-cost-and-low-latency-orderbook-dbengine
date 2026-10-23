@@ -2984,9 +2984,14 @@ load; every answer had one SHA-256 across the three:
 
 Tests: `test_scan_pool.cpp` and `test_scan_parts.cpp` - answers on pools of one to four threads held
 byte for byte to the scan without one, rows and buckets, with ties, sums too large to merge, the
-ceiling, `LIMIT`s, a part that throws, the claim and `SCHED_IDLE` - and
+ceiling, `LIMIT`s, a part that throws, the claim and `SCHED_IDLE`; `test_compaction_store.cpp`, a
+merge replacing the segments a part on the pool is reading - and
 `tests/integration/test_scan_pool.py`: a node with `--scan-threads 2` answers the bytes of a node
 without it, buckets merged across parts included, and its `/metrics` shows the parts it divided.
+The final tree's mutation table (`evidence/2026-10-23-multicore-scan/mutations/run-8-stage2-c9e716e.log`)
+killed 25 mutants of 25, among them a divided scan that lets its readers' generation go before its
+parts have read; the control survived, and so did the yield taken out, which changes when a pool
+thread runs and not what it reads. The integration module's own table killed its five.
 
 - Effort: M | Impact: a query of many rows used one core of the machine, and spent most of it
   handing rows over one at a time
