@@ -11,6 +11,20 @@ here as `#N`.
 
 ### Added
 
+- A restore to a moment after the backup (#34, point-in-time recovery). With `--wal-archive-dir
+  <DIR>` a node copies every WAL file it closes into `<DIR>/<WAL identity>/`, with its size and
+  CRC32C beside it; a copy counts once it is synced and read back, retention removes no WAL file the
+  archive does not hold, and a file already there with other contents is never overwritten - it
+  stops archiving with an `ERROR`. `--wal-archive-interval-s` (default 60) rotates a WAL file that
+  has held a record that long, so a quiet node's records reach the archive too. `ob_restore
+  --wal-archive <DIR> --until <ns|time|end>` restores a backup and replays the archived records from
+  its cut through the write path, up to the last checkpoint at or before the moment; it checks the
+  archive before it creates anything, and refuses another lineage, a hole, a file that is not what
+  its sum says, a moment before the backup and a mesh node's backup. Metrics
+  `ob_wal_archived_files_total`, `ob_wal_archived_bytes_total`, `ob_wal_archive_failures_total`,
+  `ob_wal_archive_pending_files` and `ob_wal_archive_oldest_pending_seconds`; alerts
+  `OrderbookWalArchiveFailing` and `OrderbookWalArchiveBehind`; a dashboard row. `docs/operations.md`,
+  "Restoring to a moment".
 - `ob_flush()` in the C API (#244): every write so far becomes readable, and the engine stays open
   with its live books. The Python client's local `flush()` calls it when the library has it.
 - `MREPLACE`, a side replacement (#233): `MREPLACE <symbol> <exchange> <bid|ask> <n_levels>
