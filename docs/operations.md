@@ -316,6 +316,12 @@ engine shares with other work, `--profile eco` is one loop blocking between even
 was; and a mask or a limit you give it is one it sizes itself to, so pinning the service to two cores
 gives it two loops.
 
+A query of many rows spread over several segments is read on the scan pool as well (#246): one
+thread a usable CPU under `boost` (`--scan-threads`, named `ob-scan-0` …), idle unless a query
+divides. Its threads compete with the client loops only while such a query runs, and they are what
+lets one query use the whole machine; `--scan-threads 0`, or `eco`, keeps every query on its own
+loop.
+
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,
 `top -H -p $(pidof ob_tcp_server)` shows which loop is busy, and the log line
