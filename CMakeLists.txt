@@ -323,6 +323,11 @@ target_link_libraries(orderbook_query_columns PUBLIC orderbook_logger)
 add_library(orderbook_columnar STATIC src/columnar_store.cpp src/decoded_columns.cpp
             src/column_arena.cpp src/huge_region.cpp src/book_summary.cpp src/best_track.cpp)
 target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_logger orderbook_query_columns)
+# The threads a scan's candidates are read on (OB-12, stage 2): `scan_parts()` hands them its
+# candidates. Its own library because it is the store's only dependency on the metrics registry.
+add_library(orderbook_scan_pool STATIC src/scan_pool.cpp)
+target_link_libraries(orderbook_scan_pool PUBLIC orderbook_metrics orderbook_logger)
+target_link_libraries(orderbook_columnar PUBLIC orderbook_scan_pool)
 
 # ── LZ4 compression library ────────────────────────────────────────────────────
 find_package(PkgConfig)

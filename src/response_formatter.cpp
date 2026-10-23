@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -342,6 +343,33 @@ void QueryResponseBuilder::add(const QueryResult& r) {
     used_ = static_cast<size_t>(p - reply);
 }
 
+// Out of line for the reason format_narrow_rows() is: inlined beside the seven-column path, it would
+// take `to_chars` out of that path's inlining.
+[[gnu::noinline]] static char* write_narrow_rows(char* p, char* end, const RowBatch& b, size_t n,
+                                                 const std::vector<QueryColumn>& columns) {
+    const size_t last = columns.size() - 1;
+    for (size_t k = 0; k < n; ++k) {
+        const uint32_t i = b.rows[k];
+        for (size_t c = 0; c < columns.size(); ++c) {
+            p = put_column(p, end, b, i, columns[c], c == last ? '\n' : '\t');
+        }
+    }
+    return p;
+}
+
+/// The first `n` rows of a batch as a reply's rows, from `p`, which has room for `n` of the widest
+/// row the shape can write: the seven unrolled, or a narrowed list out of line. The one writer of a
+/// batch's rows, so a reply built from batches and one built from parts cannot differ.
+static char* write_rows(char* p, char* end, const RowBatch& b, size_t n, bool all_seven,
+                        const std::vector<QueryColumn>& columns) {
+    if (all_seven) {
+        for (size_t k = 0; k < n; ++k) p = put_seven(p, end, b, b.rows[k]);
+    } else if (!columns.empty()) {
+        p = write_narrow_rows(p, end, b, n, columns);
+    }
+    return p;
+}
+
 void QueryResponseBuilder::add_rows(const RowBatch& b) {
     if (b.rows.empty()) return;
     if (!started_) start_rows();
@@ -351,26 +379,76 @@ void QueryResponseBuilder::add_rows(const RowBatch& b) {
     if (out_.size() - used_ < need) out_.resize(std::max(out_.size() * 2, used_ + need));
     char* const reply = out_.data();
     char* const end   = reply + out_.size();
-    char* p = reply + used_;
-    if (all_seven_) {
-        for (const uint32_t i : b.rows) p = put_seven(p, end, b, i);
-    } else if (!shape_.columns.empty()) {
-        p = add_narrow_rows(p, end, b);
-    }
-    used_ = static_cast<size_t>(p - reply);
+    used_ = static_cast<size_t>(write_rows(reply + used_, end, b, b.rows.size(), all_seven_,
+                                           shape_.columns) - reply);
 }
 
-// Out of line for the reason format_narrow_rows() is: inlined beside the seven-column path, it would
-// take `to_chars` out of that path's inlining.
-[[gnu::noinline]] char* QueryResponseBuilder::add_narrow_rows(char* p, char* end, const RowBatch& b) {
-    const auto& columns = shape_.columns;
-    const size_t last = columns.size() - 1;
-    for (const uint32_t i : b.rows) {
-        for (size_t c = 0; c < columns.size(); ++c) {
-            p = put_column(p, end, b, i, columns[c], c == last ? '\n' : '\t');
+namespace {
+
+/// A part of a row answer (#246, stage 2): one candidate's rows formatted where the candidate is
+/// read, into text of its own - at most `limit` rows, as no part of an answer of `limit` rows needs
+/// more - through the writer add_rows() writes through.
+class RowTextPart final : public ScanPart {
+public:
+    RowTextPart(const QueryShape& shape, uint64_t limit, size_t row_bytes)
+        : columns_(shape.columns), limit_(limit), all_seven_(shape.columns == all_query_columns()),
+          row_bytes_(row_bytes) {}
+
+    BatchVerdict take(const RowBatch& b) override {
+        const auto n = static_cast<size_t>(std::min<uint64_t>(b.rows.size(), limit_ - rows_));
+        if (n > 0) {
+            const size_t need = n * row_bytes_;
+            if (text_.size() - used_ < need) text_.resize(std::max(text_.size() * 2, used_ + need));
+            char* const base = text_.data();
+            used_ = static_cast<size_t>(
+                write_rows(base + used_, base + text_.size(), b, n, all_seven_, columns_) - base);
         }
+        rows_ += n;
+        if (rows_ == limit_) return {true, n == 0 ? 0 : n - 1};
+        return {};
     }
-    return p;
+    uint64_t rows() const override { return rows_; }
+
+    const char* data() const { return text_.data(); }
+    /// The bytes of its first `n` rows: through the end of the `n`-th, every row being one line.
+    size_t bytes_of(uint64_t n) const {
+        if (n >= rows_) return used_;
+        const char* p = text_.data();
+        const char* const end = p + used_;
+        for (uint64_t r = 0; r < n; ++r) {
+            p = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p))) + 1;
+        }
+        return static_cast<size_t>(p - text_.data());
+    }
+
+private:
+    std::vector<QueryColumn> columns_;
+    uint64_t limit_;
+    bool all_seven_;
+    size_t row_bytes_;
+    std::string text_;
+    size_t used_{0};
+    uint64_t rows_{0};
+};
+
+}  // namespace
+
+std::unique_ptr<ScanPart> QueryResponseBuilder::part(uint64_t limit) {
+    // Made on whichever thread reads the candidate: it reads the shape, which the engine filled
+    // before the scan began and nothing changes during it, and writes nothing of the builder's.
+    const bool seven = shape_.columns == all_query_columns();
+    return std::make_unique<RowTextPart>(shape_, limit,
+                                         seven ? kMaxQueryRowBytes : max_row_bytes(shape_.columns));
+}
+
+void QueryResponseBuilder::add_part(ScanPart& p, uint64_t n) {
+    auto& part = static_cast<RowTextPart&>(p);
+    if (n == 0) return;
+    if (!started_) start_rows();
+    const size_t bytes = part.bytes_of(n);
+    if (out_.size() - used_ < bytes) out_.resize(std::max(out_.size() * 2, used_ + bytes));
+    std::memcpy(out_.data() + used_, part.data(), bytes);
+    used_ += bytes;
 }
 
 std::string QueryResponseBuilder::finish() {

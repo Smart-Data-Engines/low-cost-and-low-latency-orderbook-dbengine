@@ -360,9 +360,10 @@ and `--print-config` says which values the profile set and why, under the machin
 
 ```
 # machine: 4 usable CPUs: affinity 4, no cgroup v2 CPU limit
-# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window
+# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window; a scan pool of 3 threads beside the loop a query runs on
   io-spin-us                       10  (profile)
   io-threads                       4  (profile)
+  scan-threads                     3  (profile)
   profile                          boost  (default)
 ```
 
@@ -433,6 +434,19 @@ core per loop while traffic flows"**, not a core per loop. When #144 introduced 
 `--io-spin-us 100000000`, a window that never closes, against its bounded one: the same p50 for a
 busy client, at 98% of a core — so the window gives up no latency under continuous traffic, and
 without it an idle node would hold its cores indefinitely.
+
+## A query on several cores: `--scan-threads`
+
+A query runs on its connection's loop. With `--scan-threads N` above 0, a query whose range covers
+two segments or more divides them: each segment is read, its rows chosen and formatted - or added to
+their time buckets - on one of the pool's N threads or on the query's own loop, whichever takes it
+first, and the loop puts the parts together in the segments' order (#246). The answer is the same
+bytes as with 0, a `LIMIT` included: under a `LIMIT` a segment goes to the pool only while the
+answer may still need its rows. Under `boost` N is one fewer than the usable CPUs, since the query's
+loop reads too, and under `eco` it is 0. `SNAPSHOT`, `WHERE AT` and the series of the book read in
+time order on the query's loop whatever N is. The pool's threads are `ob-scan-0` … `ob-scan-N-1`;
+`ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on them and
+on the queries' loops, and `ob_scan_threads` is N.
 
 ## Client event loops: `--io-threads`
 
@@ -615,6 +629,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: the profile's — 10 under `boost` where the process has a CPU to spare, 0 under `eco`). Costs up to one core per loop while traffic flows and takes ~18% off the loopback round trip |
 | `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: the profile's — one per usable CPU under `boost`, 1 under `eco`). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
+| `--scan-threads` | `<N>` | Threads a query's segments are read on, 0 to 64 (default: the profile's — one fewer than the usable CPUs under `boost`, 0 under `eco`). A query of two segments or more divides them among these and its own loop, and folds what each made in the segments' order, so the answer is the same bytes; 0 reads every segment on the query's loop ("A query on several cores: `--scan-threads`" below) |
 | `--profile` | `<NAME>` | `boost` (default: one client event loop per usable CPU, and a 10 µs spin where it cannot starve anything) or `eco` (one loop, blocking between events). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |

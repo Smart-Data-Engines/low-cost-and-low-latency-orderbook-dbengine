@@ -155,6 +155,37 @@ struct BatchVerdict {
 };
 using BatchReader = std::function<BatchVerdict(const RowBatch&)>;
 
+class ScanPool;
+
+/// One candidate's share of a scan (OB-12, stage 2): made and filled on whichever thread reads the
+/// candidate, then folded into the answer on the scan's thread, in the candidates' order.
+class ScanPart {
+public:
+    virtual ~ScanPart() = default;
+    /// The candidate's rows, a batch at a time and in order, as `scan_batches()` hands them over.
+    virtual BatchVerdict take(const RowBatch& batch) = 0;
+    /// The rows it took.
+    virtual uint64_t rows() const = 0;
+};
+
+/// How a scan divides its candidates among a pool's threads (OB-12, stage 2).
+struct PartsScan {
+    /// Where the candidates are read. Null, a pool of no threads, or a scan of one candidate reads
+    /// every candidate on the scan's thread, through `direct`.
+    ScanPool* pool{nullptr};
+    /// The most rows the answer takes: a candidate goes to the pool only while the rows folded and
+    /// the rows of those handed out and not folded yet are fewer, so a small LIMIT has nothing read
+    /// that it will not use.
+    uint64_t limit_rows{UINT64_MAX};
+    /// The scan read on its own thread, in order, as `scan_batches()` reads it.
+    BatchReader direct;
+    /// One candidate's part, made on the thread that reads the candidate.
+    std::function<std::unique_ptr<ScanPart>()> make_part;
+    /// A part folded into the answer, on the scan's thread and in the candidates' order. False ends
+    /// the scan.
+    std::function<bool(ScanPart&)> fold;
+};
+
 /// Row `i` of a batch as the row scan hands it over: the fields of the columns the batch holds,
 /// zero in every field whose column it does not.
 inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
@@ -695,6 +726,18 @@ public:
                           ColumnSet columns, const RowFilter& filter,
                           const BatchReader& read) const;
 
+    /// The rows `scan_batches()` reads, divided by candidate among `how.pool`'s threads (OB-12,
+    /// stage 2): each candidate read into a part of its own on whichever thread takes it, the
+    /// scan's thread among them, and the parts folded here in the candidates' order - so what
+    /// `how.fold` sees is what one thread reading them in order would have made. With no pool to
+    /// use the scan is `scan_batches()` through `how.direct`. The blocks no seal has written yet are
+    /// the last part, read here. Every part handed out is finished or dropped before this returns,
+    /// when a part throws as well, and the throw then leaves through here.
+    ScanCost scan_parts(uint64_t start_ns, uint64_t end_ns,
+                        std::string_view symbol, std::string_view exchange,
+                        ColumnSet columns, const RowFilter& filter,
+                        const PartsScan& how) const;
+
     /// Whether a segment's metadata proves no row of it meets `filter` (#47 step 2): its price
     /// range disjoint from the filter's, or its levels holding no pair the filter's sides and
     /// levels allow. False whenever what it would need is unknown; `by_price` says which proof it was.
@@ -1150,6 +1193,23 @@ private:
     /// What reading one segment came to: its rows handed over, or none because a column was
     /// missing or short (logged), or none because retention removed it while this read it.
     enum class SegmentRead { kRead, kUnreadable, kRemoved };
+
+    /// What a scan reads, taken under the index's shared lock (#165): this symbol's candidates for
+    /// the range in the order rows reach a reader, the blocks no seal has written yet, and the
+    /// generation of readers that keeps the candidates' files until the read lets go of it.
+    struct ScanSet {
+        std::vector<SegmentMeta> segments;
+        std::vector<std::shared_ptr<const RowBlock>> blocks;
+        std::shared_ptr<const void> reading;
+    };
+    /// The set for [start_ns, end_ns], `cost.compared` counted; false when the symbol has none.
+    bool scan_set(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                  std::string_view exchange, ScanSet& set, ScanCost& cost) const;
+    /// A set read on this thread, candidate by candidate and then the blocks, through `read`: the
+    /// scan `scan_batches()` is, and `scan_parts()` with no pool to use.
+    ScanCost read_in_order(const ScanSet& set, std::string_view symbol, std::string_view exchange,
+                           ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
+                           const RowFilter& filter, const BatchReader& read, ScanCost cost) const;
     /// A query's read may find its segment removed by retention, and pads a short column the way it
     /// always has; a merge's finds nothing removed under it and takes a segment whole or not at all.
     enum class ReadMode { kQuery, kMerge };

@@ -156,6 +156,12 @@ public:
     /// into the reply: the bytes add() writes for the same rows, through the same field writers.
     void add_rows(const RowBatch& batch) override;
 
+    /// One candidate's rows formatted where it is read (#246, stage 2), into a part of their own -
+    /// at most `limit` of them - and the first `n` of a part copied onto the reply, in the
+    /// candidates' order: the bytes add_rows() writes for the same rows.
+    std::unique_ptr<ScanPart> part(uint64_t limit) override;
+    void add_part(ScanPart& part, uint64_t n) override;
+
     /// The reply, header and terminator included; the builder is spent after it.
     std::string finish();
 
@@ -165,7 +171,6 @@ private:
     void start_buckets();
     void room_for_a_row();
     void add_narrow(const QueryResult& r);
-    char* add_narrow_rows(char* p, char* end, const RowBatch& b);
     void add_bucket(const QueryResult& r);
 
     const QueryShape&     shape_;

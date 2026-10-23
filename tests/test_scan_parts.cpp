@@ -1,0 +1,416 @@
+// #246, stage 2: a query's candidates read on a pool, folded in their order.
+//
+// The promise is that the pool changes where the work is done and nothing else, so every test here
+// holds an answer made with a pool - of one, two and four threads - to the answer made without one:
+//
+// - a row answer, byte for byte, for any columns, conditions and LIMIT, over segments and a block;
+// - the buckets of GROUP BY TIME_BUCKET, every aggregate, with ties on a time across two segments -
+//   FIRST and LAST break a tie by the order the scan delivers rows in, and the parts are merged in it;
+// - a sum of price times quantity whose overflow a merge cannot tell, which is read again on one
+//   thread and so answers - or refuses - as one thread would;
+//
+// and what the parts do around the answer: a LIMIT of one reads one candidate, a part that throws
+// reaches the query with every other part settled, and with nothing to divide no part is made.
+
+#include "orderbook/aggregation.hpp"
+#include "orderbook/columnar_store.hpp"
+#include "orderbook/query_engine.hpp"
+#include "orderbook/response_formatter.hpp"
+#include "orderbook/scan_pool.hpp"
+#include "orderbook/soa_buffer.hpp"
+
+#include <gtest/gtest.h>
+#include <rapidcheck.h>
+#include <rapidcheck/gtest.h>
+
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+constexpr uint64_t kSec  = 1'000'000'000ULL;
+constexpr uint64_t kBase = 20'718ULL * 86'400ULL * kSec;
+
+std::atomic<uint64_t> g_counter{0};
+
+std::string made(const fs::path& dir) {
+    fs::create_directories(dir);
+    return dir.string();
+}
+
+struct Store {
+    fs::path dir;
+    ob::ColumnarStore store;
+    ob::AggregationEngine agg;
+    ob::QueryEngine engine;
+
+    Store()
+        : dir(fs::temp_directory_path() / ("ob_scan_parts_" + std::to_string(::getpid()) + "_" +
+                                           std::to_string(g_counter.fetch_add(1))))
+        , store(made(dir))
+        , engine(store, [](const std::string&) -> std::shared_ptr<ob::SoABuffer> { return nullptr; },
+                 agg) {
+        store.set_symbol_exchange("BK", "EX");
+    }
+    ~Store() {
+        store.close();
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+
+    void segment(const std::vector<ob::SnapshotRow>& rows) {
+        store.set_symbol_exchange("BK", "EX");
+        for (const auto& r : rows) store.append(r);
+        EXPECT_TRUE(store.flush_segment().has_value());
+    }
+    void block(const std::vector<ob::SnapshotRow>& rows) {
+        store.publish_blocks({ob::RowBlock::make("BK", "EX", rows)});
+    }
+
+    /// The reply the server would send, built as the server builds it: rows a batch or a part at a
+    /// time into a `RowAnswer`, aggregates and buckets through the callback.
+    std::string reply(const std::string& sql, ob::ScanPool* pool) {
+        engine.set_scan_pool(pool);
+        ob::QueryShape shape;
+        ob::QueryResponseBuilder builder(shape);
+        const std::string err = engine.execute(sql, [&](const ob::QueryResult& r) { builder.add(r); },
+                                               shape, &builder);
+        engine.set_scan_pool(nullptr);
+        return err.empty() ? builder.finish() : "ERR " + err;
+    }
+};
+
+ob::SnapshotRow row(uint64_t ts, uint8_t side, uint16_t level, int64_t price, uint64_t qty,
+                    uint64_t seq) {
+    ob::SnapshotRow r{};
+    r.timestamp_ns    = ts;
+    r.sequence_number = seq;
+    r.side            = side;
+    r.level_index     = level;
+    r.price           = price;
+    r.quantity        = qty;
+    r.order_count     = static_cast<uint32_t>(level % 4 + 1);
+    return r;
+}
+
+/// Segments one after another in time, each a flush, the next one starting at the instant the last
+/// ended - a tie on a time across two segments - and maybe a block after them.
+uint64_t fill(Store& s, int segments, bool with_block) {
+    uint64_t t = kBase;
+    uint64_t seq = 0;
+    for (int g = 0; g < segments + (with_block ? 1 : 0); ++g) {
+        const int n = *rc::gen::inRange(1, 4000);
+        std::vector<ob::SnapshotRow> rows;
+        for (int i = 0; i < n; ++i) {
+            if (i > 0) t += static_cast<uint64_t>(*rc::gen::inRange(0, 3)) * 7'000'000;
+            rows.push_back(row(t, static_cast<uint8_t>(*rc::gen::inRange(0, 2)),
+                               static_cast<uint16_t>(*rc::gen::inRange(0, 5)),
+                               *rc::gen::inRange<int64_t>(-200, 2000),
+                               static_cast<uint64_t>(*rc::gen::inRange(0, 50)), ++seq));
+        }
+        if (g == segments) {
+            s.block(rows);
+        } else {
+            s.segment(rows);
+        }
+    }
+    return t;
+}
+
+std::string conditions(uint64_t last) {
+    std::string where = " WHERE timestamp BETWEEN ";
+    const uint64_t span = last - kBase + 1;
+    const uint64_t lo = *rc::gen::arbitrary<bool>() ? 0 : kBase + span * static_cast<uint64_t>(*rc::gen::inRange(0, 50)) / 100;
+    const uint64_t hi = *rc::gen::arbitrary<bool>() ? UINT64_MAX : kBase + span * static_cast<uint64_t>(*rc::gen::inRange(50, 101)) / 100;
+    where += std::to_string(lo) + " AND " + std::to_string(hi);
+    if (*rc::gen::arbitrary<bool>()) {
+        where += " AND price BETWEEN " + std::to_string(*rc::gen::inRange(-200, 900)) + " AND " +
+                 std::to_string(*rc::gen::inRange(900, 2000));
+    }
+    if (*rc::gen::arbitrary<bool>()) where += " AND side = " + std::to_string(*rc::gen::inRange(0, 2));
+    if (*rc::gen::arbitrary<bool>()) where += " AND level < " + std::to_string(*rc::gen::inRange(1, 5));
+    return where;
+}
+
+}  // namespace
+
+// ── The answers ───────────────────────────────────────────────────────────────────────────────
+
+RC_GTEST_PROP(ScanPartsProperty, ARowAnswerOnThePoolIsTheBytesOfOneThreads, ()) {
+    Store s;
+    const uint64_t last = fill(s, *rc::gen::inRange(2, 6), *rc::gen::arbitrary<bool>());
+    const auto column = rc::gen::element<std::string>("timestamp", "price", "quantity",
+                                                      "order_count", "side", "level",
+                                                      "sequence_number");
+    std::string select = "SELECT *";
+    if (*rc::gen::arbitrary<bool>()) {
+        const auto names = *rc::gen::nonEmpty(rc::gen::container<std::vector<std::string>>(column));
+        select = "SELECT ";
+        for (size_t i = 0; i < names.size(); ++i) select += (i ? ", " : "") + names[i];
+    }
+    std::string sql = select + " FROM 'BK'.'EX'" + conditions(last);
+    if (*rc::gen::arbitrary<bool>()) sql += " LIMIT " + std::to_string(*rc::gen::inRange(1, 9000));
+
+    ob::ScanPool one(1, nullptr), two(2, nullptr), four(4, nullptr);
+    const std::string alone = s.reply(sql, nullptr);
+    RC_ASSERT(alone.compare(0, 3, "ERR") != 0);
+    RC_ASSERT(s.reply(sql, &one) == alone);
+    RC_ASSERT(s.reply(sql, &two) == alone);
+    RC_ASSERT(s.reply(sql, &four) == alone);
+}
+
+RC_GTEST_PROP(ScanPartsProperty, BucketsOnThePoolAreTheBucketsOfOneThread, ()) {
+    Store s;
+    const uint64_t last = fill(s, *rc::gen::inRange(2, 6), *rc::gen::arbitrary<bool>());
+    const auto width = *rc::gen::element<std::string>("7ms", "50ms", "1s", "1m");
+    const std::string sql =
+        "SELECT COUNT(*), FIRST(price), LAST(price), FIRST(quantity), LAST(quantity), MIN(price), "
+        "MAX(price), MIN(quantity), MAX(quantity), SUM(quantity), AVG(price), AVG(quantity), "
+        "VWAP(price) FROM 'BK'.'EX'" + conditions(last) + " GROUP BY TIME_BUCKET(" + width + ")" +
+        (*rc::gen::arbitrary<bool>() ? " LIMIT " + std::to_string(*rc::gen::inRange(1, 50)) : "");
+    ob::ScanPool one(1, nullptr), four(4, nullptr);
+    const std::string alone = s.reply(sql, nullptr);
+    RC_ASSERT(alone.compare(0, 3, "ERR") != 0);
+    RC_ASSERT(s.reply(sql, &one) == alone);
+    RC_ASSERT(s.reply(sql, &four) == alone);
+}
+
+TEST(ScanParts, ATieOnATimeAcrossTwoSegmentsGoesToTheOrderTheScanDeliversIn) {
+    // Two segments sharing their boundary instant: FIRST of the later segment's rows at that time
+    // must not replace the earlier one's, and LAST must take the later one's.
+    Store s;
+    const uint64_t t = kBase + 5 * kSec;
+    s.segment({row(t - kSec, 0, 0, 10, 1, 1), row(t, 0, 0, 20, 2, 2)});
+    s.segment({row(t, 0, 0, 30, 3, 3), row(t + kSec, 0, 0, 40, 4, 4)});
+    s.segment({row(t + kSec, 0, 0, 50, 5, 5)});
+    const std::string sql = "SELECT FIRST(price), LAST(price), COUNT(*) FROM 'BK'.'EX' "
+                            "WHERE timestamp BETWEEN " + std::to_string(t) + " AND " +
+                            std::to_string(t + kSec) + " GROUP BY TIME_BUCKET(1m)";
+    ob::ScanPool pool(4, nullptr);
+    const std::string alone = s.reply(sql, nullptr);
+    EXPECT_NE(alone.find("\t20\t50\t4\n"), std::string::npos) << alone;
+    EXPECT_EQ(s.reply(sql, &pool), alone);
+}
+
+TEST(ScanParts, ASumTooLargeForTheMergeIsReadAgainOnOneThread) {
+    // Prices and quantities near 2^63 and 2^64: one product P is about 2^127, so whether a sum part
+    // way left 128 bits depends on where it fell. Across two segments of one bucket:
+    // - P, then -P and 1: the sums are P, 0, 1, and none left 128 bits - VWAP is answered;
+    // - P, then P and -P: the sums are P, 2P - which left them - and P: VWAP is refused.
+    // A merge cannot tell either from the parts' sums, so both are read again on one thread.
+    constexpr int64_t kP = std::numeric_limits<int64_t>::max();
+    constexpr uint64_t kQ = std::numeric_limits<uint64_t>::max();
+    for (const bool overflows : {false, true}) {
+        Store s;
+        s.segment({row(kBase + 1, 0, 0, kP, kQ, 1)});
+        if (overflows) {
+            s.segment({row(kBase + 2, 0, 0, kP, kQ, 2), row(kBase + 3, 0, 0, -kP, kQ, 3)});
+        } else {
+            s.segment({row(kBase + 2, 0, 0, -kP, kQ, 2), row(kBase + 3, 0, 0, 1, 1, 3)});
+        }
+        const std::string sql = "SELECT VWAP(price), COUNT(*) FROM 'BK'.'EX' GROUP BY TIME_BUCKET(1m)";
+        ob::ScanPool pool(2, nullptr);
+        const std::string alone = s.reply(sql, nullptr);
+        EXPECT_EQ(alone.rfind("ERR BUCKET_OVERFLOW", 0) == 0, overflows) << alone;
+        EXPECT_EQ(s.reply(sql, &pool), alone) << (overflows ? "overflows" : "does not overflow");
+    }
+}
+
+// ── Around the answer ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+/// A part that counts its rows and, on the candidate `throw_at` among the parts made, throws.
+std::atomic<int> g_parts_alive{0};
+
+class CountingPart final : public ob::ScanPart {
+public:
+    explicit CountingPart(bool throws) : throws_(throws) { ++g_parts_alive; }
+    ~CountingPart() override { --g_parts_alive; }
+    ob::BatchVerdict take(const ob::RowBatch& b) override {
+        if (throws_) throw std::runtime_error("a part failed");
+        rows_ += b.rows.size();
+        return {};
+    }
+    uint64_t rows() const override { return rows_; }
+
+private:
+    bool throws_;
+    uint64_t rows_{0};
+};
+
+void ten_segments(Store& s) {
+    for (uint64_t g = 0; g < 10; ++g) {
+        std::vector<ob::SnapshotRow> rows;
+        for (uint64_t i = 0; i < 500; ++i) rows.push_back(row(kBase + (g * 1000 + i) * 1000, 0, 0, 7, 1, g * 1000 + i));
+        s.segment(rows);
+    }
+}
+
+}  // namespace
+
+TEST(ScanParts, ALimitOfOneReadsOneCandidateOfTen) {
+    Store s;
+    ten_segments(s);
+    ob::ScanPool pool(4, nullptr);
+    std::atomic<int> made{0};
+    uint64_t folded = 0;
+    ob::PartsScan how;
+    how.pool = &pool;
+    how.limit_rows = 1;
+    how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+        ++made;
+        return std::make_unique<CountingPart>(false);
+    };
+    how.fold = [&folded](ob::ScanPart& p) {
+        folded += p.rows();
+        return folded < 1;
+    };
+    const auto cost = s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
+                                         ob::RowFilter{}, how);
+    EXPECT_EQ(made.load(), 1) << "a candidate the LIMIT did not need was read";
+    EXPECT_TRUE(cost.stopped);
+    EXPECT_EQ(cost.segments_read, 1u);
+    EXPECT_EQ(g_parts_alive.load(), 0);
+}
+
+TEST(ScanParts, APartThatThrowsReachesTheQueryWithEveryOtherPartSettled) {
+    Store s;
+    ten_segments(s);
+    ob::ScanPool pool(3, nullptr);
+    std::atomic<int> made{0};
+    ob::PartsScan how;
+    how.pool = &pool;
+    how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+        return std::make_unique<CountingPart>(made.fetch_add(1) == 3);
+    };
+    how.fold = [](ob::ScanPart&) { return true; };
+    EXPECT_THROW(s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(),
+                                    ob::RowFilter{}, how),
+                 std::runtime_error);
+    EXPECT_EQ(g_parts_alive.load(), 0) << "a part outlived the scan that made it";
+    // And the pool reads the next query as if nothing had happened.
+    made = 100;
+    uint64_t rows = 0;
+    how.fold = [&rows](ob::ScanPart& p) {
+        rows += p.rows();
+        return true;
+    };
+    s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    EXPECT_EQ(rows, 5000u);
+}
+
+TEST(ScanParts, WithNothingToDivideTheScanIsTheDirectReaderAndNoPartIsMade) {
+    Store s;
+    s.segment({row(kBase, 0, 0, 7, 1, 1), row(kBase + 1, 0, 0, 8, 1, 2)});
+    ob::ScanPool pool(2, nullptr), none(0, nullptr);
+    for (ob::ScanPool* p : {static_cast<ob::ScanPool*>(nullptr), &none, &pool}) {
+        int made = 0;
+        uint64_t direct = 0;
+        ob::PartsScan how;
+        how.pool = p;
+        how.direct = [&direct](const ob::RowBatch& b) -> ob::BatchVerdict {
+            direct += b.rows.size();
+            return {};
+        };
+        how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+            ++made;
+            return std::make_unique<CountingPart>(false);
+        };
+        how.fold = [](ob::ScanPart&) { return true; };
+        s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+        EXPECT_EQ(made, 0) << "one candidate was divided";
+        EXPECT_EQ(direct, 2u);
+    }
+}
+
+TEST(ScanParts, NoMorePartsAreHeldThanThePoolsThreadsAndOne) {
+    // What bounds the memory of a query on the pool: a part is made as its candidate is handed out
+    // and let go as it is folded, and no more are handed out ahead of the fold than the pool reads.
+    Store s;
+    ten_segments(s);
+    for (const unsigned threads : {1u, 2u, 4u}) {
+        ob::ScanPool pool(threads, nullptr);
+        std::atomic<int> most{0};
+        ob::PartsScan how;
+        how.pool = &pool;
+        how.make_part = [&most]() -> std::unique_ptr<ob::ScanPart> {
+            auto part = std::make_unique<CountingPart>(false);
+            int alive = g_parts_alive.load();
+            int seen = most.load();
+            while (alive > seen && !most.compare_exchange_weak(seen, alive)) {
+            }
+            return part;
+        };
+        uint64_t rows = 0;
+        how.fold = [&rows](ob::ScanPart& p) {
+            rows += p.rows();
+            return true;
+        };
+        s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+        EXPECT_EQ(rows, 5000u);
+        EXPECT_LE(most.load(), static_cast<int>(threads) + 1) << threads << " thread(s)";
+        EXPECT_EQ(g_parts_alive.load(), 0);
+    }
+}
+
+TEST(ScanParts, BucketsPastTheCeilingOnlyTogetherAreRefusedAsOneThreadRefusesThem) {
+    // Each segment's buckets are under the ceiling and the two together are not: the refusal is
+    // the union's, which only the merge sees.
+    Store s;
+    for (uint64_t g = 0; g < 2; ++g) {
+        std::vector<ob::SnapshotRow> rows;
+        for (uint64_t b = 0; b < 40; ++b) rows.push_back(row(kBase + (g * 40 + b) * kSec, 0, 0, 5, 1, g * 40 + b + 1));
+        s.segment(rows);
+    }
+    s.engine.set_max_query_buckets(60);
+    const std::string sql = "SELECT COUNT(*) FROM 'BK'.'EX' GROUP BY TIME_BUCKET(1s)";
+    ob::ScanPool pool(2, nullptr);
+    const std::string alone = s.reply(sql, nullptr);
+    EXPECT_EQ(alone.rfind("ERR BUCKETS_TOO_MANY", 0), 0u) << alone;
+    EXPECT_EQ(s.reply(sql, &pool), alone);
+}
+
+TEST(ScanParts, AScanItsFoldEndsCountsTheSegmentsLeftUnreadBeforeItsPartAsOneThreadDoes) {
+    // Six segments, every other one priced outside the condition and left unread by its metadata:
+    // ended at the third part read, the scan has read three and left two unread - not three.
+    Store s;
+    uint64_t t = kBase;
+    for (int g = 0; g < 6; ++g) {
+        const int64_t price = g % 2 == 0 ? 100 : 5;
+        s.segment({row(t, 0, 0, price, 1, static_cast<uint64_t>(2 * g + 1)),
+                   row(t + 1, 0, 0, price + 1, 1, static_cast<uint64_t>(2 * g + 2))});
+        t += kSec;
+    }
+    ob::RowFilter priced;
+    priced.price_lo = 100;
+    priced.price_hi = 110;
+    int read = 0;
+    const auto one_thread = s.store.scan_batches(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), priced,
+                                                 [&read](const ob::RowBatch&) -> ob::BatchVerdict {
+                                                     return {++read == 3, 0};
+                                                 });
+    ob::ScanPool pool(2, nullptr);
+    int folded = 0;
+    ob::PartsScan how;
+    how.pool = &pool;
+    how.make_part = []() -> std::unique_ptr<ob::ScanPart> { return std::make_unique<CountingPart>(false); };
+    how.fold = [&folded](ob::ScanPart&) { return ++folded < 3; };
+    const auto parts = s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), priced, how);
+    ASSERT_TRUE(one_thread.stopped);
+    EXPECT_TRUE(parts.stopped);
+    EXPECT_EQ(parts.segments_read, one_thread.segments_read);
+    EXPECT_EQ(parts.skipped_by_price, one_thread.skipped_by_price);
+    EXPECT_EQ(one_thread.segments_read, 3u);
+    EXPECT_EQ(one_thread.skipped_by_price, 2u);
+}

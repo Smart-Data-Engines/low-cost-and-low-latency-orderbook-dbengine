@@ -16,6 +16,7 @@
 #include "orderbook/query_engine.hpp"
 #include "orderbook/snapshot.hpp"
 #include "orderbook/replication.hpp"
+#include "orderbook/scan_pool.hpp"
 #include "orderbook/book_arena.hpp"
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/sequence_tracker.hpp"
@@ -314,6 +315,13 @@ public:
     /// `--decoded-cache-mb`): 0 holds none, and every query decodes what it reads. Off unless set -
     /// the server sets it from its configuration, 256 MiB by default.
     void set_decoded_columns_budget(size_t bytes);
+
+    /// The threads a query's candidates are read on (#246, stage 2; `--scan-threads`): a pool made
+    /// at `open()` and stopped at `close()`. 0 - the default, and the embedded engine's - makes none,
+    /// and every query reads on its own thread. Before `open()`.
+    void set_scan_threads(unsigned threads);
+    /// The pool's threads; 0 without one.
+    unsigned scan_threads() const { return scan_pool_ ? scan_pool_->threads() : 0; }
 
     /// The WAL archive of point-in-time recovery (#34, `--wal-archive-dir`; spec
     /// `point-in-time-recovery`). Before open(): every WAL file this node closes is copied into
@@ -1500,6 +1508,10 @@ private:
     /// Made at the first `open()` with an archive, its thread run from `open()` to `close()`. The
     /// flush tick's retention keeps every WAL file from `archived_before()` on.
     std::unique_ptr<WalArchiver> wal_archiver_;
+    /// The scan pool (#246, stage 2): its size, set before `open()`, and the pool from `open()` to
+    /// `close()` - the query engine holds a pointer to it for that long, and no longer.
+    unsigned scan_threads_{0};
+    std::unique_ptr<ScanPool> scan_pool_;
     /// The file the flush tick last saw the writer in, and when it first saw a record in it: the
     /// clock of the rotation for the archive. Flush thread, under `mtx_`.
     uint32_t archive_seen_file_{std::numeric_limits<uint32_t>::max()};

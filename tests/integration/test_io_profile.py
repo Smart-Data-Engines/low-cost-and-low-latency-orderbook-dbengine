@@ -176,11 +176,15 @@ def test_the_spin_window_closes_so_an_idle_node_does_not_hold_a_core(tmp_path) -
 
 
 def profile_line(log: str) -> tuple[int, int, int]:
-    """(loops the reason names, io-threads, io-spin-us) from the node's startup line."""
+    """(loops the reason names, io-threads, io-spin-us) from the node's startup line - and the scan
+    pool it names (#246, stage 2) held to one thread fewer than the loops, as `choose_boost()` sizes
+    it."""
     found = re.search(r"io profile boost: (\d+) client event loops?, one per usable CPU.*?"
-                      r"\(io-threads=(\d+) io-spin-us=(\d+)\)", log)
+                      r"\(io-threads=(\d+) io-spin-us=(\d+) scan-threads=(\d+)\)", log)
     assert found, f"no boost profile line in the node's log:\n{log}"
-    return int(found.group(1)), int(found.group(2)), int(found.group(3))
+    loops, scan = int(found.group(2)), int(found.group(4))
+    assert scan == loops - 1, f"{loops} loops and a scan pool of {scan} threads:\n{log}"
+    return int(found.group(1)), loops, int(found.group(3))
 
 
 def test_a_node_with_no_flags_runs_one_loop_per_usable_cpu(tmp_path) -> None:

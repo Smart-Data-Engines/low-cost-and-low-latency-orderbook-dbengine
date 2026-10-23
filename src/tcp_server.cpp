@@ -1404,6 +1404,7 @@ const std::vector<std::string>& known_flags() {
         "handover-cooldown-seconds",
         "io-spin-us",
         "io-threads",
+        "scan-threads",
         "handover-grace-seconds",
         "log-level",
         "max-query-buckets",
@@ -1504,6 +1505,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
+        {"scan-threads", {"<N>", "Threads a query's segments are read on, 0 to 64 (default: set by the profile - one fewer than the usable CPUs under boost, 0 under eco). A query of two segments or more divides them among these and its own loop; 0 reads every segment on the query's loop"}},
         {"profile", {"<name>", "boost (default: one client event loop per usable CPU, and a 10 us spin where it cannot starve anything) or eco (one loop, blocking between events). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
@@ -1744,6 +1746,9 @@ BoostChoice choose_boost(const MachineResources& machine) {
     choice.reason = std::to_string(choice.io_threads) +
                     (choice.io_threads == 1 ? " client event loop" : " client event loops") +
                     ", one per usable CPU";
+    // The loop a query runs on reads its own segments too, so the pool is the rest of the CPUs.
+    choice.scan_threads =
+        machine.usable_cpus >= 2 ? std::min<uint32_t>(machine.usable_cpus - 1, kMaxScanThreads) : 0;
     if (machine.affinity_cpus < 2) {
         // The only CPU this process may be scheduled on: the flush, the kernel and any client on
         // this machine run there too, and a loop spinning on it holds it from all of them.
@@ -1762,6 +1767,11 @@ BoostChoice choose_boost(const MachineResources& machine) {
         choice.io_spin_us = kBoostSpinUs;
         choice.reason += ", and a " + std::to_string(kBoostSpinUs) + " µs spin window";
     }
+    choice.reason += choice.scan_threads == 0
+                         ? "; no scan pool, as one usable CPU leaves none to read on"
+                         : "; a scan pool of " + std::to_string(choice.scan_threads) +
+                               (choice.scan_threads == 1 ? " thread" : " threads") +
+                               " beside the loop a query runs on";
     return choice;
 }
 
@@ -2063,6 +2073,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.io_spin_us = cursor.value_as<uint64_t>();
         } else if (arg == "--io-threads") {
             config.io_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--scan-threads") {
+            config.scan_threads = cursor.value_as<uint32_t>();
         } else if (arg == "--profile") {
             config.profile = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
@@ -2119,6 +2131,16 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                      "Error: --io-threads (%u) must be between 1 and %u. It is the number of client "
                      "event loops; 1 is the single loop this server always had.\n",
                      config.io_threads, kMaxIoThreads);
+        std::exit(1);
+    }
+
+    // Validation: the scan pool. 0 is a node that reads every segment on the query's loop, as it
+    // always did; past the cap is a typo, as for the loops.
+    if (config.scan_threads > kMaxScanThreads) {
+        std::fprintf(stderr,
+                     "Error: --scan-threads (%u) must be between 0 and %u. It is the number of "
+                     "threads a query's segments are read on; 0 reads them on the query's loop.\n",
+                     config.scan_threads, kMaxScanThreads);
         std::exit(1);
     }
 
@@ -2287,6 +2309,7 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
     {
         const bool spin_set    = origin.count("io-spin-us") > 0;
         const bool threads_set = origin.count("io-threads") > 0;
+        const bool scan_set    = origin.count("scan-threads") > 0;
         if (config.profile == "boost") {
             const BoostChoice choice = choose_boost(machine);
             if (!threads_set) {
@@ -2297,10 +2320,14 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                 config.io_spin_us = choice.io_spin_us;
                 origin["io-spin-us"] = Origin::Profile;
             }
+            if (!scan_set) {
+                config.scan_threads = choice.scan_threads;
+                origin["scan-threads"] = Origin::Profile;
+            }
             profile_choice = "boost: " + choice.reason;
         } else if (config.profile == "eco") {
             // Nothing to set: the struct's defaults are eco's values, one loop and no spin.
-            profile_choice = "eco: 1 client event loop, blocking between events";
+            profile_choice = "eco: 1 client event loop, blocking between events; no scan pool";
         } else {
             std::fprintf(stderr,
                 "Error: unknown --profile '%s'; known profiles are 'eco' and 'boost'\n",
@@ -2311,10 +2338,11 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
         // event loops" above a node running 2 is not left to be noticed.
         if (threads_set) profile_choice += " (io-threads set by the operator)";
         if (spin_set) profile_choice += " (io-spin-us set by the operator)";
+        if (scan_set) profile_choice += " (scan-threads set by the operator)";
         OB_LOG_INFO("cli",
-                    "io profile %s (io-threads=%u io-spin-us=%llu); %s",
+                    "io profile %s (io-threads=%u io-spin-us=%llu scan-threads=%u); %s",
                     profile_choice.c_str(), config.io_threads,
-                    static_cast<unsigned long long>(config.io_spin_us),
+                    static_cast<unsigned long long>(config.io_spin_us), config.scan_threads,
                     config.io_spin_us == 0
                         ? "the io threads block between events"
                         : "an io thread polls after an event and may use a whole core while "
@@ -2381,6 +2409,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("drain-timeout-ms", std::to_string(c.drain_timeout_ms));
     line("io-spin-us", std::to_string(c.io_spin_us));
     line("io-threads", std::to_string(c.io_threads));
+    line("scan-threads", std::to_string(c.scan_threads));
     line("profile", c.profile);
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
@@ -3769,6 +3798,7 @@ void TcpServer::run() {
     engine_->set_write_admission_enabled(config_.write_admission);
     engine_->set_segment_version(config_.segment_format);
     engine_->set_decoded_columns_budget(static_cast<size_t>(config_.decoded_cache_mb) << 20);
+    engine_->set_scan_threads(config_.scan_threads);
     engine_->set_wal_archive(config_.wal_archive_dir, config_.wal_archive_interval_s);
     static_assert(ServerConfig{}.max_query_buckets == QueryEngine::kDefaultMaxQueryBuckets,
                   "the server's default bucket ceiling is the query engine's");

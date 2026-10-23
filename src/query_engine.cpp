@@ -1,6 +1,7 @@
 // Feature: orderbook-dbengine — Query Engine parser and skeleton execution
 #include "orderbook/query_engine.hpp"
 #include "orderbook/logger.hpp"
+#include "orderbook/scan_pool.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1607,33 +1608,54 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     // again; what is left is LIMIT. The answer is whole at LIMIT rows and the scan opens nothing
     // more (#47 step 2): the rows are the first LIMIT the scan delivers, as they were when the rest
     // was read and dropped.
-    const ColumnarStore::ScanCost cost = store_.scan_batches(
-        ts_start, ts_end, ast.symbol, ast.exchange, to_read, filter_of(ast),
-        [&](const RowBatch& batch) -> BatchVerdict {
-            const uint64_t room = lim - count;
-            const bool ends = batch.rows.size() >= room;
-            RowBatch taken = batch;
-            if (ends) taken.rows = batch.rows.first(static_cast<size_t>(room));
-            if (rows != nullptr) {
-                rows->add_rows(taken);
-            } else {
-                for (const uint32_t i : taken.rows) {
-                    const SnapshotRow row = row_of(taken, i);
-                    QueryResult qr{};
-                    qr.timestamp_ns    = row.timestamp_ns;
-                    qr.sequence_number = row.sequence_number;
-                    qr.price           = row.price;
-                    qr.quantity        = row.quantity;
-                    qr.order_count     = row.order_count;
-                    qr.side            = row.side;
-                    qr.level           = row.level_index;
-                    cb(qr);
-                }
+    const BatchReader direct = [&](const RowBatch& batch) -> BatchVerdict {
+        const uint64_t room = lim - count;
+        const bool ends = batch.rows.size() >= room;
+        RowBatch taken = batch;
+        if (ends) taken.rows = batch.rows.first(static_cast<size_t>(room));
+        if (rows != nullptr) {
+            rows->add_rows(taken);
+        } else {
+            for (const uint32_t i : taken.rows) {
+                const SnapshotRow row = row_of(taken, i);
+                QueryResult qr{};
+                qr.timestamp_ns    = row.timestamp_ns;
+                qr.sequence_number = row.sequence_number;
+                qr.price           = row.price;
+                qr.quantity        = row.quantity;
+                qr.order_count     = row.order_count;
+                qr.side            = row.side;
+                qr.level           = row.level_index;
+                cb(qr);
             }
-            count += taken.rows.size();
-            if (ends) return {true, taken.rows.size() - 1};
-            return {};
-        });
+        }
+        count += taken.rows.size();
+        if (ends) return {true, taken.rows.size() - 1};
+        return {};
+    };
+    ColumnarStore::ScanCost cost;
+    if (rows != nullptr && scan_pool_ != nullptr && scan_pool_->threads() > 0) {
+        // On the pool (#246, stage 2): each candidate's rows formatted into a part of the answer
+        // where it is read, and the parts added to it here in the candidates' order, the last one
+        // cut at LIMIT - the bytes the batches above would have written, on as many cores as the
+        // answer has candidates and the pool threads.
+        PartsScan how;
+        how.pool = scan_pool_;
+        how.limit_rows = lim;
+        how.direct = direct;
+        how.make_part = [rows, lim]() { return rows->part(lim); };
+        how.fold = [&](ScanPart& part) {
+            const uint64_t take = std::min<uint64_t>(part.rows(), lim - count);
+            rows->add_part(part, take);
+            count += take;
+            return count < lim;
+        };
+        cost = store_.scan_parts(ts_start, ts_end, ast.symbol, ast.exchange, to_read,
+                                 filter_of(ast), how);
+    } else {
+        cost = store_.scan_batches(ts_start, ts_end, ast.symbol, ast.exchange, to_read,
+                                   filter_of(ast), direct);
+    }
     OB_LOG_DEBUG("query", "SELECT %s.%s: %llu row(s); %zu segment(s) read, %zu left unread by "
                           "their metadata, %llu row(s) filtered before they were built%s",
                  ast.symbol.c_str(), ast.exchange.c_str(), static_cast<unsigned long long>(count),
@@ -1779,39 +1801,93 @@ bool bucket_value(const BucketAgg& agg, const BucketState& b, AggValue& out) {
     return false;
 }
 
-/// The rows of a bucket query in [from, to] that its conditions keep, each added to its bucket's
-/// state (#44). False when they would fill more than `ceiling` buckets - the rest are then only
-/// counted, since rows do not arrive in time order and nothing can end the scan early.
-bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from, uint64_t to,
-                 size_t ceiling, std::unordered_map<uint64_t, BucketState>& buckets,
-                 uint64_t& rows) {
-    const uint64_t width = *ast.bucket_ns;
-    // The time, the columns the aggregates read, and the ones the conditions are on.
-    ColumnSet to_read;
-    to_read.add(QueryColumn::TimestampNs);
-    for (const BucketAgg& agg : ast.bucket_aggs) {
-        if (agg.series != Series::None) continue;
-        if (agg.fn != BucketFn::Count) to_read.add(agg.column);
-        // VWAP(price) weighs each price by its row's quantity: a column it reads without naming.
-        if (agg.fn == BucketFn::Vwap) to_read.add(QueryColumn::Quantity);
-    }
-    if (ast.price_lo.has_value() || ast.price_hi.has_value()) to_read.add(QueryColumn::Price);
-    if (ast.side_lo.has_value() || ast.side_hi.has_value()) to_read.add(QueryColumn::Side);
-    if (ast.level_lo.has_value() || ast.level_hi.has_value()) to_read.add(QueryColumn::Level);
+/// A bucket's state in one part of a scan (#246, stage 2), and the sum of the sizes of its prices
+/// times quantities: how far a sum part way through its rows can stray from where it starts, which
+/// is what says whether adding its rows after an earlier part's can have left 128 bits on the way.
+struct PartBucket {
+    BucketState state;
+    unsigned __int128 abs_px_qty{0};
+    bool abs_overflow{false};
 
-    bool too_many = false;
-    // The bucket the last row went to: a segment's rows are appended in about their time order, so
-    // the next row is nearly always in it, and the map is asked only when it is not. References to
-    // an unordered_map's elements survive its rehashing. Whether a row is in it is asked first, in
-    // two comparisons - `ts - start < width`, unsigned, is false below the start too - because a
-    // bucket's start is a 64-bit division, tens of cycles a row on the i3-7100U.
-    BucketState* last = nullptr;
-    uint64_t last_start = 0;
-    // A batch at a time (OB-12): the rows the scan chose, within [from, to] and the conditions, so
-    // nothing here checks a row again. A column the aggregates do not read is not in the batch and
-    // reads as zero, as a built row's field did.
-    store.scan_batches(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast),
-                       [&](const RowBatch& b) -> BatchVerdict {
+    void add(uint64_t ts, int64_t px, uint64_t qty) {
+        state.add(ts, px, qty);
+        // |px| <= 2^63 and qty < 2^64, so the product and its negation are inside 128 bits.
+        const __int128 product = static_cast<__int128>(px) * static_cast<__int128>(qty);
+        const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
+        if (__builtin_add_overflow(abs_px_qty, size, &abs_px_qty)) abs_overflow = true;
+    }
+};
+
+/// `later`'s rows after those `into` holds, as one bucket: what adding them one by one in that
+/// order would have left. FIRST keeps the earlier part's unless the later one's time is strictly
+/// earlier, LAST takes the later part's at an equal time or a later one - the tie broken by the
+/// order the scan delivers rows in, as a row's own add() breaks it (#168).
+///
+/// False when that cannot be told from the two states. The sum of price times quantity refuses
+/// VWAP once any sum on the way left 128 bits, so where in `later` a sum strayed is part of the
+/// answer; a part's own sums start at zero. When the sizes of `later`'s products, added to the size
+/// of the sum it starts from, stay inside 128 bits, no sum on the way can have left them, and the
+/// sum is exact. Otherwise - only with prices and quantities near 2^63 and 2^64 - it is not told.
+bool merge_later(BucketState& into, const PartBucket& later) {
+    const BucketState& l = later.state;
+    if (l.count == 0) return true;
+    if (into.count == 0) {
+        // The bucket's first rows: its sums from zero, exactly as the part's own are.
+        into = l;
+        return true;
+    }
+    if (!into.px_qty_overflow) {
+        constexpr __int128 kMin = static_cast<__int128>(static_cast<unsigned __int128>(1) << 127);
+        constexpr unsigned __int128 kMax = (static_cast<unsigned __int128>(1) << 127) - 1;
+        if (later.abs_overflow || into.sum_px_qty == kMin) return false;
+        const auto from = static_cast<unsigned __int128>(into.sum_px_qty < 0 ? -into.sum_px_qty
+                                                                             : into.sum_px_qty);
+        unsigned __int128 bound = 0;
+        if (__builtin_add_overflow(from, later.abs_px_qty, &bound) || bound > kMax) return false;
+        into.sum_px_qty += l.sum_px_qty;
+    }
+    // A sum that left 128 bits has refused VWAP for good, whatever follows: the flag stays.
+    if (l.first_ts < into.first_ts) {
+        into.first_ts = l.first_ts;
+        into.first_price = l.first_price;
+        into.first_qty = l.first_qty;
+    }
+    if (l.last_ts >= into.last_ts) {
+        into.last_ts = l.last_ts;
+        into.last_price = l.last_price;
+        into.last_qty = l.last_qty;
+    }
+    into.min_price = std::min(into.min_price, l.min_price);
+    into.max_price = std::max(into.max_price, l.max_price);
+    into.min_qty = std::min(into.min_qty, l.min_qty);
+    into.max_qty = std::max(into.max_qty, l.max_qty);
+    into.count += l.count;
+    into.sum_qty += l.sum_qty;
+    into.sum_price += l.sum_price;
+    return true;
+}
+
+/// A batch's rows added to their buckets, the bucket the last row went to kept between batches: a
+/// segment's rows are appended in about their time order, so the next row is nearly always in it,
+/// and the map is asked only when it is not. References to an unordered_map's elements survive its
+/// rehashing. Whether a row is in it is asked first, in two comparisons - `ts - start < width`,
+/// unsigned, is false below the start too - because a bucket's start is a 64-bit division, tens of
+/// cycles a row on the i3-7100U.
+///
+/// The rows are the ones the scan chose, within its range and the conditions, so nothing here
+/// checks a row again. A column the aggregates do not read is not in the batch and reads as zero,
+/// as a built row's field did.
+template <typename State>
+struct BucketFiller {
+    uint64_t width;
+    size_t ceiling;
+    std::unordered_map<uint64_t, State>& buckets;
+    State* last{nullptr};
+    uint64_t last_start{0};
+    uint64_t rows{0};
+    bool too_many{false};
+
+    BatchVerdict take(const RowBatch& b) {
         const bool priced = !b.price.empty();
         const bool sized = !b.qty.empty();
         for (size_t k = 0; k < b.rows.size(); ++k) {
@@ -1836,7 +1912,7 @@ bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from,
                         rows += k;
                         return {true, k};
                     }
-                    it = buckets.emplace(start, BucketState{}).first;
+                    it = buckets.emplace(start, State{}).first;
                 }
                 last = &it->second;
                 last_start = start;
@@ -1845,8 +1921,104 @@ bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from,
         }
         rows += b.rows.size();
         return {};
-    });
-    return !too_many;
+    }
+};
+
+/// One candidate's buckets (#246, stage 2), filled where the candidate is read and merged into the
+/// query's in the candidates' order by `merge_later()`. A part past the ceiling on its own ends the
+/// scan as the query's map past it would.
+class BucketPart final : public ScanPart {
+public:
+    BucketPart(uint64_t width, size_t ceiling) : filler_{width, ceiling, buckets} {}
+    BatchVerdict take(const RowBatch& batch) override { return filler_.take(batch); }
+    uint64_t rows() const override { return filler_.rows; }
+    bool too_many() const { return filler_.too_many; }
+
+    std::unordered_map<uint64_t, PartBucket> buckets;
+
+private:
+    BucketFiller<PartBucket> filler_;
+};
+
+/// The rows of a bucket query in [from, to] that its conditions keep, each added to its bucket's
+/// state in `buckets`, which is empty when this is called (#44). False when they would fill more
+/// than `ceiling` buckets - the rest are then only counted, since rows do not arrive in time order
+/// and nothing can end the scan early.
+///
+/// With a pool of threads, each candidate's buckets are filled where it is read and merged here in
+/// the candidates' order (#246, stage 2): the same buckets one thread would have filled. Where a
+/// merge cannot tell that - a sum of price times quantity whose size could have left 128 bits part
+/// way, which `merge_later()` explains - the rows are read again on this thread, and that is said.
+bool bucket_rows(const ColumnarStore& store, ScanPool* pool, const QueryAST& ast, uint64_t from,
+                 uint64_t to, size_t ceiling, std::unordered_map<uint64_t, BucketState>& buckets,
+                 uint64_t& rows) {
+    const uint64_t width = *ast.bucket_ns;
+    // The time, the columns the aggregates read, and the ones the conditions are on.
+    ColumnSet to_read;
+    to_read.add(QueryColumn::TimestampNs);
+    for (const BucketAgg& agg : ast.bucket_aggs) {
+        if (agg.series != Series::None) continue;
+        if (agg.fn != BucketFn::Count) to_read.add(agg.column);
+        // VWAP(price) weighs each price by its row's quantity: a column it reads without naming.
+        if (agg.fn == BucketFn::Vwap) to_read.add(QueryColumn::Quantity);
+    }
+    if (ast.price_lo.has_value() || ast.price_hi.has_value()) to_read.add(QueryColumn::Price);
+    if (ast.side_lo.has_value() || ast.side_hi.has_value()) to_read.add(QueryColumn::Side);
+    if (ast.level_lo.has_value() || ast.level_hi.has_value()) to_read.add(QueryColumn::Level);
+
+    BucketFiller<BucketState> here{width, ceiling, buckets};
+    const BatchReader direct = [&here](const RowBatch& b) { return here.take(b); };
+    if (pool == nullptr || pool->threads() == 0) {
+        store.scan_batches(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast), direct);
+        rows += here.rows;
+        return !here.too_many;
+    }
+
+    bool too_many = false;
+    bool untold = false;
+    uint64_t merged_rows = 0;
+    PartsScan how;
+    how.pool = pool;
+    how.direct = direct;
+    how.make_part = [width, ceiling]() -> std::unique_ptr<ScanPart> {
+        return std::make_unique<BucketPart>(width, ceiling);
+    };
+    how.fold = [&](ScanPart& p) {
+        auto& part = static_cast<BucketPart&>(p);
+        merged_rows += part.rows();
+        if (part.too_many()) {
+            too_many = true;
+            return false;
+        }
+        for (const auto& [start, later] : part.buckets) {
+            const auto [it, fresh] = buckets.try_emplace(start);
+            if (fresh && buckets.size() > ceiling) {
+                too_many = true;
+                return false;
+            }
+            if (!merge_later(it->second, later)) {
+                untold = true;
+                return false;
+            }
+        }
+        return true;
+    };
+    store.scan_parts(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast), how);
+    if (untold) {
+        OB_LOG_INFO("query", "GROUP BY %s.%s: a sum of price times quantity too large to tell from "
+                             "the scan's parts whether it left 128 bits on the way; the rows are "
+                             "read again on one thread",
+                    ast.symbol.c_str(), ast.exchange.c_str());
+        buckets.clear();
+        BucketFiller<BucketState> again{width, ceiling, buckets};
+        store.scan_batches(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast),
+                           [&again](const RowBatch& b) { return again.take(b); });
+        rows += again.rows;
+        return !again.too_many;
+    }
+    // The parts, or - when the scan found nothing to divide - the rows read here.
+    rows += merged_rows + here.rows;
+    return !too_many && !here.too_many;
 }
 
 std::string buckets_too_many(const QueryAST& ast, size_t ceiling) {
@@ -2223,8 +2395,8 @@ std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback&
     const size_t ceiling = max_query_buckets();
     std::unordered_map<uint64_t, BucketState> buckets;
     uint64_t rows = 0;
-    if (!bucket_rows(store_, ast, ast.ts_start_ns.value_or(0), ast.ts_end_ns.value_or(UINT64_MAX),
-                     ceiling, buckets, rows)) {
+    if (!bucket_rows(store_, scan_pool_, ast, ast.ts_start_ns.value_or(0),
+                     ast.ts_end_ns.value_or(UINT64_MAX), ceiling, buckets, rows)) {
         return buckets_too_many(ast, ceiling);
     }
 
@@ -2282,7 +2454,7 @@ std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& 
     }
     std::unordered_map<uint64_t, BucketState> row_buckets;
     uint64_t rows = 0;
-    if (row_aggs) bucket_rows(store_, ast, lo, read_to, SIZE_MAX, row_buckets, rows);
+    if (row_aggs) bucket_rows(store_, scan_pool_, ast, lo, read_to, SIZE_MAX, row_buckets, rows);
 
     const std::vector<Series> used = used_series(ast);
     std::vector<QueryResult> answer;
@@ -2376,7 +2548,7 @@ std::string QueryEngine::execute_rolling(const QueryAST& ast, const RowCallback&
         QueryAST widened = ast;
         widened.ts_start_ns = back;
         widened.ts_end_ns = read_to;
-        bucket_rows(store_, widened, back, read_to, SIZE_MAX, row_buckets, rows);
+        bucket_rows(store_, scan_pool_, widened, back, read_to, SIZE_MAX, row_buckets, rows);
     }
 
     struct Rolled {

@@ -369,6 +369,16 @@ ob_add_query_test(test_scan_batches
     test_scan_batches.cpp
 )
 
+# ── #246, stage 2: the pool a scan's candidates are read on, and the parts folded in order ─
+add_executable(test_scan_pool test_scan_pool.cpp)
+target_link_libraries(test_scan_pool PRIVATE orderbook_scan_pool GTest::gtest_main)
+gtest_discover_tests(test_scan_pool PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
+ob_add_query_test(test_scan_parts
+    test_scan_parts.cpp
+)
+target_link_libraries(test_scan_parts PRIVATE orderbook_tcp_server_lib)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

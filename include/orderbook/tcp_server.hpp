@@ -183,6 +183,10 @@ struct ServerConfig {
     /// accepts, and a connection stays on its reactor for life, because a Session is not
     /// thread-safe. 1 is the loop this server always had.
     uint32_t    io_threads{1};
+    /// --scan-threads: the pool a query's segments are read on (#246, stage 2). A query of two or
+    /// more divides them among the pool's threads and its own loop, and folds what they made in
+    /// order. 0 reads every segment on the query's loop, which is what this server always did.
+    uint32_t    scan_threads{0};
 
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
@@ -443,11 +447,15 @@ int64_t tls_certificate_not_after(const LoadedTlsContexts& tls);
 /// low enough that a typo such as 400 is refused rather than started.
 inline constexpr uint32_t kMaxIoThreads = 64;
 
+/// The largest `--scan-threads` accepted, for the reason `kMaxIoThreads` is what it is.
+inline constexpr uint32_t kMaxScanThreads = 64;
+
 /// What the `boost` profile chooses on a machine, and why - one sentence for the startup log and
 /// for `--print-config`, because a mode whose effect you cannot read is a mode on somebody's word.
 struct BoostChoice {
     uint32_t    io_threads{1};
     uint64_t    io_spin_us{0};
+    uint32_t    scan_threads{0};
     std::string reason;
 };
 
@@ -464,6 +472,9 @@ struct BoostChoice {
 ///   process may run on, a spinning loop holds it from everything else there: a client sharing it
 ///   measured a p99 of 5.9 µs without the spin and 13.7 µs with it. Under a limit, spinning spends
 ///   the limit, and a cgroup over it stops every thread until the next period.
+/// - **a scan pool of one thread fewer than the usable CPUs** (#246, stage 2), because the loop a
+///   query runs on reads its own segments too: so a query alone on the node reads on every usable
+///   CPU, and on one CPU there is no pool, as there is nothing for it to read on.
 ///
 /// Pure, like `detect_machine()`: the same machine gives the same choice.
 BoostChoice choose_boost(const MachineResources& machine);
