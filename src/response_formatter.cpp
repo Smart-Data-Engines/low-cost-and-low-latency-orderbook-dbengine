@@ -357,13 +357,22 @@ void QueryResponseBuilder::add(const QueryResult& r) {
     return p;
 }
 
+// A function a batch, out of line, so that put_seven() has this one caller and is inlined into its
+// loop. Called a row at a time from two writers - a reply's and a part's (#246, stage 2) - it was
+// kept out of line (GCC 15.2, -O3): a call a row of every `SELECT *` answer, where stage 1's one
+// caller had it inlined.
+[[gnu::noinline]] static char* write_seven_rows(char* p, char* end, const RowBatch& b, size_t n) {
+    for (size_t k = 0; k < n; ++k) p = put_seven(p, end, b, b.rows[k]);
+    return p;
+}
+
 /// The first `n` rows of a batch as a reply's rows, from `p`, which has room for `n` of the widest
-/// row the shape can write: the seven unrolled, or a narrowed list out of line. The one writer of a
-/// batch's rows, so a reply built from batches and one built from parts cannot differ.
+/// row the shape can write: the seven unrolled, or a narrowed list, each out of line. The one writer
+/// of a batch's rows, so a reply built from batches and one built from parts cannot differ.
 static char* write_rows(char* p, char* end, const RowBatch& b, size_t n, bool all_seven,
                         const std::vector<QueryColumn>& columns) {
     if (all_seven) {
-        for (size_t k = 0; k < n; ++k) p = put_seven(p, end, b, b.rows[k]);
+        p = write_seven_rows(p, end, b, n);
     } else if (!columns.empty()) {
         p = write_narrow_rows(p, end, b, n, columns);
     }
