@@ -13,7 +13,7 @@ name: release
 #
 # Third-party actions are pinned to full commit SHAs with the version in a trailing comment, as in
 # ci.yml. An annotated tag resolves with `git ls-remote '...^{}'`: pypa/gh-action-pypi-publish
-# v1.14.2's tag object is a892a5a6, its commit dc37677b - and pinning the tag object pins nothing
+# v1.14.3's tag object is aef6c9b6, its commit 7245906f - and pinning the tag object pins nothing
 # Dependabot can bump.
 
 on:
@@ -160,6 +160,6 @@ jobs:
         with:
           name: python-dist
           path: dist
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           packages-dir: dist/
