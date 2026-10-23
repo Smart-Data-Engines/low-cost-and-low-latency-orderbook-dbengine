@@ -4469,9 +4469,9 @@ where one is before their instant; `MREPLACE` replaces a side whole; and a start
 book from the store (pitfalls 568, 569, 598). **#244** (PR #276): the C API has `ob_flush()`, so a
 local flush no longer reopens the engine. **#245 is closed** (PR #278): the embedded engine replays
 its WAL from its last checkpoint when it opens, and a flush syncs its segments before the checkpoint
-claims them (pitfall 601). **#243 is closed**: a series of the book reads the best tracks written
-beside the book summaries, 0.08 ms over the last ten minutes of 3 M rows on the x86 host, against
-11.21-21.98 ms on master (pitfalls 602, 603).
+claims them (pitfall 601). **#243 is closed** (PR #279): a series of the book reads the best tracks
+written beside the book summaries, 0.08 ms over the last ten minutes of 3 M rows on the x86 host,
+against 11.21-21.98 ms on master (pitfalls 602, 603).
 
 **#197 is closed**: a snapshot install and a discard begin a new WAL lineage, so a replica that had
 bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step
