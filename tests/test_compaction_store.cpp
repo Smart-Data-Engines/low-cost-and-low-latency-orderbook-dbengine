@@ -26,6 +26,7 @@
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/query_columns.hpp"
+#include "orderbook/scan_pool.hpp"
 
 namespace fs = std::filesystem;
 
@@ -414,6 +415,89 @@ TEST(CompactionStore, AScanThatCopiedAnInputKeepsItReadableUntilItEnds) {
     cv.notify_all();
     reader.join();
     EXPECT_EQ(seen, (std::vector<int64_t>{1, 2, 3})) << "the scan that copied the inputs lost rows";
+    EXPECT_TRUE(result.readers_before.expired());
+}
+
+TEST(CompactionStore, AScanOnThePoolKeepsWhatItCopiedReadableUntilItsLastPartEnds) {
+    // #246, requirement 2.6: a scan divided among a pool's threads holds the generation it took
+    // until every part has read, so a merge that replaces segments while one part waits on them
+    // keeps their files, and the scan delivers every row of them in order.
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}, {kBase + 2 * kSec, 2}});
+    const auto b = written(dir.str(), "A", {{kBase + 3 * kSec, 3}});
+    const auto c = written(dir.str(), "A", {{kBase + 4 * kSec, 4}});
+    store.merge_segments({a, b, c});
+    const auto out = merged(store, dir.str(), {a, b});
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool held = false, go_on = false;
+
+    // A part that keeps its rows' prices, and waits on the batch that holds segment `a`'s first.
+    class Part final : public ob::ScanPart {
+    public:
+        Part(std::mutex& m, std::condition_variable& cv, bool& held, bool& go_on)
+            : m_(m), cv_(cv), held_(held), go_on_(go_on) {}
+        ob::BatchVerdict take(const ob::RowBatch& batch) override {
+            for (const uint32_t r : batch.rows) prices.push_back(batch.price[r]);
+            if (prices.front() == 1) {
+                std::unique_lock<std::mutex> lock(m_);
+                held_ = true;
+                cv_.notify_all();
+                cv_.wait(lock, [&] { return go_on_; });
+            }
+            return {};
+        }
+        uint64_t rows() const override { return prices.size(); }
+        std::vector<int64_t> prices;
+
+    private:
+        std::mutex& m_;
+        std::condition_variable& cv_;
+        bool& held_;
+        bool& go_on_;
+    };
+
+    ob::ScanPool pool(2, nullptr);
+    std::atomic<int> parts{0};
+    std::vector<int64_t> seen;
+    std::thread reader([&] {
+        ob::PartsScan how;
+        how.pool = &pool;
+        how.divide_small = true;
+        how.direct = [](const ob::RowBatch&) -> ob::BatchVerdict {
+            ADD_FAILURE() << "the scan was not divided";
+            return {};
+        };
+        how.make_part = [&]() -> std::unique_ptr<ob::ScanPart> {
+            ++parts;
+            return std::make_unique<Part>(m, cv, held, go_on);
+        };
+        how.fold = [&seen](ob::ScanPart& part) {
+            const auto& prices = static_cast<Part&>(part).prices;
+            seen.insert(seen.end(), prices.begin(), prices.end());
+            return true;
+        };
+        store.scan_parts(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    });
+    {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return held; });
+    }
+    const auto result = store.replace_segments({a, b}, out, rename_to_segment);
+    ASSERT_EQ(result.outcome, ob::ColumnarStore::Replaced::kYes);
+    EXPECT_EQ(delivered(store, "A").size(), 4u);
+    EXPECT_FALSE(result.readers_before.expired())
+        << "the inputs' files could have been removed under a part that is reading them";
+    {
+        std::lock_guard<std::mutex> lock(m);
+        go_on = true;
+    }
+    cv.notify_all();
+    reader.join();
+    EXPECT_EQ(parts.load(), 3) << "a part a segment";
+    EXPECT_EQ(seen, (std::vector<int64_t>{1, 2, 3, 4})) << "the divided scan lost or reordered rows";
     EXPECT_TRUE(result.readers_before.expired());
 }
 

@@ -462,6 +462,21 @@ TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
                         "this machine");
 }
 
+TEST(BoostRule, NoProfileSetsAScanPool) {
+    // #246, stage 2: the pool is the operator's to ask for - measured beside a writer, a query on it
+    // cost the writer a tenth of its rate and more of its tail - so boost and eco leave it at 0, and
+    // a value given is the operator's.
+    const auto silent = resolve({});
+    EXPECT_EQ(silent.config.scan_threads, 0u);
+    EXPECT_EQ(silent.origin.count("scan-threads"), 0u);
+    const auto eco = resolve({"--profile", "eco"});
+    EXPECT_EQ(eco.config.scan_threads, 0u);
+    const auto given = resolve({"--scan-threads", "2"});
+    EXPECT_EQ(given.config.scan_threads, 2u);
+    EXPECT_EQ(given.origin.at("scan-threads"), ob::Origin::CommandLine);
+    EXPECT_NE(ob::format_config(given).find("scan-threads"), std::string::npos);
+}
+
 TEST(BoostRule, NoSpinUnderALimitThatBinds) {
     // A limit below the mask is the loops' floor, so it never leaves a CPU of time beyond them.
     const ob::BoostChoice one = ob::choose_boost(machine_of(4, 1.5, 1));

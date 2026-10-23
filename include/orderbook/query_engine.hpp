@@ -191,6 +191,13 @@ public:
     virtual ~RowAnswer() = default;
     /// Every row of the batch, in order: the answer's LIMIT has already cut it to what it holds.
     virtual void add_rows(const RowBatch& batch) = 0;
+    /// A part of the answer for one candidate (#246, stage 2): made and filled on whichever thread
+    /// reads that candidate, its rows formatted there - `limit` of them at most, since no part of an
+    /// answer of `limit` rows needs more.
+    virtual std::unique_ptr<ScanPart> part(uint64_t limit) = 0;
+    /// The first `n` rows of a part this made, onto the answer: on the query's thread, in the
+    /// candidates' order.
+    virtual void add_part(ScanPart& part, uint64_t n) = 0;
 };
 
 // ── QueryEngine ───────────────────────────────────────────────────────────────
@@ -245,6 +252,16 @@ public:
 
     /// The most buckets one `GROUP BY TIME_BUCKET(...)` answer may have (#44); past it the query is
     /// refused with `BUCKETS_TOO_MANY` rather than cut short. `--max-query-buckets`.
+    /// The pool a scan's candidates are read on (#246, stage 2): a row answer given a `RowAnswer`,
+    /// and the row aggregates of `GROUP BY TIME_BUCKET`, are divided by candidate among its threads
+    /// where that can speed them up. Null, or a pool of no threads, reads every candidate on the
+    /// query's thread. `divide_small` divides the scans that cannot be sped up as well, for tests
+    /// (`PartsScan::divide_small`). Set before the first query; the pool outlives every query that
+    /// reads through it.
+    void set_scan_pool(ScanPool* pool, bool divide_small = false) {
+        scan_pool_ = pool;
+        scan_divide_small_ = divide_small;
+    }
     void set_max_query_buckets(size_t n) { max_query_buckets_.store(n, std::memory_order_relaxed); }
     size_t max_query_buckets() const { return max_query_buckets_.load(std::memory_order_relaxed); }
     static constexpr size_t kDefaultMaxQueryBuckets = 100'000;
@@ -295,6 +312,8 @@ private:
     LiveBufferLookup     live_buffer_;
     const AggregationEngine& agg_;
     std::atomic<size_t>  max_query_buckets_{kDefaultMaxQueryBuckets};
+    ScanPool*            scan_pool_{nullptr};
+    bool                 scan_divide_small_{false};
 
     /// A `GROUP BY TIME_BUCKET(...)` query (#44): one scan of the rows its conditions keep, each
     /// added to its bucket's state, then every bucket's values computed and checked before the

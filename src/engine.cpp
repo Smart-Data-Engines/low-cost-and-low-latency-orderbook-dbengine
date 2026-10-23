@@ -595,11 +595,24 @@ void Engine::open() {
                     wal_archiver_->lineage_dir(identity).c_str(), wal_archive_interval_s_);
     }
 
+    // The scan pool (#246, stage 2), before any query can run: one made by this open, given to the
+    // query engine until close() takes it back.
+    if (scan_threads_ > 0 && !scan_pool_) {
+        scan_pool_ = std::make_unique<ScanPool>(scan_threads_, &registry_);
+        query_engine_->set_scan_pool(scan_pool_.get());
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+}
+
+void Engine::set_scan_threads(unsigned threads) {
+    scan_threads_ = threads;
+    OB_LOG_DEBUG("engine", "scan pool set to %u thread(s)%s", threads,
+                 threads == 0 ? ": every query reads on its own thread" : "");
 }
 
 void Engine::set_wal_archive(std::string dir, uint32_t interval_s) {
@@ -611,6 +624,15 @@ void Engine::set_wal_archive(std::string dir, uint32_t interval_s) {
 }
 
 void Engine::close() {
+    // The scan pool first: no query reads after the server has stopped its loops, which is before it
+    // closes the engine, so its threads have nothing left to read. The query engine is told before
+    // the pool goes, so nothing can reach a pool that is gone.
+    if (scan_pool_) {
+        query_engine_->set_scan_pool(nullptr);
+        scan_pool_->stop();
+        scan_pool_.reset();
+    }
+
     // Stop multi-master manager first (it broadcasts, so must stop before WAL/flush).
     if (mm_mgr_) {
         mm_mgr_->stop();

@@ -273,6 +273,9 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
          "same problem as the others from the other side (#131)"},
         {"OrderbookPool::health_check_loop",
          "a client pool stops noticing dead connections; the only one outside the server (#131)"},
+        {"ScanPool::worker_loop",
+         "the pool has one thread fewer to read a query's segments on; the queries still run every "
+         "part no thread took, on their own loops, so they slow down and do not stop (#246)"},
         {"Reactor::run_loop",
          "every client this reactor serves would stop being answered while the connections dealt "
          "to it kept coming, so a reactor that ends on an exception stops the server instead: "

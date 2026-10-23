@@ -1,4 +1,5 @@
 #include "orderbook/columnar_store.hpp"
+#include "orderbook/scan_pool.hpp"
 #include "orderbook/durable_file.hpp"
 #include "orderbook/codec.hpp"
 #include "orderbook/column_codec.hpp"
@@ -6,27 +7,29 @@
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <functional>
-#include <map>
 #include <atomic>
 #include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <limits>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 
 namespace ob {
@@ -2334,108 +2337,35 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
     return scan_batches(start_ns, end_ns, symbol, exchange, columns, filter, rows_to(cb));
 }
 
-ColumnarStore::ScanCost ColumnarStore::scan_batches(uint64_t start_ns, uint64_t end_ns,
-                                                     std::string_view symbol,
-                                                     std::string_view exchange, ColumnSet columns,
-                                                     const RowFilter& filter,
-                                                     const BatchReader& read) const {
-    // Whatever the caller asked to be handed, this filters on the row's timestamp, so it reads
-    // that column. Adding it here rather than trusting the caller means a set built by hand
-    // cannot produce a scan that compares every row against a zero it never loaded. The filter's
-    // columns likewise (#47 step 2): it is checked on them before a row is built.
+namespace {
+
+/// Whatever the caller asked to be handed, a scan filters on the row's timestamp, so it reads that
+/// column. Adding it here rather than trusting the caller means a set built by hand cannot produce
+/// a scan that compares every row against a zero it never loaded. The filter's columns likewise
+/// (#47 step 2): it is checked on them before a row is chosen.
+ColumnSet widened(ColumnSet columns, const RowFilter& filter) {
     columns.add(QueryColumn::TimestampNs);
     if (filter.has_price()) columns.add(QueryColumn::Price);
     if (filter.has_side()) columns.add(QueryColumn::Side);
     if (filter.has_level()) columns.add(QueryColumn::Level);
+    return columns;
+}
 
-    // The segments that can hold a row of this range, copied under the shared lock so the files
-    // are read without it. Only this symbol's, and only the window each width tier's sorted starts
-    // allow (#165): this used to copy every segment of every symbol - three strings each - and
-    // filter the copy.
-    ScanCost cost;
-    std::vector<SegmentMeta> index_snapshot;
-    std::vector<std::shared_ptr<const RowBlock>> block_snapshot;
-    // Held until the files are read (#165 part 2b): a merge that replaces a segment this copied
-    // removes its files only once every scan that took this generation has let it go.
-    std::shared_ptr<const void> reading;
-    {
-        std::shared_lock<std::shared_mutex> lock(index_mtx_);
-        reading = reader_generation_;
-        const auto it = by_symbol_.find(index_key(symbol, exchange));
-        if (it == by_symbol_.end()) return cost;
-        for (const auto& b : it->second.blocks) {
-            if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) block_snapshot.push_back(b);
-        }
-        for (const WidthTier& tier : it->second.tiers) {
-            const auto& v = tier.segments;
-            const size_t before = index_snapshot.size();
-            const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
-            auto first = std::lower_bound(
-                v.begin(), v.end(), from,
-                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
-            for (auto i = first; i != v.end() && i->start_ts_ns <= end_ns; ++i) {
-                ++cost.compared;
-                if (i->end_ts_ns >= start_ns) index_snapshot.push_back(*i);
-            }
-            // In the order the flat index gave them, which is the order rows reach the callback:
-            // each tier's are sorted, so this merges two runs rather than sorting every candidate.
-            if (before != 0 && before != index_snapshot.size()) {
-                std::inplace_merge(index_snapshot.begin(),
-                                   index_snapshot.begin() + static_cast<std::ptrdiff_t>(before),
-                                   index_snapshot.end(), segment_order_less);
-            }
-        }
-    }
-    cost.candidates = index_snapshot.size();
-    cost.blocks = block_snapshot.size();
-    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu segment(s) compared, %zu read, "
-                             "%zu unsealed block(s)",
-                 static_cast<int>(symbol.size()), symbol.data(),
-                 static_cast<int>(exchange.size()), exchange.data(),
-                 static_cast<unsigned long long>(start_ns),
-                 static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates,
-                 cost.blocks);
-
-    const auto summary = [&]() {
-        OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s: %zu segment(s) read, %zu left unread by price "
-                                 "and %zu by levels, %llu row(s) filtered before they were built%s",
-                     static_cast<int>(symbol.size()), symbol.data(),
-                     static_cast<int>(exchange.size()), exchange.data(), cost.segments_read,
-                     cost.skipped_by_price, cost.skipped_by_levels,
-                     static_cast<unsigned long long>(cost.rows_filtered),
-                     cost.stopped ? "; ended by its reader" : "");
-    };
-    const bool filtering = !filter.empty();
-    for (const auto& meta : index_snapshot) {
-        bool by_price = false;
-        if (filtering && cannot_hold(meta, filter, &by_price)) {
-            ++(by_price ? cost.skipped_by_price : cost.skipped_by_levels);
-            continue;
-        }
-        ++cost.segments_read;
-        bool stopped = false;
-        read_segment_rows(meta, columns, start_ns, end_ns, filter, read, ReadMode::kQuery,
-                          &cost.rows_filtered, &stopped);
-        if (stopped) {
-            cost.stopped = true;
-            summary();
-            return cost;
-        }
-    }
-
+/// The rows no seal has written yet through `read`, block by block in the order they were drained:
+/// they are a symbol's newest writes, so a reader that keeps the last row of a tie keeps the one
+/// written later (#168). Each block's columns are copied out of its rows into the pool's buffers -
+/// only the columns the read asks for, so one it did not ask for is empty here as in a segment's
+/// batch - and emitted through the loop a segment's rows are (OB-12). False once the reader stopped.
+bool emit_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks, ColumnSet columns,
+                 uint64_t start_ns, uint64_t end_ns, const RowFilter& filter,
+                 const BatchReader& read, uint64_t& filtered) {
     const bool want_price = columns.has(QueryColumn::Price);
     const bool want_qty   = columns.has(QueryColumn::Quantity);
     const bool want_cnt   = columns.has(QueryColumn::OrderCount);
     const bool want_side  = columns.has(QueryColumn::Side);
     const bool want_level = columns.has(QueryColumn::Level);
     const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
-
-    // Then the rows no seal has written yet, after every segment and in the order they were
-    // drained: they are this symbol's newest writes, so a reader that keeps the last row of a tie
-    // keeps the one written later (#168). Their columns are copied out of the block's rows into
-    // the pool's buffers - only the columns the read asks for, so one it did not ask for is empty
-    // here as in a segment's batch - and emitted through the same loop as a segment's (OB-12).
-    for (const auto& block : block_snapshot) {
+    for (const auto& block : blocks) {
         const std::vector<SnapshotRow>& rows = block->rows;
         const size_t n = rows.size();
         if (n == 0) continue;
@@ -2457,19 +2387,313 @@ ColumnarStore::ScanCost ColumnarStore::scan_batches(uint64_t start_ns, uint64_t 
         copy(want_side, t.sides, [](const Row& r) { return r.side; });
         copy(want_level, t.levels, [](const Row& r) { return r.level_index; });
         copy(want_seq, t.seqs, [](const Row& r) { return static_cast<int64_t>(r.sequence_number); });
-        uint64_t failed = 0;
-        const bool going =
-            emit_batches(n, RowColumns{t.timestamps, t.prices, t.qtys, t.counts, t.sides, t.levels,
-                                       t.seqs},
-                         start_ns, end_ns, filter, read, failed);
-        cost.rows_filtered += failed;
-        if (!going) {
+        if (!emit_batches(n, RowColumns{t.timestamps, t.prices, t.qtys, t.counts, t.sides, t.levels,
+                                        t.seqs},
+                          start_ns, end_ns, filter, read, filtered)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool ColumnarStore::scan_set(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                             std::string_view exchange, ScanSet& set, ScanCost& cost) const {
+    // The segments that can hold a row of this range, copied under the shared lock so the files
+    // are read without it. Only this symbol's, and only the window each width tier's sorted starts
+    // allow (#165): this used to copy every segment of every symbol - three strings each - and
+    // filter the copy.
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    // Held until the files are read (#165 part 2b): a merge that replaces a segment this copied
+    // removes its files only once every scan that took this generation has let it go.
+    set.reading = reader_generation_;
+    const auto it = by_symbol_.find(index_key(symbol, exchange));
+    if (it == by_symbol_.end()) return false;
+    for (const auto& b : it->second.blocks) {
+        if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) set.blocks.push_back(b);
+    }
+    for (const WidthTier& tier : it->second.tiers) {
+        const auto& v = tier.segments;
+        const size_t before = set.segments.size();
+        const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
+        auto first = std::lower_bound(
+            v.begin(), v.end(), from,
+            [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+        for (auto i = first; i != v.end() && i->start_ts_ns <= end_ns; ++i) {
+            ++cost.compared;
+            if (i->end_ts_ns >= start_ns) set.segments.push_back(*i);
+        }
+        // In the order the flat index gave them, which is the order rows reach the reader: each
+        // tier's are sorted, so this merges two runs rather than sorting every candidate.
+        if (before != 0 && before != set.segments.size()) {
+            std::inplace_merge(set.segments.begin(),
+                               set.segments.begin() + static_cast<std::ptrdiff_t>(before),
+                               set.segments.end(), segment_order_less);
+        }
+    }
+    return true;
+}
+
+ColumnarStore::ScanCost ColumnarStore::scan_batches(uint64_t start_ns, uint64_t end_ns,
+                                                     std::string_view symbol,
+                                                     std::string_view exchange, ColumnSet columns,
+                                                     const RowFilter& filter,
+                                                     const BatchReader& read) const {
+    columns = widened(columns, filter);
+    ScanCost cost;
+    ScanSet set;
+    if (!scan_set(start_ns, end_ns, symbol, exchange, set, cost)) return cost;
+    return read_in_order(set, symbol, exchange, columns, start_ns, end_ns, filter, read, cost);
+}
+
+ColumnarStore::ScanCost ColumnarStore::read_in_order(const ScanSet& set, std::string_view symbol,
+                                                      std::string_view exchange, ColumnSet columns,
+                                                      uint64_t start_ns, uint64_t end_ns,
+                                                      const RowFilter& filter,
+                                                      const BatchReader& read, ScanCost cost) const {
+    cost.candidates = set.segments.size();
+    cost.blocks = set.blocks.size();
+    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu segment(s) compared, %zu read, "
+                             "%zu unsealed block(s)",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(start_ns),
+                 static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates,
+                 cost.blocks);
+
+    const auto summary = [&]() {
+        OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s: %zu segment(s) read, %zu left unread by price "
+                                 "and %zu by levels, %llu row(s) filtered before they were built%s",
+                     static_cast<int>(symbol.size()), symbol.data(),
+                     static_cast<int>(exchange.size()), exchange.data(), cost.segments_read,
+                     cost.skipped_by_price, cost.skipped_by_levels,
+                     static_cast<unsigned long long>(cost.rows_filtered),
+                     cost.stopped ? "; ended by its reader" : "");
+    };
+    const bool filtering = !filter.empty();
+    for (const auto& meta : set.segments) {
+        bool by_price = false;
+        if (filtering && cannot_hold(meta, filter, &by_price)) {
+            ++(by_price ? cost.skipped_by_price : cost.skipped_by_levels);
+            continue;
+        }
+        ++cost.segments_read;
+        bool stopped = false;
+        read_segment_rows(meta, columns, start_ns, end_ns, filter, read, ReadMode::kQuery,
+                          &cost.rows_filtered, &stopped);
+        if (stopped) {
             cost.stopped = true;
             summary();
             return cost;
         }
     }
+    // Then the rows no seal has written yet, after every segment.
+    if (!emit_blocks(set.blocks, columns, start_ns, end_ns, filter, read, cost.rows_filtered)) {
+        cost.stopped = true;
+    }
     summary();
+    return cost;
+}
+
+ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t end_ns,
+                                                   std::string_view symbol,
+                                                   std::string_view exchange, ColumnSet columns,
+                                                   const RowFilter& filter,
+                                                   const PartsScan& how) const {
+    columns = widened(columns, filter);
+    ScanCost cost;
+    ScanSet set;
+    if (!scan_set(start_ns, end_ns, symbol, exchange, set, cost)) return cost;
+
+    // One part a candidate the filter's proof does not leave unread, and one for the blocks, last.
+    // How many the proof left unread before each part is kept, so a scan its reader ends counts
+    // them as the scan on one thread would have: the ones before the part it ended at.
+    struct Slot {
+        const SegmentMeta* meta{nullptr};   // null: the blocks
+        uint64_t rows_at_most{0};
+        size_t by_price_before{0};
+        size_t by_levels_before{0};
+        std::unique_ptr<ScanPart> part;
+        uint64_t filtered{0};
+        bool stopped{false};   // the part's own stop, which ends its candidate and nothing else
+        bool on_pool{false};
+        std::shared_ptr<ScanPool::Task> task;
+    };
+    std::vector<Slot> slots;
+    slots.reserve(set.segments.size() + 1);
+    size_t by_price = 0;
+    size_t by_levels = 0;
+    const bool filtering = !filter.empty();
+    for (const SegmentMeta& meta : set.segments) {
+        bool price_proof = false;
+        if (filtering && cannot_hold(meta, filter, &price_proof)) {
+            ++(price_proof ? by_price : by_levels);
+            continue;
+        }
+        Slot s;
+        s.meta = &meta;
+        s.rows_at_most = meta.row_count;
+        s.by_price_before = by_price;
+        s.by_levels_before = by_levels;
+        slots.push_back(std::move(s));
+    }
+    const size_t segment_slots = slots.size();
+    // The rows each candidate may give this range, read from its metadata as if spread evenly over
+    // its time - all of it when its range is one instant.
+    uint64_t in_range = 0;
+    uint64_t largest = 0;
+    for (Slot& s : slots) {
+        const SegmentMeta& m = *s.meta;
+        const uint64_t lo = std::max(m.start_ts_ns, start_ns);
+        const uint64_t hi = std::min(m.end_ts_ns, end_ns);
+        const uint64_t span = m.end_ts_ns - m.start_ts_ns;
+        const uint64_t rows =
+            span == 0 || hi < lo
+                ? (hi < lo ? 0 : m.row_count)
+                : static_cast<uint64_t>(static_cast<double>(m.row_count) *
+                                        (static_cast<double>(hi - lo) + 1.0) /
+                                        (static_cast<double>(span) + 1.0));
+        in_range += rows;
+        largest = std::max(largest, rows);
+    }
+    // Divided only where a pool can speed it up. Nothing to divide - no pool, no threads, one
+    // candidate - or a LIMIT the first candidate's rows may meet on their own, as a small one does;
+    // and, measured on the x86 host, a scan of a few thousand rows paid a few microseconds for the
+    // queue and won nothing, and one whose rows are mostly in one candidate paid the copy of its
+    // part on top of reading it. Below those, one thread's scan - the scan_batches() this replaces
+    // when it can - with no queue to pass through.
+    const bool worth = how.divide_small ||
+                       (in_range >= kScanDivideMinRows && largest <= in_range / 4 * 3);
+    const bool divide = how.pool != nullptr && how.pool->threads() > 0 && segment_slots > 1 &&
+                        (how.limit_rows == UINT64_MAX || how.limit_rows > slots[0].rows_at_most) &&
+                        worth;
+    if (!divide || !how.pool->claim()) {
+        return read_in_order(set, symbol, exchange, columns, start_ns, end_ns, filter, how.direct,
+                             cost);
+    }
+    ScanPool* const pool = how.pool;
+    struct Release {
+        ScanPool* pool;
+        ~Release() { pool->release(); }
+    } const released{pool};
+    if (!set.blocks.empty()) {
+        Slot s;
+        for (const auto& b : set.blocks) s.rows_at_most += b->rows.size();
+        s.by_price_before = by_price;
+        s.by_levels_before = by_levels;
+        slots.push_back(std::move(s));
+    }
+    cost.candidates = set.segments.size();
+    cost.blocks = set.blocks.size();
+
+    // A part read wherever it is taken. Its reader checks `stop` between batches, so a part the
+    // answer no longer needs - a LIMIT reached, a refusal, a throw - ends at its next batch.
+    const std::thread::id here = std::this_thread::get_id();
+    std::atomic<bool> stop{false};
+    const auto read_slot = [&](Slot& s) {
+        s.on_pool = std::this_thread::get_id() != here;
+        s.part = how.make_part();
+        const BatchReader into = [&s, &stop](const RowBatch& b) -> BatchVerdict {
+            if (stop.load(std::memory_order_relaxed)) return {true, 0};
+            // A pool thread gives its CPU up between batches, so a client loop woken onto it waits
+            // for one batch at most rather than for the scheduler's tick (`ScanPool`'s threads).
+            if (s.on_pool) ::sched_yield();
+            return s.part->take(b);
+        };
+        if (s.meta != nullptr) {
+            read_segment_rows(*s.meta, columns, start_ns, end_ns, filter, into, ReadMode::kQuery,
+                              &s.filtered, &s.stopped);
+        } else {
+            s.stopped = !emit_blocks(set.blocks, columns, start_ns, end_ns, filter, into, s.filtered);
+        }
+    };
+
+    // Handed out ahead of the fold by at most the pool's threads and one - so as many parts are
+    // held as can be read at once - and, under a LIMIT, only while what has been folded and what
+    // is out may still fall short of it.
+    const size_t n = slots.size();
+    const size_t window = static_cast<size_t>(pool->threads()) + 1;
+    size_t handed = 0;
+    uint64_t folded_rows = 0;
+    uint64_t out_rows = 0;
+    const auto hand_out = [&](size_t folding) {
+        while (handed < n && handed < folding + window &&
+               (how.limit_rows == UINT64_MAX || folded_rows + out_rows < how.limit_rows)) {
+            Slot& s = slots[handed];
+            out_rows += s.rows_at_most;
+            s.task = pool->submit([&read_slot, &s] { read_slot(s); });
+            ++handed;
+        }
+    };
+    // Every part handed out after `from` finished or dropped - before anything this frame owns, the
+    // slots and `stop` among them, goes.
+    const auto settle = [&](size_t from) {
+        stop.store(true, std::memory_order_relaxed);
+        for (size_t j = from; j < handed; ++j) {
+            if (slots[j].task) pool->drop_or_wait(*slots[j].task);
+        }
+    };
+
+    size_t k = 0;
+    bool ended = false;
+    std::chrono::steady_clock::duration waited{};
+    try {
+        for (; k < n; ++k) {
+            hand_out(k);
+            Slot& s = slots[k];
+            if (s.task) {
+                // Waited for, not helped with: a query that read another of its parts while the
+                // one it needs was read elsewhere was measured slower, because what it read held
+                // up the fold, and with it the parts handed out to the threads that had finished.
+                const auto t0 = std::chrono::steady_clock::now();
+                pool->run_or_wait(*s.task);
+                waited += std::chrono::steady_clock::now() - t0;
+                out_rows -= s.rows_at_most;
+            } else {
+                // Past what the LIMIT lets out ahead: read here, when it is the one the fold needs.
+                pool->ran_here();
+                read_slot(s);
+            }
+            if (s.meta != nullptr) ++cost.segments_read;
+            cost.rows_filtered += s.filtered;
+            // Whether the scan goes on is the fold's to say: a part that stops ends its own
+            // candidate - at the rows its answer can use, or at a refusal its fold then makes.
+            const bool more = how.fold(*s.part);
+            folded_rows += s.part->rows();
+            s.part.reset();   // its memory, now
+            if (!more) {
+                ended = true;
+                break;
+            }
+        }
+    } catch (...) {
+        settle(k + 1);
+        throw;
+    }
+    settle(ended ? k + 1 : n);
+
+    cost.stopped = ended;
+    if (ended) {
+        cost.skipped_by_price = slots[k].by_price_before;
+        cost.skipped_by_levels = slots[k].by_levels_before;
+    } else {
+        cost.skipped_by_price = by_price;
+        cost.skipped_by_levels = by_levels;
+    }
+    size_t pooled = 0;
+    for (size_t j = 0; j < std::min(n, ended ? k + 1 : n); ++j) pooled += slots[j].on_pool ? 1 : 0;
+    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu part(s), %zu on the pool, waited "
+                             "%.3f ms for parts; %zu segment(s) read, %zu left unread by price and "
+                             "%zu by levels, %llu row(s) filtered%s",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(start_ns), static_cast<unsigned long long>(end_ns),
+                 ended ? k + 1 : n, pooled,
+                 std::chrono::duration<double, std::milli>(waited).count(), cost.segments_read,
+                 cost.skipped_by_price, cost.skipped_by_levels,
+                 static_cast<unsigned long long>(cost.rows_filtered),
+                 ended ? "; ended by its reader" : "");
     return cost;
 }
 

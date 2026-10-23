@@ -148,6 +148,13 @@ MetricsRegistry::MetricsRegistry() {
                                      "Segments whose held columns were evicted to make room"));
     counters_.push_back(make_counter("ob_decoded_columns_arena_fallbacks_total",
                                      "Held columns decoded on the heap: no slot under the arena's cap (#223)"));
+    // A scan's candidates read on the pool's threads, and by the query that waited for them (#246,
+    // stage 2): the two say whether a pool sized to the machine is doing the reading, or the queries
+    // are reading their own candidates because its threads were busy.
+    counters_.push_back(make_counter("ob_scan_parts_pooled_total",
+                                     "Scan parts read on the scan pool's threads (#246)"));
+    counters_.push_back(make_counter("ob_scan_parts_inline_total",
+                                     "Scan parts read by the query that waited for them (#246)"));
     counters_.push_back(make_counter("ob_backup_failures_total",
                                      "Backups that failed, and left nothing that looks like one"));
     // The certificate read again on SIGHUP (#238). A failure leaves the certificate in force, which
@@ -302,6 +309,8 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_wal_archive_oldest_pending_seconds",
                                  "Seconds since the oldest of them was last written; 0 with none (#34)"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
+    gauges_.push_back(make_gauge("ob_scan_threads",
+                                 "Threads of the pool a scan's candidates are read on (#246); 0 is none"));
     gauges_.push_back(make_gauge("ob_decoded_columns_bytes",
                                  "Bytes of decoded columns held between queries (#220)"));
     gauges_.push_back(make_gauge("ob_decoded_columns_budget_bytes",

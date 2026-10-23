@@ -434,6 +434,38 @@ core per loop while traffic flows"**, not a core per loop. When #144 introduced 
 busy client, at 98% of a core — so the window gives up no latency under continuous traffic, and
 without it an idle node would hold its cores indefinitely.
 
+## A query on several cores: `--scan-threads`
+
+A query runs on its connection's loop. With `--scan-threads N` above 0, a query whose rows in range
+are many and spread over two segments or more divides them: each segment is read, its rows chosen
+and formatted - or added to their time buckets - on one of the pool's N threads, and the query's
+loop puts the parts together in the segments' order (#246). The answer is the same bytes as with 0,
+a `LIMIT` included: a `LIMIT` the first segment may meet is not divided, and under a larger one a
+segment goes to the pool only while the answer may still need its rows. A scan of fewer than 32 768
+rows in range, or one whose rows are mostly in one segment, is read on the query's loop, where a
+pool would add its queue and win nothing; and one query divides at a time - another that comes
+meanwhile reads on its own loop. The pool's threads, `ob-scan-0` … `ob-scan-N-1`, run under
+`SCHED_IDLE` and give their CPU up between batches, so a client loop woken onto one waits for a
+batch at most.
+
+**It is off under every profile**, and that is a measured choice: what the pool costs a writer on
+the same node depends on the host. Measured with a 1.9 M-row store, the same build with and without
+four threads:
+- **x86 test host** (4 cores, kernel 7.0 built to preempt lazily, at 1000 Hz): a query alone took
+  55-61% of the time - 80 one-minute buckets of all of it 3.3-3.7 ms against 6.1, all of it in one
+  column 14.4-15.3 ms against 25.7-26.2 - but **beside a writer it cost the writer 8-20% of its rate
+  and its batch p99 went from about 40 µs to 48-205 µs** while the query ran, and four connections
+  asking the bucket query at once answered 8-10% fewer of them.
+- **ARM test host** (4 Graviton cores, kernel 6.18 built `PREEMPT_NONE`, at 100 Hz): the queries took
+  34-45% of the time - 3.2-3.3 ms against 9.2-9.3, 12.2-13.0 against 28.8-30.2 - and the writer beside
+  them lost nothing measurable, with the buckets beside it answered twice as often.
+
+A node that takes writes should choose the pool after measuring it on its own host rather than be
+given it; a node that mostly answers big queries - a replica kept for them - is where to turn it on,
+at one thread per CPU.
+`ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on the pool
+and on the queries' loops, and `ob_scan_threads` is N.
+
 ## Client event loops: `--io-threads`
 
 `--io-threads N` gives the server N client event loops. The one that holds the listening socket
@@ -615,6 +647,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: the profile's — 10 under `boost` where the process has a CPU to spare, 0 under `eco`). Costs up to one core per loop while traffic flows and takes ~18% off the loopback round trip |
 | `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: the profile's — one per usable CPU under `boost`, 1 under `eco`). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
+| `--scan-threads` | `<N>` | Threads a query's segments are read on, 0 to 64 (default: 0, under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, and its loop folds what each made in the segments' order, so the answer is the same bytes; 0 reads every segment on the query's loop. Beside writes it costs them, which is why it is off ("A query on several cores: `--scan-threads`" below) |
 | `--profile` | `<NAME>` | `boost` (default: one client event loop per usable CPU, and a 10 µs spin where it cannot starve anything) or `eco` (one loop, blocking between events). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |

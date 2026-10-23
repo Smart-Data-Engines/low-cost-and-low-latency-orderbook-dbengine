@@ -316,6 +316,14 @@ engine shares with other work, `--profile eco` is one loop blocking between even
 was; and a mask or a limit you give it is one it sizes itself to, so pinning the service to two cores
 gives it two loops.
 
+A node that mostly answers big queries can give them the scan pool (#246, `--scan-threads N`,
+threads named `ob-scan-0` …): a query of many rows spread over several segments is then read on N
+threads at once, 1.6-2.9 times as fast on four. It is off under every profile because on one of the
+two test hosts the pool's reads cost a writer on the same node 8-20% of its rate while they ran -
+measured in
+`docs/cli.md`, "A query on several cores" - so on a node taking writes it is a choice to make, not a
+default; on a replica kept for queries, one thread per CPU.
+
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,
 `top -H -p $(pidof ob_tcp_server)` shows which loop is busy, and the log line
