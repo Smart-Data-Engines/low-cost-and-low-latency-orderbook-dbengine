@@ -2951,10 +2951,9 @@ ColumnarStore::TopsCost ColumnarStore::tops_by_time(
     size_t next = 0;                // the first span not passed
     const Span* after = nullptr;    // the track just read, whose summary holds the book at x - 1
     bool have_book = false;         // whether bids and asks hold the book at x - 1
-    bool tracks_readable = true;
     for (;;) {
         while (next < spans.size() && spans[next].as_of < x) ++next;
-        if (tracks_readable && next < spans.size() && spans[next].from_ts < x) {
+        if (next < spans.size() && spans[next].from_ts < x) {
             // A track covers x: the best from its entries.
             const Span& sp = spans[next];
             BestTrack t;
@@ -2979,12 +2978,14 @@ ColumnarStore::TopsCost ColumnarStore::tops_by_time(
                 ++next;
                 continue;
             }
-            OB_LOG_WARN("columnar", "best track %s unreadable: a series of %.*s.%.*s reads the rows "
-                                    "from %llu",
+            // read_best_track() said why. The rows answer for its span, and the next track, if it
+            // reads, takes over where it starts.
+            OB_LOG_WARN("columnar", "best track %s unreadable: a series of %.*s.%.*s reads the rows of "
+                                    "its span from %llu",
                         sp.track.c_str(), static_cast<int>(symbol.size()), symbol.data(),
                         static_cast<int>(exchange.size()), exchange.data(),
                         static_cast<unsigned long long>(x));
-            tracks_readable = false;
+            ++next;
         }
         // A stretch of rows from x, from the book at x - 1: after a track, its summary's.
         if (!have_book) {
@@ -3010,8 +3011,7 @@ ColumnarStore::TopsCost ColumnarStore::tops_by_time(
         if (!started) start(top_now());
         // To the instant the next track starts at, whose best it holds, or to the end.
         uint64_t end = read_to;
-        if (tracks_readable && next < spans.size() && spans[next].from_ts >= x &&
-            spans[next].from_ts < end) {
+        if (next < spans.size() && spans[next].from_ts >= x && spans[next].from_ts < end) {
             end = spans[next].from_ts;
         }
         uint64_t instant = 0;

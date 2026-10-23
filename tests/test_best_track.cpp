@@ -606,3 +606,29 @@ TEST(BestTrackWrite, ASegmentThatLeavesTakesItsTrackWithIt) {
     EXPECT_EQ(tops_read(*s.store, kBase, kBase + 30, &cost), tops_of_rows(*s.store, kBase, kBase + 30));
     EXPECT_EQ(cost.tracks, 1u);
 }
+
+TEST(BestTrackRead, AnUnreadableTrackCostsItsOwnSpanAlone) {
+    // Two tracks, the first of which does not read: the rows answer for its span, and the second
+    // takes over where it starts.
+    Store s;
+    std::vector<ob::SnapshotRow> first;
+    for (uint64_t i = 0; i < 30; ++i) first.push_back(row(kBase + i, ob::SIDE_BID, 100 + static_cast<int64_t>(i % 4), i % 3));
+    const std::string d1 = s.segment(first);
+    const auto w1 = s.summarise(d1);
+    ASSERT_TRUE(w1.written);
+    std::vector<ob::SnapshotRow> second;
+    for (uint64_t i = 30; i < 60; ++i) second.push_back(row(kBase + i, ob::SIDE_BID, 98 + static_cast<int64_t>(i % 5), 1 + i % 2));
+    const std::string d2 = s.segment(second);
+    ASSERT_TRUE(s.summarise(d2).written);
+    {
+        std::fstream f((fs::path(d1) / ob::best_track_file(w1.as_of_ts)).string(),
+                       std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(-1, std::ios::end);
+        f.put('\x2a');   // inside the last column: the entries' CRC
+    }
+    ob::ColumnarStore::TopsCost cost;
+    EXPECT_EQ(tops_read(*s.store, kBase + 3, kBase + 59, &cost), tops_of_rows(*s.store, kBase + 3, kBase + 59));
+    EXPECT_EQ(cost.tracks, 1u) << "the track after the unreadable one was not read";
+    // The rows of kBase + 3 to the first track's end, kBase + 29: the second holds the rest.
+    EXPECT_EQ(cost.rows.kept, 27u);
+}
