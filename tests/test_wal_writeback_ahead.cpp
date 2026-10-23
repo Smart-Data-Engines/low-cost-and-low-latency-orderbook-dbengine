@@ -166,21 +166,27 @@ TEST(WalWritebackAhead, AWalUnderIntervalIsHandedToWritebackAsItGrows) {
 }
 
 TEST(WalWritebackAhead, WhatIsHandedToWritebackIsDirtyNoLonger) {
-    // No tick runs under this test, so nothing syncs the WAL: below the kernel's background
-    // threshold its pages stay dirty for dirty_expire_centisecs, 30 s by default, unless something
-    // asks for their writeback. The tail under a megabyte is not asked for yet.
+    // Nothing syncs the WAL under this test: no tick at the interval, and under half the budget -
+    // 4 MB before any sync has measured the device - no writer asks for one. Below the kernel's
+    // background threshold its pages stay dirty for dirty_expire_centisecs, 30 s by default, unless
+    // something asks for their writeback. Of about 1.86 MB the thread asks for the first megabyte;
+    // the tail under a megabyte waits for the next.
     TempDir dir;
     auto engine = engine_at(dir.path, ob::FsyncPolicy::INTERVAL);
-    write_megabytes(*engine, 4, 1'000'000'000ULL);
+    write_records(*engine, 760, 1'000'000'000ULL);
     const std::string wal = dir.path + "/wal_000000.bin";
     const int fd = ::open(wal.c_str(), O_RDONLY | O_CLOEXEC);
     ASSERT_GE(fd, 0) << wal;
+    ASSERT_GT(std::filesystem::file_size(wal), (3u << 20) / 2) << "the premise: more than 1.5 MB";
+    ASSERT_LT(std::filesystem::file_size(wal), 2u << 20) << "the premise: under half the budget";
     const uint64_t page = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
     uint64_t dirty = 0;
     EXPECT_TRUE(eventually([&] {
         dirty = dirty_pages(fd);
-        return dirty * page <= (1u << 20) + page;
+        return dirty * page <= (1u << 20);
     })) << dirty << " page(s) of " << page << " bytes of the WAL still dirty";
+    EXPECT_EQ(engine->registry().counter_value("ob_flush_ticks_total"), 0u)
+        << "the premise: no tick, so no sync, cleaned these pages";
     ::close(fd);
     engine->close();
 }
