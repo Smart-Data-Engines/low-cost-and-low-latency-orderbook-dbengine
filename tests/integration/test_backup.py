@@ -274,6 +274,24 @@ def book_summaries_under(path: str) -> list[str]:
                   if name.startswith("book.") and name.endswith(".v1"))
 
 
+def best_tracks_under(path: str) -> list[str]:
+    """The best tracks (#243) under a directory, by name: `best.<as_of>.v1` beside the summary each
+    ends at."""
+    return sorted(name for _, _, names in os.walk(path) for name in names
+                  if name.startswith("best.") and name.endswith(".v1"))
+
+
+def series_answer(port: int, sql: str) -> str:
+    """A query's answer, whole: a series must answer the same after the restore as before."""
+    wire = Wire(port)
+    try:
+        answer = wire.ask(sql)
+    finally:
+        wire.close()
+    assert answer.startswith("OK"), answer
+    return answer
+
+
 def book_levels(port: int, symbol: str) -> list[tuple[str, ...]]:
     """`BOOK` of one symbol, each row's price, quantity, order count, side and level - the columns
     that are the book, not the label every row of an answer shares."""
@@ -294,9 +312,14 @@ def test_a_backup_carries_the_book_summaries_and_a_restored_node_starts_from_the
     restored node starts its live book from it, and `BOOK` answers what it answered before. A summary
     is written once a symbol holds 65 536 rows since its last one, so the test writes 70 700: 700
     side replacements of 100 levels, each removing the one price that left the side. It first asserts
-    a summary was written, without which nothing here would be about carrying one."""
+    a summary was written, without which nothing here would be about carrying one.
+
+    The best track written beside the summary (#243) goes with it, and a series of the book answers
+    the same on the restored node."""
     symbol = "BOOKSUM"
     first = 1_790_000_000_000_000_000
+    series = (f"SELECT OPEN(bid), HIGH(bid), LOW(bid), CLOSE(bid), TWAP(bid) FROM '{symbol}'.'{EXCH}' "
+              f"WHERE timestamp BETWEEN {first} AND {first + 699_000} GROUP BY TIME_BUCKET(50us)")
     with tempfile.TemporaryDirectory(prefix="ob_backup_books_") as tmp:
         node = Node(f"{tmp}/data", ["--backup-dir", f"{tmp}/backups"])
         node.start()
@@ -313,20 +336,26 @@ def test_a_backup_carries_the_book_summaries_and_a_restored_node_starts_from_the
                 wire.close()
             written = book_summaries_under(node.data_dir)
             assert written, "no book summary was written for 70 700 rows of one symbol"
+            tracks = best_tracks_under(node.data_dir)
+            assert [t.replace("best.", "book.", 1) for t in tracks] == written, (tracks, written)
             book = book_levels(node.port, symbol)
             assert len(book) == 100, book[:3]
+            before = series_answer(node.port, series)
             name, st = backup_and_wait(node.port)
             assert st["state"] == "done", st
         finally:
             node.stop()
         assert book_summaries_under(f"{tmp}/backups/{name}") == written, "the backup left a summary behind"
+        assert best_tracks_under(f"{tmp}/backups/{name}") == tracks, "the backup left a track behind"
 
         restore(f"{tmp}/backups/{name}", f"{tmp}/restored")
         assert book_summaries_under(f"{tmp}/restored") == written, "the restore left a summary behind"
+        assert best_tracks_under(f"{tmp}/restored") == tracks, "the restore left a track behind"
         back = Node(f"{tmp}/restored")
         back.start()
         try:
             assert book_levels(back.port, symbol) == book
+            assert series_answer(back.port, series) == before
             log = back.log_text()
             assert re.search(r"live books restored: 1 symbol\(s\), 1 from a summary", log), log[-2000:]
         finally:
