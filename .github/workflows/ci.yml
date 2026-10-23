@@ -811,9 +811,13 @@ jobs:
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
           OB_KEEP_FAILED_NODE_LOGS: ${{ github.workspace }}/failed-node-logs
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
+        # The limit of each test is three times pytest.ini's, as every wait in the suite is under a
+        # sanitizer (patience()). At 120 s a test was cut before its own tripled wait could end, and
+        # a replica that had not caught up read as a timeout rather than as the assertion saying how
+        # many rows it held (test_compaction.py, on PR #277).
         run: |
           set -o pipefail
-          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs \
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs --timeout=360 \
             --ignore=tests/integration/test_binance_live.py \
             --ignore=tests/integration/test_binance_failover_sync.py \
             --junitxml=tsan-integration-report.xml \
