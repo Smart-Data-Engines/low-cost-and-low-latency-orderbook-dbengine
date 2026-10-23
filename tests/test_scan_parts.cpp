@@ -189,6 +189,32 @@ RC_GTEST_PROP(ScanPartsProperty, BucketsOnThePoolAreTheBucketsOfOneThread, ()) {
     RC_ASSERT(s.reply(sql, &four) == alone);
 }
 
+TEST(ScanParts, ARowAnswerWhosePartsSpanManyChunksIsTheBytesOfOneThreads) {
+    // Three segments of 30 000 rows of every column: some 2 MB of text a part, so several of a row
+    // part's 256 KiB chunks each, and a LIMIT that ends in a later chunk of a later part is cut there
+    // (#248). The property above draws parts of at most 4 000 rows, which a chunk mostly holds whole.
+    Store s;
+    uint64_t t = kBase;
+    uint64_t seq = 0;
+    for (int g = 0; g < 3; ++g) {
+        std::vector<ob::SnapshotRow> rows;
+        for (int i = 0; i < 30000; ++i) {
+            t += 7'000'000;
+            rows.push_back(row(t, static_cast<uint8_t>(i % 2), static_cast<uint16_t>(i % 5),
+                               1'000'000 + (i * 37) % 100'000, static_cast<uint64_t>(i % 977 + 1),
+                               ++seq));
+        }
+        s.segment(rows);
+    }
+    ob::ScanPool two(2, nullptr);
+    for (const char* limit : {"", " LIMIT 1", " LIMIT 30000", " LIMIT 45001", " LIMIT 89999"}) {
+        const std::string sql = std::string("SELECT * FROM 'BK'.'EX'") + limit;
+        const std::string alone = s.reply(sql, nullptr);
+        ASSERT_NE(alone.compare(0, 3, "ERR"), 0) << sql << ": " << alone.substr(0, 80);
+        EXPECT_EQ(s.reply(sql, &two), alone) << sql;
+    }
+}
+
 TEST(ScanParts, ATieOnATimeAcrossTwoSegmentsGoesToTheOrderTheScanDeliversIn) {
     // Two segments sharing their boundary instant: FIRST of the later segment's rows at that time
     // must not replace the earlier one's, and LAST must take the later one's.

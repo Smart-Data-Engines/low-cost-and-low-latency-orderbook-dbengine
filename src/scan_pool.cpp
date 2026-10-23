@@ -7,11 +7,36 @@
 #include <pthread.h>
 #include <sched.h>
 
+#include <chrono>
 #include <cstring>
 
 #include <string>
+#include <utility>
 
 namespace ob {
+
+namespace {
+
+/// What `pace()` did on this thread since its last task ended, added to the pool's counts then.
+thread_local uint64_t t_entries = 0;
+thread_local uint64_t t_gave_up = 0;
+
+uint64_t steady_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+
+}  // namespace
+
+void ScanPool::pace() {
+    thread_local ScanPace pace;
+    const uint64_t now = steady_ns();
+    if (!pace.due(now)) return;
+    ::sched_yield();
+    ++t_entries;
+    if (pace.entered(now, steady_ns())) ++t_gave_up;
+}
 
 bool ScanPool::Task::take() {
     uint8_t queued = kQueued;
@@ -51,12 +76,12 @@ ScanPool::ScanPool(unsigned threads, MetricsRegistry* registry)
     threads_.reserve(threads);
     for (unsigned i = 0; i < threads; ++i) {
         threads_.emplace_back([this] {
-            // Below the client loops (#246): the pool reads on the CPU the loops leave, and gives it
-            // up between batches (`scan_parts()`). Neither half was enough alone, measured on the
-            // x86 host beside a writer: at the normal policy, at nice 19 and under SCHED_IDLE the
-            // writer's p99 was 0.4-1.3 ms, a loop woken onto a CPU a pool thread held waiting for
-            // the scheduler's tick; under SCHED_IDLE with the yield, 50-54 us beside the bucket
-            // query against 38-44 without a pool. Lowering a thread's own policy needs no privilege.
+            // Below the client loops (#246): the pool reads on the CPU the loops leave, and enters
+            // the kernel between the steps of its work (`pace()`, #248). Neither half was enough
+            // alone, measured on the x86 host beside a writer: at the normal policy, at nice 19 and
+            // under SCHED_IDLE the writer's p99 was 0.4-1.3 ms, a loop woken onto a CPU a pool
+            // thread held waiting for the scheduler's tick. Lowering a thread's own policy needs no
+            // privilege.
             sched_param idle{};
             idle.sched_priority = 0;
             if (const int err = ::pthread_setschedparam(::pthread_self(), SCHED_IDLE, &idle); err != 0) {
@@ -136,9 +161,13 @@ void ScanPool::stop() {
         queue_.clear();
     }
     OB_LOG_INFO("scan_pool", "scan pool stopped: %llu part(s) run on its threads, %llu by their "
-                             "queries; %zu queued and left to their queries",
+                             "queries; %zu queued and left to their queries; its threads entered "
+                             "the kernel %llu time(s) between steps, %llu of them giving their CPU "
+                             "to another thread",
                 static_cast<unsigned long long>(pooled_.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(by_queries_.load(std::memory_order_relaxed)), left);
+                static_cast<unsigned long long>(by_queries_.load(std::memory_order_relaxed)), left,
+                static_cast<unsigned long long>(entries_.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(gave_up_.load(std::memory_order_relaxed)));
 }
 
 void ScanPool::worker_loop() {
@@ -158,6 +187,8 @@ void ScanPool::worker_loop() {
                 pooled_.fetch_add(1, std::memory_order_relaxed);
                 if (registry_ != nullptr) registry_->increment_counter("ob_scan_parts_pooled_total");
                 task->run();
+                entries_.fetch_add(std::exchange(t_entries, 0), std::memory_order_relaxed);
+                gave_up_.fetch_add(std::exchange(t_gave_up, 0), std::memory_order_relaxed);
             }
             guard.ok();
         } catch (const std::exception& e) {

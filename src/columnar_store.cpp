@@ -7,7 +7,6 @@
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
-#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -2596,10 +2595,19 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         s.part = how.make_part();
         const BatchReader into = [&s, &stop](const RowBatch& b) -> BatchVerdict {
             if (stop.load(std::memory_order_relaxed)) return {true, 0};
-            // A pool thread gives its CPU up between batches, so a client loop woken onto it waits
-            // for one batch at most rather than for the scheduler's tick (`ScanPool`'s threads).
-            if (s.on_pool) ::sched_yield();
-            return s.part->take(b);
+            if (!s.on_pool) return s.part->take(b);
+            // On a pool thread a batch goes to the part a step at a time, with `pace()` between, so
+            // a client loop woken onto the thread's CPU waits about a microsecond rather than a
+            // batch, or the scheduler's tick on a kernel that preempts lazily (#248). The scan
+            // hands a reader no empty batch, so the part sees every batch.
+            RowBatch step = b;
+            const size_t n = b.rows.size();
+            for (size_t from = 0; from < n; from += ScanPool::kStepRows) {
+                ScanPool::pace();
+                step.rows = b.rows.subspan(from, std::min(ScanPool::kStepRows, n - from));
+                if (const BatchVerdict v = s.part->take(step); v.stop) return {true, from + v.at};
+            }
+            return {};
         };
         if (s.meta != nullptr) {
             read_segment_rows(*s.meta, columns, start_ns, end_ns, filter, into, ReadMode::kQuery,
