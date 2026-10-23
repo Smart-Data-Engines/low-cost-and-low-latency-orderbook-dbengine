@@ -448,14 +448,21 @@ meanwhile reads on its own loop. The pool's threads, `ob-scan-0` … `ob-scan-N-
 `SCHED_IDLE` and give their CPU up between batches, so a client loop woken onto one waits for a
 batch at most.
 
-**It is off under every profile**, and that is a measured choice (x86 test host, 4 vCPU, a 1.9 M-row
-store in ten segments, the same build with and without four threads). A query alone took 55-61% of
-the time - 80 one-minute buckets of all of it 3.3-3.7 ms against 6.1, all of it in one column
-14.4-15.3 ms against 25.7-26.2 - but **beside a writer it cost the writer 8-20% of its rate and its
-batch p99 went from about 40 µs to 48-205 µs** while the query ran, and four connections asking the
-bucket query at once answered 8-10% fewer of them. A node that takes writes should choose that
-rather than be given it; a node that mostly answers big queries - a replica kept for them - is where
-to turn it on, at one thread per CPU.
+**It is off under every profile**, and that is a measured choice: what the pool costs a writer on
+the same node depends on the host. Measured with a 1.9 M-row store, the same build with and without
+four threads:
+- **x86 test host** (4 cores, kernel 7.0 built to preempt lazily, at 1000 Hz): a query alone took
+  55-61% of the time - 80 one-minute buckets of all of it 3.3-3.7 ms against 6.1, all of it in one
+  column 14.4-15.3 ms against 25.7-26.2 - but **beside a writer it cost the writer 8-20% of its rate
+  and its batch p99 went from about 40 µs to 48-205 µs** while the query ran, and four connections
+  asking the bucket query at once answered 8-10% fewer of them.
+- **ARM test host** (4 Graviton cores, kernel 6.18 built `PREEMPT_NONE`, at 100 Hz): the queries took
+  34-45% of the time - 3.2-3.3 ms against 9.2-9.3, 12.2-13.0 against 28.8-30.2 - and the writer beside
+  them lost nothing measurable, with the buckets beside it answered twice as often.
+
+A node that takes writes should choose the pool after measuring it on its own host rather than be
+given it; a node that mostly answers big queries - a replica kept for them - is where to turn it on,
+at one thread per CPU.
 `ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on the pool
 and on the queries' loops, and `ob_scan_threads` is N.
 

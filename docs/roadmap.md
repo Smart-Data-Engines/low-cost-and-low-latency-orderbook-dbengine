@@ -2966,6 +2966,31 @@ load; every answer had one SHA-256 across the three:
 - **So the pool is off under every profile** (`--scan-threads 0`), and requirement 3.1 of the spec,
   which had `boost` set it to the machine, is changed. A node whose queries matter more than the
   writes beside them - a replica kept for reads - is where to turn it on.
+
+**The same on the m9g.xlarge** (4 Graviton cores, AL2023, kernel 6.18 built with `PREEMPT_NONE`
+and `HZ` 100; the x86 host's is 7.0, lazily preempting at `HZ` 1000; neither has SMT), four rounds
+alone and three under load, every answer one SHA-256 across the builds:
+
+| | stage 1 | no pool | four threads |
+|---|---|---|---|
+| 1 904 640 rows of one column, alone | 28.29-29.54 ms | 28.84-30.16 ms | 12.25-12.97 ms |
+| 80 one-minute buckets of them, alone | 9.26-9.37 ms | 9.15-9.28 ms | 3.19-3.28 ms |
+| 190 360 rows of three columns, alone | 6.60-6.65 ms | 6.93-6.97 ms | 3.85-3.94 ms |
+| 4 000 rows of three columns, alone | 0.152-0.153 ms | 0.158-0.159 ms | 0.158-0.161 ms |
+| four connections asking the buckets at once | 426.4-427.3 q/s | 430.6-432.1 q/s | 419.7-420.3 q/s |
+| a writer beside the buckets: levels/s, batch p99 | 4.64-4.76 M, 57.1-58.4 us | 4.66-4.80 M, 56.6-58.5 us | 4.62-4.93 M, 58.3-63.6 us |
+| the buckets answered beside it | 103.9-104.4 q/s | 104.7-104.9 q/s | 210.8-212.7 q/s |
+| a writer beside the 1.9 M rows | 4.39-4.63 M, 59.1-60.0 us | 4.63-4.77 M, 57.5-59.7 us | 4.64-4.92 M, 55.9-60.3 us |
+
+- **Here the pool costs the writer nothing measurable**, and makes the queries 1.8-2.9 times as fast:
+  the buckets beside the writer are answered twice as often. The 190 360 rows are divided too, the
+  load's merges having left eleven segments where the x86 host's left ten.
+- **What a pool costs a writer depends on the host**, then, and the default is the one that costs no
+  host anything. Turning it on is measuring on the host it is for.
+- **Stage 2's tree with no pool is a little slower on small row answers here:** 4% on the 4 000 rows,
+  6% on `LIMIT 1000` over all of it. Counted with `perf stat` under `eco`, it runs 0.4% more
+  user-space instructions on them, about three a row of three columns, and 2-5% more cycles; on the
+  1.9 M rows of one column the same of both. The x86 host showed 1% on the 4 000 rows.
 - **How the cost came down to that.** Measured under load first, the pool cost the writer most of
   its tail - a p99 of 0.5-1.2 ms and 2.98-4.60 M levels a second - and four connections 22% of their
   queries.

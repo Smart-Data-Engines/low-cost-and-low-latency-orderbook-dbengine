@@ -4482,7 +4482,9 @@ Learned the hard way. Check here before debugging.
      tick rather than stop the one running, whatever their policies. What brought the p99 to 50 us
      was the pool thread giving its CPU up after each batch (`sched_yield()`), so that a woken loop
      waits for a batch rather than a tick. A policy decides who runs next; when the running thread
-     stops is the kernel's preemption model's.
+     stops is the kernel's preemption model's. On the ARM host, whose kernel is built `PREEMPT_NONE`,
+     the same pool cost the writer nothing measurable: what a thread beside the loops costs them is
+     measured per host, not carried across.
 612. **A query that helps its own pool can slow it down.** #246's query thread read its own queued
      parts while it waited, from the far end of what was out, so as not to take the one the fold
      needed next. It held up the fold all the same, and with it the parts handed to the threads that
@@ -4493,10 +4495,10 @@ Learned the hard way. Check here before debugging.
      `FIRST` was the same price whichever segment it came from, and a merge taking `FIRST` from the
      later part answered the same bytes and survived (mutation run 5 of the multicore-scan
      evidence). Each segment's prices now start from an offset of its own.
-614. **A pool measured alone is half of what it costs.** #246's query was 1.6-1.8 times as fast on
-     four threads, and the same query cost a writer on the same node 8-20% of its levels a second and
-     four query connections 8-10% of their answers: where the connections' loops already use every
-     CPU, the pool's threads only compete with them. The spec had `boost` turn the pool on; measured
+614. **A pool measured alone is half of what it costs.** On the x86 host #246's query was 1.6-1.8
+     times as fast on four threads, and the same query cost a writer on the same node 8-20% of its
+     levels a second and four query connections 8-10% of their answers: where the connections' loops
+     already use every CPU, the pool's threads only compete with them. The spec had `boost` turn the pool on; measured
      beside other work, it is off under every profile and an operator's choice.
 
 ## Current state and open problems
@@ -4535,9 +4537,9 @@ warns about it.
 rows chosen from them - and the server formats a row answer from the columns (`RowAnswer`); a
 190 000-row answer and a bucket query take 1.46 and 1.93 times less on one core, with the same
 bytes (pitfalls 609, 610). **Stage 2**: with `--scan-threads N` a query of many rows over several
-segments reads them on N threads and folds the parts in order, the same bytes, 1.6-1.8 times as fast
-on four; it is off under every profile, because beside a writer on the same node it cost the writer
-8-20% of its rate (pitfalls 611-614).
+segments reads them on N threads and folds the parts in order, the same bytes, 1.6-2.9 times as fast
+on four; it is off under every profile, because on the x86 test host it cost a writer on the same
+node 8-20% of its rate, where on the ARM host it cost nothing measurable (pitfalls 611-614).
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)
