@@ -55,9 +55,12 @@ protected:
         fs::remove_all(base_, ec);
     }
 
-    std::unique_ptr<ob::WalArchiver> archiver() {
+    /// Linking where the archive is on the WAL's filesystem, as a node does - here it always is - or
+    /// copying, for the tests of the copy.
+    std::unique_ptr<ob::WalArchiver> archiver(bool link = true) {
         return std::make_unique<ob::WalArchiver>(
-            wal_.string(), archive_.string(), kLineage, [this] { return bound_.load(); }, &registry_);
+            wal_.string(), archive_.string(), kLineage, [this] { return bound_.load(); }, &registry_,
+            link);
     }
 
     /// Bytes no other index has. 3001 by default, so a file is not a whole number of anything.
@@ -107,7 +110,7 @@ TEST_F(WalArchiveTest, CopiesEveryClosedFileByteForByteAndNoOther) {
     close_files(1, 4);
     // Larger than the archive's read block, so a copy that read one block would be short.
     write(in_wal(2), bytes_of(2, (2u << 20) + (1u << 19) + 7));
-    auto a = archiver();
+    auto a = archiver(/*link=*/false);
     EXPECT_EQ(a->archived_before(), 0u) << "before a pass, retention may remove nothing";
 
     const auto pass = a->archive_closed(kLineage, 4);
@@ -123,6 +126,7 @@ TEST_F(WalArchiveTest, CopiesEveryClosedFileByteForByteAndNoOther) {
         total += fs::file_size(in_wal(i));
     }
     EXPECT_EQ(pass.bytes, total);
+    EXPECT_NE(inode(in_archive(1)), inode(in_wal(1))) << "a copy, not a second name";
     EXPECT_FALSE(fs::exists(in_archive(4))) << "file 4 is the bound: not closed";
     EXPECT_EQ(a->archived_before(), 4u);
     for (const auto& entry : fs::directory_iterator(archive_ / std::to_string(kLineage))) {
@@ -136,6 +140,25 @@ TEST_F(WalArchiveTest, CopiesEveryClosedFileByteForByteAndNoOther) {
     EXPECT_EQ(registry_.counter_value("ob_wal_archived_bytes_total"), total);
     EXPECT_EQ(registry_.counter_value("ob_wal_archive_failures_total"), 0u);
     EXPECT_EQ(registry_.unknown_metric_writes(), 0u);
+}
+
+TEST_F(WalArchiveTest, OnTheWalsFilesystemAFileIsLinkedAndOutlivesItsWalName) {
+    close_files(1, 3);
+    auto a = archiver();
+    const auto pass = a->archive_closed(kLineage, 4);
+    EXPECT_EQ(pass.archived, 3u);
+    EXPECT_TRUE(pass.failure.empty()) << pass.failure;
+    const std::string dir = (archive_ / std::to_string(kLineage)).string();
+    for (uint32_t i = 1; i <= 3; ++i) {
+        EXPECT_EQ(inode(in_archive(i)), inode(in_wal(i))) << "file " << i << " was copied, not linked";
+        EXPECT_EQ(ob::verify_archived_file(dir, i), "") << i;
+    }
+    EXPECT_EQ(registry_.counter_value("ob_wal_archived_bytes_total"), 3u * 3001u);
+    // Retention removes the WAL's name; the archive's keeps the bytes.
+    const std::string one = read(in_wal(1));
+    fs::remove(in_wal(1));
+    EXPECT_EQ(read(in_archive(1)), one);
+    EXPECT_EQ(ob::verify_archived_file(dir, 1), "");
 }
 
 TEST_F(WalArchiveTest, AFileThereUnchangedIsLeftAloneAcrossPassesAndRestarts) {
@@ -262,7 +285,7 @@ TEST_F(WalArchiveTest, ACopyThatFailsStopsThePassAtItsFile) {
     // The copy of file 2 goes through `<name>.tmp`, and a directory of that name cannot be opened
     // for writing.
     fs::create_directories(in_archive(2).string() + ".tmp");
-    auto a = archiver();
+    auto a = archiver(/*link=*/false);
 
     const auto pass = a->archive_closed(kLineage, 4);
     EXPECT_EQ(pass.archived, 1u);

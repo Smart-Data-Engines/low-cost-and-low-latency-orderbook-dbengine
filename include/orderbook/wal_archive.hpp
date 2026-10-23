@@ -9,10 +9,13 @@
 // retention removes nothing the archive does not hold. `ob_restore --until` then replays the archive
 // from a backup's cut to a chosen moment.
 //
-// The copy is checked, not trusted: the source is synced first - a rotation leaves its file for the
-// next flush tick to sync, and a copy of bytes a power cut could still take from the source would
-// differ from it afterwards - its CRC32C is folded as it is read, the copy is synced and renamed into
-// place, read back, and refused unless its CRC is the source's. A file that is
+// On the WAL's filesystem a file is linked into the archive - a closed WAL file is never written
+// again, so a second name holds its bytes as a copy would, without the I/O - and on another it is
+// copied, which is what survives the loss of the WAL's device. Either way the source is synced first:
+// a rotation leaves its file for the next flush tick to sync, and an archive of bytes a power cut
+// could still take from the source would differ from it afterwards. A copy is checked, not trusted:
+// its CRC32C is folded as the source is read, it is synced and renamed into place, read back, and
+// refused unless its CRC is the source's. A file that is
 // already in the archive is compared the same way and left alone when it matches. One that does
 // not match is never overwritten. That is someone else's file, or this lineage's file damaged, and
 // archiving stops there, with retention, until an operator looks.
@@ -65,8 +68,10 @@ public:
     /// `wal_dir` is the WAL's directory, `root` the archive's, `identity` the lineage the files are
     /// of. `current_file` says which file the writer is in - the files below it are closed - a
     /// function since every rotation changes it. `registry` may be null.
+    /// `link_when_possible` false copies even onto the WAL's filesystem: for the tests of the copy.
     WalArchiver(std::string wal_dir, std::string root, uint64_t identity,
-                std::function<uint32_t()> current_file, MetricsRegistry* registry);
+                std::function<uint32_t()> current_file, MetricsRegistry* registry,
+                bool link_when_possible = true);
     ~WalArchiver();
 
     WalArchiver(const WalArchiver&)            = delete;
@@ -104,6 +109,7 @@ private:
     std::atomic<uint64_t> identity_;
     const std::function<uint32_t()> current_file_;
     MetricsRegistry* const registry_;
+    const bool link_when_possible_;
 
     std::atomic<uint32_t> archived_before_{0};
     std::atomic<bool> refused_{false};

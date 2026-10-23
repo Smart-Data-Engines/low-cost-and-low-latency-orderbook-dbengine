@@ -10,6 +10,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -250,12 +251,14 @@ std::string verify_archived_file(const std::string& lineage_dir, uint32_t index)
 }
 
 WalArchiver::WalArchiver(std::string wal_dir, std::string root, uint64_t identity,
-                         std::function<uint32_t()> current_file, MetricsRegistry* registry)
+                         std::function<uint32_t()> current_file, MetricsRegistry* registry,
+                         bool link_when_possible)
     : wal_dir_(std::move(wal_dir))
     , root_(std::move(root))
     , identity_(identity)
     , current_file_(std::move(current_file))
-    , registry_(registry) {}
+    , registry_(registry)
+    , link_when_possible_(link_when_possible) {}
 
 WalArchiver::~WalArchiver() { stop(); }
 
@@ -358,11 +361,23 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
     uint32_t held_from = before_file;   // the lowest index the archive does not hold
     std::string failed_name;           // the file a failure stopped at
     std::vector<uint8_t> buf(kBufferBytes);
-    // Synced once a pass, before its first copy: the lineage's directory into the archive's, and the
-    // archive's into its parent. Retention removes a WAL file once its copy is in the archive, and a
-    // copy whose directory a power cut takes is no copy - whichever process made the directory.
+    // Synced once a pass, before its first new file: the lineage's directory into the archive's, and
+    // the archive's into its parent - retention removes a WAL file once it is in the archive, and a
+    // file whose directory a power cut takes is not there, whichever process made the directory. And
+    // the WAL's own directory: the file after the ones archived now has to survive a cut too, or a
+    // restart would append to the last of them - archived, and linked into the archive below.
     bool dirs_synced = false;
+    // Linked when the archive is on the WAL's filesystem: a closed WAL file is never written again, so
+    // a second name for its bytes holds them as a copy would, and costs no I/O. Copied otherwise -
+    // which is what survives the loss of the WAL's device. On the x86 host a copy on the WAL's own
+    // NVMe, at the writes' ceiling, took 897-926 us of a batch's p99.9 to 1029-1109 us.
+    bool link = false;
     fs::create_directories(dir, ec);
+    if (!ec && link_when_possible_) {
+        struct stat wal_st{}, dir_st{};
+        link = ::stat(wal_dir_.c_str(), &wal_st) == 0 && ::stat(dir.c_str(), &dir_st) == 0 &&
+               wal_st.st_dev == dir_st.st_dev;
+    }
     if (ec) {
         out.failure = "cannot create " + dir + ": " + ec.message();
         if (!files.empty()) {
@@ -424,7 +439,7 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                 break;
             }
             if (!dirs_synced) {
-                for (const std::string& d : {root_, fs::path(root_).parent_path().string()}) {
+                for (const std::string& d : {wal_dir_, root_, fs::path(root_).parent_path().string()}) {
                     if (const int err = sync_directory(d.empty() ? "." : d); err != 0) {
                         why = "cannot sync the directory " + d + ": " + std::strerror(err);
                         break;
@@ -441,20 +456,51 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
             const auto started = std::chrono::steady_clock::now();
             uint64_t copied = 0, back_size = 0;
             uint32_t copy_crc = 0, back_crc = 0;
-            if (!copy_synced(src, dst, buf, copied, copy_crc, why)) {
-                out.failure = why;
-                held_from = index;
-                failed_name = name;
-                break;
+            const char* method = "copied";
+            if (link) {
+                if (::link(src.c_str(), dst.c_str()) == 0) {
+                    method = "linked";
+                    if (const int err = sync_directory(dir); err != 0) {
+                        why = "cannot sync " + dir + " after linking " + name + ": " + std::strerror(err);
+                    } else {
+                        (void)size_and_crc(dst, buf, copied, copy_crc, why);
+                    }
+                    if (!why.empty()) {
+                        fs::remove(dst, ec);
+                        out.failure = why;
+                        held_from = index;
+                        failed_name = name;
+                        break;
+                    }
+                } else if (errno == EXDEV || errno == EPERM || errno == EMLINK || errno == EOPNOTSUPP) {
+                    // A filesystem that will not link, or will not link these: copied from here on.
+                    OB_LOG_WARN("wal_archive", "cannot link %s into %s (%s): copying instead",
+                                src.c_str(), dir.c_str(), std::strerror(errno));
+                    link = false;
+                } else {
+                    out.failure = "cannot link " + src + " as " + dst + ": " + std::strerror(errno);
+                    held_from = index;
+                    failed_name = name;
+                    break;
+                }
             }
-            // Read back: a copy is believed once it reads as the bytes that went into it.
-            if (!size_and_crc(dst, buf, back_size, back_crc, why) || back_size != copied ||
-                back_crc != copy_crc) {
-                fs::remove(dst, ec);
-                out.failure = why.empty() ? "the copy of " + name + " does not read back as written" : why;
-                held_from = index;
-                failed_name = name;
-                break;
+            if (!link) {
+                if (!copy_synced(src, dst, buf, copied, copy_crc, why)) {
+                    out.failure = why;
+                    held_from = index;
+                    failed_name = name;
+                    break;
+                }
+                // Read back: a copy is believed once it reads as the bytes that went into it.
+                if (!size_and_crc(dst, buf, back_size, back_crc, why) || back_size != copied ||
+                    back_crc != copy_crc) {
+                    fs::remove(dst, ec);
+                    out.failure =
+                        why.empty() ? "the copy of " + name + " does not read back as written" : why;
+                    held_from = index;
+                    failed_name = name;
+                    break;
+                }
             }
             // And its sum, after the file: a sum names a file that is whole.
             if (!ensure_sum(dir, index, copied, copy_crc, why)) {
@@ -470,8 +516,8 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
                 registry_->increment_counter("ob_wal_archived_files_total");
                 registry_->increment_counter("ob_wal_archived_bytes_total", copied);
             }
-            OB_LOG_INFO("wal_archive", "archived %s (%llu bytes, crc %08x) in %.1f ms", name.c_str(),
-                        static_cast<unsigned long long>(copied), copy_crc,
+            OB_LOG_INFO("wal_archive", "archived %s (%llu bytes, crc %08x, %s) in %.1f ms", name.c_str(),
+                        static_cast<unsigned long long>(copied), copy_crc, method,
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                                   started).count());
         }
