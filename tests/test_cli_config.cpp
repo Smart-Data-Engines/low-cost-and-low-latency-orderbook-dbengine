@@ -465,6 +465,21 @@ TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
                         "this machine; no scan pool, as one usable CPU leaves none to read on");
 }
 
+TEST(BoostRule, TheProfileSetsTheScanPoolUnlessTheOperatorDoes) {
+    // Applied as the loops are: what the operator gave wins, and what the profile set is the
+    // profile's in --print-config.
+    const auto silent = resolve({});
+    EXPECT_EQ(silent.config.scan_threads, ob::choose_boost(silent.machine).scan_threads);
+    EXPECT_EQ(silent.origin.at("scan-threads"), ob::Origin::Profile);
+    const auto given = resolve({"--scan-threads", "2"});
+    EXPECT_EQ(given.config.scan_threads, 2u);
+    EXPECT_EQ(given.origin.at("scan-threads"), ob::Origin::CommandLine);
+    EXPECT_NE(given.profile_choice.find("(scan-threads set by the operator)"), std::string::npos)
+        << given.profile_choice;
+    const auto eco = resolve({"--profile", "eco"});
+    EXPECT_EQ(eco.config.scan_threads, 0u);
+}
+
 TEST(BoostRule, AScanPoolOfOneThreadFewerThanTheUsableCpus) {
     // The loop a query runs on reads its own segments too (#246, stage 2), so a query alone on the
     // node reads on every usable CPU; on one there is nothing for a pool to read on.

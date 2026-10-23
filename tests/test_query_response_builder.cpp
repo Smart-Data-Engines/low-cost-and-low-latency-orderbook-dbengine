@@ -140,6 +140,40 @@ RC_GTEST_PROP(QueryResponseBuilderProperty, RowsFromBatchesAreTheBytesOfTheSameR
     RC_ASSERT(from_batches.finish() == built(results, columns));
 }
 
+// #246, stage 2: a part of an answer formats at most its LIMIT of rows - no part of an answer of N
+// rows needs more - and stops there, and the first n of its rows copied onto a reply are the bytes
+// add_rows() writes for them.
+TEST(QueryResponseBuilder, APartTakesNoMoreRowsThanItsLimitAndGivesUpItsFirstOnesAsTheyWereAdded) {
+    std::vector<uint64_t> ts(3000), qty(3000);
+    std::vector<int64_t> price(3000), seq(3000);
+    std::vector<uint32_t> cnt(3000);
+    std::vector<uint8_t> side(3000);
+    std::vector<uint16_t> level(3000);
+    std::vector<uint32_t> all(3000);
+    for (uint32_t i = 0; i < 3000; ++i) {
+        ts[i] = 1'790'000'000'000'000'000ULL + i;
+        price[i] = 1000 + i;
+        qty[i] = i % 17;
+        all[i] = i;
+    }
+    ob::QueryShape shape;
+    shape.columns = {ob::QueryColumn::TimestampNs, ob::QueryColumn::Price, ob::QueryColumn::Quantity};
+    ob::QueryResponseBuilder parts(shape);
+    auto part = parts.part(10);
+    const ob::RowBatch batch{ts, price, qty, cnt, side, level, seq, std::span<const uint32_t>(all)};
+    const ob::BatchVerdict verdict = part->take(batch);
+    EXPECT_EQ(part->rows(), 10u);
+    EXPECT_TRUE(verdict.stop);
+    EXPECT_EQ(verdict.at, 9u);
+    parts.add_part(*part, 7);
+
+    ob::QueryResponseBuilder direct(shape);
+    ob::RowBatch seven = batch;
+    seven.rows = seven.rows.first(7);
+    direct.add_rows(seven);
+    EXPECT_EQ(parts.finish(), direct.finish());
+}
+
 TEST(QueryResponseBuilder, NoRowIsTheHeaderAndTheTerminator) {
     for (const auto& columns : std::vector<std::vector<ob::QueryColumn>>{
              ob::all_query_columns(), {ob::QueryColumn::Price}, {}}) {

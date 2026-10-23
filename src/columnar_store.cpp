@@ -2515,7 +2515,7 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         size_t by_levels_before{0};
         std::unique_ptr<ScanPart> part;
         uint64_t filtered{0};
-        bool stopped{false};
+        bool stopped{false};   // the part's own stop, which ends its candidate and nothing else
         bool on_pool{false};
         std::shared_ptr<ScanPool::Task> task;
     };
@@ -2619,10 +2619,12 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
             }
             if (s.meta != nullptr) ++cost.segments_read;
             cost.rows_filtered += s.filtered;
+            // Whether the scan goes on is the fold's to say: a part that stops ends its own
+            // candidate - at the rows its answer can use, or at a refusal its fold then makes.
             const bool more = how.fold(*s.part);
             folded_rows += s.part->rows();
             s.part.reset();   // its memory, now
-            if (!more || s.stopped) {
+            if (!more) {
                 ended = true;
                 break;
             }
