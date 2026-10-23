@@ -318,18 +318,24 @@ bool backup_path_is_contained(std::string_view rel) {
     return true;
 }
 
-std::string backup_dir_problem(const std::string& backup_dir, const std::string& data_dir,
-                               const std::string& wal_dir) {
-    if (backup_dir.empty()) return "--backup-dir is empty";
+namespace {
+
+/// Why `dir`, given as `--<flag>`, cannot be an operator's directory beside the node's: created when
+/// missing, a writable directory, and neither the data nor the WAL directory, inside either or
+/// holding either. `inside` says what goes wrong when it is inside one of them.
+std::string operator_dir_problem(const char* flag, const std::string& dir, const std::string& data_dir,
+                                 const std::string& wal_dir, const char* inside) {
+    const std::string name = std::string("--") + flag;
+    if (dir.empty()) return name + " is empty";
     std::error_code ec;
-    fs::create_directories(backup_dir, ec);
-    if (ec) return "cannot create " + backup_dir + ": " + ec.message();
-    if (!fs::is_directory(backup_dir, ec)) return backup_dir + " is not a directory";
-    if (::access(backup_dir.c_str(), W_OK | X_OK) != 0) {
-        return "cannot write to " + backup_dir + ": " + errno_text(errno);
+    fs::create_directories(dir, ec);
+    if (ec) return "cannot create " + dir + ": " + ec.message();
+    if (!fs::is_directory(dir, ec)) return dir + " is not a directory";
+    if (::access(dir.c_str(), W_OK | X_OK) != 0) {
+        return "cannot write to " + dir + ": " + errno_text(errno);
     }
-    const fs::path b = fs::weakly_canonical(backup_dir, ec);
-    if (ec) return "cannot resolve " + backup_dir + ": " + ec.message();
+    const fs::path b = fs::weakly_canonical(dir, ec);
+    if (ec) return "cannot resolve " + dir + ": " + ec.message();
     struct Named { const char* what; std::string path; };
     for (const Named& other : {Named{"data directory", data_dir}, Named{"WAL directory", wal_dir}}) {
         if (other.path.empty()) continue;
@@ -337,16 +343,31 @@ std::string backup_dir_problem(const std::string& backup_dir, const std::string&
         if (ec) return std::string("cannot resolve the ") + other.what + " " + other.path + ": " +
                        ec.message();
         if (within(b, o)) {
-            return "--backup-dir " + b.string() + " is in the " + other.what + " " + o.string() +
-                   ": the engine would read the backups' segments as its own, and a snapshot "
-                   "install would remove them";
+            return name + " " + b.string() + " is in the " + other.what + " " + o.string() + ": " +
+                   inside;
         }
         if (within(o, b)) {
-            return std::string("the ") + other.what + " " + o.string() + " is in --backup-dir " +
+            return std::string("the ") + other.what + " " + o.string() + " is in " + name + " " +
                    b.string();
         }
     }
     return {};
+}
+
+}  // namespace
+
+std::string backup_dir_problem(const std::string& backup_dir, const std::string& data_dir,
+                               const std::string& wal_dir) {
+    return operator_dir_problem("backup-dir", backup_dir, data_dir, wal_dir,
+                                "the engine would read the backups' segments as its own, and a "
+                                "snapshot install would remove them");
+}
+
+std::string wal_archive_dir_problem(const std::string& archive_dir, const std::string& data_dir,
+                                    const std::string& wal_dir) {
+    return operator_dir_problem("wal-archive-dir", archive_dir, data_dir, wal_dir,
+                                "a replica's bootstrap would remove it, and a new WAL lineage the "
+                                "files it holds");
 }
 
 // ── The description ──────────────────────────────────────────────────────────

@@ -41,6 +41,8 @@
 
 namespace ob {
 
+class WalArchiver;
+
 /// The data directory's note that its numbering from before per-origin numbers is closed (#187).
 /// What keeps a later start from closing it again: a node that joined after the close numbers a symbol
 /// from 1, and closing again would take its records below kClosedNumberingBase for ones this node
@@ -310,6 +312,16 @@ public:
     /// `--decoded-cache-mb`): 0 holds none, and every query decodes what it reads. Off unless set -
     /// the server sets it from its configuration, 256 MiB by default.
     void set_decoded_columns_budget(size_t bytes);
+
+    /// The WAL archive of point-in-time recovery (#34, `--wal-archive-dir`; spec
+    /// `point-in-time-recovery`). Before open(): every WAL file this node closes is copied into
+    /// `<dir>/<WAL identity>/`, retention removes no file the archive does not hold, and a file that
+    /// has held a record for `interval_s` seconds is rotated so that it gets there. An empty `dir` is
+    /// no archive, and the engine as before. The caller keeps the archive outside the data and WAL
+    /// directories (`wal_archive_dir_problem()`).
+    void set_wal_archive(std::string dir, uint32_t interval_s);
+    /// The archiver, null without an archive.
+    const WalArchiver* wal_archiver() const { return wal_archiver_.get(); }
 
     /// How many rows of a symbol a seal takes in before it writes a summary of its book (#233,
     /// `book_summary.hpp`): the most rows a book read applies after one. 0 writes none, and every
@@ -1478,6 +1490,21 @@ private:
     /// Atomic since #197: a snapshot install begins a new lineage, and the accessor reads it without
     /// a lock. Written only under `flush_mtx_` and `mtx_` after `open()`.
     std::atomic<uint64_t> wal_identity_{0};
+
+    /// The WAL archive (#34): its directory, empty for none, and the seconds after which a WAL file
+    /// holding a record is rotated so that the archive gets it. Set before `open()`.
+    std::string wal_archive_dir_;
+    uint32_t    wal_archive_interval_s_{60};
+    /// Made at the first `open()` with an archive, its thread run from `open()` to `close()`. The
+    /// flush tick's retention keeps every WAL file from `archived_before()` on.
+    std::unique_ptr<WalArchiver> wal_archiver_;
+    /// The file the flush tick last saw the writer in, and when it first saw a record in it: the
+    /// clock of the rotation for the archive. Flush thread, under `mtx_`.
+    uint32_t archive_seen_file_{std::numeric_limits<uint32_t>::max()};
+    std::chrono::steady_clock::time_point archive_record_seen_at_{};
+    /// Rotate the WAL when its file has held a record for the archive's interval (#34, 1.3), and
+    /// wake the archiver whenever a file was closed since the last tick. Caller holds `mtx_`.
+    void rotate_for_the_archive_locked();
 
     /// What a start takes from the whole WAL besides its last checkpoint, gathered in the pass that
     /// finds it (#174). The vector, the held numbers and the epoch were a pass each, and a pass over

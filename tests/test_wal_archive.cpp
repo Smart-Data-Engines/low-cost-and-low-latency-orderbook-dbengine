@@ -11,16 +11,22 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "orderbook/data_model.hpp"
+#include "orderbook/engine.hpp"
 #include "orderbook/metrics.hpp"
+#include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
 #include "orderbook/wal_archive.hpp"
 
@@ -301,6 +307,174 @@ TEST(WalFileNames, TheNameRoundTripsAndNearMissesAreNotWalFiles) {
         EXPECT_FALSE(ob::parse_wal_file_basename(name, back)) << name;
         EXPECT_EQ(back, 7u) << name;
     }
+}
+
+// ── In the engine ─────────────────────────────────────────────────────────────
+
+/// An hour: the flush loop does not tick by itself in a test, which runs the ticks it needs.
+constexpr uint64_t kNoAutoFlush = 3'600'000'000'000ULL;
+/// A few dozen records a file, so a test crosses files without writing megabytes.
+constexpr size_t kSmallFiles = 4096;
+
+class WalArchiveEngineTest : public WalArchiveTest {
+protected:
+    std::unique_ptr<ob::Engine> engine_at(const fs::path& data, size_t rotate_bytes) {
+        return std::make_unique<ob::Engine>(data.string(), kNoAutoFlush, ob::FsyncPolicy::INTERVAL,
+                                            ob::ReplicationConfig{}, ob::ReplicationClientConfig{},
+                                            ob::FailoverConfig{}, ob::TTLConfig{},
+                                            ob::MultiMasterConfig{}, rotate_bytes);
+    }
+
+    static void write_rows(ob::Engine& engine, int from, int count) {
+        for (int i = from; i < from + count; ++i) {
+            ob::DeltaUpdate delta{};
+            std::strncpy(delta.symbol, "PITR", sizeof(delta.symbol) - 1);
+            std::strncpy(delta.exchange, "EX", sizeof(delta.exchange) - 1);
+            delta.timestamp_ns = 1'000'000'000ULL + static_cast<uint64_t>(i) * 1'000'000ULL;
+            delta.side = ob::SIDE_BID;
+            delta.n_levels = 1;
+            ob::Level level{};
+            level.price = 10'000 + i;
+            level.qty = 1;
+            level.cnt = 1;
+            level._pad = 0;
+            ASSERT_EQ(engine.apply_delta(delta, &level), ob::OB_OK);
+        }
+    }
+
+    static std::vector<uint32_t> wal_files(const fs::path& dir) {
+        std::vector<uint32_t> out;
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            uint32_t index = 0;
+            if (ob::parse_wal_file_basename(entry.path().filename().string(), index)) out.push_back(index);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    /// Ticks until `done()` or ten seconds, whichever is first.
+    template <typename Done>
+    static bool tick_until(ob::Engine& engine, Done done) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!done()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            engine.flush_tick_for_test();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return true;
+    }
+
+    fs::path data() const { return base_ / "data"; }
+};
+
+TEST_F(WalArchiveEngineTest, RetentionKeepsEveryFileTheArchiveDoesNotHold) {
+    // Control: without an archive the same writes and ticks remove the closed files - so what the
+    // archive keeps below is retention held back, not retention that had nothing to do.
+    size_t control_left = 0;
+    uint32_t control_current = 0;
+    {
+        auto control = engine_at(base_ / "control", kSmallFiles);
+        control->open();
+        write_rows(*control, 0, 400);
+        control->flush_incremental();
+        for (int i = 0; i < 3; ++i) control->flush_tick_for_test();
+        control_left = wal_files(base_ / "control").size();
+        control_current = control->get_wal_position().first;
+        control->close();
+    }
+    ASSERT_GT(control_current, 3u);
+    ASSERT_LT(control_left, control_current) << "retention removed nothing even without an archive";
+
+    write(archive_, "a file where the archive's directory should be");
+    auto engine = engine_at(data(), kSmallFiles);
+    engine->set_wal_archive(archive_.string(), 3600);
+    engine->open();
+    write_rows(*engine, 0, 400);
+    engine->flush_incremental();
+    for (int i = 0; i < 3; ++i) engine->flush_tick_for_test();
+    const uint32_t current = engine->get_wal_position().first;
+    const auto kept = wal_files(data());
+    ASSERT_FALSE(kept.empty());
+    EXPECT_EQ(kept.front(), 0u) << "retention removed a file the archive does not hold";
+    EXPECT_EQ(kept.size(), current + 1u);
+    EXPECT_EQ(engine->wal_archiver()->archived_before(), 0u);
+    // Said by the archiver's own pass, which the tick only wakes.
+    EXPECT_TRUE(tick_until(*engine, [&] {
+        return engine->registry().gauge_value("ob_wal_archive_pending_files") ==
+               static_cast<int64_t>(engine->get_wal_position().first);
+    })) << engine->registry().gauge_value("ob_wal_archive_pending_files");
+    EXPECT_GT(engine->registry().counter_value("ob_wal_archive_failures_total"), 0u);
+
+    // The archive can be made again: it takes every closed file, and retention follows it.
+    fs::remove(archive_);
+    ASSERT_TRUE(tick_until(*engine, [&] { return engine->wal_archiver()->archived_before() >= current; }));
+    engine->flush_tick_for_test();
+    const auto left = wal_files(data());
+    EXPECT_LT(left.size(), kept.size()) << "retention did not follow the archive";
+    for (uint32_t i = 0; i < left.front(); ++i) {
+        EXPECT_TRUE(fs::exists(in_archive(i, engine->wal_identity()))) << "file " << i << " removed unarchived";
+    }
+    engine->close();
+}
+
+TEST_F(WalArchiveEngineTest, AFileHoldingARecordIsRotatedForTheArchiveAfterTheInterval) {
+    auto engine = engine_at(data(), 512ULL << 20);   // no rotation by size in this test
+    engine->set_wal_archive(archive_.string(), 1);
+    engine->open();
+    const uint32_t first = engine->get_wal_position().first;
+    write_rows(*engine, 0, 10);
+    engine->flush_incremental();
+    const auto wrote = std::chrono::steady_clock::now();
+
+    ASSERT_TRUE(tick_until(*engine, [&] { return engine->get_wal_position().first != first; }));
+    const auto waited = std::chrono::steady_clock::now() - wrote;
+    EXPECT_GE(waited, std::chrono::milliseconds(900)) << "rotated before the interval";
+    ASSERT_TRUE(tick_until(*engine, [&] { return engine->wal_archiver()->archived_before() > first; }));
+    EXPECT_EQ(read(in_archive(first, engine->wal_identity())), read(data() / ob::wal_file_basename(first)));
+
+    // A file nothing was written into is not rotated: an idle node keeps one file.
+    const uint32_t now_in = engine->get_wal_position().first;
+    const auto idle_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < idle_until) {
+        engine->flush_tick_for_test();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(engine->get_wal_position().first, now_in);
+    engine->close();
+}
+
+TEST_F(WalArchiveEngineTest, ANewLineageArchivesTheOldOnesFilesBeforeRemovingThem) {
+    auto engine = engine_at(data(), kSmallFiles);
+    engine->set_wal_archive(archive_.string(), 3600);
+    engine->open();
+    const uint64_t old_identity = engine->wal_identity();
+    write_rows(*engine, 0, 300);
+    const uint32_t last_old = engine->get_wal_position().first;
+    ASSERT_GT(last_old, 2u);
+
+    engine->discard_local_data_for_resync();
+    const uint64_t new_identity = engine->wal_identity();
+    ASSERT_NE(new_identity, old_identity);
+    for (uint32_t i = 0; i <= last_old; ++i) {
+        EXPECT_FALSE(fs::exists(data() / ob::wal_file_basename(i))) << i;
+        EXPECT_TRUE(fs::exists(in_archive(i, old_identity))) << "file " << i << " removed unarchived";
+    }
+    // Every record of the old lineage replays from the archive, the last file's included.
+    uint64_t deltas = 0;
+    ob::WALReplayer old_lineage((archive_ / std::to_string(old_identity)).string());
+    old_lineage.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_DELTA) ++deltas;
+    });
+    EXPECT_EQ(deltas, 300u);
+    EXPECT_EQ(engine->wal_archiver()->lineage(), new_identity);
+
+    // The new lineage's files go to its own directory.
+    write_rows(*engine, 300, 100);
+    const uint32_t current = engine->get_wal_position().first;
+    ASSERT_TRUE(tick_until(*engine, [&] { return engine->wal_archiver()->archived_before() >= current; }));
+    EXPECT_TRUE(fs::exists(in_archive(last_old + 1, new_identity)));
+    EXPECT_FALSE(fs::exists(in_archive(last_old + 1, old_identity)));
+    engine->close();
 }
 
 }  // namespace

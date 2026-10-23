@@ -9,8 +9,10 @@
 // retention removes nothing the archive does not hold. `ob_restore --until` then replays the archive
 // from a backup's cut to a chosen moment.
 //
-// The copy is checked, not trusted: the source's CRC32C is folded as it is read, the copy is synced
-// and renamed into place, read back, and refused unless its CRC is the source's. A file that is
+// The copy is checked, not trusted: the source is synced first - a rotation leaves its file for the
+// next flush tick to sync, and a copy of bytes a power cut could still take from the source would
+// differ from it afterwards - its CRC32C is folded as it is read, the copy is synced and renamed into
+// place, read back, and refused unless its CRC is the source's. A file that is
 // already in the archive is compared the same way and left alone when it matches. One that does
 // not match is never overwritten. That is someone else's file, or this lineage's file damaged, and
 // archiving stops there, with retention, until an operator looks.
@@ -45,11 +47,8 @@ public:
     };
 
     /// `wal_dir` is the WAL's directory, `root` the archive's, `identity` the lineage the files are
-    /// of. `current_file` gives the index below which every file is closed **and synced**, a
-    /// function since every rotation and every sync moves it. Not the writer's file: a rotation
-    /// leaves its file for the next flush tick to sync, and a copy taken before that can hold records
-    /// a power cut then takes from the source - after which the two differ and archiving stops at a
-    /// file nobody damaged. `registry` may be null.
+    /// of. `current_file` says which file the writer is in - the files below it are closed - a
+    /// function since every rotation changes it. `registry` may be null.
     WalArchiver(std::string wal_dir, std::string root, uint64_t identity,
                 std::function<uint32_t()> current_file, MetricsRegistry* registry);
     ~WalArchiver();

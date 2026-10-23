@@ -1440,6 +1440,8 @@ const std::vector<std::string>& known_flags() {
         "ttl-scan-interval-seconds",
         "unix-socket",
         "unix-socket-mode",
+        "wal-archive-dir",
+        "wal-archive-interval-s",
         "wal-dir",
         "wal-rotate-bytes",
         "write-admission",
@@ -1552,6 +1554,12 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
                                    "on this host; not encrypted, its file's mode decides who may "
                                    "connect (#52)"}},
         {"unix-socket-mode", {"<OCTAL>", "The mode of --unix-socket's file (default: 0660)"}},
+        {"wal-archive-dir", {"<DIR>", "Where every WAL file this node closes is copied, for a restore "
+                                      "to a moment after the last backup (ob_restore --until); "
+                                      "retention removes none it does not hold. Not the data or the "
+                                      "WAL directory, nor inside either (#34)"}},
+        {"wal-archive-interval-s", {"<N>", "Seconds after which a WAL file holding a record is rotated "
+                                           "so that the archive gets it (default: 60)"}},
         {"wal-dir", {"<DIR>", "Where the WAL files live (default: the data directory). Give the WAL "
                               "a filesystem of its own when the data directory holds thousands of "
                               "instruments: on ext4 a WAL append waits for the journal, which "
@@ -2085,6 +2093,10 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.wal_dir = std::string{cursor.value()};
         } else if (arg == "--backup-dir") {
             config.backup_dir = std::string{cursor.value()};
+        } else if (arg == "--wal-archive-dir") {
+            config.wal_archive_dir = std::string{cursor.value()};
+        } else if (arg == "--wal-archive-interval-s") {
+            config.wal_archive_interval_s = cursor.value_as<uint32_t>();
         } else {
             // Previously ignored in silence, which meant a typo started a server on the default
             // port: `--prot 5599` was accepted, and so was `--port` with no value at all.
@@ -2134,6 +2146,12 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                      MAX_WAL_ROTATE_THRESHOLD,
                      sizeof(WALRecordV2),
                      WAL_MAX_PAYLOAD_LEN);
+        std::exit(1);
+    }
+    // Refused rather than read as "as often as possible": 0 would rotate the WAL at every flush tick
+    // that found a record in it, a file each tick.
+    if (config.wal_archive_interval_s == 0) {
+        std::fprintf(stderr, "Error: --wal-archive-interval-s must be at least 1 second\n");
         std::exit(1);
     }
 
@@ -2430,6 +2448,8 @@ std::string format_config(const ResolvedConfig& resolved) {
     }
     line("wal-dir", c.wal_dir.empty() ? c.data_dir : c.wal_dir);
     line("wal-rotate-bytes", std::to_string(c.wal_rotate_bytes));
+    line("wal-archive-dir", c.wal_archive_dir.empty() ? "(none)" : c.wal_archive_dir);
+    line("wal-archive-interval-s", std::to_string(c.wal_archive_interval_s));
     return out;
 }
 
@@ -2478,6 +2498,18 @@ TcpServer::TcpServer(ServerConfig config)
     if (!config_.backup_dir.empty()) {
         if (const std::string problem =
                 backup_dir_problem(config_.backup_dir, config_.data_dir, config_.wal_dir);
+            !problem.empty()) {
+            OB_LOG_ERROR("tcp_server", "Refusing to start: %s", problem.c_str());
+            std::fprintf(stderr, "Error: %s\n", problem.c_str());
+            std::exit(1);
+        }
+    }
+
+    // And the WAL archive (#34), for the same reasons: a replica's bootstrap removes every directory
+    // of the data directory but its own, and the WAL directory is the writer's.
+    if (!config_.wal_archive_dir.empty()) {
+        if (const std::string problem =
+                wal_archive_dir_problem(config_.wal_archive_dir, config_.data_dir, config_.wal_dir);
             !problem.empty()) {
             OB_LOG_ERROR("tcp_server", "Refusing to start: %s", problem.c_str());
             std::fprintf(stderr, "Error: %s\n", problem.c_str());
@@ -3732,6 +3764,7 @@ void TcpServer::run() {
     engine_->set_write_admission_enabled(config_.write_admission);
     engine_->set_segment_version(config_.segment_format);
     engine_->set_decoded_columns_budget(static_cast<size_t>(config_.decoded_cache_mb) << 20);
+    engine_->set_wal_archive(config_.wal_archive_dir, config_.wal_archive_interval_s);
     static_assert(ServerConfig{}.max_query_buckets == QueryEngine::kDefaultMaxQueryBuckets,
                   "the server's default bucket ceiling is the query engine's");
     engine_->query_engine().set_max_query_buckets(static_cast<size_t>(config_.max_query_buckets));

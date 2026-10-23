@@ -16,6 +16,7 @@
 #include "orderbook/crc32c.hpp"
 #include "orderbook/durable_file.hpp"
 #include "orderbook/logger.hpp"
+#include "orderbook/wal_archive.hpp"
 
 #include <algorithm>
 #include <span>
@@ -576,11 +577,37 @@ void Engine::open() {
         });
     }
 
+    // The WAL archive (#34), before the flush thread whose retention waits for it. Its lineage is the
+    // one this start found or made, and a reopen may have begun another since the first open.
+    if (!wal_archive_dir_.empty()) {
+        const uint64_t identity = wal_identity_.load(std::memory_order_relaxed);
+        if (!wal_archiver_) {
+            wal_archiver_ = std::make_unique<WalArchiver>(
+                wal_dir_, wal_archive_dir_, identity, [this] { return wal_.current_file_index(); },
+                &registry_);
+        } else {
+            wal_archiver_->set_lineage(identity);
+        }
+        wal_archiver_->start();
+        OB_LOG_INFO("engine", "WAL archive %s: every closed WAL file is copied there, retention removes "
+                              "none it does not hold, and a file that has held a record for %u s is "
+                              "rotated so that it gets there",
+                    wal_archiver_->lineage_dir(identity).c_str(), wal_archive_interval_s_);
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+}
+
+void Engine::set_wal_archive(std::string dir, uint32_t interval_s) {
+    wal_archive_dir_ = std::move(dir);
+    wal_archive_interval_s_ = std::max<uint32_t>(interval_s, 1);
+    OB_LOG_DEBUG("engine", "WAL archive set to %s, interval %u s",
+                 wal_archive_dir_.empty() ? "(none)" : wal_archive_dir_.c_str(),
+                 wal_archive_interval_s_);
 }
 
 void Engine::close() {
@@ -624,6 +651,8 @@ void Engine::close() {
     if (flush_thread_.joinable()) {
         flush_thread_.join();
     }
+    // The archive's thread after the retention that read it.
+    if (wal_archiver_) wal_archiver_->stop();
 
     // flush_mtx_ is taken after join(), never before: the flush thread holds it for
     // the duration of a tick, so taking it first would make this thread wait on the
@@ -1065,7 +1094,30 @@ void Engine::begin_wal_lineage_locked(const char* why) {
     // once it has taken the start of a log - so a request for the start is WAL_TRUNCATED.
     wal_.rotate();
     const WalPosition first = wal_.current_position();
+    // With a WAL archive (#34), the old lineage's files go there before they go from here: they are
+    // removed now rather than by retention, which would have waited for the archive. Under the lock,
+    // which is what it costs - a lineage begins at a snapshot install or a resync, when the files the
+    // archive lacks are the last one or two - and in the old lineage's directory, since the archiver
+    // is told the new one only once they are gone.
+    if (wal_archiver_) {
+        const auto began = std::chrono::steady_clock::now();
+        const WalArchiver::Pass pass = wal_archiver_->archive_closed(old_identity, first.file_index);
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+        const std::string old_dir = wal_archiver_->lineage_dir(old_identity);
+        if (pass.failure.empty()) {
+            OB_LOG_INFO("engine", "The old WAL lineage is in the archive, %s, before its files are "
+                                  "removed: %zu file(s) copied, %zu already there, in %.1f ms",
+                        old_dir.c_str(), pass.archived, pass.present, ms);
+        } else {
+            OB_LOG_ERROR("engine", "The WAL archive %s lacks the old lineage's files from file %u (%s), "
+                                   "and they are removed with it: a restore to a moment before this one "
+                                   "cannot replay them",
+                         old_dir.c_str(), wal_archiver_->archived_before(), pass.failure.c_str());
+        }
+    }
     const size_t removed = wal_.truncate_before(first.file_index);
+    if (wal_archiver_) wal_archiver_->set_lineage(fresh);
     if (const int err = sync_directory(wal_dir_); err != 0) {
         OB_LOG_WARN("engine", "The WAL directory %s could not be synced after the old lineage's files "
                               "were removed (%s): a power cut may bring some back",
@@ -1088,6 +1140,44 @@ void Engine::begin_wal_lineage_locked(const char* why) {
                 "snapshot (#197)",
                 why, static_cast<unsigned long long>(fresh),
                 static_cast<unsigned long long>(old_identity), first.file_index, removed);
+}
+
+void Engine::rotate_for_the_archive_locked() {
+    // Caller holds mtx_, from the flush tick.
+    const WalPosition at = wal_.current_position();
+    if (at.file_index != archive_seen_file_) {
+        // A file closed since the last tick - at its size, for a lineage or for this - is copied
+        // now rather than at the archiver's next pass.
+        archive_seen_file_ = at.file_index;
+        archive_record_seen_at_ = {};
+        wal_archiver_->wake();
+    }
+    if (at.offset == 0) return;   // nothing in the file yet
+    const auto now = std::chrono::steady_clock::now();
+    if (archive_record_seen_at_ == std::chrono::steady_clock::time_point{}) {
+        archive_record_seen_at_ = now;
+        return;
+    }
+    if (now - archive_record_seen_at_ < std::chrono::seconds(wal_archive_interval_s_)) return;
+
+    // What a restore can lose with this node (#34, 1.3): records reach the archive within the
+    // interval and a tick, however slowly the file fills. The call the writer makes at its size.
+    wal_.rotate();
+    const WalPosition next = wal_.current_position();
+    if (next.file_index == at.file_index) {
+        // The marker could not be written, which rotate() has said. Again after the interval, not
+        // at every tick.
+        archive_record_seen_at_ = now;
+        OB_LOG_WARN("engine", "WAL file %u was not rotated for the archive; tried again in %u s",
+                    at.file_index, wal_archive_interval_s_);
+        return;
+    }
+    OB_LOG_DEBUG("engine", "Rotated WAL file %u at %u bytes for the archive: it held a record for "
+                           "%u s; writing to file %u",
+                 at.file_index, at.offset, wal_archive_interval_s_, next.file_index);
+    archive_seen_file_ = next.file_index;
+    archive_record_seen_at_ = {};
+    wal_archiver_->wake();
 }
 
 bool Engine::restore_version_vector(WalStartRecords& from_wal) {
@@ -3818,6 +3908,12 @@ void Engine::flush_tick() {
             // whose rows moved no frontier - a peer's numbers held above a hole - gets none, and the
             // checkpoint after them is past the vector's file.
             safe_truncate = std::min(safe_truncate, vector_base_file_);
+            // And never a file the WAL archive does not hold yet (#34): the archive is what a
+            // restore to a moment after the last backup replays.
+            if (wal_archiver_) {
+                safe_truncate = std::min(safe_truncate, wal_archiver_->archived_before());
+                rotate_for_the_archive_locked();
+            }
         }
         if (safe_truncate > 0) {
             wal_.truncate_before(safe_truncate);

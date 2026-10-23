@@ -86,6 +86,12 @@ bool backup_path_is_contained(std::string_view rel);
 std::string backup_dir_problem(const std::string& backup_dir, const std::string& data_dir,
                                const std::string& wal_dir);
 
+/// The same for the WAL archive (`--wal-archive-dir`, #34 point-in-time recovery): a replica's
+/// bootstrap removes every directory of the data directory but its own, and a lineage change removes
+/// the WAL's files.
+std::string wal_archive_dir_problem(const std::string& archive_dir, const std::string& data_dir,
+                                    const std::string& wal_dir);
+
 /// Read `<backup>/backup.json`.
 bool read_backup_description(const std::string& backup, BackupDescription& out, std::string& error);
 

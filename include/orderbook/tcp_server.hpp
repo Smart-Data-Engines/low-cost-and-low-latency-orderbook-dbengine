@@ -152,6 +152,12 @@ struct ServerConfig {
     bool        rings{true};
     uint64_t    ring_bytes{ring::kDefaultBytes};
     std::string backup_dir;                       // empty: BACKUP is refused (#34)
+    /// --wal-archive-dir: where every WAL file this node closes is copied, for a restore to a moment
+    /// after the last backup (#34, point-in-time recovery). Empty: no archive. Outside the data and
+    /// WAL directories. --wal-archive-interval-s: the seconds after which a WAL file holding a
+    /// record is rotated so that the archive gets it - what a restore can lose with this node.
+    std::string wal_archive_dir;
+    uint32_t    wal_archive_interval_s{60};
 
     /// Background flush interval. Shorter means less unflushed data at any moment and
     /// more segment writes; longer means the opposite. Configurable because it decides

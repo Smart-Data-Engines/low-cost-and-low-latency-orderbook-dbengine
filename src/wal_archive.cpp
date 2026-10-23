@@ -55,6 +55,15 @@ bool size_and_crc(const std::string& path, std::vector<uint8_t>& buf, uint64_t& 
     return true;
 }
 
+/// `fsync` a file the writer has closed. Returns 0, or the errno.
+int sync_file(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno;
+    const int rc = ::fsync(fd) == 0 ? 0 : errno;
+    ::close(fd);
+    return rc;
+}
+
 /// `src` copied to `dst` through `<dst>.tmp`: the CRC folded from the bytes read, the copy synced
 /// before it is renamed into place and its directory after. False and why when a step fails, and
 /// then nothing is at `dst`.
@@ -253,6 +262,16 @@ WalArchiver::Pass WalArchiver::archive_closed(uint64_t identity, uint32_t before
             const std::string src = wal_dir_ + "/" + name;
             const std::string dst = dir + "/" + name;
             std::string why;
+            // Synced before it is read: a rotation leaves its file for the next flush tick to sync,
+            // and a copy of bytes a power cut can still take from the source would differ from the
+            // source after it - and archiving would stop at a file nobody damaged. A file the tick
+            // has synced costs a call.
+            if (const int err = sync_file(src); err != 0) {
+                out.failure = "cannot sync " + src + " before it is read: " + std::strerror(err);
+                held_from = index;
+                failed_name = name;
+                break;
+            }
             if (fs::exists(dst, ec)) {
                 uint64_t src_size = 0, dst_size = 0;
                 uint32_t src_crc = 0, dst_crc = 0;
