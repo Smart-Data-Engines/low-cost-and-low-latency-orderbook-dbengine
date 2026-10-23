@@ -52,6 +52,11 @@ process ended before a flush (`evidence/2026-10-23-embedded-wal-replay/` in the 
 | 100 000 | 2.6-2.8 ms, and no update found | 54.5-60.2 ms, and every update found |
 | 1 000 000 | 2.4-3.8 ms, and no update found | 662-708 ms, and every update found |
 
+A directory a build before #245 wrote holds no checkpoint, so the first open reads its whole WAL,
+once: the first flush or close after it appends the first checkpoint. At a million rows written and
+closed by such a build, the first open took 177-221 ms and the next 165-172 ms, and each found every
+update once.
+
 ### ob_engine_destroy
 
 ```c

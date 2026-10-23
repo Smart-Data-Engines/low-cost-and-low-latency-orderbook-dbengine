@@ -2899,6 +2899,10 @@ tree (`evidence/2026-10-23-embedded-wal-replay/` in the workspace):
 - **A flush after one update of 100 levels:** 2.79-3.03 ms median and 4.99-6.16 ms at the 90th
   percentile, where it took 0.11-0.19 and 0.15-0.26 ms. The sync is all of it: without the sync the
   replay's build took 0.14-0.21 ms. A flush with nothing new does not sync.
+- **The first open of a directory an older build wrote** reads its whole WAL once, as it holds no
+  checkpoint: 177-221 ms at a million rows, where the next open took 165-172 ms. Every update was
+  found once. Measuring it found that the first flush after any open synced even with nothing new,
+  because the open did not know its WAL already ended at a checkpoint; it does now.
 - **The limit that stays:** a power cut or a kernel crash still loses what was written since the
   last flush or close. The WAL is synced there, not at each write.
 
@@ -2908,14 +2912,16 @@ Tests in `test_c_api.cpp`:
 - a death between a flush's segments and its checkpoint stores each row once;
 - a closed engine ends its WAL with a checkpoint;
 - a segment of an older build is judged by the time of its last row;
-- a flush syncs before its checkpoint claims the rows, and a flush with nothing new syncs nothing.
+- a flush syncs before its checkpoint claims the rows, and a flush with nothing new syncs nothing;
+- the first flush after an open syncs only what no checkpoint claims.
 
 Mutations killed: the replay disabled; no position stamped at a write; no fallback by time; no
 checkpoint at a flush; the position compared the wrong way; the position stamped without its +1; no
-flush after the replay; no sync before the checkpoint; the sync after it; a sync at every flush.
-The control, a reworded warning, survived. Three mutants of the failure path survived too, because
-only a failing device shows them: a `syncfs()` that does nothing, a failed sync that freezes
-nothing, and `OB_C_ERR_IO` answered as `OB_C_OK`.
+flush after the replay; no sync before the checkpoint; the sync after it; a sync at every flush;
+an open that never takes its WAL as checkpointed; one that takes it so with records after the
+checkpoint. The controls, reworded log lines, survived. Three mutants of the failure path survived
+too, because only a failing device shows them: a `syncfs()` that does nothing, a failed sync that
+freezes nothing, and `OB_C_ERR_IO` answered as `OB_C_OK`.
 
 - Effort: M | Impact: every write the embedded engine acknowledged since its last flush is lost when
   its process dies; the Python client's local mode flushes before a read, not after a write

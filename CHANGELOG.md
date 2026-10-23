@@ -174,6 +174,8 @@ here as `#N`.
   - A record a segment already holds is skipped by the WAL position the segment records. A segment
     of an older build records none, and is judged by the time of its last row.
   - WAL files wholly before the last checkpoint are removed; nothing removed them before.
+  - The first open of a directory an older build wrote reads its whole WAL, once: such a WAL holds
+    no checkpoint.
   - An open after a process ended at a million unflushed rows of one symbol took 662-708 ms, and
     found every update, where before it found none (i3-7100U, Release, ext4 over LUKS on NVMe).
 - A local flush no longer reopens the embedded engine (#244). Since #235 an open composes every book
