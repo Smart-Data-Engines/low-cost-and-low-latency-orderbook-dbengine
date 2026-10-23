@@ -130,6 +130,33 @@ static char* put_seven(char* p, char* end, const QueryResult& r) {
     return p;
 }
 
+/// The same two, from row `i` of a batch's columns (OB-12): each field the type the `QueryResult`
+/// path formats it as - the sequence number unsigned, as `QueryResult::sequence_number` is - so the
+/// bytes cannot differ between the two. A row answer's batch holds every column the shape names.
+static char* put_seven(char* p, char* end, const RowBatch& b, uint32_t i) {
+    p = put_field(p, end, b.ts[i],                           '\t');
+    p = put_field(p, end, b.price[i],                        '\t');
+    p = put_field(p, end, b.qty[i],                          '\t');
+    p = put_field(p, end, b.cnt[i],                          '\t');
+    p = put_field(p, end, b.side[i],                         '\t');
+    p = put_field(p, end, b.level[i],                        '\t');
+    p = put_field(p, end, static_cast<uint64_t>(b.seq[i]), '\n');
+    return p;
+}
+
+static char* put_column(char* p, char* end, const RowBatch& b, uint32_t i, QueryColumn c, char sep) {
+    switch (c) {
+        case QueryColumn::TimestampNs:    return put_field(p, end, b.ts[i],                         sep);
+        case QueryColumn::Price:          return put_field(p, end, b.price[i],                      sep);
+        case QueryColumn::Quantity:       return put_field(p, end, b.qty[i],                        sep);
+        case QueryColumn::OrderCount:     return put_field(p, end, b.cnt[i],                        sep);
+        case QueryColumn::Side:           return put_field(p, end, b.side[i],                       sep);
+        case QueryColumn::Level:          return put_field(p, end, b.level[i],                      sep);
+        case QueryColumn::SequenceNumber: return put_field(p, end, static_cast<uint64_t>(b.seq[i]), sep);
+    }
+    return p;
+}
+
 /// The narrowed path, deliberately out of line.
 ///
 /// Not a style choice, and not where this started. With both loops inlined into
@@ -249,6 +276,11 @@ void QueryResponseBuilder::start(const QueryResult& first) {
         aggregates_ = first.agg_values;
         return;
     }
+    start_rows();
+}
+
+void QueryResponseBuilder::start_rows() {
+    started_ = true;
     // Not reserved from a count, as format_query_response() is: no count exists until the scan
     // ends. A string that doubles copies what it holds about once over in all, where the vector of
     // rows it replaces copied 64 bytes a row each time it grew and was read once more to format.
@@ -308,6 +340,37 @@ void QueryResponseBuilder::add(const QueryResult& r) {
         p = put_column(p, end, r, columns[i], i == last ? '\n' : '\t');
     }
     used_ = static_cast<size_t>(p - reply);
+}
+
+void QueryResponseBuilder::add_rows(const RowBatch& b) {
+    if (b.rows.empty()) return;
+    if (!started_) start_rows();
+    // Room for the whole batch at once, at the widest row this shape can write, grown by doubling
+    // as an appended string grows; finish() cuts off what the rows did not use.
+    const size_t need = b.rows.size() * row_bytes_;
+    if (out_.size() - used_ < need) out_.resize(std::max(out_.size() * 2, used_ + need));
+    char* const reply = out_.data();
+    char* const end   = reply + out_.size();
+    char* p = reply + used_;
+    if (all_seven_) {
+        for (const uint32_t i : b.rows) p = put_seven(p, end, b, i);
+    } else if (!shape_.columns.empty()) {
+        p = add_narrow_rows(p, end, b);
+    }
+    used_ = static_cast<size_t>(p - reply);
+}
+
+// Out of line for the reason format_narrow_rows() is: inlined beside the seven-column path, it would
+// take `to_chars` out of that path's inlining.
+[[gnu::noinline]] char* QueryResponseBuilder::add_narrow_rows(char* p, char* end, const RowBatch& b) {
+    const auto& columns = shape_.columns;
+    const size_t last = columns.size() - 1;
+    for (const uint32_t i : b.rows) {
+        for (size_t c = 0; c < columns.size(); ++c) {
+            p = put_column(p, end, b, i, columns[c], c == last ? '\n' : '\t');
+        }
+    }
+    return p;
 }
 
 std::string QueryResponseBuilder::finish() {

@@ -4461,6 +4461,21 @@ Learned the hard way. Check here before debugging.
      overlap on both hosts; copied to tmpfs, they overlap too. Measure a change that writes beside
      the WAL at the ceiling's p99.9, on more than one host: the cost hid on one of the two.
 
+609. **Two loads of the same rows are not the same segments, so a round that loads its own data
+     measures a layout as well as a build.** Which seals a load makes, and how the merges after it go,
+     follow the flush ticks' timing. Loaded the same way eight times, #246's 1.9 M rows came out as ten
+     segments seven times and as nine once, and that one round answered the same query in 8.19 ms
+     against 5.0 in the other three - same build, same bytes answered. Every round of an A/B starts
+     a node from one settled copy of the data directory (`scan_profile.py --template`), so the layout
+     is the one thing that cannot differ between builds.
+610. **Before parallelising a stage, measure what share of the work it is.** Stage 6 of the plan to
+     use the whole machine was "decode the segments on a pool, emit in order". Profiled first, a
+     query's decoding was 0-15% of it and the rest was the hand-over of each row - two
+     `std::function` calls and two structs a row - so the design could have made a query 1.2 times
+     faster at most. Pitfall 366's lesson, which was about the write path, held on the read path too:
+     the per-row cost had to come down on one core (1.46-1.93 times, #246's stage 1) before there was
+     anything worth dividing among cores.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -4492,6 +4507,11 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**#246's stage 1**: a scan hands its rows over a batch at a time - a candidate's columns and the
+rows chosen from them - and the server formats a row answer from the columns (`RowAnswer`); a
+190 000-row answer and a bucket query take 1.46 and 1.93 times less on one core, with the same
+bytes. Stage 2, a candidate's work on a pool, is open (pitfalls 609, 610).
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)

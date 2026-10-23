@@ -1926,9 +1926,9 @@ DecodedColumnsBudget::Stats ColumnarStore::decoded_columns_stats() const {
 
 namespace {
 
-/// The columns one segment's rows are emitted from: spans over the pool's buffers or over held
-/// columns (#220), each the segment's rows long or empty when it was not read - a format-2 price,
-/// quantity or count cut short is padded with zeros, as it always was.
+/// The columns one candidate's rows are emitted from: spans over the pool's buffers or over held
+/// columns (#220), each the candidate's rows long or empty when it was not read - a format-2 column
+/// cut short is padded with zeros before it gets here, as reading it row by row always padded it.
 struct RowColumns {
     std::span<const uint64_t> ts;
     std::span<const int64_t>  price;
@@ -1939,8 +1939,8 @@ struct RowColumns {
     std::span<const int64_t>  seq;
 };
 
-/// Rows the selection pass marks at a time (#225): its masks stay in L1 between the column passes.
-constexpr size_t kSelectChunk = 2048;
+/// Rows the selection pass marks at a time (#225), which is the most rows a batch holds (OB-12).
+constexpr size_t kSelectChunk = kScanBatchRows;
 
 /// AND into `mask` whether each of `len` values from `v` is within [lo, hi]: one loop with no branch
 /// and no bounds check, which the compiler vectorizes.
@@ -1951,121 +1951,113 @@ void select_within(const T* v, size_t len, T lo, T hi, uint8_t* mask) {
     }
 }
 
-/// The rows of one segment within [start_ns, end_ns] that `filter` keeps, built field by field from
-/// what `columns` names and handed to `cb` in the segment's order; false once `cb` has said to stop
-/// (#47 step 2). A row the filter fails is counted into `filtered` and never built. The one loop
-/// both reads emit through, so a pooled read and a held one cannot answer differently.
-bool emit_rows(size_t n, const RowColumns& c, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
-               const RowFilter& filter, const std::function<bool(const SnapshotRow&)>& cb,
-               uint64_t& filtered) {
-    const bool want_price = columns.has(QueryColumn::Price);
-    const bool want_qty   = columns.has(QueryColumn::Quantity);
-    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
-    const bool want_side  = columns.has(QueryColumn::Side);
-    const bool want_level = columns.has(QueryColumn::Level);
-    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
+/// The rows of one candidate within [start_ns, end_ns] that `filter` keeps, chosen a chunk at a time
+/// and handed to `read` one batch a chunk, in the candidate's order (OB-12); false once `read` has
+/// said to stop. Every column in `c` is empty or `n` long - a format-2 column cut short is padded
+/// before this is called - so the selection runs on whole columns with no branch and no bounds check
+/// (#225), filter or none. A row the filter fails is counted into `filtered` and never chosen; when
+/// the reader stops at a row, the count is the rows the filter failed before it, as the row-by-row
+/// loop this replaced counted them (#47 step 2). The one loop every read emits through - a pooled
+/// read, a held one and the unsealed blocks - so none of them can answer differently.
+bool emit_batches(size_t n, const RowColumns& c, uint64_t start_ns, uint64_t end_ns,
+                  const RowFilter& filter, const BatchReader& read, uint64_t& filtered) {
     const bool check = !filter.empty();
-    const auto build = [&](size_t i, uint64_t ts) {
-        // Value-initialised, so a field whose column was not read is zero rather than whatever
-        // the last row left there.
-        SnapshotRow row{};
-        row.timestamp_ns = ts;
-        if (want_seq)   row.sequence_number = static_cast<uint64_t>(c.seq[i]);
-        if (want_side)  row.side            = c.side[i];
-        if (want_level) row.level_index     = c.level[i];
-        if (want_price) row.price           = (i < c.price.size()) ? c.price[i] : 0;
-        if (want_qty)   row.quantity        = (i < c.qty.size())   ? c.qty[i]   : 0;
-        if (want_cnt)   row.order_count     = (i < c.cnt.size())   ? c.cnt[i]   : 0;
-        return row;
-    };
-
-    // The selection pass (#225), when the time and every column the filter reads hold the segment's
-    // rows - a format-3 segment always, a format-2 one unless a short file was padded. The rows are
-    // chosen first, a chunk at a time, by one loop over each column with no branch and no bounds
-    // check, and only the chosen are built; a condition that keeps one row in a hundred costs the
-    // passes over its columns rather than a check of every row's optional ends.
-    const auto holds = [n](bool read, size_t rows) { return !read || rows == n; };
-    const bool whole = c.ts.size() == n && holds(filter.has_price(), c.price.size()) &&
-                       holds(filter.has_side(), c.side.size()) &&
-                       holds(filter.has_level(), c.level.size());
-    if (check && whole) {
-        const int64_t  price_lo = filter.price_lo.value_or(std::numeric_limits<int64_t>::min());
-        const int64_t  price_hi = filter.price_hi.value_or(std::numeric_limits<int64_t>::max());
-        const uint8_t  side_lo  = filter.side_lo.value_or(0);
-        const uint8_t  side_hi  = filter.side_hi.value_or(std::numeric_limits<uint8_t>::max());
-        const uint16_t level_lo = filter.level_lo.value_or(0);
-        const uint16_t level_hi = filter.level_hi.value_or(std::numeric_limits<uint16_t>::max());
-        uint8_t in_range[kSelectChunk];
-        uint8_t keep[kSelectChunk];
-        for (size_t from = 0; from < n; from += kSelectChunk) {
-            const size_t len = std::min(kSelectChunk, n - from);
-            const uint64_t* ts = c.ts.data() + from;
-            size_t ranged = 0;
-            for (size_t k = 0; k < len; ++k) {
-                in_range[k] = static_cast<uint8_t>((ts[k] >= start_ns) & (ts[k] <= end_ns));
-                ranged += in_range[k];
-            }
-            if (ranged == 0) continue;
+    const int64_t  price_lo = filter.price_lo.value_or(std::numeric_limits<int64_t>::min());
+    const int64_t  price_hi = filter.price_hi.value_or(std::numeric_limits<int64_t>::max());
+    const uint8_t  side_lo  = filter.side_lo.value_or(0);
+    const uint8_t  side_hi  = filter.side_hi.value_or(std::numeric_limits<uint8_t>::max());
+    const uint16_t level_lo = filter.level_lo.value_or(0);
+    const uint16_t level_hi = filter.level_hi.value_or(std::numeric_limits<uint16_t>::max());
+    uint8_t  in_range[kSelectChunk];
+    uint8_t  keep[kSelectChunk];
+    uint32_t chosen[kSelectChunk];
+    RowBatch batch{c.ts, c.price, c.qty, c.cnt, c.side, c.level, c.seq, {}};
+    for (size_t from = 0; from < n; from += kSelectChunk) {
+        const size_t len = std::min(kSelectChunk, n - from);
+        const uint64_t* ts = c.ts.data() + from;
+        size_t ranged = 0;
+        for (size_t k = 0; k < len; ++k) {
+            in_range[k] = static_cast<uint8_t>((ts[k] >= start_ns) & (ts[k] <= end_ns));
+            ranged += in_range[k];
+        }
+        if (ranged == 0) continue;
+        const uint8_t* mask = in_range;
+        if (check) {
             std::memcpy(keep, in_range, len);
             if (filter.has_price()) select_within(c.price.data() + from, len, price_lo, price_hi, keep);
             if (filter.has_side()) select_within(c.side.data() + from, len, side_lo, side_hi, keep);
             if (filter.has_level()) select_within(c.level.data() + from, len, level_lo, level_hi, keep);
-            size_t kept = 0;
-            for (size_t k = 0; k < len;) {
-                // Eight unchosen rows at a time: a selective condition leaves most of the mask zero.
-                if (k + 8 <= len) {
-                    uint64_t eight = 0;
-                    std::memcpy(&eight, keep + k, sizeof eight);
-                    if (eight == 0) {
-                        k += 8;
-                        continue;
-                    }
-                }
-                if (keep[k] == 0) {
-                    ++k;
-                    continue;
-                }
-                ++kept;
-                if (!cb(build(from + k, ts[k]))) {
-                    // Counted as the row-by-row loop counts them: the rows in the range the filter
-                    // failed before the one the reader stopped at.
-                    size_t ranged_before = 0;
-                    for (size_t j = 0; j <= k; ++j) ranged_before += in_range[j];
-                    filtered += ranged_before - kept;
-                    return false;
-                }
-                ++k;
-            }
-            filtered += ranged - kept;
+            mask = keep;
         }
-        return true;
-    }
-
-    for (size_t i = 0; i < n; ++i) {
-        const uint64_t ts = (i < c.ts.size()) ? c.ts[i] : 0;
-        if (ts < start_ns || ts > end_ns) continue;
-        if (check) {
-            // The values the row would carry, so a condition sees what a check of the built row
-            // would have seen - a padded price included.
-            const int64_t  price = (i < c.price.size()) ? c.price[i] : 0;
-            const uint8_t  side  = (i < c.side.size()) ? c.side[i] : 0;
-            const uint16_t level = (i < c.level.size()) ? c.level[i] : 0;
-            if (!filter.keeps(price, side, level)) {
-                ++filtered;
-                continue;
+        // The chosen rows' indices, written whether or not the row is chosen and counted only when
+        // it is, so a mask of no pattern costs no mispredicted branch; eight unchosen rows at a time
+        // are passed over whole, as a selective condition leaves most of the mask zero.
+        size_t kept = 0;
+        size_t k = 0;
+        for (; k + 8 <= len; k += 8) {
+            uint64_t eight = 0;
+            std::memcpy(&eight, mask + k, sizeof eight);
+            if (eight == 0) continue;
+            for (size_t j = k; j < k + 8; ++j) {
+                chosen[kept] = static_cast<uint32_t>(from + j);
+                kept += mask[j];
             }
         }
-        if (!cb(build(i, ts))) return false;
+        for (; k < len; ++k) {
+            chosen[kept] = static_cast<uint32_t>(from + k);
+            kept += mask[k];
+        }
+        if (kept == 0) {
+            filtered += ranged;
+            continue;
+        }
+        batch.rows = std::span<const uint32_t>(chosen, kept);
+        const BatchVerdict verdict = read(batch);
+        if (verdict.stop) {
+            // Counted as the row-by-row loop counted them: the rows in the range the filter failed
+            // before the one the reader stopped at.
+            const size_t at = std::min(verdict.at, kept - 1);
+            const size_t last = chosen[at] - from;
+            size_t ranged_before = 0;
+            for (size_t j = 0; j <= last; ++j) ranged_before += in_range[j];
+            filtered += ranged_before - (at + 1);
+            return false;
+        }
+        filtered += ranged - kept;
     }
     return true;
+}
+
+/// A reader that hands a batch's rows to `cb` one at a time, built as the row scan always built
+/// them (`row_of()`): the row scan, over batches (OB-12). `cb` is held by reference, so the reader
+/// lives no longer than the call it is made for.
+BatchReader rows_to(const std::function<bool(const SnapshotRow&)>& cb) {
+    return [&cb](const RowBatch& b) -> BatchVerdict {
+        for (size_t k = 0; k < b.rows.size(); ++k) {
+            if (!cb(row_of(b, b.rows[k]))) return {true, k};
+        }
+        return {};
+    };
+}
+
+/// A column of a query's read that came back shorter than its segment's rows - a format-2 file cut
+/// short - padded with zeros to them, which is what reading it row by row always gave past its end.
+/// Said once a read, because a short column is a damaged segment and every query of it pads it.
+template <typename T>
+void pad_short_column(std::vector<T>& v, bool read, size_t rows, const std::string& dir,
+                      const char* file) {
+    if (!read || v.size() >= rows) return;
+    OB_LOG_WARN("columnar", "segment %s: %s holds %zu of its %zu rows; read as zeros past its end",
+                dir.c_str(), file, v.size(), rows);
+    v.resize(rows, T{});
 }
 
 }  // namespace
 
 ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
-        const RowFilter& filter, const std::function<bool(const SnapshotRow&)>& cb, ReadMode mode,
-        uint64_t* filtered, bool* stopped) const {
+        const RowFilter& filter, const BatchReader& read, ReadMode mode, uint64_t* filtered,
+        bool* stopped) const {
     const bool want_price = columns.has(QueryColumn::Price);
     const bool want_qty   = columns.has(QueryColumn::Quantity);
     const bool want_cnt   = columns.has(QueryColumn::OrderCount);
@@ -2088,7 +2080,7 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         return SegmentRead::kUnreadable;
     }
     if (meta.format_version == kColumnarFormatV3 && mode == ReadMode::kQuery && meta.decoded) {
-        return read_held_columns(meta, columns, start_ns, end_ns, filter, cb, filtered, stopped);
+        return read_held_columns(meta, columns, start_ns, end_ns, filter, read, filtered, stopped);
     }
 
     // A set of buffers from the pool, holding an earlier read's columns. Every column this read uses
@@ -2209,12 +2201,17 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
                          counts.size());
             return SegmentRead::kUnreadable;
         }
+        // A query's read pads them instead, so every batch holds whole columns (OB-12).
+        pad_short_column(timestamps, columns.has(QueryColumn::TimestampNs), expected, dir, "ts.col");
+        pad_short_column(prices, want_price, expected, dir, "price.col");
+        pad_short_column(qtys, want_qty, expected, dir, "qty.col");
+        pad_short_column(counts, want_cnt, expected, dir, "cnt.col");
     }
 
     uint64_t failed = 0;
-    const bool going = emit_rows(static_cast<size_t>(meta.row_count),
-                                 RowColumns{timestamps, prices, qtys, counts, sides, levels, seqs},
-                                 columns, start_ns, end_ns, filter, cb, failed);
+    const bool going = emit_batches(static_cast<size_t>(meta.row_count),
+                                    RowColumns{timestamps, prices, qtys, counts, sides, levels, seqs},
+                                    start_ns, end_ns, filter, read, failed);
     if (filtered != nullptr) *filtered += failed;
     if (stopped != nullptr) *stopped = !going;
     return SegmentRead::kRead;
@@ -2222,8 +2219,7 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
 
 ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
-        const RowFilter& filter, const std::function<bool(const SnapshotRow&)>& cb,
-        uint64_t* filtered, bool* stopped) const {
+        const RowFilter& filter, const BatchReader& read, uint64_t* filtered, bool* stopped) const {
     DecodedColumns& slot = *meta.decoded;
     const std::string& dir = meta.dir_path;
 
@@ -2269,12 +2265,12 @@ ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
         return held[c] ? held[c]->as<T>() : std::span<const T>{};
     };
     uint64_t failed = 0;
-    const bool going = emit_rows(
+    const bool going = emit_batches(
         static_cast<size_t>(meta.row_count),
         RowColumns{column(0, uint64_t{}), column(1, int64_t{}), column(2, uint64_t{}),
                    column(3, uint32_t{}), column(4, uint8_t{}), column(5, uint16_t{}),
                    column(6, int64_t{})},
-        columns, start_ns, end_ns, filter, cb, failed);
+        start_ns, end_ns, filter, read, failed);
     if (filtered != nullptr) *filtered += failed;
     if (stopped != nullptr) *stopped = !going;
     return SegmentRead::kRead;
@@ -2284,11 +2280,11 @@ bool ColumnarStore::read_segment(const SegmentMeta& meta,
                                  const std::function<void(const SnapshotRow&)>& cb) const {
     // Nothing removes a segment a merge is reading - retention and the merge run on one thread -
     // so a missing file here is the corruption it is everywhere else.
-    return read_segment_rows(meta, ColumnSet::all(), 0, UINT64_MAX, RowFilter{},
-                             [&](const SnapshotRow& row) {
-                                 cb(row);
-                                 return true;
-                             },
+    const std::function<bool(const SnapshotRow&)> each = [&](const SnapshotRow& row) {
+        cb(row);
+        return true;
+    };
+    return read_segment_rows(meta, ColumnSet::all(), 0, UINT64_MAX, RowFilter{}, rows_to(each),
                              ReadMode::kMerge) == SegmentRead::kRead;
 }
 
@@ -2335,6 +2331,14 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                                              std::string_view symbol, std::string_view exchange,
                                              ColumnSet columns, const RowFilter& filter,
                                              const std::function<bool(const SnapshotRow&)>& cb) const {
+    return scan_batches(start_ns, end_ns, symbol, exchange, columns, filter, rows_to(cb));
+}
+
+ColumnarStore::ScanCost ColumnarStore::scan_batches(uint64_t start_ns, uint64_t end_ns,
+                                                     std::string_view symbol,
+                                                     std::string_view exchange, ColumnSet columns,
+                                                     const RowFilter& filter,
+                                                     const BatchReader& read) const {
     // Whatever the caller asked to be handed, this filters on the row's timestamp, so it reads
     // that column. Adding it here rather than trusting the caller means a set built by hand
     // cannot produce a scan that compares every row against a zero it never loaded. The filter's
@@ -2410,7 +2414,7 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
         }
         ++cost.segments_read;
         bool stopped = false;
-        read_segment_rows(meta, columns, start_ns, end_ns, filter, cb, ReadMode::kQuery,
+        read_segment_rows(meta, columns, start_ns, end_ns, filter, read, ReadMode::kQuery,
                           &cost.rows_filtered, &stopped);
         if (stopped) {
             cost.stopped = true;
@@ -2428,28 +2432,41 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
 
     // Then the rows no seal has written yet, after every segment and in the order they were
     // drained: they are this symbol's newest writes, so a reader that keeps the last row of a tie
-    // keeps the one written later (#168). Field by field as a segment's rows are, so a column the
-    // caller did not ask for is zero here too rather than a value it would read by accident.
+    // keeps the one written later (#168). Their columns are copied out of the block's rows into
+    // the pool's buffers - only the columns the read asks for, so one it did not ask for is empty
+    // here as in a segment's batch - and emitted through the same loop as a segment's (OB-12).
     for (const auto& block : block_snapshot) {
-        for (const SnapshotRow& r : block->rows) {
-            if (r.timestamp_ns < start_ns || r.timestamp_ns > end_ns) continue;
-            if (filtering && !filter.keeps(r.price, r.side, r.level_index)) {
-                ++cost.rows_filtered;
-                continue;
+        const std::vector<SnapshotRow>& rows = block->rows;
+        const size_t n = rows.size();
+        if (n == 0) continue;
+        ReadBuffersLease lease;
+        SegmentReadBuffers& t = lease.buffers();
+        const auto copy = [&](bool wanted, auto& dest, auto field) {
+            if (!wanted) {
+                dest.clear();
+                return;
             }
-            SnapshotRow row{};
-            row.timestamp_ns = r.timestamp_ns;
-            if (want_seq)   row.sequence_number = r.sequence_number;
-            if (want_side)  row.side            = r.side;
-            if (want_level) row.level_index     = r.level_index;
-            if (want_price) row.price           = r.price;
-            if (want_qty)   row.quantity        = r.quantity;
-            if (want_cnt)   row.order_count     = r.order_count;
-            if (!cb(row)) {
-                cost.stopped = true;
-                summary();
-                return cost;
-            }
+            dest.resize(n);
+            for (size_t i = 0; i < n; ++i) dest[i] = field(rows[i]);
+        };
+        using Row = SnapshotRow;
+        copy(true, t.timestamps, [](const Row& r) { return r.timestamp_ns; });
+        copy(want_price, t.prices, [](const Row& r) { return r.price; });
+        copy(want_qty, t.qtys, [](const Row& r) { return r.quantity; });
+        copy(want_cnt, t.counts, [](const Row& r) { return r.order_count; });
+        copy(want_side, t.sides, [](const Row& r) { return r.side; });
+        copy(want_level, t.levels, [](const Row& r) { return r.level_index; });
+        copy(want_seq, t.seqs, [](const Row& r) { return static_cast<int64_t>(r.sequence_number); });
+        uint64_t failed = 0;
+        const bool going =
+            emit_batches(n, RowColumns{t.timestamps, t.prices, t.qtys, t.counts, t.sides, t.levels,
+                                       t.seqs},
+                         start_ns, end_ns, filter, read, failed);
+        cost.rows_filtered += failed;
+        if (!going) {
+            cost.stopped = true;
+            summary();
+            return cost;
         }
     }
     summary();
@@ -3169,11 +3186,11 @@ ColumnarStore::TimeOrderedCost ColumnarStore::scan_gathered(
         }
         auto run = std::make_unique<Run>();
         run->rank = i;
-        read_segment_rows(segments[i], columns, start_ns, end_ns, filter,
-                          [&](const SnapshotRow& row) {
-                              run->rows.push_back(row);
-                              return true;
-                          },
+        const std::function<bool(const SnapshotRow&)> keep = [&](const SnapshotRow& row) {
+            run->rows.push_back(row);
+            return true;
+        };
+        read_segment_rows(segments[i], columns, start_ns, end_ns, filter, rows_to(keep),
                           ReadMode::kQuery, &cost.rows_filtered);
         add_run(std::move(run));
     };

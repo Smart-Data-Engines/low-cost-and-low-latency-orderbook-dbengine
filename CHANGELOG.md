@@ -131,6 +131,13 @@ here as `#N`.
 
 ### Changed
 
+- **A scan hands its rows over a batch at a time** (#246, stage 1 of a scan on several cores): a
+  candidate's columns and the rows chosen from them, rather than a row and two calls through
+  `std::function` each. The server formats a row answer from the columns into its reply, and
+  `GROUP BY TIME_BUCKET` sums them. Answers are the same bytes. On the x86 test host, 190 360 rows
+  of three columns answer in 5.0 ms where they took 7.3, 80 one-minute buckets of 1.9 M rows in
+  6.5 ms where they took 12.5, and 4 000 rows in 0.12 ms where they took 0.19. A format-2 column
+  cut short, which reads as zeros past its end as before, now says so with a `WARN`.
 - **A book at an instant is read by price** (#233, decision B'). `WHERE AT`, a `SNAPSHOT` and the
   series of the book (`OPEN`, `HIGH`, `LOW`, `CLOSE` and `TWAP` of the bid, the ask, the mid and the
   spread) apply every row up to their instant in time order, each setting its price's quantity and

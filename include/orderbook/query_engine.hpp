@@ -183,6 +183,16 @@ struct QueryShape {
     std::vector<BucketColumn> bucket_columns;
 };
 
+/// Where a row answer's rows go a batch at a time, when its caller can take them so (OB-12): the
+/// server formats them from the columns as they arrive. Without one, `execute()` hands a row
+/// answer over one `QueryResult` a row, as it always did, and builds each from the same batches.
+class RowAnswer {
+public:
+    virtual ~RowAnswer() = default;
+    /// Every row of the batch, in order: the answer's LIMIT has already cut it to what it holds.
+    virtual void add_rows(const RowBatch& batch) = 0;
+};
+
 // ── QueryEngine ───────────────────────────────────────────────────────────────
 
 class QueryEngine {
@@ -202,6 +212,10 @@ public:
 
     /// As above, and report the shape of the answer in `shape` before the first row.
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
+
+    /// As above, and a row answer's rows a batch at a time into `rows` when it is given (OB-12):
+    /// the aggregates, the buckets and every other answer still arrive through `cb`.
+    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows);
 
     /// The live book for one symbol, as rows. Error string on failure, empty on success.
     ///

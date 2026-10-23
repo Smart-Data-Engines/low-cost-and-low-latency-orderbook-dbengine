@@ -1050,8 +1050,10 @@ namespace {
 /// each a range inclusive at both ends. One predicate for the row scan, a snapshot's levels and a
 /// subscription's pushes, which kept three copies of the time and price checks between them.
 /// The conditions of a query a scan applies before it builds a row (#47 step 2): its price, side and
-/// level ranges. The time range is the scan's own; `row_allowed()` stays where the rows arrive, as a
-/// belt that costs a compare a row.
+/// level ranges. The time range is the scan's own. A row scan and a bucket scan check nothing again
+/// where the rows arrive (OB-12): `row_allowed()` did, a compare a row, a second statement of the
+/// scan's guarantee that no test could tell from its absence (pitfall 45), and the property test
+/// of the batches against the rows is what holds the guarantee now.
 static RowFilter filter_of(const QueryAST& ast) {
     RowFilter f;
     f.price_lo = ast.price_lo;
@@ -1223,6 +1225,11 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
 }
 
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShape& shape) {
+    return execute(sql, std::move(cb), shape, nullptr);
+}
+
+std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShape& shape,
+                                 RowAnswer* rows) {
     QueryAST ast;
     if (auto err = parse(sql, ast); !err.empty()) return err;
 
@@ -1595,24 +1602,37 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
 
     // LIMIT 0 asks for no row, and reads none (#47 step 2).
     if (lim == 0) return {};
-    const ColumnarStore::ScanCost cost = store_.scan(
+    // A batch at a time (OB-12). The scan hands over only the rows within the range and the
+    // conditions - `filter_of()` and the time are its own checks - so nothing here checks a row
+    // again; what is left is LIMIT. The answer is whole at LIMIT rows and the scan opens nothing
+    // more (#47 step 2): the rows are the first LIMIT the scan delivers, as they were when the rest
+    // was read and dropped.
+    const ColumnarStore::ScanCost cost = store_.scan_batches(
         ts_start, ts_end, ast.symbol, ast.exchange, to_read, filter_of(ast),
-        [&](const SnapshotRow& row) {
-            if (!row_allowed(ast, row)) return true;
-
-            QueryResult qr{};
-            qr.timestamp_ns    = row.timestamp_ns;
-            qr.sequence_number = row.sequence_number;
-            qr.price           = row.price;
-            qr.quantity        = row.quantity;
-            qr.order_count     = row.order_count;
-            qr.side            = row.side;
-            qr.level           = row.level_index;
-            cb(qr);
-            ++count;
-            // The answer is whole at LIMIT rows: the scan opens nothing more (#47 step 2). The rows
-            // are the first LIMIT the scan delivers, as they were when the rest was read and dropped.
-            return count < lim;
+        [&](const RowBatch& batch) -> BatchVerdict {
+            const uint64_t room = lim - count;
+            const bool ends = batch.rows.size() >= room;
+            RowBatch taken = batch;
+            if (ends) taken.rows = batch.rows.first(static_cast<size_t>(room));
+            if (rows != nullptr) {
+                rows->add_rows(taken);
+            } else {
+                for (const uint32_t i : taken.rows) {
+                    const SnapshotRow row = row_of(taken, i);
+                    QueryResult qr{};
+                    qr.timestamp_ns    = row.timestamp_ns;
+                    qr.sequence_number = row.sequence_number;
+                    qr.price           = row.price;
+                    qr.quantity        = row.quantity;
+                    qr.order_count     = row.order_count;
+                    qr.side            = row.side;
+                    qr.level           = row.level_index;
+                    cb(qr);
+                }
+            }
+            count += taken.rows.size();
+            if (ends) return {true, taken.rows.size() - 1};
+            return {};
         });
     OB_LOG_DEBUG("query", "SELECT %s.%s: %llu row(s); %zu segment(s) read, %zu left unread by "
                           "their metadata, %llu row(s) filtered before they were built%s",
@@ -1646,19 +1666,19 @@ struct BucketState {
     __int128 sum_px_qty{0};
     bool     px_qty_overflow{false};
 
-    void add(const SnapshotRow& row) {
-        const int64_t  px  = row.price;
-        const uint64_t qty = row.quantity;
+    /// One row: its time, its price and its quantity, the last two zero where the scan did not
+    /// read their column - as a built row's were.
+    void add(uint64_t ts, int64_t px, uint64_t qty) {
         if (count == 0) {
-            first_ts = last_ts = row.timestamp_ns;
+            first_ts = last_ts = ts;
             first_price = last_price = min_price = max_price = px;
             first_qty = last_qty = min_qty = max_qty = qty;
         } else {
-            if (row.timestamp_ns < first_ts) {
-                first_ts = row.timestamp_ns; first_price = px; first_qty = qty;
+            if (ts < first_ts) {
+                first_ts = ts; first_price = px; first_qty = qty;
             }
-            if (row.timestamp_ns >= last_ts) {
-                last_ts = row.timestamp_ns; last_price = px; last_qty = qty;
+            if (ts >= last_ts) {
+                last_ts = ts; last_price = px; last_qty = qty;
             }
             min_price = std::min(min_price, px);   max_price = std::max(max_price, px);
             min_qty   = std::min(min_qty, qty);    max_qty   = std::max(max_qty, qty);
@@ -1787,33 +1807,44 @@ bool bucket_rows(const ColumnarStore& store, const QueryAST& ast, uint64_t from,
     // bucket's start is a 64-bit division, tens of cycles a row on the i3-7100U.
     BucketState* last = nullptr;
     uint64_t last_start = 0;
-    store.scan(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast), [&](const SnapshotRow& row) {
-        if (!row_allowed(ast, row)) return true;
-        if (last != nullptr && row.timestamp_ns - last_start < width) {
-            last->add(row);
-            ++rows;
-            return true;
-        }
-        const uint64_t start = row.timestamp_ns - row.timestamp_ns % width;
-        if (last == nullptr || start != last_start) {
-            auto it = buckets.find(start);
-            if (it == buckets.end()) {
-                // Rows do not arrive in time order - segments by their start, a segment's rows as
-                // appended, and a client's own event times anywhere (#105) - so LIMIT cannot end the
-                // scan early. The ceiling can (#47 step 2): past it the query is refused, whatever
-                // the rest of the range holds.
-                if (buckets.size() >= ceiling) {
-                    too_many = true;
-                    return false;
-                }
-                it = buckets.emplace(start, BucketState{}).first;
+    // A batch at a time (OB-12): the rows the scan chose, within [from, to] and the conditions, so
+    // nothing here checks a row again. A column the aggregates do not read is not in the batch and
+    // reads as zero, as a built row's field did.
+    store.scan_batches(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast),
+                       [&](const RowBatch& b) -> BatchVerdict {
+        const bool priced = !b.price.empty();
+        const bool sized = !b.qty.empty();
+        for (size_t k = 0; k < b.rows.size(); ++k) {
+            const uint32_t i = b.rows[k];
+            const uint64_t ts = b.ts[i];
+            const int64_t px = priced ? b.price[i] : 0;
+            const uint64_t qty = sized ? b.qty[i] : 0;
+            if (last != nullptr && ts - last_start < width) {
+                last->add(ts, px, qty);
+                continue;
             }
-            last = &it->second;
-            last_start = start;
+            const uint64_t start = ts - ts % width;
+            if (last == nullptr || start != last_start) {
+                auto it = buckets.find(start);
+                if (it == buckets.end()) {
+                    // Rows do not arrive in time order - segments by their start, a segment's rows
+                    // as appended, and a client's own event times anywhere (#105) - so LIMIT cannot
+                    // end the scan early. The ceiling can (#47 step 2): past it the query is
+                    // refused, whatever the rest of the range holds.
+                    if (buckets.size() >= ceiling) {
+                        too_many = true;
+                        rows += k;
+                        return {true, k};
+                    }
+                    it = buckets.emplace(start, BucketState{}).first;
+                }
+                last = &it->second;
+                last_start = start;
+            }
+            last->add(ts, px, qty);
         }
-        last->add(row);
-        ++rows;
-        return true;
+        rows += b.rows.size();
+        return {};
     });
     return !too_many;
 }
