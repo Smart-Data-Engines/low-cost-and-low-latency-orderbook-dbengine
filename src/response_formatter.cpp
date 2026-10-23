@@ -348,8 +348,10 @@ void QueryResponseBuilder::add(const QueryResult& r) {
 [[gnu::noinline]] static char* write_narrow_rows(char* p, char* end, const RowBatch& b, size_t n,
                                                  const std::vector<QueryColumn>& columns) {
     const size_t last = columns.size() - 1;
-    for (size_t k = 0; k < n; ++k) {
-        const uint32_t i = b.rows[k];
+    // Over a span taken once: a store through `p` may alias anything, so `b.rows[k]` would load the
+    // span's pointer again for every row, where this keeps it (stage 1's loop, three instructions a
+    // row fewer on ARM).
+    for (const uint32_t i : b.rows.first(n)) {
         for (size_t c = 0; c < columns.size(); ++c) {
             p = put_column(p, end, b, i, columns[c], c == last ? '\n' : '\t');
         }
@@ -362,7 +364,7 @@ void QueryResponseBuilder::add(const QueryResult& r) {
 // kept out of line (GCC 15.2, -O3): a call a row of every `SELECT *` answer, where stage 1's one
 // caller had it inlined.
 [[gnu::noinline]] static char* write_seven_rows(char* p, char* end, const RowBatch& b, size_t n) {
-    for (size_t k = 0; k < n; ++k) p = put_seven(p, end, b, b.rows[k]);
+    for (const uint32_t i : b.rows.first(n)) p = put_seven(p, end, b, i);
     return p;
 }
 
