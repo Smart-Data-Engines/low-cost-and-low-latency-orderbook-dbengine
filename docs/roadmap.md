@@ -2998,6 +2998,11 @@ alone and three under load, every answer one SHA-256 across the builds:
   `write_narrow_rows()` does a narrowed list, and inlines it again: 142.7 M, stage 1's and 0.5%.
   Engine time 8.53-8.60 ms against stage 1's 8.08-8.12 and the tree before it 8.69-8.76; the cycles
   2.7-5.4% above stage 1's, as for the narrowed answers.
+- **And a pointer a row.** The two writers read row `k` as `b.rows[k]`, and a store through the
+  `char` pointer they write with may alias the batch, so the span's pointer was loaded for every row.
+  Looping over a span taken once, as stage 1's range-for did, is one instruction a row fewer. What
+  stage 2's tree with no pool still costs on ARM is 0.3-0.5% of the instructions of a row answer and
+  1.3-3.7% of its cycles.
 - **How the cost came down to that.** Measured under load first, the pool cost the writer most of
   its tail - a p99 of 0.5-1.2 ms and 2.98-4.60 M levels a second - and four connections 22% of their
   queries.
