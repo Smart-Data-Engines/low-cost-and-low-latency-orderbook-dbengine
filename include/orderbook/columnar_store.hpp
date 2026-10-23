@@ -184,7 +184,14 @@ struct PartsScan {
     /// A part folded into the answer, on the scan's thread and in the candidates' order. False ends
     /// the scan.
     std::function<bool(ScanPart&)> fold;
+    /// Divide a scan a pool cannot speed up as well - fewer rows in range than
+    /// `kScanDivideMinRows`, or most of them in one candidate - which only tests ask for, so that
+    /// a small store reads the parts' path.
+    bool divide_small{false};
 };
+
+/// The fewest rows in range a scan is divided at: below it a scan is read on its query's thread.
+inline constexpr uint64_t kScanDivideMinRows = 32'768;
 
 /// Row `i` of a batch as the row scan hands it over: the fields of the columns the batch holds,
 /// zero in every field whose column it does not.

@@ -1642,6 +1642,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         PartsScan how;
         how.pool = scan_pool_;
         how.limit_rows = lim;
+        how.divide_small = scan_divide_small_;
         how.direct = direct;
         how.make_part = [rows, lim]() { return rows->part(lim); };
         how.fold = [&](ScanPart& part) {
@@ -1949,9 +1950,9 @@ private:
 /// the candidates' order (#246, stage 2): the same buckets one thread would have filled. Where a
 /// merge cannot tell that - a sum of price times quantity whose size could have left 128 bits part
 /// way, which `merge_later()` explains - the rows are read again on this thread, and that is said.
-bool bucket_rows(const ColumnarStore& store, ScanPool* pool, const QueryAST& ast, uint64_t from,
-                 uint64_t to, size_t ceiling, std::unordered_map<uint64_t, BucketState>& buckets,
-                 uint64_t& rows) {
+bool bucket_rows(const ColumnarStore& store, ScanPool* pool, bool divide_small, const QueryAST& ast,
+                 uint64_t from, uint64_t to, size_t ceiling,
+                 std::unordered_map<uint64_t, BucketState>& buckets, uint64_t& rows) {
     const uint64_t width = *ast.bucket_ns;
     // The time, the columns the aggregates read, and the ones the conditions are on.
     ColumnSet to_read;
@@ -1979,6 +1980,7 @@ bool bucket_rows(const ColumnarStore& store, ScanPool* pool, const QueryAST& ast
     uint64_t merged_rows = 0;
     PartsScan how;
     how.pool = pool;
+    how.divide_small = divide_small;
     how.direct = direct;
     how.make_part = [width, ceiling]() -> std::unique_ptr<ScanPart> {
         return std::make_unique<BucketPart>(width, ceiling);
@@ -2395,7 +2397,7 @@ std::string QueryEngine::execute_buckets(const QueryAST& ast, const RowCallback&
     const size_t ceiling = max_query_buckets();
     std::unordered_map<uint64_t, BucketState> buckets;
     uint64_t rows = 0;
-    if (!bucket_rows(store_, scan_pool_, ast, ast.ts_start_ns.value_or(0),
+    if (!bucket_rows(store_, scan_pool_, scan_divide_small_, ast, ast.ts_start_ns.value_or(0),
                      ast.ts_end_ns.value_or(UINT64_MAX), ceiling, buckets, rows)) {
         return buckets_too_many(ast, ceiling);
     }
@@ -2454,7 +2456,10 @@ std::string QueryEngine::execute_series(const QueryAST& ast, const RowCallback& 
     }
     std::unordered_map<uint64_t, BucketState> row_buckets;
     uint64_t rows = 0;
-    if (row_aggs) bucket_rows(store_, scan_pool_, ast, lo, read_to, SIZE_MAX, row_buckets, rows);
+    if (row_aggs) {
+        bucket_rows(store_, scan_pool_, scan_divide_small_, ast, lo, read_to, SIZE_MAX, row_buckets,
+                    rows);
+    }
 
     const std::vector<Series> used = used_series(ast);
     std::vector<QueryResult> answer;
@@ -2548,7 +2553,8 @@ std::string QueryEngine::execute_rolling(const QueryAST& ast, const RowCallback&
         QueryAST widened = ast;
         widened.ts_start_ns = back;
         widened.ts_end_ns = read_to;
-        bucket_rows(store_, scan_pool_, widened, back, read_to, SIZE_MAX, row_buckets, rows);
+        bucket_rows(store_, scan_pool_, scan_divide_small_, widened, back, read_to, SIZE_MAX,
+                    row_buckets, rows);
     }
 
     struct Rolled {

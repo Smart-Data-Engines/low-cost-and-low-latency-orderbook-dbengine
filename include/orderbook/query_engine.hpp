@@ -253,10 +253,15 @@ public:
     /// The most buckets one `GROUP BY TIME_BUCKET(...)` answer may have (#44); past it the query is
     /// refused with `BUCKETS_TOO_MANY` rather than cut short. `--max-query-buckets`.
     /// The pool a scan's candidates are read on (#246, stage 2): a row answer given a `RowAnswer`,
-    /// and the row aggregates of `GROUP BY TIME_BUCKET`, are divided by candidate among its threads.
-    /// Null, or a pool of no threads, reads every candidate on the query's thread. Set before the
-    /// first query; the pool outlives every query that reads through it.
-    void set_scan_pool(ScanPool* pool) { scan_pool_ = pool; }
+    /// and the row aggregates of `GROUP BY TIME_BUCKET`, are divided by candidate among its threads
+    /// where that can speed them up. Null, or a pool of no threads, reads every candidate on the
+    /// query's thread. `divide_small` divides the scans that cannot be sped up as well, for tests
+    /// (`PartsScan::divide_small`). Set before the first query; the pool outlives every query that
+    /// reads through it.
+    void set_scan_pool(ScanPool* pool, bool divide_small = false) {
+        scan_pool_ = pool;
+        scan_divide_small_ = divide_small;
+    }
     void set_max_query_buckets(size_t n) { max_query_buckets_.store(n, std::memory_order_relaxed); }
     size_t max_query_buckets() const { return max_query_buckets_.load(std::memory_order_relaxed); }
     static constexpr size_t kDefaultMaxQueryBuckets = 100'000;
@@ -308,6 +313,7 @@ private:
     const AggregationEngine& agg_;
     std::atomic<size_t>  max_query_buckets_{kDefaultMaxQueryBuckets};
     ScanPool*            scan_pool_{nullptr};
+    bool                 scan_divide_small_{false};
 
     /// A `GROUP BY TIME_BUCKET(...)` query (#44): one scan of the rows its conditions keep, each
     /// added to its bucket's state, then every bucket's values computed and checked before the

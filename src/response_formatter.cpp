@@ -446,9 +446,11 @@ void QueryResponseBuilder::add_part(ScanPart& p, uint64_t n) {
     if (n == 0) return;
     if (!started_) start_rows();
     const size_t bytes = part.bytes_of(n);
-    if (out_.size() - used_ < bytes) out_.resize(std::max(out_.size() * 2, used_ + bytes));
-    std::memcpy(out_.data() + used_, part.data(), bytes);
-    used_ += bytes;
+    // Appended rather than copied into room made ahead, which a resize fills with zeros first: the
+    // copy is the one pass over the bytes this reply makes.
+    out_.resize(used_);
+    out_.append(part.data(), bytes);
+    used_ = out_.size();
 }
 
 std::string QueryResponseBuilder::finish() {

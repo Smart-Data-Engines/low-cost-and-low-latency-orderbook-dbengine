@@ -2538,11 +2538,35 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         slots.push_back(std::move(s));
     }
     const size_t segment_slots = slots.size();
-    // Nothing to divide - no pool, no threads, one candidate - or a LIMIT the first candidate's rows
-    // may meet on their own, as a small one does: one thread's scan, the scan_batches() this
-    // replaces when it can, and no queue to pass through on the way.
+    // The rows each candidate may give this range, read from its metadata as if spread evenly over
+    // its time - all of it when its range is one instant.
+    uint64_t in_range = 0;
+    uint64_t largest = 0;
+    for (Slot& s : slots) {
+        const SegmentMeta& m = *s.meta;
+        const uint64_t lo = std::max(m.start_ts_ns, start_ns);
+        const uint64_t hi = std::min(m.end_ts_ns, end_ns);
+        const uint64_t span = m.end_ts_ns - m.start_ts_ns;
+        const uint64_t rows =
+            span == 0 || hi < lo
+                ? (hi < lo ? 0 : m.row_count)
+                : static_cast<uint64_t>(static_cast<double>(m.row_count) *
+                                        (static_cast<double>(hi - lo) + 1.0) /
+                                        (static_cast<double>(span) + 1.0));
+        in_range += rows;
+        largest = std::max(largest, rows);
+    }
+    // Divided only where a pool can speed it up. Nothing to divide - no pool, no threads, one
+    // candidate - or a LIMIT the first candidate's rows may meet on their own, as a small one does;
+    // and, measured on the x86 host, a scan of a few thousand rows paid a few microseconds for the
+    // queue and won nothing, and one whose rows are mostly in one candidate paid the copy of its
+    // part on top of reading it. Below those, one thread's scan - the scan_batches() this replaces
+    // when it can - with no queue to pass through.
+    const bool worth = how.divide_small ||
+                       (in_range >= kScanDivideMinRows && largest <= in_range / 4 * 3);
     const bool divide = how.pool != nullptr && how.pool->threads() > 0 && segment_slots > 1 &&
-                        (how.limit_rows == UINT64_MAX || how.limit_rows > slots[0].rows_at_most);
+                        (how.limit_rows == UINT64_MAX || how.limit_rows > slots[0].rows_at_most) &&
+                        worth;
     if (!divide) {
         return read_in_order(set, symbol, exchange, columns, start_ns, end_ns, filter, how.direct,
                              cost);
@@ -2611,12 +2635,9 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
             hand_out(k);
             Slot& s = slots[k];
             if (s.task) {
-                // While a thread reads the part the fold needs next, this one reads another of
-                // this scan's parts no thread has taken yet - the last one out, which the threads
-                // reach last - rather than wait idle.
-                for (size_t j = handed; !s.task->done() && j > k + 1; --j) {
-                    if (slots[j - 1].task) pool->run_here_if_untaken(*slots[j - 1].task);
-                }
+                // Waited for, not helped with: a query that read another of its parts while the
+                // one it needs was read elsewhere was measured slower, because what it read held
+                // up the fold, and with it the parts handed out to the threads that had finished.
                 const auto t0 = std::chrono::steady_clock::now();
                 pool->run_or_wait(*s.task);
                 waited += std::chrono::steady_clock::now() - t0;

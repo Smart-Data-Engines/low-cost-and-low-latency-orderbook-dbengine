@@ -67,11 +67,6 @@ public:
     /// work threw.
     void run_or_wait(Task& task);
 
-    /// The task run here if no thread has taken it - what a query does with another of its parts
-    /// while the one it needs next is being read elsewhere, rather than wait idle. False when a
-    /// thread had it; what its work threw stays with it, for run_or_wait() to rethrow.
-    bool run_here_if_untaken(Task& task);
-
     /// The task finished or never started: dropped if no thread has taken it, waited for if one
     /// has. What its work threw is not rethrown - a query that drops its tasks is already leaving.
     void drop_or_wait(Task& task);

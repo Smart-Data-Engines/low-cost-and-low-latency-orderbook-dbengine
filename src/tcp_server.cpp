@@ -1505,7 +1505,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
-        {"scan-threads", {"<N>", "Threads a query's segments are read on, 0 to 64 (default: set by the profile - one fewer than the usable CPUs under boost, 0 under eco). A query of two segments or more divides them among these and its own loop; 0 reads every segment on the query's loop"}},
+        {"scan-threads", {"<N>", "Threads a query's segments are read on, 0 to 64 (default: set by the profile - one per usable CPU under boost where there are two or more, 0 under eco). A query whose rows in range are many and spread over two segments or more divides them among these; 0 reads every segment on the query's loop"}},
         {"profile", {"<name>", "boost (default: one client event loop per usable CPU, and a 10 us spin where it cannot starve anything) or eco (one loop, blocking between events). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
@@ -1746,9 +1746,10 @@ BoostChoice choose_boost(const MachineResources& machine) {
     choice.reason = std::to_string(choice.io_threads) +
                     (choice.io_threads == 1 ? " client event loop" : " client event loops") +
                     ", one per usable CPU";
-    // The loop a query runs on reads its own segments too, so the pool is the rest of the CPUs.
+    // One per usable CPU: the loop a query runs on folds the parts in order and waits for the next,
+    // so it reads none of them, and on one CPU there is nothing for a pool to read on.
     choice.scan_threads =
-        machine.usable_cpus >= 2 ? std::min<uint32_t>(machine.usable_cpus - 1, kMaxScanThreads) : 0;
+        machine.usable_cpus >= 2 ? std::min<uint32_t>(machine.usable_cpus, kMaxScanThreads) : 0;
     if (machine.affinity_cpus < 2) {
         // The only CPU this process may be scheduled on: the flush, the kernel and any client on
         // this machine run there too, and a loop spinning on it holds it from all of them.
@@ -1771,7 +1772,7 @@ BoostChoice choose_boost(const MachineResources& machine) {
                          ? "; no scan pool, as one usable CPU leaves none to read on"
                          : "; a scan pool of " + std::to_string(choice.scan_threads) +
                                (choice.scan_threads == 1 ? " thread" : " threads") +
-                               " beside the loop a query runs on";
+                               ", one per usable CPU";
     return choice;
 }
 

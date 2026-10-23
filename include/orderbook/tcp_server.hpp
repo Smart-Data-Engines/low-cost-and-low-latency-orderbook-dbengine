@@ -183,9 +183,10 @@ struct ServerConfig {
     /// accepts, and a connection stays on its reactor for life, because a Session is not
     /// thread-safe. 1 is the loop this server always had.
     uint32_t    io_threads{1};
-    /// --scan-threads: the pool a query's segments are read on (#246, stage 2). A query of two or
-    /// more divides them among the pool's threads and its own loop, and folds what they made in
-    /// order. 0 reads every segment on the query's loop, which is what this server always did.
+    /// --scan-threads: the pool a query's segments are read on (#246, stage 2). A query whose rows
+    /// in range are many and spread over two segments or more divides them among the pool's
+    /// threads, and its loop folds what they made in order. 0 reads every segment on the query's
+    /// loop, which is what this server always did.
     uint32_t    scan_threads{0};
 
     // Replication (primary)
@@ -472,9 +473,11 @@ struct BoostChoice {
 ///   process may run on, a spinning loop holds it from everything else there: a client sharing it
 ///   measured a p99 of 5.9 µs without the spin and 13.7 µs with it. Under a limit, spinning spends
 ///   the limit, and a cgroup over it stops every thread until the next period.
-/// - **a scan pool of one thread fewer than the usable CPUs** (#246, stage 2), because the loop a
-///   query runs on reads its own segments too: so a query alone on the node reads on every usable
-///   CPU, and on one CPU there is no pool, as there is nothing for it to read on.
+/// - **a scan pool of one thread per usable CPU** (#246, stage 2), where there are two or more. The
+///   loop a query runs on folds the parts and waits for the next one, so it reads none: on the x86
+///   host four threads took 80 buckets of 1.9 M rows in 3.30-3.32 ms where three took 4.13-4.19,
+///   and a query that read a part of its own while it waited was slower still (3.80-3.82). On one
+///   CPU there is nothing for a pool to read on.
 ///
 /// Pure, like `detect_machine()`: the same machine gives the same choice.
 BoostChoice choose_boost(const MachineResources& machine);

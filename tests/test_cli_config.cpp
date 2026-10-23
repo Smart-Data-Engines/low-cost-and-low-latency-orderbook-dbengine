@@ -450,8 +450,7 @@ TEST(BoostRule, SpinsWhereTheProcessHasACpuToSpare) {
     EXPECT_EQ(c.io_spin_us, ob::kBoostSpinUs);
     EXPECT_EQ(c.reason, "4 client event loops, one per usable CPU, and a " +
                             std::to_string(ob::kBoostSpinUs) +
-                            " µs spin window; a scan pool of 3 threads beside the loop a query "
-                            "runs on");
+                            " µs spin window; a scan pool of 4 threads, one per usable CPU");
 }
 
 TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
@@ -480,16 +479,17 @@ TEST(BoostRule, TheProfileSetsTheScanPoolUnlessTheOperatorDoes) {
     EXPECT_EQ(eco.config.scan_threads, 0u);
 }
 
-TEST(BoostRule, AScanPoolOfOneThreadFewerThanTheUsableCpus) {
-    // The loop a query runs on reads its own segments too (#246, stage 2), so a query alone on the
-    // node reads on every usable CPU; on one there is nothing for a pool to read on.
+TEST(BoostRule, AScanPoolOfOneThreadPerUsableCpuWhereThereAreTwo) {
+    // The loop a query runs on folds the parts and waits for the next (#246, stage 2), so the pool
+    // reads on every usable CPU; on one there is nothing for a pool to read on.
     for (unsigned cpus : {1u, 2u, 3u, 4u, 8u, 16u}) {
-        EXPECT_EQ(ob::choose_boost(machine_of(cpus, std::nullopt, cpus)).scan_threads, cpus - 1)
+        EXPECT_EQ(ob::choose_boost(machine_of(cpus, std::nullopt, cpus)).scan_threads,
+                  cpus >= 2 ? cpus : 0u)
             << cpus << " usable CPUs";
     }
     // Below the mask a cgroup limit decides, as for the loops.
     EXPECT_EQ(ob::choose_boost(machine_of(4, 1.5, 1)).scan_threads, 0u);
-    EXPECT_EQ(ob::choose_boost(machine_of(8, 2.5, 2)).scan_threads, 1u);
+    EXPECT_EQ(ob::choose_boost(machine_of(8, 2.5, 2)).scan_threads, 2u);
     EXPECT_EQ(ob::choose_boost(machine_of(200, std::nullopt, 200)).scan_threads, ob::kMaxScanThreads);
 }
 

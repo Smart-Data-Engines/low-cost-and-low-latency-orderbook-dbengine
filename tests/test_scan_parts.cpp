@@ -80,7 +80,9 @@ struct Store {
     /// The reply the server would send, built as the server builds it: rows a batch or a part at a
     /// time into a `RowAnswer`, aggregates and buckets through the callback.
     std::string reply(const std::string& sql, ob::ScanPool* pool) {
-        engine.set_scan_pool(pool);
+        // Divided whenever there is a pool, small stores included: the parts' path is the one held
+        // to the answer without a pool here, and these stores are below where a query divides.
+        engine.set_scan_pool(pool, /*divide_small=*/true);
         ob::QueryShape shape;
         ob::QueryResponseBuilder builder(shape);
         const std::string err = engine.execute(sql, [&](const ob::QueryResult& r) { builder.add(r); },
@@ -278,6 +280,7 @@ TEST(ScanParts, ALimitReadsNoCandidateItWillNotNeed) {
         uint64_t direct = 0;
         ob::PartsScan how;
         how.pool = &pool;
+        how.divide_small = true;
         how.limit_rows = limit;
         how.direct = [&direct, limit](const ob::RowBatch& b) -> ob::BatchVerdict {
             const uint64_t room = limit - direct;
@@ -318,6 +321,7 @@ TEST(ScanParts, APartThatThrowsReachesTheQueryWithEveryOtherPartSettled) {
     std::atomic<int> made{0};
     ob::PartsScan how;
     how.pool = &pool;
+    how.divide_small = true;
     how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
         return std::make_unique<CountingPart>(made.fetch_add(1) == 3);
     };
@@ -346,6 +350,7 @@ TEST(ScanParts, WithNothingToDivideTheScanIsTheDirectReaderAndNoPartIsMade) {
         uint64_t direct = 0;
         ob::PartsScan how;
         how.pool = p;
+        how.divide_small = true;
         how.direct = [&direct](const ob::RowBatch& b) -> ob::BatchVerdict {
             direct += b.rows.size();
             return {};
@@ -371,6 +376,7 @@ TEST(ScanParts, NoMorePartsAreHeldThanThePoolsThreadsAndOne) {
         std::atomic<int> most{0};
         ob::PartsScan how;
         how.pool = &pool;
+        how.divide_small = true;
         how.make_part = [&most]() -> std::unique_ptr<ob::ScanPart> {
             auto part = std::make_unique<CountingPart>(false);
             int alive = g_parts_alive.load();
@@ -431,6 +437,7 @@ TEST(ScanParts, AScanItsFoldEndsCountsTheSegmentsLeftUnreadBeforeItsPartAsOneThr
     int folded = 0;
     ob::PartsScan how;
     how.pool = &pool;
+    how.divide_small = true;
     how.make_part = []() -> std::unique_ptr<ob::ScanPart> { return std::make_unique<CountingPart>(false); };
     how.fold = [&folded](ob::ScanPart&) { return ++folded < 3; };
     const auto parts = s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), priced, how);
@@ -440,4 +447,39 @@ TEST(ScanParts, AScanItsFoldEndsCountsTheSegmentsLeftUnreadBeforeItsPartAsOneThr
     EXPECT_EQ(parts.skipped_by_price, one_thread.skipped_by_price);
     EXPECT_EQ(one_thread.segments_read, 3u);
     EXPECT_EQ(one_thread.skipped_by_price, 2u);
+}
+
+TEST(ScanParts, AScanAPoolCannotSpeedUpIsReadOnItsQuerysThread) {
+    // A segment of 40 000 rows, one of 2 000, then eight of 5 000, one row a microsecond in that
+    // order. Divided: the eight of 5 000, 40 000 rows spread over eight candidates. Not divided:
+    // 4 000 rows over two of them - too few - nor the 42 000 of the first two, most of them in one.
+    Store s;
+    uint64_t next = 0;
+    std::vector<uint64_t> first_of;   // the index of each segment's first row
+    for (const uint64_t n : {40'000u, 2'000u, 5'000u, 5'000u, 5'000u, 5'000u, 5'000u, 5'000u, 5'000u, 5'000u}) {
+        first_of.push_back(next);
+        std::vector<ob::SnapshotRow> rows;
+        for (uint64_t i = 0; i < n; ++i, ++next) rows.push_back(row(kBase + next * 1000, 0, 0, 7, 1, next + 1));
+        s.segment(rows);
+    }
+    const auto at = [](uint64_t index) { return kBase + index * 1000; };
+    ob::ScanPool pool(2, nullptr);
+    const auto parts_made = [&](uint64_t from, uint64_t to) {
+        int made = 0;
+        ob::PartsScan how;
+        how.pool = &pool;
+        how.direct = [](const ob::RowBatch&) -> ob::BatchVerdict { return {}; };
+        how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+            ++made;
+            return std::make_unique<CountingPart>(false);
+        };
+        how.fold = [](ob::ScanPart&) { return true; };
+        s.store.scan_parts(from, to, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+        return made;
+    };
+    EXPECT_EQ(parts_made(at(first_of[2]), at(next - 1)), 8);
+    EXPECT_EQ(parts_made(at(first_of[2] - 2000), at(first_of[2] + 1999)), 0)
+        << "4 000 rows in range were divided";
+    EXPECT_EQ(parts_made(at(0), at(first_of[2] - 1)), 0) << "a range mostly in one segment was divided";
+    EXPECT_EQ(g_parts_alive.load(), 0);
 }
