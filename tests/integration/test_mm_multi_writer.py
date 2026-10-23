@@ -29,7 +29,7 @@ import urllib.request
 import pytest
 
 from conftest import ClusterManager, node_log_since, node_log_size
-from orderbook_engine import BookUpdate, OrderbookEngine
+from orderbook_engine import BookUpdate, OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.multi_master
 
@@ -69,10 +69,16 @@ def write(node, first_ts: int, count: int) -> None:
 
 
 def rows(node) -> int:
+    """The rows `node` holds of SYMBOL, none while the mesh has not delivered any: the waits below
+    poll a node that may not have the symbol yet, which answers `NOT_FOUND` (pitfall 576)."""
     client = client_for(node)
     try:
         client.flush()
         return len(client.query_all(SYMBOL, EXCHANGE))
+    except OrderbookError as e:
+        if "OB_ERR_NOT_FOUND" not in str(e):
+            raise
+        return 0
     finally:
         client.close()
 

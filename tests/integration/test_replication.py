@@ -13,7 +13,7 @@ import time
 import pytest
 from conftest import node_log_since, node_log_size, patience
 
-from orderbook_engine import OrderbookEngine
+from orderbook_engine import OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.replication
 
@@ -265,7 +265,13 @@ def test_the_replicas_log_does_not_grow_with_the_records_it_applies(cluster,
         deadline = time.monotonic() + patience(60)
         held = 0
         while time.monotonic() < deadline:
-            held = len(reader.query_all(symbol, exchange))
+            try:
+                held = len(reader.query_all(symbol, exchange))
+            except OrderbookError as e:
+                # The replica has not been sent the symbol's first record yet (pitfall 576).
+                if "OB_ERR_NOT_FOUND" not in str(e):
+                    raise
+                held = 0
             if held >= records:
                 break
             time.sleep(0.5)
