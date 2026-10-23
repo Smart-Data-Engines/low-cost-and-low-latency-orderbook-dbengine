@@ -2895,8 +2895,8 @@ Measured on the i3-7100U, Release, a flush with nothing new (`laptop/local-flush
 - after it: 1.2-1.5 ms at 10 000 rows of one symbol, 17.8-19.9 ms at 100 000, and 94-146 ms at a
   million, over two runs.
 
-**Closed**: `ob_flush()` writes and indexes each symbol's open segment, with any segment a write
-rolled over into, and keeps the engine open with its live books. The Python client calls it when
+**Closed in PR #276** (23 October 2026): `ob_flush()` writes and indexes each symbol's open
+segment, with any segment a write rolled over into, and keeps the engine open with its live books. The Python client calls it when
 the library has it, and closes and opens one that does not.
 - A flush with nothing new takes 0.02 ms or less at every size.
 - An open still composes every book: 112-290 ms at a million rows of one symbol, once a process
