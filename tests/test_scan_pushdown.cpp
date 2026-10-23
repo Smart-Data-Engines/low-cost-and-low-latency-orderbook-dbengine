@@ -334,9 +334,9 @@ TEST(ScanPushdown, ASelectionAcrossChunksStopsAndCountsAsTheRowByRowLoopDid) {
 }
 
 TEST(ScanPushdown, AFormat2SegmentWithItsPriceCutShortIsFilteredRowByRowAsBefore) {
-    // A price column a short file left short is padded with zeros, and the selection pass needs
-    // whole columns: this read goes through the loop it falls back to, and answers as the scan
-    // filtered after does.
+    // A price column a short file left short is padded with zeros - before the selection pass since
+    // OB-12, which runs on whole columns for every read and has no row-by-row loop to fall back to
+    // - and the read answers as the scan filtered after does.
     Fixture f;
     auto format = f.store.segment_format();
     format.version = ob::kColumnarFormatV2;

@@ -364,6 +364,11 @@ ob_add_query_test(test_scan_pushdown
     test_scan_pushdown.cpp
 )
 
+# ── OB-12, stage 1: a scan hands its rows over a batch at a time ──────────────
+ob_add_query_test(test_scan_batches
+    test_scan_batches.cpp
+)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

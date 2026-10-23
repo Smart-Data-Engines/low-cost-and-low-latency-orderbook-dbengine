@@ -23,11 +23,13 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +88,56 @@ RC_GTEST_PROP(QueryResponseBuilderProperty, WritesTheBytesFormatQueryResponseWri
                              *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>())));
     }
     RC_ASSERT(built(rows, columns) == ob::format_query_response(rows, columns));
+}
+
+// OB-12: the same rows handed over as a batch's columns rather than one result each, in batches of
+// any size and with rows of the columns left out between the chosen ones - the bytes are add()'s.
+// The sequence number is the one field whose column and result differ in type (int64 in a segment,
+// uint64 in a result), and drawing it at full size is what holds the cast that keeps them one.
+RC_GTEST_PROP(QueryResponseBuilderProperty, RowsFromBatchesAreTheBytesOfTheSameRowsAsResults, ()) {
+    const auto column = rc::gen::element(ob::QueryColumn::TimestampNs, ob::QueryColumn::Price,
+                                         ob::QueryColumn::Quantity, ob::QueryColumn::OrderCount,
+                                         ob::QueryColumn::Side, ob::QueryColumn::Level,
+                                         ob::QueryColumn::SequenceNumber);
+    const auto columns = *rc::gen::weightedOneOf<std::vector<ob::QueryColumn>>({
+        {2, rc::gen::just(ob::all_query_columns())},
+        {3, rc::gen::nonEmpty(rc::gen::container<std::vector<ob::QueryColumn>>(column))},
+    });
+    const auto n = *rc::gen::inRange<size_t>(0, 300);
+    std::vector<uint64_t> ts(n), qty(n);
+    std::vector<int64_t> price(n), seq(n);
+    std::vector<uint32_t> cnt(n);
+    std::vector<uint8_t> side(n);
+    std::vector<uint16_t> level(n);
+    for (size_t i = 0; i < n; ++i) {
+        ts[i]    = *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>());
+        price[i] = *rc::gen::resize(100, rc::gen::arbitrary<int64_t>());
+        qty[i]   = *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>());
+        cnt[i]   = *rc::gen::resize(100, rc::gen::arbitrary<uint32_t>());
+        side[i]  = *rc::gen::resize(100, rc::gen::arbitrary<uint8_t>());
+        level[i] = *rc::gen::resize(100, rc::gen::arbitrary<uint16_t>());
+        seq[i]   = static_cast<int64_t>(*rc::gen::resize(100, rc::gen::arbitrary<uint64_t>()));
+    }
+    std::vector<uint32_t> chosen;
+    for (size_t i = 0; i < n; ++i) {
+        if (*rc::gen::inRange(0, 4) != 0) chosen.push_back(static_cast<uint32_t>(i));
+    }
+    std::vector<ob::QueryResult> results;
+    for (const uint32_t i : chosen) {
+        results.push_back(a_row(ts[i], price[i], qty[i], cnt[i], side[i], level[i],
+                                static_cast<uint64_t>(seq[i])));
+    }
+    ob::QueryShape shape;
+    shape.columns = columns;
+    ob::QueryResponseBuilder from_batches(shape);
+    for (size_t at = 0; at < chosen.size();) {
+        const size_t take = std::min(chosen.size() - at, *rc::gen::inRange<size_t>(1, 120));
+        ob::RowBatch b{ts, price, qty, cnt, side, level, seq,
+                       std::span<const uint32_t>(chosen.data() + at, take)};
+        from_batches.add_rows(b);
+        at += take;
+    }
+    RC_ASSERT(from_batches.finish() == built(results, columns));
 }
 
 TEST(QueryResponseBuilder, NoRowIsTheHeaderAndTheTerminator) {
@@ -280,6 +332,56 @@ TEST(QueryShapeBeforeRows, TheBuiltReplyIsTheCollectedOnes) {
         ob::QueryResponseBuilder reply(shape);
         ASSERT_TRUE(fx.engine.execute(sql, [&](const ob::QueryResult& r) { reply.add(r); }, shape)
                         .empty());
+        EXPECT_EQ(reply.finish(), collected) << sql;
+    }
+}
+
+// OB-12: the reply built from the engine's batches, against the rows the engine hands over one result
+// each and formatted after - the two paths a row answer has - for whole scans, narrowings, repeats,
+// conditions the scan applies and a LIMIT that ends inside a batch or exactly at its end.
+TEST(QueryShapeBeforeRows, TheReplyFromBatchesIsTheCollectedRowsOnes) {
+    Fixture fx;
+    // Two more segments, so the scan crosses candidates: 5 000 rows each, more than two batches.
+    for (int g = 0; g < 2; ++g) {
+        fx.store.set_symbol_exchange("RB", "EX");
+        for (uint64_t i = 0; i < 5'000; ++i) {
+            ob::SnapshotRow r{};
+            r.timestamp_ns = 1'790'000'000'100'000'000ULL + static_cast<uint64_t>(g) * 10'000'000 + i * 1'000;
+            r.sequence_number = 100 + static_cast<uint64_t>(g) * 5'000 + i;
+            r.side = static_cast<uint8_t>(i % 2);
+            r.level_index = static_cast<uint16_t>(i % 7);
+            r.price = 9'000 + static_cast<int64_t>(i % 1'000);
+            r.quantity = 1 + i % 13;
+            r.order_count = static_cast<uint32_t>(1 + i % 3);
+            fx.store.append(r);
+        }
+        ASSERT_TRUE(fx.store.flush_segment().has_value());
+    }
+    const std::string all = "FROM 'RB'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
+    for (const std::string& sql : {
+             "SELECT * " + all,
+             "SELECT timestamp, price, quantity " + all,
+             "SELECT quantity, price, quantity, side, side " + all,
+             "SELECT * " + all + " AND price BETWEEN 9100 AND 9200",
+             "SELECT price, level " + all + " AND side = 1 AND level BETWEEN 2 AND 3",
+             "SELECT * " + all + " LIMIT 1",
+             "SELECT timestamp, price " + all + " LIMIT 2048",
+             "SELECT timestamp, price " + all + " LIMIT 2098",
+             "SELECT sequence_number " + all + " AND price < 9050 LIMIT 300",
+             std::string{"SELECT * FROM 'RB'.'EX' WHERE timestamp BETWEEN 1790000000100500000 AND "
+                         "1790000000110100000"}}) {
+        std::vector<ob::QueryResult> rows;
+        ob::QueryShape collected_shape;
+        ASSERT_TRUE(fx.engine.execute(sql, [&](const ob::QueryResult& r) { rows.push_back(r); },
+                                      collected_shape).empty()) << sql;
+        const std::string collected = ob::format_query_response(rows, collected_shape.columns);
+
+        ob::QueryShape shape;
+        ob::QueryResponseBuilder reply(shape);
+        size_t one_at_a_time = 0;
+        ASSERT_TRUE(fx.engine.execute(sql, [&](const ob::QueryResult&) { ++one_at_a_time; }, shape,
+                                      &reply).empty()) << sql;
+        EXPECT_EQ(one_at_a_time, 0u) << sql << ": a row answer's rows came one result at a time";
         EXPECT_EQ(reply.finish(), collected) << sql;
     }
 }

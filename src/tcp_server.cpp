@@ -860,7 +860,10 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
     const auto started = std::chrono::steady_clock::now();
     QueryResponseBuilder reply(shape);
     try {
-        const std::string err = read([&](const QueryResult& r) { reply.add(r); });
+        // The builder twice: as a row callback for whatever arrives one result at a time, and as
+        // the place a row answer's batches go (OB-12).
+        const std::string err = read([&](const QueryResult& r) { reply.add(r); },
+                                     static_cast<RowAnswer&>(reply));
         if (!err.empty()) {
             OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, session.fd(),
                          sanitise_for_log(err, 256).c_str());
@@ -1066,9 +1069,10 @@ std::string execute_command(const Command& cmd,
         // client while the engine computed them correctly. The engine fills `shape` in as it
         // parses the query.
         QueryShape shape;
-        return answer_read("SELECT", engine, session, stats, registry, shape, [&](auto row) {
-            return engine.execute(cmd.raw_sql, row, shape);
-        });
+        return answer_read("SELECT", engine, session, stats, registry, shape,
+                           [&](auto row, RowAnswer& rows) {
+                               return engine.execute(cmd.raw_sql, row, shape, &rows);
+                           });
     }
 
     case CommandType::BOOK: {
@@ -1077,10 +1081,11 @@ std::string execute_command(const Command& cmd,
         // for it.
         QueryShape shape;
         shape.columns = all_query_columns();
-        return answer_read("BOOK", engine, session, stats, registry, shape, [&](auto row) {
-            return engine.read_book(cmd.book_args.symbol, cmd.book_args.exchange,
-                                    cmd.book_args.depth, row);
-        });
+        return answer_read("BOOK", engine, session, stats, registry, shape,
+                           [&](auto row, RowAnswer&) {
+                               return engine.read_book(cmd.book_args.symbol, cmd.book_args.exchange,
+                                                       cmd.book_args.depth, row);
+                           });
     }
     case CommandType::INSERT:
     case CommandType::MINSERT:

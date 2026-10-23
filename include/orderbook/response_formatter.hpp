@@ -143,7 +143,7 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
 /// `shape` is read at the first result and at finish(): the engine fills a query's shape before it
 /// hands over a row - a test in `test_query_engine.cpp` holds it to that - and the reply's header is
 /// written from it then.
-class QueryResponseBuilder {
+class QueryResponseBuilder : public RowAnswer {
 public:
     explicit QueryResponseBuilder(const QueryShape& shape) : shape_(shape) {}
     QueryResponseBuilder(const QueryResponseBuilder&) = delete;
@@ -152,14 +152,20 @@ public:
     /// One result, formatted now: a row, or the aggregates an aggregate query hands over once.
     void add(const QueryResult& r);
 
+    /// A row answer's rows a batch at a time (OB-12), formatted from the batch's columns straight
+    /// into the reply: the bytes add() writes for the same rows, through the same field writers.
+    void add_rows(const RowBatch& batch) override;
+
     /// The reply, header and terminator included; the builder is spent after it.
     std::string finish();
 
 private:
     void start(const QueryResult& first);
+    void start_rows();
     void start_buckets();
     void room_for_a_row();
     void add_narrow(const QueryResult& r);
+    char* add_narrow_rows(char* p, char* end, const RowBatch& b);
     void add_bucket(const QueryResult& r);
 
     const QueryShape&     shape_;

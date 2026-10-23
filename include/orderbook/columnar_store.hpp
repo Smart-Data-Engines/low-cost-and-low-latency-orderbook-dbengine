@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -122,6 +123,51 @@ struct RowFilter {
         return c;
     }
 };
+
+/// The most rows one batch of a scan chooses: the chunk its selection pass marks at a time (#225),
+/// whose masks stay in L1 between the passes over the columns.
+inline constexpr size_t kScanBatchRows = 2048;
+
+/// One candidate's rows as a scan hands them over a chunk at a time (OB-12): its columns - each
+/// holding the candidate's rows, or empty where the read did not ask for that column - and the
+/// indices of the rows chosen from them, increasing, at most `kScanBatchRows` of them.
+///
+/// The columns are the read's buffers or a segment's held ones (#220), so a batch is valid only
+/// inside the call it is handed to. A format-2 column cut short has been padded with zeros to the
+/// candidate's rows, which is what reading it a row at a time always gave.
+struct RowBatch {
+    std::span<const uint64_t> ts;
+    std::span<const int64_t>  price;
+    std::span<const uint64_t> qty;
+    std::span<const uint32_t> cnt;
+    std::span<const uint8_t>  side;
+    std::span<const uint16_t> level;
+    std::span<const int64_t>  seq;
+    std::span<const uint32_t> rows;
+};
+
+/// What a reader did with a batch: went through all of it, or stopped at `rows[at]` - the row it
+/// looked at last, whether or not it took it - after which the scan reads nothing more. The scan's
+/// `rows_filtered` then counts the rows the filter failed before that row, as it did row by row.
+struct BatchVerdict {
+    bool   stop{false};
+    size_t at{0};
+};
+using BatchReader = std::function<BatchVerdict(const RowBatch&)>;
+
+/// Row `i` of a batch as the row scan hands it over: the fields of the columns the batch holds,
+/// zero in every field whose column it does not.
+inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
+    SnapshotRow row{};
+    row.timestamp_ns = b.ts[i];
+    if (!b.seq.empty())   row.sequence_number = static_cast<uint64_t>(b.seq[i]);
+    if (!b.side.empty())  row.side            = b.side[i];
+    if (!b.level.empty()) row.level_index     = b.level[i];
+    if (!b.price.empty()) row.price           = b.price[i];
+    if (!b.qty.empty())   row.quantity        = b.qty[i];
+    if (!b.cnt.empty())   row.order_count     = b.cnt[i];
+    return row;
+}
 
 struct SegmentMeta {
     uint32_t format_version{kColumnarFormatVersion};
@@ -640,6 +686,15 @@ public:
                   ColumnSet columns, const RowFilter& filter,
                   const std::function<bool(const SnapshotRow&)>& cb) const;
 
+    /// The rows scan() hands over, a batch at a time (OB-12): the same rows, in the same order and
+    /// at the same `ScanCost`, with `read` called once a chunk of a candidate rather than once a
+    /// row. scan() is this with a reader that builds each row; a reader that takes the columns
+    /// themselves - a reply's formatter, a bucket's sums - builds no row it does not need.
+    ScanCost scan_batches(uint64_t start_ns, uint64_t end_ns,
+                          std::string_view symbol, std::string_view exchange,
+                          ColumnSet columns, const RowFilter& filter,
+                          const BatchReader& read) const;
+
     /// Whether a segment's metadata proves no row of it meets `filter` (#47 step 2): its price
     /// range disjoint from the filter's, or its levels holding no pair the filter's sides and
     /// levels allow. False whenever what it would need is unknown; `by_price` says which proof it was.
@@ -1098,18 +1153,18 @@ private:
     /// A query's read may find its segment removed by retention, and pads a short column the way it
     /// always has; a merge's finds nothing removed under it and takes a segment whole or not at all.
     enum class ReadMode { kQuery, kMerge };
-    /// `filter` is checked on the decoded columns before a row is built (#47 step 2) - the columns
+    /// `filter` is checked on the decoded columns before a row is chosen (#47 step 2) - the columns
     /// it reads are in `columns`, which the scans make sure of - and its failures are counted into
-    /// `filtered`; `cb` returning false ends the read, which `stopped` then says.
+    /// `filtered`; `read` takes the chosen rows a batch at a time (OB-12), and its stopping ends
+    /// the read, which `stopped` then says.
     SegmentRead read_segment_rows(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
-                                  uint64_t end_ns, const RowFilter& filter,
-                                  const std::function<bool(const SnapshotRow&)>& cb, ReadMode mode,
-                                  uint64_t* filtered = nullptr, bool* stopped = nullptr) const;
+                                  uint64_t end_ns, const RowFilter& filter, const BatchReader& read,
+                                  ReadMode mode, uint64_t* filtered = nullptr,
+                                  bool* stopped = nullptr) const;
     /// A format-3 query read of a segment with a slot: the columns held, the rest read, decoded
     /// and held (#220).
     SegmentRead read_held_columns(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
-                                  uint64_t end_ns, const RowFilter& filter,
-                                  const std::function<bool(const SnapshotRow&)>& cb,
+                                  uint64_t end_ns, const RowFilter& filter, const BatchReader& read,
                                   uint64_t* filtered, bool* stopped) const;
 
     // Helpers
