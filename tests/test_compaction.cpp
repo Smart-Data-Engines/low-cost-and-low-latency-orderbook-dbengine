@@ -199,38 +199,48 @@ TEST(Compaction, EightSealsOfASymbolMergeIntoOneAndEveryRowAnswersInOrder) {
     engine.close();
 }
 
-TEST(Compaction, AMergeCarriesTheBookSummariesOfItsInputs) {
-    // The summaries a read by price starts from (#233) are files in their segments' directories, and
-    // a merge's inputs are removed: the merged segment takes them, or reads start from the first row.
+TEST(Compaction, AMergeCarriesTheBookSummariesAndBestTracksOfItsInputs) {
+    // The summaries a read by price starts from (#233), and the best tracks a series reads (#243),
+    // are files in their segments' directories, and a merge's inputs are removed: the merged segment
+    // takes them, or reads start from the first row and series read every row.
     TempDir dir;
     std::vector<uint64_t> summaries;
+    std::vector<uint64_t> tracks;
     {
         ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
         engine.set_book_summary_rows(1);
         engine.open();
         seal_n(engine, "A", 1, ob::compaction::kFanIn);
         summaries = engine.store().book_summaries("A", "EX");
+        tracks = engine.store().best_tracks("A", "EX");
         ASSERT_FALSE(summaries.empty()) << "a seal of 50 rows with a summary due every row wrote none";
+        ASSERT_EQ(tracks, summaries) << "a summary was written without its track";
         ASSERT_TRUE(eventually([&] { return segments_on_disk(dir.path, "A") == 1; }));
         EXPECT_EQ(engine.store().book_summaries("A", "EX"), summaries)
             << "the merge lost a summary of its inputs";
+        EXPECT_EQ(engine.store().best_tracks("A", "EX"), tracks)
+            << "the merge lost a best track of its inputs";
         const auto book = engine.store().book_at_by_price(UINT64_MAX, "A", "EX");
         ASSERT_TRUE(book.from_summary.has_value());
         EXPECT_EQ(*book.from_summary, summaries.back());
         engine.close();
     }
     // And they are in the merged segment's directory, where a start finds them.
-    size_t files = 0;
+    size_t summary_files = 0;
+    size_t track_files = 0;
     for (const auto& meta : meta_files(dir.path)) {
         if (meta.string().find("/A/") == std::string::npos) continue;
         for (const auto& entry : fs::directory_iterator(meta.parent_path())) {
-            if (ob::is_book_summary_file(entry.path().filename().string())) ++files;
+            if (ob::is_book_summary_file(entry.path().filename().string())) ++summary_files;
+            if (ob::is_best_track_file(entry.path().filename().string())) ++track_files;
         }
     }
-    EXPECT_EQ(files, summaries.size());
+    EXPECT_EQ(summary_files, summaries.size());
+    EXPECT_EQ(track_files, tracks.size());
     ob::Engine reopened(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
     reopened.open();
     EXPECT_EQ(reopened.store().book_summaries("A", "EX"), summaries);
+    EXPECT_EQ(reopened.store().best_tracks("A", "EX"), tracks);
     reopened.close();
 }
 
