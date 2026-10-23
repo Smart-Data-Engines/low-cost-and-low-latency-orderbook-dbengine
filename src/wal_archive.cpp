@@ -3,7 +3,9 @@
 #include "orderbook/crc32c.hpp"
 #include "orderbook/durable_file.hpp"
 #include "orderbook/logger.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/metrics.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/wal.hpp"
 
 #include <fcntl.h>
@@ -267,7 +269,7 @@ void WalArchiver::start() {
         std::lock_guard<std::mutex> lock(mtx_);
         stop_ = false;
     }
-    thread_ = std::thread([this] { run(); });
+    thread_ = std::thread([this] { run_thread_body("wal_archive", "the WAL archiver", [this] { run(); }); });
     pthread_setname_np(thread_.native_handle(), "ob-wal-archive");
     OB_LOG_INFO("wal_archive", "archiving the WAL of %s to %s", wal_dir_.c_str(),
                 lineage_dir(lineage()).c_str());
@@ -291,18 +293,24 @@ void WalArchiver::wake() {
 }
 
 void WalArchiver::run() {
+    // A pass that throws - an allocation, in practice - is counted and the next one runs a second
+    // later: a dead archiver would hold retention back for the life of the process.
+    LoopGuard guard{"wal_archive", "an archive pass", registry_};
     std::unique_lock<std::mutex> lock(mtx_);
     while (!stop_) {
         lock.unlock();
-        {
+        try {
             // The bound before the lineage. A new lineage begins in the file the writer is in, so a
             // bound read before `set_lineage()` is at most that file's index and names only files of
             // the old lineage; read the other way round, an old lineage could be paired with a bound
-            // a sync after the change has moved into the new one, and its files would go to the old
-            // lineage's directory.
+            // a rotation after the change has moved into the new one, and its files would go to the
+            // old lineage's directory.
             const uint32_t before = current_file_();
             const uint64_t identity = lineage();
             (void)archive_closed(identity, before);
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
         }
         lock.lock();
         cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_ || woken_; });
