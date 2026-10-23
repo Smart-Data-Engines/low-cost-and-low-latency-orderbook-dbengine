@@ -589,3 +589,20 @@ TEST(BestTrackRead, ARangeThatBeginsBeforeTheTracksReadsRowsOnlyUntilTheyStart) 
     // The rows of kBase + 5 to the first track's start, kBase + 39, and no further.
     EXPECT_EQ(cost.rows.kept, 35u) << "rows were read where a track covers the range";
 }
+
+TEST(BestTrackWrite, ASegmentThatLeavesTakesItsTrackWithIt) {
+    Store s;
+    const std::string d1 = s.segment({row(kBase + 10, ob::SIDE_BID, 100, 1)});
+    ASSERT_TRUE(s.summarise(d1).written);
+    const std::string d2 = s.segment({row(kBase + 20, ob::SIDE_ASK, 105, 1)});
+    const auto w2 = s.summarise(d2);
+    ASSERT_TRUE(w2.written);
+    ASSERT_EQ(s.store->best_tracks("SUM", "EX").size(), 2u);
+    // The second segment removed, as retention or a drop removes one: its track goes with it, and a
+    // series no longer reads a file that is not there.
+    ASSERT_EQ(s.store->remove_segments({d2}), 1u);
+    EXPECT_EQ(s.store->best_tracks("SUM", "EX"), (std::vector<uint64_t>{kBase + 10}));
+    ob::ColumnarStore::TopsCost cost;
+    EXPECT_EQ(tops_read(*s.store, kBase, kBase + 30, &cost), tops_of_rows(*s.store, kBase, kBase + 30));
+    EXPECT_EQ(cost.tracks, 1u);
+}
