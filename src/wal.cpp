@@ -25,13 +25,28 @@
 
 namespace ob {
 
+std::string wal_file_basename(uint32_t index) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "wal_%06u.bin", index);
+    return buf;
+}
+
+bool parse_wal_file_basename(std::string_view name, uint32_t& index) {
+    if (name.size() != 14 || name.substr(0, 4) != "wal_" || name.substr(10) != ".bin") return false;
+    uint32_t value = 0;
+    for (const char c : name.substr(4, 6)) {
+        if (c < '0' || c > '9') return false;
+        value = value * 10 + static_cast<uint32_t>(c - '0');
+    }
+    index = value;
+    return true;
+}
+
 namespace {
 
 // Build the WAL filename for a given index.
 static std::string wal_filename(const std::string& dir, uint32_t index) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "wal_%06u.bin", index);
-    return dir + "/" + buf;
+    return dir + "/" + wal_file_basename(index);
 }
 
 /// Append one DELTA record - header, then payload - to `buf` at `used`, and advance `used` past it.
