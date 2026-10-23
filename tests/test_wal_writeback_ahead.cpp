@@ -19,7 +19,9 @@
 
 #include <fcntl.h>
 #include <linux/mman.h>
+#include <linux/magic.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -40,8 +42,9 @@ std::atomic<uint64_t> g_dir_counter{0};
 
 struct TempDir {
     std::string path;
-    TempDir() {
-        path = (fs::temp_directory_path() /
+    /// Under `base`, the system's temporary directory by default.
+    explicit TempDir(const fs::path& base = fs::temp_directory_path()) {
+        path = (base /
                 ("ob_wal_writeback_" + std::to_string(::getpid()) + "_" +
                  std::to_string(g_dir_counter.fetch_add(1, std::memory_order_relaxed))))
                    .string();
@@ -171,7 +174,15 @@ TEST(WalWritebackAhead, WhatIsHandedToWritebackIsDirtyNoLonger) {
     // background threshold its pages stay dirty for dirty_expire_centisecs, 30 s by default, unless
     // something asks for their writeback. Of about 1.86 MB the thread asks for the first megabyte;
     // the tail under a megabyte waits for the next.
-    TempDir dir;
+    //
+    // On the build's own disk rather than in /tmp: a tmpfs has no backing store, so its pages are
+    // never dirty, and on one this test passed without a single request (the development machine's
+    // /tmp is one).
+    TempDir dir(OB_TEST_DISK_DIR);
+    struct statfs fs_info{};
+    ASSERT_EQ(::statfs(dir.path.c_str(), &fs_info), 0);
+    ASSERT_NE(static_cast<long>(fs_info.f_type), static_cast<long>(TMPFS_MAGIC))
+        << dir.path << " is on a tmpfs, where no page is ever dirty: this test would test nothing";
     auto engine = engine_at(dir.path, ob::FsyncPolicy::INTERVAL);
     write_records(*engine, 760, 1'000'000'000ULL);
     const std::string wal = dir.path + "/wal_000000.bin";

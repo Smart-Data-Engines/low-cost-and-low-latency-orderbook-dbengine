@@ -462,6 +462,10 @@ target_link_libraries(test_best_track PRIVATE rapidcheck rapidcheck_gtest)
 ob_add_engine_test(test_wal_writeback_ahead
     test_wal_writeback_ahead.cpp
 )
+# A directory on the build's disk: whether the WAL's pages are dirty means nothing on a tmpfs.
+target_compile_definitions(test_wal_writeback_ahead
+    PRIVATE OB_TEST_DISK_DIR="${CMAKE_CURRENT_BINARY_DIR}"
+)
 
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
