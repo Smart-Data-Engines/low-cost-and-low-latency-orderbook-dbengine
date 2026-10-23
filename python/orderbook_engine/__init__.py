@@ -1104,6 +1104,9 @@ class _LocalBackend:
         # ob_flush() takes what writing the segments takes. A library before #244 has no other way.
         if hasattr(self._lib, "ob_flush"):
             rc = self._lib.ob_flush(self._engine)
+            if rc == OB_ERR_IO:
+                raise OrderbookError(rc, "flush failed: the segments are written and readable, and "
+                                         "their sync to the device failed")
             if rc != OB_OK:
                 raise OrderbookError(rc, "flush failed: a segment could not be written")
             return

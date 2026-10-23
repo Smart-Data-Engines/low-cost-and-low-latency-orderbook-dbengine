@@ -2861,7 +2861,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 245. The embedded engine never replays its WAL: a process that dies loses what it wrote since its last flush **P1**
+### 245. The embedded engine never replays its WAL: a process that dies loses what it wrote since its last flush ✅ **P1**
 
 **Found writing #244's documentation.** The C API's engine writes an update to its WAL and appends its
 rows to the symbol's open segment, which only `ob_flush()` or `ob_engine_destroy()` writes.
@@ -2879,6 +2879,49 @@ file: they rotate at 512 MB and stay.
 **A fix writes a checkpoint at `ob_flush()` and `ob_engine_destroy()`**, after their segments, and
 replays at an open the records after the last one into the stores and the books, then flushes them.
 Files wholly before the last checkpoint can then go.
+
+**Closed in PR #278** (23 October 2026), as the fix above says, with three more rules from the server:
+- **The position a segment records.** A segment records the WAL identity and where its last record
+  starts, and the replay skips a record a segment holds by that position. That closes the window
+  between a flush's segments and its checkpoint (#63). A segment of an older build records none and
+  is judged by the time of its last row, the server's rule before #63.
+- **The sync before the checkpoint.** A flush takes its segments and the WAL to the device with one
+  `syncfs()` before the checkpoint that claims them, and a failed sync freezes the checkpoints
+  (#160). Nothing had synced an embedded segment, and a close syncs the WAL, so without the sync the
+  close's checkpoint would reach the device over segments that might not (pitfall 601).
+- **`OB_C_ERR_IO`.** `ob_flush()` answers it when the sync fails, as the server's `FLUSH` answers an
+  error.
+
+Measured on the i3-7100U, Release, ext4 over LUKS on NVMe, with three builds of the library from one
+tree (`evidence/2026-10-23-embedded-wal-replay/` in the workspace):
+- **A process that ended before a flush:** the open found every update. At a million rows of one
+  symbol it took 662-708 ms. The build before found none, in 2.4-3.8 ms.
+- **A flush after one update of 100 levels:** 2.79-3.03 ms median and 4.99-6.16 ms at the 90th
+  percentile, where it took 0.11-0.19 and 0.15-0.26 ms. The sync is all of it: without the sync the
+  replay's build took 0.14-0.21 ms. A flush with nothing new does not sync.
+- **The first open of a directory an older build wrote** reads its whole WAL once, as it holds no
+  checkpoint: 177-221 ms at a million rows, where the next open took 165-172 ms. Every update was
+  found once. Measuring it found that the first flush after any open synced even with nothing new,
+  because the open did not know its WAL already ended at a checkpoint; it does now.
+- **The limit that stays:** a power cut or a kernel crash still loses what was written since the
+  last flush or close. The WAL is synced there, not at each write.
+
+Tests in `test_c_api.cpp`:
+- writes not flushed are replayed at an open;
+- a write after a flush is replayed, and the flushed ones are not;
+- a death between a flush's segments and its checkpoint stores each row once;
+- a closed engine ends its WAL with a checkpoint;
+- a segment of an older build is judged by the time of its last row;
+- a flush syncs before its checkpoint claims the rows, and a flush with nothing new syncs nothing;
+- the first flush after an open syncs only what no checkpoint claims.
+
+Mutations killed: the replay disabled; no position stamped at a write; no fallback by time; no
+checkpoint at a flush; the position compared the wrong way; the position stamped without its +1; no
+flush after the replay; no sync before the checkpoint; the sync after it; a sync at every flush;
+an open that never takes its WAL as checkpointed; one that takes it so with records after the
+checkpoint. The controls, reworded log lines, survived. Three mutants of the failure path survived
+too, because only a failing device shows them: a `syncfs()` that does nothing, a failed sync that
+freezes nothing, and `OB_C_ERR_IO` answered as `OB_C_OK`.
 
 - Effort: M | Impact: every write the embedded engine acknowledged since its last flush is lost when
   its process dies; the Python client's local mode flushes before a read, not after a write
@@ -15506,7 +15549,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #242, #243, #245.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #242, #243.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -15645,7 +15688,6 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
-| **P1** | The embedded engine replays its WAL from a checkpoint when it opens (#245) | M | A process using the C API or the Python client's local mode loses every write since its last flush when it dies |
 | **P2** | A series of the book reads one row a change of the best price (#243) | M | Since #233 a series applies every row of its range by price: 7-12 times the time it took for a writer of whole sides |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

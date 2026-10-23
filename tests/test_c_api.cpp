@@ -1,10 +1,13 @@
 // Feature: orderbook-dbengine — C API unit tests (Requirements 13.5)
 #include "orderbook/c_api.h"
 #include "orderbook/level_payload.hpp"
+#include "orderbook/logger.hpp"
 #include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -429,6 +432,252 @@ TEST_F(CApiTest, AFlushKeepsTheLiveBookAndItsLabel) {
         << "the replacement after the flush did not remove what the side held before it";
     engine = ob_engine_create(dir.c_str());
     ASSERT_NE(engine, nullptr);
+}
+
+// ── The WAL replayed at an open (#245) ───────────────────────────────────────────
+//
+// A process that dies leaves its WAL and what it flushed, and nothing else. Each test takes the
+// directory as such a process would leave it - a copy made while nothing writes (pitfall 475) - and
+// opens an engine on the copy.
+
+namespace {
+
+/// A copy of `dir`, removed with this object.
+struct CrashImage {
+    std::string path;
+    CrashImage(const std::string& dir, const std::string& tag) : path(dir + "_" + tag) {
+        fs::remove_all(path);
+        fs::copy(dir, path, fs::copy_options::recursive);
+    }
+    ~CrashImage() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
+};
+
+/// The WAL files under `dir`, by name.
+std::vector<std::string> wal_files(const std::string& dir) {
+    std::vector<std::string> out;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("wal_", 0) == 0 && entry.path().extension() == ".bin") out.push_back(entry.path().string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+/// Every segment's WAL position under `dir` taken away, as a build before #245 wrote them.
+void strip_positions(const std::string& dir) {
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (entry.path().filename() != "meta.json") continue;
+        std::ifstream in(entry.path());
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        for (const char* key : {"\"wal_identity\":", "\"wal_file_index\":", "\"wal_byte_offset\":"}) {
+            const auto at = text.find(key);
+            ASSERT_NE(at, std::string::npos) << key << " is not in " << entry.path();
+            const auto from = at + std::string(key).size();
+            const auto to = text.find_first_not_of("0123456789", from);
+            text.replace(from, to - from, "0");
+        }
+        std::ofstream(entry.path(), std::ios::trunc) << text;
+    }
+}
+
+std::vector<PriceQty> sorted(std::vector<PriceQty> rows) {
+    std::sort(rows.begin(), rows.end());
+    return rows;
+}
+
+}  // namespace
+
+TEST_F(CApiTest, WritesNotFlushedAreReplayedWhenTheEngineOpensAgain) {
+    int64_t  p1[] = {100, 99};
+    uint64_t q1[] = {1, 2};
+    uint32_t c1[] = {1, 1};
+    ASSERT_EQ(ob_apply_delta(engine, "RP", "EX", 1, 1000ULL, p1, q1, c1, 2, 0), OB_C_OK);
+    int64_t  p2[] = {200};
+    uint64_t q2[] = {3};
+    uint32_t c2[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "RQ", "EX", 1, 1001ULL, p2, q2, c2, 1, 1), OB_C_OK);
+    const CrashImage image(dir, "killed");
+    ob_engine_t* reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(sorted(capi_history(reopened, "RP")), (std::vector<PriceQty>{{99, 2}, {100, 1}}));
+    EXPECT_EQ(capi_history(reopened, "RQ"), (std::vector<PriceQty>{{200, 3}}));
+    ob_engine_destroy(reopened);
+    // The open flushed what it replayed and left a checkpoint after it, so the next one replays
+    // none of it again.
+    reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(sorted(capi_history(reopened, "RP")), (std::vector<PriceQty>{{99, 2}, {100, 1}}));
+    ob_engine_destroy(reopened);
+}
+
+TEST_F(CApiTest, AWriteAfterAFlushIsReplayedAndTheFlushedOnesAreNot) {
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "AF", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    p[0] = 101;
+    q[0] = 2;
+    ASSERT_EQ(ob_apply_delta(engine, "AF", "EX", 2, 1001ULL, p, q, c, 1, 0), OB_C_OK);
+    const CrashImage image(dir, "after_flush");
+    ob_engine_t* reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(sorted(capi_history(reopened, "AF")), (std::vector<PriceQty>{{100, 1}, {101, 2}}));
+    ob_engine_destroy(reopened);
+}
+
+TEST_F(CApiTest, ADeathBetweenAFlushsSegmentsAndItsCheckpointStoresEachRowOnce) {
+    // A flush writes the segments and then the checkpoint. Dying between them leaves segments that
+    // hold records no checkpoint covers, and applying those again would store their rows twice: a
+    // segment records where its last record starts, and the replay skips what it holds. The times
+    // run backwards on purpose, because a segment without a position is judged by the time of its
+    // last row, and that rule would replay the first of these.
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "CW", "EX", 1, 3000ULL, p, q, c, 1, 0), OB_C_OK);
+    p[0] = 101;
+    q[0] = 2;
+    ASSERT_EQ(ob_apply_delta(engine, "CW", "EX", 2, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    const auto files = wal_files(dir);
+    ASSERT_EQ(files.size(), 1u);
+    const auto before_flush = fs::file_size(files[0]);
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    ASSERT_GT(fs::file_size(files[0]), before_flush) << "the flush appended no checkpoint";
+    const CrashImage image(dir, "between");
+    fs::resize_file(fs::path(image.path) / fs::path(files[0]).filename(), before_flush);
+    ob_engine_t* reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(sorted(capi_history(reopened, "CW")), (std::vector<PriceQty>{{100, 1}, {101, 2}}));
+    ob_engine_destroy(reopened);
+}
+
+TEST_F(CApiTest, AClosedEngineEndsItsWalWithACheckpoint) {
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "CL", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    engine = nullptr;
+    uint8_t last = 0;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) { last = ctx.header.record_type; });
+    EXPECT_EQ(last, ob::WAL_RECORD_CHECKPOINT);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+    EXPECT_EQ(capi_history(engine, "CL"), (std::vector<PriceQty>{{100, 1}}));
+}
+
+namespace {
+
+/// What one `ob_flush()` logs, at DEBUG.
+std::string flush_logged(ob_engine_t* engine, ob_status_t& status) {
+    auto& logger = ob::StructuredLogger::instance();
+    const ob::LogLevel was = logger.level();
+    logger.set_level(ob::LogLevel::DEBUG);
+    testing::internal::CaptureStderr();
+    status = ob_flush(engine);
+    const std::string said = testing::internal::GetCapturedStderr();
+    logger.set_level(was);
+    return said;
+}
+
+}  // namespace
+
+TEST_F(CApiTest, AFlushTakesItsSegmentsToTheDeviceBeforeItsCheckpointClaimsThem) {
+    // #160's rule, which the server's flush keeps: a checkpoint claims only rows on the device. One
+    // that claimed rows still in the page cache - and a close syncs the WAL, so it would be on the
+    // device - would leave a power cut nothing to replay them from. What a sync does shows only when
+    // the power fails, so this reads the order in which a flush reports its steps.
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "SY", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ob_status_t flushed = OB_C_ERR_INTERNAL;
+    const std::string said = flush_logged(engine, flushed);
+    // With nothing new a flush claims nothing, and it waits for no device: what #244 measured.
+    ob_status_t again = OB_C_ERR_INTERNAL;
+    const std::string said_again = flush_logged(engine, again);
+    ASSERT_EQ(flushed, OB_C_OK);
+    ASSERT_EQ(again, OB_C_OK);
+    const auto synced = said.find("the segments and the WAL synced in");
+    const auto claimed = said.find("Checkpoint appended");
+    ASSERT_NE(synced, std::string::npos) << "the flush did not sync:\n" << said;
+    ASSERT_NE(claimed, std::string::npos) << "the flush appended no checkpoint:\n" << said;
+    EXPECT_LT(synced, claimed) << "the checkpoint came before the sync:\n" << said;
+    EXPECT_EQ(said_again.find("synced in"), std::string::npos)
+        << "a flush with nothing new synced:\n" << said_again;
+    EXPECT_EQ(said_again.find("Checkpoint appended"), std::string::npos)
+        << "a flush with nothing new appended a checkpoint:\n" << said_again;
+}
+
+TEST_F(CApiTest, TheFirstFlushAfterAnOpenSyncsOnlyWhatNoCheckpointClaims) {
+    // A fresh directory, and one a close ended with a checkpoint, hold nothing a checkpoint has to
+    // claim: the first flush after the open, with nothing written, waits for no device.
+    ob_status_t status = OB_C_ERR_INTERNAL;
+    std::string said = flush_logged(engine, status);
+    ASSERT_EQ(status, OB_C_OK);
+    EXPECT_EQ(said.find("synced in"), std::string::npos) << "a fresh directory:\n" << said;
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "FF", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    ob_engine_destroy(engine);
+    engine = ob_engine_create(dir.c_str());
+    ASSERT_NE(engine, nullptr);
+    said = flush_logged(engine, status);
+    ASSERT_EQ(status, OB_C_OK);
+    EXPECT_EQ(said.find("synced in"), std::string::npos) << "after a close:\n" << said;
+    EXPECT_EQ(said.find("Checkpoint appended"), std::string::npos) << "after a close:\n" << said;
+    EXPECT_EQ(capi_history(engine, "FF"), (std::vector<PriceQty>{{100, 1}}));
+
+    // Records after the last checkpoint that the segments already hold are another matter: the
+    // first flush checkpoints them, so that the next open does not read them again.
+    p[0] = 101;
+    ASSERT_EQ(ob_apply_delta(engine, "FF", "EX", 2, 2000ULL, p, q, c, 1, 0), OB_C_OK);
+    const auto files = wal_files(dir);
+    ASSERT_FALSE(files.empty());
+    const auto before_flush = fs::file_size(files.back());
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    const CrashImage image(dir, "held");
+    fs::resize_file(fs::path(image.path) / fs::path(files.back()).filename(), before_flush);
+    ob_engine_t* reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    said = flush_logged(reopened, status);
+    EXPECT_EQ(status, OB_C_OK);
+    EXPECT_NE(said.find("Checkpoint appended"), std::string::npos)
+        << "records the segments hold were left for the next open to read again:\n" << said;
+    EXPECT_EQ(sorted(capi_history(reopened, "FF")), (std::vector<PriceQty>{{100, 1}, {101, 1}}));
+    ob_engine_destroy(reopened);
+}
+
+TEST_F(CApiTest, ASegmentOfAnOlderBuildIsJudgedByTheTimeOfItsLastRow) {
+    // A build before #245 recorded no position in a segment and wrote no checkpoint, so its WAL holds
+    // every record it ever wrote. Replayed whole, every row it stored would be stored twice. A
+    // segment without a position is judged as the server judged one before #63: a record no later
+    // than its last row is in it.
+    int64_t  p[] = {100};
+    uint64_t q[] = {1};
+    uint32_t c[] = {1};
+    ASSERT_EQ(ob_apply_delta(engine, "OB", "EX", 1, 1000ULL, p, q, c, 1, 0), OB_C_OK);
+    p[0] = 101;
+    q[0] = 2;
+    ASSERT_EQ(ob_apply_delta(engine, "OB", "EX", 2, 2000ULL, p, q, c, 1, 0), OB_C_OK);
+    const auto files = wal_files(dir);
+    ASSERT_EQ(files.size(), 1u);
+    const auto before_flush = fs::file_size(files[0]);
+    ASSERT_EQ(ob_flush(engine), OB_C_OK);
+    const CrashImage image(dir, "older");
+    fs::resize_file(fs::path(image.path) / fs::path(files[0]).filename(), before_flush);
+    strip_positions(image.path);
+    ob_engine_t* reopened = ob_engine_create(image.path.c_str());
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(sorted(capi_history(reopened, "OB")), (std::vector<PriceQty>{{100, 1}, {101, 2}}));
+    ob_engine_destroy(reopened);
 }
 
 TEST_F(CApiTest, ReplaceSideWithNoLevelsEmptiesTheSide) {
