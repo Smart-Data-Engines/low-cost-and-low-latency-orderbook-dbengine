@@ -2991,6 +2991,13 @@ alone and three under load, every answer one SHA-256 across the builds:
   6% on `LIMIT 1000` over all of it. Counted with `perf stat` under `eco`, it runs 0.4% more
   user-space instructions on them, about three a row of three columns, and 2-5% more cycles; on the
   1.9 M rows of one column the same of both. The x86 host showed 1% on the 4 000 rows.
+- **Measuring `SELECT *` found a row's call put back.** The seven columns of 190 360 rows took
+  158.2-158.3 M instructions an ask on the tree measured above, against 141.9-142.0 M on stage 1: with
+  a reply's writer and a part's both calling it, GCC kept `put_seven()` out of line, a call a row
+  that stage 1's one caller had inlined. `write_seven_rows()` now writes a batch's seven columns, as
+  `write_narrow_rows()` does a narrowed list, and inlines it again: 142.7 M, stage 1's and 0.5%.
+  Engine time 8.53-8.60 ms against stage 1's 8.08-8.12 and the tree before it 8.69-8.76; the cycles
+  2.7-5.4% above stage 1's, as for the narrowed answers.
 - **How the cost came down to that.** Measured under load first, the pool cost the writer most of
   its tail - a p99 of 0.5-1.2 ms and 2.98-4.60 M levels a second - and four connections 22% of their
   queries.
