@@ -647,8 +647,10 @@ inline constexpr size_t kRunBlock = 8;
 ///
 /// A 16-bit column's eight are one vector of eight lanes - one multiply, one add, one store - written
 /// as a GCC and Clang vector because neither compiler made it one inside the decode, where it was
-/// eight scalar stores. 64-bit lanes have no vector multiply below AVX-512, and their scalar steps are
-/// an add and a store each.
+/// eight scalar stores. The wider ones are sums of the step doubled and doubled again, ten adds and no
+/// multiply: written as (k + 1) times the step, GCC made a 64-bit column's eight a vector multiply,
+/// which no x86 vector unit below AVX-512 has - three multiplies of halves and their shifts, and a
+/// quarter of the decode of binance-diff's sequence numbers on the x86 host (#223).
 template <typename T>
 inline void step_block(T* run, uint64_t v, uint64_t d) {
     if constexpr (sizeof(T) == 2) {
@@ -660,18 +662,32 @@ inline void step_block(T* run, uint64_t v, uint64_t d) {
         std::memcpy(run, &x, sizeof x);
     } else {
         using W = std::conditional_t<(sizeof(T) <= sizeof(uint32_t)), uint32_t, uint64_t>;
+        static_assert(kRunBlock == 8, "the sums below are written out");
         const W start = static_cast<W>(v);
-        const W step = static_cast<W>(d);
-        for (size_t k = 0; k < kRunBlock; ++k) {
-            run[k] = static_cast<T>(static_cast<W>(start + static_cast<W>(k + 1) * step));
-        }
+        const W d1 = static_cast<W>(d);
+        const W d2 = static_cast<W>(d1 + d1);
+        const W d4 = static_cast<W>(d2 + d2);
+        const W x1 = static_cast<W>(start + d1);
+        const W x2 = static_cast<W>(start + d2);
+        const W x3 = static_cast<W>(x1 + d2);
+        const W x4 = static_cast<W>(start + d4);
+        run[0] = static_cast<T>(x1);
+        run[1] = static_cast<T>(x2);
+        run[2] = static_cast<T>(x3);
+        run[3] = static_cast<T>(x4);
+        run[4] = static_cast<T>(static_cast<W>(x1 + d4));
+        run[5] = static_cast<T>(static_cast<W>(x2 + d4));
+        run[6] = static_cast<T>(static_cast<W>(x3 + d4));
+        run[7] = static_cast<T>(static_cast<W>(x4 + d4));
     }
 }
 
+/// How many of a run's slots its blocks write: its length rounded up to whole blocks.
+inline size_t whole_blocks(size_t len) { return (len + kRunBlock - 1) & ~(kRunBlock - 1); }
+
 /// The runs of a column without delta: each run's value, through the frame of reference when `kFor`
-/// (times `g`, plus the anchor `a`), filled as many times as the run is long - a short one as a whole
-/// block when `by_blocks`, as runs_inverse() writes the delta runs. Nonzero when a value is past T's
-/// range.
+/// (times `g`, plus the anchor `a`), filled as many times as the run is long - in whole blocks where
+/// runs_inverse() writes the delta runs in them. Nonzero when a value is past T's range.
 template <typename T, bool kFor>
 uint64_t value_runs(const uint64_t* values, const uint64_t* lengths, size_t runs, uint64_t g, uint64_t a,
                     bool by_blocks, size_t count, T* o) {
@@ -682,8 +698,8 @@ uint64_t value_runs(const uint64_t* values, const uint64_t* lengths, size_t runs
         const uint64_t v = kFor ? values[r] * g + a : values[r];
         above |= v > kMax;
         const size_t len = static_cast<size_t>(lengths[r]) + 1;
-        if (by_blocks && len <= kRunBlock && count - i >= kRunBlock) {
-            std::fill_n(o + i, kRunBlock, static_cast<T>(v));
+        if ((by_blocks || len > kRunBlock) && count - i >= whole_blocks(len)) {
+            for (size_t k = 0; k < len; k += kRunBlock) std::fill_n(o + i + k, kRunBlock, static_cast<T>(v));
         } else {
             std::fill_n(o + i, len, static_cast<T>(v));
         }
@@ -695,10 +711,11 @@ uint64_t value_runs(const uint64_t* values, const uint64_t* lengths, size_t runs
 /// Runs, unpacked straight into the column: a value filled run by run for none and for, and the
 /// running sum stepped by one run's difference at a time for delta.
 ///
-/// Where the runs average two to kRunBlock values, a run of at most kRunBlock values, with room for
-/// kRunBlock of them before the column ends, writes kRunBlock: the values past its end are the next
-/// run's to overwrite, and the runs are written in order, so each slot ends up holding its own run's
-/// value. The last runs, near the column's end, and longer ones are written value by value.
+/// A run longer than kRunBlock values, and where the runs average two to kRunBlock values any run, is
+/// written in whole blocks of kRunBlock where they fit before the column ends: the values past its end
+/// are the next run's to overwrite, and the runs are written in order, so each slot ends up holding its
+/// own run's value. The other short runs, and the last runs, near the column's end, are written value
+/// by value.
 template <typename T>
 bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, DecodeScratch& scratch,
                   std::string* why) {
@@ -718,19 +735,22 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
     if (!unpack_simple8b(p.subspan(at + value_bytes), static_cast<size_t>(runs), lengths, scratch.words, why)) {
         return false;
     }
-    // The runs cover the packed values exactly - checked before anything is written. Every run shorter
-    // than the values and the runs' lengths adding up to them is the same check as a running total
-    // that never passes the values and ends at them, without a branch a run: a run's stored length is
-    // one less than its length, so below n each, and below n^2 together, which a 64-bit sum holds for
-    // any n under 2^32.
+    // The runs cover the packed values exactly - checked before anything is written, as the lengths
+    // adding up to the values, which is the same check as a running total that never passes the values
+    // and ends at them, without a branch a run. A sum of fewer than 2^32 stored lengths, each below
+    // 2^32, cannot wrap, and whether each is below 2^32 is their bits OR'd together: an unsigned 64-bit
+    // maximum, which this checked before, is an instruction neither AVX2 nor NEON has, and was 11-15%
+    // of the decode of binance-diff's timestamps and sequence numbers on the ARM host (#223). A sum that
+    // adds up to the values with the runs makes every run shorter than the values, since each is at
+    // least one value long.
     if (n < (uint64_t{1} << 32)) {
-        uint64_t longest = 0;
+        uint64_t bits = 0;
         uint64_t sum = 0;
         for (size_t r = 0; r < runs; ++r) {
-            longest = std::max(longest, lengths[r]);
+            bits |= lengths[r];
             sum += lengths[r];
         }
-        if ((runs > 0 && longest >= n) || sum + runs > n) return fail(why, "runs longer than the values");
+        if ((bits >> 32) != 0 || sum + runs > n) return fail(why, "runs longer than the values");
         if (sum + runs < n) return fail(why, "runs shorter than the values");
     } else {
         size_t total = 0;
@@ -742,14 +762,19 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
     }
     const uint64_t* rv = values.data();
     const uint64_t* rl = lengths.data();
-    // Blocks pay where the runs average two to kRunBlock values. Where nearly every run is one value
-    // long - a book's prices on a recording of its changes, which move at almost every row - a block
-    // writes eight values for each one it keeps, and the loop's branch is predicted anyway. Where runs
-    // average more than a block, the long ones carry the column and their lengths repeat - twenty rows
-    // an update of a book's snapshots - and the branch is predicted again. Measured on the EPYC host,
-    // by blocks everywhere: binance-diff's prices decoded 8% slower and binance-top20's sequence
-    // numbers 10%. Either way a run decodes to the same values; this decides only how fast.
+    // A short run's block pays where the runs average two to kRunBlock values. Where nearly every run is
+    // one value long - a book's prices on a recording of its changes, which move at almost every row - a
+    // block writes eight values for each one it keeps, and the loop's branch is predicted anyway. Where
+    // runs average more than a block, the long ones carry the column and their lengths repeat - twenty
+    // rows an update of a book's snapshots - and the branch is predicted again. Measured on the EPYC
+    // host, a block for every short run: binance-diff's prices decoded 8% slower and binance-top20's
+    // sequence numbers 10%. A run longer than a block is written in blocks wherever they fit: value by
+    // value, the runs of binance-diff's timestamps longer than a block, two thirds of its values, were a
+    // quarter of its decode on both test hosts (#223). Either way a run decodes to the same values; this
+    // decides only how fast.
     const bool by_blocks = runs * 2 <= n && n <= runs * kRunBlock;
+    // A line's two ends bound it while it is shorter than 2^32 values (below).
+    const bool lines_bounded = n < (uint64_t{1} << 32);
     uint64_t above = 0;
     if (h.transform == Transform::kDelta) {
         if (count == 0) return true;
@@ -765,14 +790,19 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
             const uint64_t d = unzigzag(rv[r]) * g;
             const size_t len = static_cast<size_t>(rl[r]) + 1;
             T* run = o + i;
-            if (by_blocks && len <= kRunBlock && count - i >= kRunBlock) {
+            if ((by_blocks || len > kRunBlock) && lines_bounded && count - i >= whole_blocks(len)) {
                 // A run is a line, so its first and last values bound it. With v and v + d both in
-                // T's range, d is at most T's maximum either way, a run this short cannot wrap, and
-                // every value between the two ends is in range too. The values past the run's end are
-                // not checked: they are not the column's.
+                // T's range, d is at most T's maximum either way; a narrower T's maximum is below 2^32,
+                // so a run shorter than 2^32 values cannot wrap, and every value between the two ends
+                // is in range too (a 64-bit T takes every value). The values past the run's end are not
+                // checked: they are not the column's.
                 above |= (v + d) > kMax;
                 above |= (v + len * d) > kMax;
-                step_block(run, v, d);
+                uint64_t x = v;
+                for (size_t k = 0; k < len; k += kRunBlock) {
+                    step_block(run + k, x, d);
+                    x += kRunBlock * d;
+                }
             } else {
                 for (size_t k = 0; k < len; ++k) {
                     const uint64_t x = v + (k + 1) * d;
