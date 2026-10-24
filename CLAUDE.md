@@ -4578,6 +4578,16 @@ Learned the hard way. Check here before debugging.
      thread held the pull request. The server owns the object now, declared before the engine so it
      outlives it; the next analysis closes the alert and its thread - nothing dismissed, as with
      pitfall 618.
+627. **A thread's CPU time is not the clock its rule reads.** #248's test of a pool thread stepping
+     through its work let it work 20 quiet intervals of its own CPU time and expected 10 entries into
+     the kernel; a CI runner under ASan gave 5. `pace()` enters a quiet interval of `steady_clock`
+     after its last entry, so the steady clock saw at most about 100 µs of those steps - the CPU
+     clock ran ahead of it over less than a tick, or a step took 60 µs; the run does not say which.
+     The test now reads the steady clock before each `pace()` and counts the entries the rule owes
+     there - one at the first step, one at each step a quiet interval after the step that followed
+     the last owed one - and the pool must have made at least those, however long a step takes and
+     however long the thread is off a CPU. With no yield giving the CPU away it made exactly those;
+     a doubled interval it fails only then, and `ScanPace`'s tests, on an explicit clock, always.
 
 ## Current state and open problems
 
@@ -4625,7 +4635,7 @@ row answer on the pool takes about half the time it did on the x86 host (pitfall
 **#249 is closed** (PR #292): `boost` gives the pool a thread per usable CPU, and a scan divides only
 while fewer client loops are serving, or served in the last 2 ms, than the CPUs (`LoopLoad`,
 `ScanPool::cpu_to_spare()`), so four connections asking at once answer as many queries as with no
-pool (pitfalls 624-626). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns
+pool (pitfalls 624-627). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns
 it off.
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,

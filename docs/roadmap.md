@@ -2926,7 +2926,11 @@ rounds under load, queries a second:
   other loops idle, and a node with every loop serving keeps its scans on their loops. CI's first run
   found a loop that had never served counted as serving within a test's hour on a runner booted
   minutes before (pitfall 625). Mutations: eight killed; a window of 1 ms survives, which only the
-  measurement shows, and so does the control.
+  measurement shows, and so does the control. CodeQL read the loops' `LoopLoad` on the server's
+  stack as an escape, and the server owns it now (pitfall 626). The third run found #248's test of a
+  pool thread's entries into the kernel measuring the thread's CPU time against a rule that reads
+  the steady clock; it counts the entries the rule owes at its steps' steady-clock times instead,
+  and kills #248's two mutants of it in every run (pitfall 627).
 
 - Effort: S | Impact: a query of many rows read on one core unless an operator turned the pool on;
   it is read on every core by default now, and several connections at once lose nothing to it
