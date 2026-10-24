@@ -4608,8 +4608,12 @@ host, whose kernel preempts lazily, the pool had cost a writer on the same node 
 pool thread now hands its part 128 rows at a time and enters the kernel between steps about every
 microsecond while that lets another thread run (`ScanPace`), and a row part keeps its text in chunks
 never copied as it grows, so a writer beside the pool keeps its rate on both test hosts and a large
-row answer on the pool takes about half the time it did on the x86 host (pitfalls 619-623). The pool stays off under every
-profile: four connections asking at once answer 4-10% fewer queries with it.
+row answer on the pool takes about half the time it did on the x86 host (pitfalls 619-623).
+**#249 is closed** (PR #292): `boost` gives the pool a thread per usable CPU, and a scan divides only
+while fewer client loops are serving, or served in the last 2 ms, than the CPUs (`LoopLoad`,
+`ScanPool::cpu_to_spare()`), so four connections asking at once answer as many queries as with no
+pool (pitfall 624). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns it
+off.
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)

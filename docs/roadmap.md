@@ -2881,6 +2881,53 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 249. Four connections asking at once answered a tenth fewer queries with the scan pool, so it was off by default ✅ **P3**
+
+**Found closing #248.** With a writer's cost gone, what kept the pool off under every profile was
+several connections asking at once: four of the bucket query answered 10% fewer on the x86 host and
+4% fewer on ARM with `--scan-threads 4` than with no pool (`evidence/2026-10-24-scan-pool-writer/` in
+the workspace). On 22 September the engine was to use every core of the machine by default, which
+`boost` was to do with the pool (`specs/multicore-scan/`, requirement 3.1).
+
+**Closed in PR #292** (24 October 2026), measured in `evidence/2026-10-24-scan-pool-by-default/` in
+the workspace:
+- **A scan divides only while a CPU has no client loop serving on it.** Each loop writes a flag of its
+  own as a pass over its events begins and, as it ends, when it stopped (`LoopLoad`, a cache line a
+  loop), and a scan that could divide counts the loops serving against the CPUs the process may use.
+- **Counted at the instant, it was not enough** (pitfall 624): four connections still answered 4.6%
+  fewer, two CPUs to spare changed nothing, and a pool that never divided cost nothing - so the cost
+  was the 2-4% of scans that divided in a loop's gap between two of its connection's queries.
+  Counting a loop as serving for 2 ms after it stops (`ScanPool::kLoopRecent`) took them from 134 in
+  5 000 to 4.
+- **`boost` gives the pool a thread per usable CPU** where there are two or more; `eco` none.
+
+Master `7ed72f7` as every profile ran it, with no pool, against the branch as `boost` runs it, five
+rounds under load, queries a second:
+
+| | x86, master | x86, this | ARM, master | ARM, this |
+|---|---|---|---|---|
+| 1 connection, 81 buckets of 1.9 M rows | 162.5-165.0 | 259.1-267.2 | 106.1-106.7 | 280.1-283.4 |
+| 2 connections | 327.3-331.3 | 373.6-382.4 | 213.3-215.5 | 329.0-332.8 |
+| 3 connections | 493.0-496.8 | 478.8-485.1 | 319.9-323.9 | 363.8-367.1 |
+| 4 connections | 649.4-654.2 | 651.4-655.6 | 427.6-432.3 | 428.4-431.3 |
+| 1 connection, 1.9 M rows of one column | 29.2-29.7 | 59.4-61.0 | 20.9-21.3 | 38.4-39.2 |
+| 4 connections | 92.5-93.9 | 91.7-93.6 | 54.7-55.8 | 59.5-60.7 |
+
+- Four connections answer as many as with no pool on both hosts, where master's pool answered
+  581.7-589.8 buckets a second on the x86 host.
+- Three connections on the x86 host answer 3% fewer, as on master's pool: three loops serving on four
+  CPUs leave one, and a scan divides. On ARM they answer 14% more.
+- A writer beside one connection: on ARM within no pool's range; on the x86 host 4-5% fewer levels a
+  second than with no pool at the median, as beside master's pool, of which 1-2% is the build's code
+  layout - the writer alone, with no query, ran the same instructions a batch in 2% more cycles under
+  the branch's build, pool or not.
+- Tests: `LoopLoad` and the gate with an explicit clock; a scan with no CPU to spare makes no part;
+  `boost` sizes the pool and an operator's value, 0 included, wins; a default node divides with its
+  other loops idle, and a node with every loop serving keeps its scans on their loops.
+
+- Effort: S | Impact: a query of many rows read on one core unless an operator turned the pool on;
+  it is read on every core by default now, and several connections at once lose nothing to it
+
 ### 248. On a lazily preempting kernel the scan pool costs a writer beside it 8-20% of its rate ✅ **P3**
 
 **Found measuring #246's stage 2** (`evidence/2026-10-23-multicore-scan/` in the workspace). The same

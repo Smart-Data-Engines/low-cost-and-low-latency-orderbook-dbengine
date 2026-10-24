@@ -316,13 +316,13 @@ engine shares with other work, `--profile eco` is one loop blocking between even
 was; and a mask or a limit you give it is one it sizes itself to, so pinning the service to two cores
 gives it two loops.
 
-A node that mostly answers big queries can give them the scan pool (#246, `--scan-threads N`,
-threads named `ob-scan-0` …): a query of many rows spread over several segments is then read on N
-threads at once, 1.5-3.7 times as fast on four. Since #248 a writer on the same node keeps its rate
-beside it on both test hosts, the one whose kernel preempts lazily included. It is off under every
-profile because where many connections keep every CPU busy the pool only competes with their loops:
-four connections asking at once answered 4-11% fewer queries with it - measured in `docs/cli.md`,
-"A query on several cores". On a replica kept for big queries, one thread per CPU.
+`boost` also gives a node the scan pool (#246, #249; `--scan-threads N`, threads named
+`ob-scan-0` …): a query of many rows spread over several segments is read on N threads at once, 1.5-3.7
+times as fast on four. A scan divides only while a CPU has no client loop serving on it, so four
+connections asking at once answer as many queries as with no pool, and a writer beside a query on
+the pool keeps 95% of its rate or more on both test hosts (#248) - measured in `docs/cli.md`, "A
+query on several cores". A node taking writes and nothing else can give its CPUs to its loops alone with
+`--scan-threads 0`.
 
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,

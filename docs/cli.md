@@ -353,17 +353,19 @@ them, whether or not anything else is in flight.
 
 `--profile` names a set of the knobs below rather than a second code path. **`boost` is the
 default**, and it sizes the node to the machine it runs on: one client event loop per usable CPU
-(`--io-threads`) and, where the process has a CPU to spare, a 10 µs spin window after each event
-(`--io-spin-us`). `eco` is byte for byte what the server did before either knob existed — one loop,
-blocking between events. A value given on the command line or in the file wins over the profile,
+(`--io-threads`), where the process has a CPU to spare a 10 µs spin window after each event
+(`--io-spin-us`), and where it has two CPUs or more a scan pool of a thread per usable CPU
+(`--scan-threads`, "A query on several cores" below). `eco` is byte for byte what the server did
+before any of those knobs existed — one loop, blocking between events, no pool. A value given on the command line or in the file wins over the profile,
 and `--print-config` says which values the profile set and why, under the machine it found:
 
 ```
 # machine: 4 usable CPUs: affinity 4, no cgroup v2 CPU limit
-# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window
+# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window; a scan pool of 4 threads, a query's segments divided while a CPU is left over
   io-spin-us                       10  (profile)
   io-threads                       4  (profile)
   profile                          boost  (default)
+  scan-threads                     4  (profile)
 ```
 
 The same sentence is logged at startup (`io profile boost: …`). `--profile` refuses a name it does
@@ -444,32 +446,37 @@ a `LIMIT` included: a `LIMIT` the first segment may meet is not divided, and und
 segment goes to the pool only while the answer may still need its rows. A scan of fewer than 32 768
 rows in range, or one whose rows are mostly in one segment, is read on the query's loop, where a
 pool would add its queue and win nothing; and one query divides at a time - another that comes
-meanwhile reads on its own loop. The pool's threads, `ob-scan-0` … `ob-scan-N-1`, run under
+meanwhile reads on its own loop. Nor does a scan divide while every CPU the process may use has a
+client loop serving events on it, or that served one in the last 2 ms (#249): there the pool's
+threads would only wait behind the loops. The pool's threads, `ob-scan-0` … `ob-scan-N-1`, run under
 `SCHED_IDLE` and hand a part its rows 128 at a time, entering the kernel between those steps about
 every microsecond of their work while an entry in the last millisecond let another thread run, and
 every 16 µs otherwise (#248). On a kernel that preempts lazily a client loop woken onto a pool
 thread's CPU runs only when that thread next enters the kernel, so that rule is what keeps a writer
 beside the pool at its rate.
 
-**It is off under every profile**, and that is a measured choice: the pool's threads take the CPU
-the client loops leave, and where many connections keep every CPU busy there is little to take.
-Measured with a 1.9 M-row store, the same build with and without four threads
-(`evidence/2026-10-24-scan-pool-writer/` in the workspace, its last run):
-- **x86 test host** (4 cores, kernel 7.0 built to preempt lazily, at 1000 Hz): a query alone took
-  a third to two thirds of the time - all of it in one column 8.3-12.4 ms against 25.2-26.1, 81
-  one-minute buckets of all of it 3.8-4.1 ms against 6.0 - and **a writer beside it kept its rate**:
-  6.08-6.40 M levels a second beside the buckets against 6.16-6.49 without the pool, 5.74-6.47 M
-  beside the column against 6.08-6.48, its batch p99 36.9-56.1 µs against 37.1-43.0. Four
-  connections asking the bucket query at once answered 11% fewer of them.
-- **ARM test host** (4 Graviton cores, kernel 6.18 built `PREEMPT_NONE`, at 100 Hz): the queries took
-  27-38% of the time - 8.1-8.4 ms against 27.7-29.5, 3.3-3.5 against 9.2-9.3 - the writer beside
-  them lost nothing measurable, and four connections answered 4% fewer.
+**`boost` gives the pool a thread per usable CPU** where there are two or more; `eco` gives it none,
+and `--scan-threads 0` turns it off under either. Measured with a 1.9 M-row store, master before this
+against the build that ships it, as each profile runs them
+(`evidence/2026-10-24-scan-pool-by-default/` in the workspace, its final run):
+- **x86 test host** (4 cores, kernel 7.0 built to preempt lazily, at 1000 Hz): one connection asking
+  81 one-minute buckets of all of it answered 259-267 times a second against 163-165, and all of it
+  in one column 59-61 times against 29-30; four connections asking at once answered as many as with
+  no pool (651-656 buckets a second against 649-654); three connections 3% fewer, as on the pool
+  before the 2 ms rule. A writer beside one connection wrote 4-5% fewer levels a second than with no
+  pool at the median - as beside the pool before - of which 1-2% is the new build's code layout,
+  which it pays with no pool too (the same instructions a batch, 2% more cycles).
+- **ARM test host** (4 Graviton cores, kernel 6.18 built `PREEMPT_NONE`, at 100 Hz): one connection
+  2.6 times the buckets and 1.8-1.9 times the column, three connections 14% more, four as many as
+  with no pool, and the writer beside them within the levels a second it wrote with no pool.
 
-A node whose connections keep every CPU busy answers fewer queries with the pool; a node that answers
-big queries a few at a time - a replica kept for them, or one beside a single stream of writes - is
-where to turn it on, at one thread per CPU.
+Before #248 and #249 the pool cost a writer beside it 8-20% of its rate on the x86 host, and four
+connections a tenth of their answers, and it was off under every profile. An operator who wants a
+node's CPUs for its client loops alone - a node taking writes and nothing else - sets
+`--scan-threads 0`.
 `ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on the pool
-and on the queries' loops, and `ob_scan_threads` is N.
+and on the queries' loops, `ob_scan_undivided_total` the scans kept on their loop because every CPU
+had a loop serving, and `ob_scan_threads` is N.
 
 ## Client event loops: `--io-threads`
 
