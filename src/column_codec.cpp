@@ -647,10 +647,13 @@ inline constexpr size_t kRunBlock = 8;
 ///
 /// A 16-bit column's eight are one vector of eight lanes - one multiply, one add, one store - written
 /// as a GCC and Clang vector because neither compiler made it one inside the decode, where it was
-/// eight scalar stores. The wider ones are sums of the step doubled and doubled again, ten adds and no
-/// multiply: written as (k + 1) times the step, GCC made a 64-bit column's eight a vector multiply,
-/// which no x86 vector unit below AVX-512 has - three multiplies of halves and their shifts, and a
-/// quarter of the decode of binance-diff's sequence numbers on the x86 host (#223).
+/// eight scalar stores. A 64-bit column's are four vectors of two lanes, each the one before plus
+/// twice the step - three adds and four stores, as SSE2 and NEON have them. Written as (k + 1) times
+/// the step, GCC made them a vector multiply, which no x86 vector unit below AVX-512 has for 64-bit
+/// lanes: three multiplies of halves and their shifts, a quarter of the decode of binance-diff's
+/// sequence numbers on the x86 host; and written as scalar sums, eight stores, which made a loop over
+/// their segments 29% slower there (#223). Other widths multiply, which every vector unit does in
+/// 32-bit lanes.
 template <typename T>
 inline void step_block(T* run, uint64_t v, uint64_t d) {
     if constexpr (sizeof(T) == 2) {
@@ -660,25 +663,21 @@ inline void step_block(T* run, uint64_t v, uint64_t d) {
         const Lanes steps = {1, 2, 3, 4, 5, 6, 7, 8};
         const Lanes x = static_cast<U>(v) + steps * static_cast<U>(d);
         std::memcpy(run, &x, sizeof x);
+    } else if constexpr (sizeof(T) == 8) {
+        typedef uint64_t Pair __attribute__((vector_size(2 * sizeof(uint64_t))));
+        static_assert(kRunBlock % 2 == 0, "a block is whole pairs");
+        const uint64_t d2 = d + d;
+        Pair x = {v + d, v + d2};
+        for (size_t k = 0; k < kRunBlock; k += 2) {
+            std::memcpy(run + k, &x, sizeof x);
+            x += d2;
+        }
     } else {
-        using W = std::conditional_t<(sizeof(T) <= sizeof(uint32_t)), uint32_t, uint64_t>;
-        static_assert(kRunBlock == 8, "the sums below are written out");
-        const W start = static_cast<W>(v);
-        const W d1 = static_cast<W>(d);
-        const W d2 = static_cast<W>(d1 + d1);
-        const W d4 = static_cast<W>(d2 + d2);
-        const W x1 = static_cast<W>(start + d1);
-        const W x2 = static_cast<W>(start + d2);
-        const W x3 = static_cast<W>(x1 + d2);
-        const W x4 = static_cast<W>(start + d4);
-        run[0] = static_cast<T>(x1);
-        run[1] = static_cast<T>(x2);
-        run[2] = static_cast<T>(x3);
-        run[3] = static_cast<T>(x4);
-        run[4] = static_cast<T>(static_cast<W>(x1 + d4));
-        run[5] = static_cast<T>(static_cast<W>(x2 + d4));
-        run[6] = static_cast<T>(static_cast<W>(x3 + d4));
-        run[7] = static_cast<T>(static_cast<W>(x4 + d4));
+        const uint32_t start = static_cast<uint32_t>(v);
+        const uint32_t step = static_cast<uint32_t>(d);
+        for (size_t k = 0; k < kRunBlock; ++k) {
+            run[k] = static_cast<T>(static_cast<uint32_t>(start + static_cast<uint32_t>(k + 1) * step));
+        }
     }
 }
 
