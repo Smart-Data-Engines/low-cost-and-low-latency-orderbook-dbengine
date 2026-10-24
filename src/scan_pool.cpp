@@ -32,6 +32,19 @@ void ScanPool::pace() {
     if (pace.entered(now, ScanPace::Clock::now())) ++t_gave_up;
 }
 
+bool ScanPool::cpu_to_spare(LoopLoad::Clock::time_point now) {
+    const LoopLoad* load = load_.load(std::memory_order_acquire);
+    if (load == nullptr) return true;
+    const unsigned cpus = cpus_.load(std::memory_order_relaxed);
+    const size_t serving = load->serving_within(now, kLoopRecent);
+    if (serving < cpus) return true;
+    undivided_.fetch_add(1, std::memory_order_relaxed);
+    if (registry_ != nullptr) registry_->increment_counter("ob_scan_undivided_total");
+    OB_LOG_DEBUG("scan_pool", "a scan reads on its own loop: %zu of %zu client loop(s) serving on %u CPU(s)",
+                 serving, load->loops(), cpus);
+    return false;
+}
+
 bool ScanPool::Task::take() {
     uint8_t queued = kQueued;
     return state_.compare_exchange_strong(queued, kTaken, std::memory_order_acq_rel,
@@ -157,11 +170,13 @@ void ScanPool::stop() {
     OB_LOG_INFO("scan_pool", "scan pool stopped: %llu part(s) run on its threads, %llu by their "
                              "queries; %zu queued and left to their queries; its threads entered "
                              "the kernel %llu time(s) between steps, %llu of them giving their CPU "
-                             "to another thread",
+                             "to another thread; %llu scan(s) kept on their own loop, every CPU's "
+                             "client loop serving",
                 static_cast<unsigned long long>(pooled_.load(std::memory_order_relaxed)),
                 static_cast<unsigned long long>(by_queries_.load(std::memory_order_relaxed)), left,
                 static_cast<unsigned long long>(entries_.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(gave_up_.load(std::memory_order_relaxed)));
+                static_cast<unsigned long long>(gave_up_.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(undivided_.load(std::memory_order_relaxed)));
 }
 
 void ScanPool::worker_loop() {

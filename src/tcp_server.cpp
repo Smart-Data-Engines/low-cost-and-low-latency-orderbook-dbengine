@@ -11,6 +11,7 @@
 #include "orderbook/shard_coordinator.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
+#include "orderbook/scan_pool.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1746,6 +1747,8 @@ BoostChoice choose_boost(const MachineResources& machine) {
     choice.reason = std::to_string(choice.io_threads) +
                     (choice.io_threads == 1 ? " client event loop" : " client event loops") +
                     ", one per usable CPU";
+    // A scan pool of one thread per usable CPU, where there is a second: on one CPU a scan never
+    // has one to spare from its own loop (#249), so a pool there would only wait.
     if (machine.affinity_cpus < 2) {
         // The only CPU this process may be scheduled on: the flush, the kernel and any client on
         // this machine run there too, and a loop spinning on it holds it from all of them.
@@ -1764,6 +1767,12 @@ BoostChoice choose_boost(const MachineResources& machine) {
         choice.io_spin_us = kBoostSpinUs;
         choice.reason += ", and a " + std::to_string(kBoostSpinUs) + " µs spin window";
     }
+    const uint32_t usable = std::max(1u, machine.usable_cpus);
+    choice.scan_threads = usable >= 2 ? std::min<uint32_t>(usable, kMaxScanThreads) : 0;
+    choice.reason += choice.scan_threads == 0
+                         ? "; no scan pool: one CPU leaves a scan none to spare"
+                         : "; a scan pool of " + std::to_string(choice.scan_threads) +
+                               " threads, a query's segments divided while a CPU is left over";
     return choice;
 }
 
@@ -2289,6 +2298,7 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
     // against - and before the profile, which sizes the loops and the spin to it.
     const MachineResources machine = detect_machine(read_system_view());
     OB_LOG_INFO("cli", "machine: %s", machine.reason.c_str());
+    config.usable_cpus = std::max(1u, machine.usable_cpus);
 
     // The profile is applied last and refuses a name it does not know, because a parser that
     // ignores what it does not understand hides operator mistakes (#27, #36): `--profile bost`
@@ -2301,6 +2311,7 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
     {
         const bool spin_set    = origin.count("io-spin-us") > 0;
         const bool threads_set = origin.count("io-threads") > 0;
+        const bool scan_set    = origin.count("scan-threads") > 0;
         if (config.profile == "boost") {
             const BoostChoice choice = choose_boost(machine);
             if (!threads_set) {
@@ -2310,6 +2321,10 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             if (!spin_set) {
                 config.io_spin_us = choice.io_spin_us;
                 origin["io-spin-us"] = Origin::Profile;
+            }
+            if (!scan_set) {
+                config.scan_threads = choice.scan_threads;
+                origin["scan-threads"] = Origin::Profile;
             }
 
             profile_choice = "boost: " + choice.reason;
@@ -2326,6 +2341,7 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
         // event loops" above a node running 2 is not left to be noticed.
         if (threads_set) profile_choice += " (io-threads set by the operator)";
         if (spin_set) profile_choice += " (io-spin-us set by the operator)";
+        if (scan_set) profile_choice += " (scan-threads set by the operator)";
         OB_LOG_INFO("cli",
                     "io profile %s (io-threads=%u io-spin-us=%llu); %s",
                     profile_choice.c_str(), config.io_threads,
@@ -2678,6 +2694,9 @@ struct ReactorShared {
 
     /// BACKUP's runner, null without --backup-dir (#34).
     BackupRunner*            backups;
+
+    /// Which reactors are serving events, now or a moment ago, for a scan that could divide (#249).
+    LoopLoad*                loop_load;
 };
 
 class Reactor {
@@ -2755,6 +2774,7 @@ private:
     ServerStats&             stats_;
     ShardCoordinator*        shard_coord_;
     BackupRunner*            backups_;
+    LoopLoad*                loop_load_;
     MetricsServer*           metrics_server_;
     int&                     listen_fd_;
     int&                     unix_listen_fd_;
@@ -2845,6 +2865,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , stats_(shared.stats)
     , shard_coord_(shared.shard_coord)
     , backups_(shared.backups)
+    , loop_load_(shared.loop_load)
     , metrics_server_(shared.metrics_server)
     , listen_fd_(listen_fd)
     , unix_listen_fd_(unix_listen_fd)
@@ -3253,7 +3274,11 @@ void Reactor::run_loop() {
                 if (!rs->ring_prepare_to_sleep()) ring_filled = true;
             }
         }
+        // Waiting is not serving: a scan deciding whether to divide counts the loops serving, or
+        // that served within ScanPool::kLoopRecent (#249).
+        loop_load_->stopped(static_cast<size_t>(index_));
         int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, ring_filled ? 0 : wait_ms);
+        if (nfds > 0) loop_load_->serving(static_cast<size_t>(index_));
         if (rings_told) {
             for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();
         }
@@ -3915,9 +3940,24 @@ void TcpServer::run() {
     ServerStats stats;
     std::vector<Reactor*> dealt_to;
     std::mutex            admin_mtx;
+    // The loops' load, for the scan pool to divide against (#249). The server owns it, so it is no
+    // address on this frame's stack that the engine holds; the engine holds it only while the
+    // reactors run.
+    loop_load_ = std::make_unique<LoopLoad>(config_.io_threads);
     ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
-                         &dealt_to, admin_mtx, backups.get()};
+                         &dealt_to, admin_mtx, backups.get(), loop_load_.get()};
+    const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
+    engine_->set_loop_load(loop_load_.get(), cpus);
+    struct Unload {
+        Engine* engine;
+        ~Unload() { engine->set_loop_load(nullptr, 0); }
+    } const unload{engine_.get()};
+    OB_LOG_INFO("tcp_server", "a scan divides among the scan pool's %u thread(s) while fewer than %u of "
+                              "the %u client loop(s) are serving, or served in the last %lld us",
+                config_.scan_threads, cpus, config_.io_threads,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           ScanPool::kLoopRecent).count()));
 
     // 7-8. Reactor 0 holds the listening sockets and runs on this thread; the others have a thread
     // each. Every one is built before any of them runs, so the list reactor 0 deals from is complete

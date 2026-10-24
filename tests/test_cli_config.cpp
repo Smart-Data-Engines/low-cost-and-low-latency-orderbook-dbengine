@@ -448,7 +448,9 @@ TEST(BoostRule, SpinsWhereTheProcessHasACpuToSpare) {
     EXPECT_EQ(c.io_threads, 4u);
     EXPECT_EQ(c.io_spin_us, ob::kBoostSpinUs);
     EXPECT_EQ(c.reason, "4 client event loops, one per usable CPU, and a " +
-                            std::to_string(ob::kBoostSpinUs) + " µs spin window");
+                            std::to_string(ob::kBoostSpinUs) +
+                            " µs spin window; a scan pool of 4 threads, a query's segments divided "
+                            "while a CPU is left over");
 }
 
 TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
@@ -459,22 +461,32 @@ TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
     EXPECT_EQ(c.io_spin_us, 0u);
     EXPECT_EQ(c.reason, "1 client event loop, one per usable CPU, and no spin: the only CPU this "
                         "process may run on is shared with its flush, the kernel and any client on "
-                        "this machine");
+                        "this machine; no scan pool: one CPU leaves a scan none to spare");
 }
 
-TEST(BoostRule, NoProfileSetsAScanPool) {
-    // #246, stage 2: the pool is the operator's to ask for - measured beside a writer, a query on it
-    // cost the writer a tenth of its rate and more of its tail - so boost and eco leave it at 0, and
-    // a value given is the operator's.
+TEST(BoostRule, BoostSetsAScanPoolOfOneThreadPerUsableCpu) {
+    // #249: since a scan divides only while a CPU is left over from the client loops, and a writer
+    // beside the pool keeps its rate (#248), boost gives the pool a thread per usable CPU - none on
+    // one CPU, where a scan never has one to spare from its own loop. eco leaves it at 0, and a value
+    // given is the operator's under either.
+    EXPECT_EQ(ob::choose_boost(machine_of(4, std::nullopt, 4)).scan_threads, 4u);
+    EXPECT_EQ(ob::choose_boost(machine_of(2, std::nullopt, 2)).scan_threads, 2u);
+    EXPECT_EQ(ob::choose_boost(machine_of(1, std::nullopt, 1)).scan_threads, 0u);
+    EXPECT_EQ(ob::choose_boost(machine_of(200, std::nullopt, 200)).scan_threads, ob::kMaxScanThreads);
     const auto silent = resolve({});
-    EXPECT_EQ(silent.config.scan_threads, 0u);
-    EXPECT_EQ(silent.origin.count("scan-threads"), 0u);
+    EXPECT_EQ(silent.config.scan_threads, ob::choose_boost(silent.machine).scan_threads);
+    ASSERT_EQ(silent.origin.count("scan-threads"), 1u);
+    EXPECT_EQ(silent.origin.at("scan-threads"), ob::Origin::Profile);
+    EXPECT_EQ(silent.config.usable_cpus, std::max(1u, silent.machine.usable_cpus));
     const auto eco = resolve({"--profile", "eco"});
     EXPECT_EQ(eco.config.scan_threads, 0u);
+    EXPECT_EQ(eco.origin.count("scan-threads"), 0u);
     const auto given = resolve({"--scan-threads", "2"});
     EXPECT_EQ(given.config.scan_threads, 2u);
     EXPECT_EQ(given.origin.at("scan-threads"), ob::Origin::CommandLine);
     EXPECT_NE(ob::format_config(given).find("scan-threads"), std::string::npos);
+    const auto off = resolve({"--scan-threads", "0"});
+    EXPECT_EQ(off.config.scan_threads, 0u) << "an operator's 0 lost to the profile";
 }
 
 TEST(BoostRule, NoSpinUnderALimitThatBinds) {

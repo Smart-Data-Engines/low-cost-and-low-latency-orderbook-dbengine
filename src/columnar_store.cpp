@@ -2573,13 +2573,15 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
     // and, measured on the x86 host, a scan of a few thousand rows paid a few microseconds for the
     // queue and won nothing, and one whose rows are mostly in one candidate paid the copy of its
     // part on top of reading it. Below those, one thread's scan - the scan_batches() this replaces
-    // when it can - with no queue to pass through.
+    // when it can - with no queue to pass through. Nor while every CPU has a client loop serving on
+    // it (`cpu_to_spare()`, #249): the pool's threads would wait behind the loops, and the scan with
+    // them.
     const bool worth = how.divide_small ||
                        (in_range >= kScanDivideMinRows && largest <= in_range / 4 * 3);
     const bool divide = how.pool != nullptr && how.pool->threads() > 0 && segment_slots > 1 &&
                         (how.limit_rows == UINT64_MAX || how.limit_rows > slots[0].rows_at_most) &&
                         worth;
-    if (!divide || !how.pool->claim()) {
+    if (!divide || !how.pool->cpu_to_spare() || !how.pool->claim()) {
         return read_in_order(set, symbol, exchange, columns, start_ns, end_ns, filter, how.direct,
                              cost);
     }

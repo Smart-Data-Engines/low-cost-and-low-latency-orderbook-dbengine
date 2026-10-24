@@ -320,6 +320,9 @@ public:
     /// at `open()` and stopped at `close()`. 0 - the default, and the embedded engine's - makes none,
     /// and every query reads on its own thread. Before `open()`.
     void set_scan_threads(unsigned threads);
+    /// The server's client loops its scan pool divides against, and the CPUs the process may use
+    /// (#249) - null when the server stops.
+    void set_loop_load(const LoopLoad* load, unsigned cpus);
     /// The pool's threads; 0 without one.
     unsigned scan_threads() const { return scan_pool_ ? scan_pool_->threads() : 0; }
 
@@ -1511,6 +1514,8 @@ private:
     /// The scan pool (#246, stage 2): its size, set before `open()`, and the pool from `open()` to
     /// `close()` - the query engine holds a pointer to it for that long, and no longer.
     unsigned scan_threads_{0};
+    const LoopLoad* loop_load_{nullptr};
+    unsigned loop_load_cpus_{0};
     std::unique_ptr<ScanPool> scan_pool_;
     /// The file the flush tick last saw the writer in, and when it first saw a record in it: the
     /// clock of the rotation for the archive. Flush thread, under `mtx_`.

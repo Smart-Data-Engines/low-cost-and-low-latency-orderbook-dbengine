@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/loop_load.hpp"
 #include "orderbook/metrics.hpp"
 
 #include <atomic>
@@ -113,6 +114,30 @@ public:
     /// says, so a loop woken onto its CPU runs (#248). The pace is the thread's own, across its parts.
     static void pace();
 
+    /// How long a client loop counts as serving after it stops (#249): one asking queries back to
+    /// back is between two of them for tens of microseconds at a time, and a scan that divided in such
+    /// a gap had its parts wait behind loops that held every CPU. Measured on the m8a.xlarge with four
+    /// connections asking the bucket query at once: dividing while a CPU's loop was idle at that
+    /// instant, 134 scans in 5 000 divided and the connections answered 4.6% fewer queries than with no
+    /// pool; counting a loop as serving for 2 ms after it stops, 4 divided and they answered as many.
+    static constexpr std::chrono::nanoseconds kLoopRecent{2'000'000};
+
+    /// The server's client loops a scan divides against, and the CPUs the process may use. With none
+    /// - the embedded engine, a test - a scan divides on the rules of the scan alone.
+    void set_loop_load(const LoopLoad* load, unsigned cpus) {
+        cpus_.store(cpus, std::memory_order_relaxed);
+        load_.store(load, std::memory_order_release);
+    }
+
+    /// Whether a CPU is left over for the pool's threads: fewer loops serving, or serving within
+    /// `kLoopRecent`, than the CPUs, the scan's own loop among them. Where every CPU has one, the
+    /// pool's threads would only wait behind them. A no is counted (`ob_scan_undivided_total`).
+    bool cpu_to_spare() { return cpu_to_spare(LoopLoad::Clock::now()); }
+    bool cpu_to_spare(LoopLoad::Clock::time_point now);
+
+    /// The scans `cpu_to_spare()` kept on their own loop.
+    uint64_t undivided() const { return undivided_.load(std::memory_order_relaxed); }
+
     /// The entries `pace()` made on the pool's threads, and those of them that gave the CPU away,
     /// counted as each task ends.
     uint64_t entries() const { return entries_.load(std::memory_order_relaxed); }
@@ -158,6 +183,9 @@ private:
     std::atomic<uint64_t> by_queries_{0};
     std::atomic<uint64_t> entries_{0};
     std::atomic<uint64_t> gave_up_{0};
+    std::atomic<const LoopLoad*> load_{nullptr};
+    std::atomic<unsigned> cpus_{0};
+    std::atomic<uint64_t> undivided_{0};
 };
 
 }  // namespace ob

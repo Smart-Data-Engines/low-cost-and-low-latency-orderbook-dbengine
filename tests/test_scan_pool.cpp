@@ -9,12 +9,12 @@
 // And when its threads enter the kernel between the steps of their work (#248): `ScanPace` held to
 // its rule, and a pool thread that works between steps entering it.
 
+#include "orderbook/loop_load.hpp"
 #include "orderbook/scan_pool.hpp"
 
 #include <gtest/gtest.h>
 
 #include <sched.h>
-#include <time.h>
 
 #include <atomic>
 #include <chrono>
@@ -229,31 +229,104 @@ TEST(ScanPace, AnEntryJustShortOfTheThresholdGaveNothingAway) {
 }
 
 TEST(ScanPool, AThreadThatWorksBetweenStepsEntersTheKernel) {
-    // A task only a pool thread runs, working 20 quiet intervals of its own CPU time - so however
-    // long the scheduler keeps it off a CPU - with a step a fraction of a microsecond long, as a
-    // part's reader steps through a batch.
+    // A task only a pool thread runs, stepping as a part's reader steps through a batch, a step a
+    // fraction of a microsecond long. Before each `pace()` it reads the clock the rule reads and
+    // counts the entries the rule owes: one at the first step, and one at each step a quiet
+    // interval after the step that followed the last owed one - by when that entry, if the thread
+    // made it, had ended. Every interval of the rule is at most the quiet one, so the thread entered
+    // at least as often as it owed, however long a step took and however long the scheduler kept it
+    // off a CPU. The thread's own CPU time was the measure until a CI runner gave 20 quiet intervals
+    // of it and 5 entries (pitfall 627).
     ob::ScanPool pool(1, nullptr);
     std::atomic<uint64_t> spun{0};
+    std::atomic<unsigned> owed{0};
+    std::atomic<uint64_t> steps{0};
+    std::atomic<int64_t> span_us{0};
     auto task = pool.submit([&] {
-        const auto cpu_ns = [] {
-            timespec ts{};
-            ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-            return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
-        };
-        const uint64_t from = cpu_ns();
+        using Clock = ob::ScanPace::Clock;
+        const auto from = Clock::now();
+        auto at = from;
+        Clock::time_point ended{};
+        bool ending = false;
+        unsigned due = 0;
+        uint64_t n = 0;
         uint64_t x = 0;
-        while (cpu_ns() - from < 20 * static_cast<uint64_t>(ob::ScanPace::kQuiet.count())) {
+        while (due < 20 && at - from < 5s) {
             for (int i = 0; i < 200; ++i) x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            at = Clock::now();
+            if (ending) {   // the step after an owed entry: the entry, if made, had ended by now
+                ended = at;
+                ending = false;
+            }
+            if (due == 0 || at - ended >= ob::ScanPace::kQuiet) {
+                ++due;
+                ending = true;
+            }
             ob::ScanPool::pace();
+            ++n;
         }
         spun = x | 1;
+        owed = due;
+        steps = n;
+        span_us = std::chrono::duration_cast<std::chrono::microseconds>(at - from).count();
     });
-    for (int i = 0; i < 5000 && !task->done(); ++i) std::this_thread::sleep_for(1ms);
+    for (int i = 0; i < 10000 && !task->done(); ++i) std::this_thread::sleep_for(1ms);
     ASSERT_TRUE(task->done()) << "no pool thread ran the task";
     pool.run_or_wait(*task);
     pool.stop();   // the thread joined, so what it counted is in the pool's counts
     EXPECT_NE(spun.load(), 0u);
-    EXPECT_GE(pool.entries(), 10u) << "a pool thread worked 20 quiet intervals and entered the kernel "
-                                   << pool.entries() << " time(s)";
+    EXPECT_GE(pool.entries(), owed.load())
+        << "a pool thread whose " << steps.load() << " steps over " << span_us.load() << " us owed "
+        << owed.load() << " entries entered the kernel " << pool.entries() << " time(s)";
+    EXPECT_EQ(owed.load(), 20u) << "a pool thread did not step through 20 quiet intervals in 5 s";
     EXPECT_LE(pool.gave_up(), pool.entries());
+}
+
+// ── Whether a CPU is left over from the client loops (#249) ───────────────────────────────────────
+
+TEST(LoopLoad, ALoopCountsAsServingWhileItServesAndForAMomentAfter) {
+    ob::LoopLoad load(3);
+    const auto t0 = ob::LoopLoad::Clock::now();
+    EXPECT_EQ(load.serving_within(t0, 2ms), 0u);
+    // A loop that never served did not serve a moment ago, however long the moment - longer than
+    // the clock has run since the machine booted included.
+    EXPECT_EQ(load.serving_within(t0, std::chrono::hours(24 * 365 * 100)), 0u);
+    load.serving(0);
+    load.serving(2);
+    EXPECT_EQ(load.serving_within(t0, 2ms), 2u);
+    load.stopped_at(0, t0);
+    EXPECT_EQ(load.serving_within(t0 + 1ms, 2ms), 2u) << "a loop that stopped a moment ago counted as idle";
+    EXPECT_EQ(load.serving_within(t0 + 2ms, 2ms), 1u) << "a loop counted as serving past the moment";
+    load.stopped(1);   // a loop that never served: nothing to end
+    EXPECT_EQ(load.serving_within(t0 + 2ms, 2ms), 1u);
+    load.stopped(2);
+    EXPECT_EQ(load.serving_within(ob::LoopLoad::Clock::now(), 1h), 2u)
+        << "loops 0 and 2 stopped within the hour; one of them did not record when";
+    EXPECT_EQ(load.serving_within(ob::LoopLoad::Clock::now() + 2h, 1h), 0u);
+}
+
+TEST(ScanPool, AScanDividesOnlyWhileACpuIsLeftOverFromTheClientLoops) {
+    ob::ScanPool pool(2, nullptr);
+    const auto t0 = ob::LoopLoad::Clock::now();
+    EXPECT_TRUE(pool.cpu_to_spare(t0)) << "with no loops to count, a scan divides on its own rules";
+    ob::LoopLoad load(4);
+    pool.set_loop_load(&load, 4);
+    load.serving(0);   // the scan's own loop
+    EXPECT_TRUE(pool.cpu_to_spare(t0));
+    load.serving(1);
+    load.serving(2);
+    EXPECT_TRUE(pool.cpu_to_spare(t0)) << "three loops of four serving leave a CPU";
+    load.serving(3);
+    EXPECT_FALSE(pool.cpu_to_spare(t0));
+    EXPECT_EQ(pool.undivided(), 1u);
+    load.stopped_at(3, t0);
+    EXPECT_FALSE(pool.cpu_to_spare(t0 + ob::ScanPool::kLoopRecent - 1us))
+        << "a loop between two of its connection's requests counted as a CPU to spare";
+    EXPECT_TRUE(pool.cpu_to_spare(t0 + ob::ScanPool::kLoopRecent));
+    EXPECT_EQ(pool.undivided(), 2u);
+    // On fewer CPUs than loops, as under a cgroup limit, the CPUs are what a scan divides against.
+    pool.set_loop_load(&load, 3);
+    EXPECT_FALSE(pool.cpu_to_spare(t0 + ob::ScanPool::kLoopRecent));
+    pool.set_loop_load(nullptr, 0);
+    EXPECT_TRUE(pool.cpu_to_spare(t0));
 }

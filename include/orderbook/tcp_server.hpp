@@ -185,11 +185,13 @@ struct ServerConfig {
     uint32_t    io_threads{1};
     /// --scan-threads: the pool a query's segments are read on (#246, stage 2). A query whose rows
     /// in range are many and spread over two segments or more divides them among the pool's
-    /// threads, and its loop folds what they made in order. 0 - the default under every profile -
-    /// reads every segment on the query's loop, which is what this server always did: measured
-    /// beside a writer, a query on the pool cost the writer 10-17% of its rate and up to three
-    /// times its p99 while it ran, which a node taking writes should choose rather than be given.
+    /// threads, and its loop folds what they made in order - while a CPU is left over from the
+    /// client loops (#249). `boost` sets one thread per usable CPU; 0, `eco`'s and the struct's,
+    /// reads every segment on the query's loop, which is what this server always did.
     uint32_t    scan_threads{0};
+    /// The CPUs this process may use, as `detect_machine()` found them (#156): what a scan on the
+    /// pool divides against. 0 until the command line is read, and then the client loops' count.
+    uint32_t    usable_cpus{0};
 
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
@@ -458,6 +460,7 @@ inline constexpr uint32_t kMaxScanThreads = 64;
 struct BoostChoice {
     uint32_t    io_threads{1};
     uint64_t    io_spin_us{0};
+    uint32_t    scan_threads{0};
     std::string reason;
 };
 
@@ -475,8 +478,10 @@ struct BoostChoice {
 ///   measured a p99 of 5.9 µs without the spin and 13.7 µs with it. Under a limit, spinning spends
 ///   the limit, and a cgroup over it stops every thread until the next period.
 ///
-/// It sets no scan pool (#246, stage 2): `--scan-threads` is 0 under every profile, for the reason
-/// given beside `ServerConfig::scan_threads`.
+/// - **a scan pool of one thread per usable CPU** (#246, stage 2; #249) where there are two or more.
+///   A query alone read 1.9 M rows on four in a third to two thirds of the time; a writer beside it
+///   kept its rate (#248); and four connections asking at once answered as many as with no pool,
+///   since a scan divides only while a CPU is left over from the client loops.
 ///
 /// Pure, like `detect_machine()`: the same machine gives the same choice.
 BoostChoice choose_boost(const MachineResources& machine);
@@ -541,6 +546,10 @@ public:
 
 private:
     ServerConfig             config_;
+    /// The client loops' load the engine's scan pool divides against (#249): made by run() for its
+    /// reactors, and declared before the engine so that it outlives it - the engine holds its
+    /// address only while run() does, and drops it on every way out.
+    std::unique_ptr<LoopLoad> loop_load_;
     std::unique_ptr<Engine>  engine_;
     std::unique_ptr<MetricsServer> metrics_server_;
 

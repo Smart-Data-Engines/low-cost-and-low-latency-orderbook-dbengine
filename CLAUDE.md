@@ -4557,6 +4557,38 @@ Learned the hard way. Check here before debugging.
      as `prev:pid [prio] state ==> next:pid [prio]`.** A parser of the older `prev_comm=` fields
      found no switch at all. A woken thread's CPU is its waking's `target_cpu`, or the `dest_cpu` of
      a `sched_migrate_task` that follows before it runs (`wait_by_holder.py` in #248's evidence).
+624. **Whether a CPU is free for a scan is not what the loops are doing at the instant it decides.**
+     #249's first gate divided a scan while fewer client loops were serving than CPUs, counted at
+     that instant. Four connections asking the bucket query back to back still answered 4.6% fewer
+     queries than with no pool: a loop spends tens of microseconds between two of its connection's
+     queries, a scan deciding in such a gap divided - 2-4% of them did - and each cost one to two
+     queries' time. Two CPUs to spare changed nothing, and a pool that never divided cost nothing,
+     so the cost was those scans. Counting a loop as serving for 2 ms after it stops took them from
+     134 in 5 000 to 4, and the cost to none.
+625. **A time point's zero is not "never".** `steady_clock`'s epoch is the machine's boot: #249's
+     `LoopLoad` started each loop's "stopped at" there, and a loop that had never served counted as
+     serving a moment ago wherever the machine had been up for less than the moment. With a 2 ms
+     window no machine is; a test asking within an hour passed on the laptop, up for days, and failed
+     on a CI runner booted minutes before. "Never" is `time_point::min()`, compared as `stopped_at >
+     now - recent`, since `now - min()` overflows.
+626. **A guard that drops a stack object's address does not keep code scanning from reading it as an
+     escape.** #249's `TcpServer::run()` made the loops' `LoopLoad` on its stack and handed its
+     address to the engine, with a guard taking it back on every way out of the frame. CodeQL's
+     `cpp/stack-address-escape` raised alert 114 on the engine's store all the same, and its review
+     thread held the pull request. The server owns the object now, declared before the engine so it
+     outlives it; the next analysis closes the alert and its thread - nothing dismissed, as with
+     pitfall 618.
+627. **A thread's CPU time is not the clock its rule reads.** #248's test of a pool thread stepping
+     through its work let it work 20 quiet intervals of its own CPU time and expected 10 entries into
+     the kernel; a CI runner under ASan gave 5. `pace()` enters a quiet interval of `steady_clock`
+     after its last entry, so the steady clock saw at most about 100 µs of those steps - the CPU
+     clock ran ahead of it over less than a tick, or a step took 60 µs; the run does not say which.
+     The test now reads the steady clock before each `pace()` and counts the entries the rule owes
+     there - one at the first step, one at each step a quiet interval after the step that followed
+     the last owed one - and the pool must have made at least those, however long a step takes and
+     however long the thread is off a CPU. With no yield giving the CPU away it made 20 to 22 of
+     the 20 it owed, and a doubled interval failed it in exactly those runs, 9 of 100; `ScanPace`'s
+     tests, on an explicit clock, fail a doubled interval always.
 
 ## Current state and open problems
 
@@ -4600,8 +4632,12 @@ host, whose kernel preempts lazily, the pool had cost a writer on the same node 
 pool thread now hands its part 128 rows at a time and enters the kernel between steps about every
 microsecond while that lets another thread run (`ScanPace`), and a row part keeps its text in chunks
 never copied as it grows, so a writer beside the pool keeps its rate on both test hosts and a large
-row answer on the pool takes about half the time it did on the x86 host (pitfalls 619-623). The pool stays off under every
-profile: four connections asking at once answer 4-10% fewer queries with it.
+row answer on the pool takes about half the time it did on the x86 host (pitfalls 619-623).
+**#249 is closed** (PR #292): `boost` gives the pool a thread per usable CPU, and a scan divides only
+while fewer client loops are serving, or served in the last 2 ms, than the CPUs (`LoopLoad`,
+`ScanPool::cpu_to_spare()`), so four connections asking at once answer as many queries as with no
+pool (pitfalls 624-627). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns
+it off.
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)

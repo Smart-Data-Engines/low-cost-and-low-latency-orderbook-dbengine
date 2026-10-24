@@ -14,6 +14,7 @@
 
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
+#include "orderbook/loop_load.hpp"
 #include "orderbook/query_engine.hpp"
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/scan_pool.hpp"
@@ -622,4 +623,35 @@ TEST(ScanParts, AScanFindingThePoolDividedAlreadyReadsOnItsOwnThread) {
     EXPECT_EQ(first_rows, 5000u);
     EXPECT_TRUE(pool.claim()) << "the first scan kept the pool after it ended";
     pool.release();
+}
+
+TEST(ScanParts, AScanWithNoCpuToSpareFromTheClientLoopsIsReadOnItsQuerysThread) {
+    // #249: with every CPU's client loop serving, a scan the pool could divide is read on its own
+    // thread, and makes no part; with a CPU left over, it divides.
+    Store s;
+    ten_segments(s);
+    ob::ScanPool pool(2, nullptr);
+    ob::LoopLoad load(2);
+    pool.set_loop_load(&load, 2);
+    load.serving(0);
+    load.serving(1);
+    std::atomic<int> made{0};
+    ob::PartsScan how;
+    how.pool = &pool;
+    how.divide_small = true;
+    how.direct = [](const ob::RowBatch&) -> ob::BatchVerdict { return {}; };
+    how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+        ++made;
+        return std::make_unique<CountingPart>(false);
+    };
+    how.fold = [](ob::ScanPart&) { return true; };
+    const auto kept = s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    EXPECT_EQ(made.load(), 0) << "a scan divided with every CPU's client loop serving";
+    EXPECT_EQ(kept.segments_read, 10u);
+    EXPECT_EQ(pool.undivided(), 1u);
+    load.stopped_at(1, ob::LoopLoad::Clock::now() - 2 * ob::ScanPool::kLoopRecent);
+    s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    EXPECT_GT(made.load(), 0) << "a scan with a CPU to spare did not divide";
+    EXPECT_EQ(pool.undivided(), 1u);
+    pool.set_loop_load(nullptr, 0);
 }

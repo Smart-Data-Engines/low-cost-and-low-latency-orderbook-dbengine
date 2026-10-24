@@ -25,9 +25,12 @@ here as `#N`.
   answered 1.9 M rows of one column in 8.3-12.4 ms where the same build took 25.2-26.1 without them,
   and their 81 one-minute buckets in 3.8-4.1 ms where 6.0, with a writer beside them within the levels
   a second it wrote without the pool; on the ARM test host the same queries took 27-38% of the time.
-  **Off under every profile:** four connections asking at once answered 4-11% fewer queries with the
-  pool. One query divides at a time. Metrics `ob_scan_parts_pooled_total`,
-  `ob_scan_parts_inline_total` and `ob_scan_threads`; `docs/cli.md`, "A query on several cores".
+  **On under `boost`, the default** (#249), with a thread per usable CPU where there are two or
+  more: a scan divides only while fewer client loops are serving, or have served in the last 2 ms,
+  than the CPUs, so four connections asking at once answer as many queries as with no pool, where
+  they answered 4-11% fewer. `eco` and `--scan-threads 0` leave it off. One query divides at a time.
+  Metrics `ob_scan_parts_pooled_total`, `ob_scan_parts_inline_total`, `ob_scan_undivided_total` and
+  `ob_scan_threads`; `docs/cli.md`, "A query on several cores".
 - A restore to a moment after the backup (#34, point-in-time recovery). With `--wal-archive-dir
   <DIR>` a node puts every WAL file it closes into `<DIR>/<WAL identity>/`, with its size and CRC32C
   beside it: linked on the WAL's filesystem, copied, synced and read back on another. Retention

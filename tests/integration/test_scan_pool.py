@@ -1,7 +1,8 @@
 """#246, stage 2: a query's segments read on the scan pool, on live nodes.
 
-The pool is off under every profile, so nothing else in this battery reads through it: these tests
-start a node with `--scan-threads 2` beside one without, write both the same rows, and hold every
+Since #249 `boost`, the default profile, gives the pool a thread per usable CPU, so the battery's
+nodes read through it wherever their machine has two CPUs or more. These tests start a node with
+`--scan-threads 2` beside one with `--scan-threads 0`, write both the same rows, and hold every
 answer of the first to the second's bytes - rows, narrowed rows, a LIMIT that ends inside a
 segment and buckets of every row aggregate, both buckets inside one segment and buckets gathering
 two or all of them, whose aggregates the parts' are merged into. The pool node's /metrics then has
@@ -18,6 +19,7 @@ import re
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -125,7 +127,7 @@ def load(port: int) -> None:
 
 @pytest.fixture(scope="module")
 def two_nodes(tmp_path_factory):
-    plain = Node(tmp_path_factory.mktemp("plain"))
+    plain = Node(tmp_path_factory.mktemp("plain"), "--scan-threads", "0")
     pooled = None
     try:
         pooled = Node(tmp_path_factory.mktemp("pooled"), "--scan-threads", "2")
@@ -172,3 +174,61 @@ def test_the_pool_read_the_parts(two_nodes) -> None:
     parts = pooled.metric("ob_scan_parts_pooled_total") + pooled.metric("ob_scan_parts_inline_total")
     assert parts >= SEGMENTS, f"{parts} parts read on a node whose every whole-range scan divides"
     assert plain.metric("ob_scan_parts_pooled_total") == 0
+
+
+def test_the_default_profile_sizes_the_pool_to_the_machine(tmp_path) -> None:
+    """#249: a node started with no `--scan-threads` has the pool `--print-config` says the profile
+    chose for this machine - a thread per usable CPU, none on one - and where it has one, a scan of
+    many rows with every other loop idle divides."""
+    printed = subprocess.run([server_binary_path(), "--print-config"], capture_output=True, text=True,
+                             timeout=patience(30), check=True).stdout
+    chosen = re.search(r"^\s*scan-threads\s+(\d+)\s+\(profile\)", printed, re.MULTILINE)
+    assert chosen, printed
+    node = Node(tmp_path / "default")
+    try:
+        assert node.metric("ob_scan_threads") == int(chosen.group(1))
+        if int(chosen.group(1)) >= 2:
+            load(node.port)
+            ask(node.port, f"SELECT * {ALL}")
+            parts = node.metric("ob_scan_parts_pooled_total") + node.metric("ob_scan_parts_inline_total")
+            assert parts >= SEGMENTS, f"{parts} parts read on a default node, its other loops idle"
+            assert node.metric("ob_scan_undivided_total") == 0
+    finally:
+        node.close()
+
+
+def test_a_node_whose_every_loop_serves_keeps_its_scans_on_their_loops(tmp_path) -> None:
+    """#249: with a connection on each of a default node's client loops, every one asking the bucket
+    query back to back, most scans find no CPU to spare and read on their own loop - counted - and
+    every answer is still the bytes of one read without the pool."""
+    printed = subprocess.run([server_binary_path(), "--print-config"], capture_output=True, text=True,
+                             timeout=patience(30), check=True).stdout
+    loops = int(re.search(r"^\s*io-threads\s+(\d+)", printed, re.MULTILINE).group(1))
+    pool = int(re.search(r"^\s*scan-threads\s+(\d+)", printed, re.MULTILINE).group(1))
+    if pool < 2:
+        pytest.skip(f"a scan pool of {pool} thread(s) on this machine: nothing to keep from dividing")
+    node = Node(tmp_path / "busy")
+    try:
+        load(node.port)
+        sql = f"SELECT {AGGREGATES} {ALL} GROUP BY TIME_BUCKET(10m)"
+        expected = ask(node.port, sql)
+        assert expected.startswith(b"OK"), expected[:200]
+        stop_at = time.monotonic() + 3
+        wrong: list[bytes] = []
+
+        def asker() -> None:
+            while time.monotonic() < stop_at:
+                got = ask(node.port, sql)
+                if got != expected:
+                    wrong.append(got[:200])
+
+        threads = [threading.Thread(target=asker) for _ in range(loops)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not wrong, wrong[0]
+        assert node.metric("ob_scan_undivided_total") > 0, \
+            f"{loops} loops each serving a connection, and no scan was kept on its loop"
+    finally:
+        node.close()
