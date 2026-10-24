@@ -4565,6 +4565,12 @@ Learned the hard way. Check here before debugging.
      queries' time. Two CPUs to spare changed nothing, and a pool that never divided cost nothing,
      so the cost was those scans. Counting a loop as serving for 2 ms after it stops took them from
      134 in 5 000 to 4, and the cost to none.
+625. **A time point's zero is not "never".** `steady_clock`'s epoch is the machine's boot: #249's
+     `LoopLoad` started each loop's "stopped at" there, and a loop that had never served counted as
+     serving a moment ago wherever the machine had been up for less than the moment. With a 2 ms
+     window no machine is; a test asking within an hour passed on the laptop, up for days, and failed
+     on a CI runner booted minutes before. "Never" is `time_point::min()`, compared as `stopped_at >
+     now - recent`, since `now - min()` overflows.
 
 ## Current state and open problems
 
@@ -4612,8 +4618,8 @@ row answer on the pool takes about half the time it did on the x86 host (pitfall
 **#249 is closed** (PR #292): `boost` gives the pool a thread per usable CPU, and a scan divides only
 while fewer client loops are serving, or served in the last 2 ms, than the CPUs (`LoopLoad`,
 `ScanPool::cpu_to_spare()`), so four connections asking at once answer as many queries as with no
-pool (pitfall 624). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns it
-off.
+pool (pitfalls 624-625). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns
+it off.
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)

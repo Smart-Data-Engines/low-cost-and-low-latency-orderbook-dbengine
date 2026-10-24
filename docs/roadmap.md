@@ -2923,7 +2923,10 @@ rounds under load, queries a second:
   the branch's build, pool or not.
 - Tests: `LoopLoad` and the gate with an explicit clock; a scan with no CPU to spare makes no part;
   `boost` sizes the pool and an operator's value, 0 included, wins; a default node divides with its
-  other loops idle, and a node with every loop serving keeps its scans on their loops.
+  other loops idle, and a node with every loop serving keeps its scans on their loops. CI's first run
+  found a loop that had never served counted as serving within a test's hour on a runner booted
+  minutes before (pitfall 625). Mutations: eight killed; a window of 1 ms survives, which only the
+  measurement shows, and so does the control.
 
 - Effort: S | Impact: a query of many rows read on one core unless an operator turned the pool on;
   it is read on every core by default now, and several connections at once lose nothing to it
