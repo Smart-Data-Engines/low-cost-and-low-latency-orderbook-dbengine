@@ -15,7 +15,6 @@
 #include <gtest/gtest.h>
 
 #include <sched.h>
-#include <time.h>
 
 #include <atomic>
 #include <chrono>
@@ -230,32 +229,56 @@ TEST(ScanPace, AnEntryJustShortOfTheThresholdGaveNothingAway) {
 }
 
 TEST(ScanPool, AThreadThatWorksBetweenStepsEntersTheKernel) {
-    // A task only a pool thread runs, working 20 quiet intervals of its own CPU time - so however
-    // long the scheduler keeps it off a CPU - with a step a fraction of a microsecond long, as a
-    // part's reader steps through a batch.
+    // A task only a pool thread runs, stepping as a part's reader steps through a batch, a step a
+    // fraction of a microsecond long. Before each `pace()` it reads the clock the rule reads and
+    // counts the entries the rule owes: one at the first step, and one at each step a quiet
+    // interval after the step that followed the last owed one - by when that entry, if the thread
+    // made it, had ended. Every interval of the rule is at most the quiet one, so the thread entered
+    // at least as often as it owed, however long a step took and however long the scheduler kept it
+    // off a CPU. The thread's own CPU time was the measure until a CI runner gave 20 quiet intervals
+    // of it and 5 entries (pitfall 627).
     ob::ScanPool pool(1, nullptr);
     std::atomic<uint64_t> spun{0};
+    std::atomic<unsigned> owed{0};
+    std::atomic<uint64_t> steps{0};
+    std::atomic<int64_t> span_us{0};
     auto task = pool.submit([&] {
-        const auto cpu_ns = [] {
-            timespec ts{};
-            ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-            return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
-        };
-        const uint64_t from = cpu_ns();
+        using Clock = ob::ScanPace::Clock;
+        const auto from = Clock::now();
+        auto at = from;
+        Clock::time_point ended{};
+        bool ending = false;
+        unsigned due = 0;
+        uint64_t n = 0;
         uint64_t x = 0;
-        while (cpu_ns() - from < 20 * static_cast<uint64_t>(ob::ScanPace::kQuiet.count())) {
+        while (due < 20 && at - from < 5s) {
             for (int i = 0; i < 200; ++i) x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            at = Clock::now();
+            if (ending) {   // the step after an owed entry: the entry, if made, had ended by now
+                ended = at;
+                ending = false;
+            }
+            if (due == 0 || at - ended >= ob::ScanPace::kQuiet) {
+                ++due;
+                ending = true;
+            }
             ob::ScanPool::pace();
+            ++n;
         }
         spun = x | 1;
+        owed = due;
+        steps = n;
+        span_us = std::chrono::duration_cast<std::chrono::microseconds>(at - from).count();
     });
-    for (int i = 0; i < 5000 && !task->done(); ++i) std::this_thread::sleep_for(1ms);
+    for (int i = 0; i < 10000 && !task->done(); ++i) std::this_thread::sleep_for(1ms);
     ASSERT_TRUE(task->done()) << "no pool thread ran the task";
     pool.run_or_wait(*task);
     pool.stop();   // the thread joined, so what it counted is in the pool's counts
     EXPECT_NE(spun.load(), 0u);
-    EXPECT_GE(pool.entries(), 10u) << "a pool thread worked 20 quiet intervals and entered the kernel "
-                                   << pool.entries() << " time(s)";
+    EXPECT_GE(pool.entries(), owed.load())
+        << "a pool thread whose " << steps.load() << " steps over " << span_us.load() << " us owed "
+        << owed.load() << " entries entered the kernel " << pool.entries() << " time(s)";
+    EXPECT_EQ(owed.load(), 20u) << "a pool thread did not step through 20 quiet intervals in 5 s";
     EXPECT_LE(pool.gave_up(), pool.entries());
 }
 
