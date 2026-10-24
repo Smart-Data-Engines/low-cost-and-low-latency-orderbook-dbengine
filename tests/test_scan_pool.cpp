@@ -265,6 +265,9 @@ TEST(LoopLoad, ALoopCountsAsServingWhileItServesAndForAMomentAfter) {
     ob::LoopLoad load(3);
     const auto t0 = ob::LoopLoad::Clock::now();
     EXPECT_EQ(load.serving_within(t0, 2ms), 0u);
+    // A loop that never served did not serve a moment ago, however long the moment - longer than
+    // the clock has run since the machine booted included.
+    EXPECT_EQ(load.serving_within(t0, std::chrono::hours(24 * 365 * 100)), 0u);
     load.serving(0);
     load.serving(2);
     EXPECT_EQ(load.serving_within(t0, 2ms), 2u);

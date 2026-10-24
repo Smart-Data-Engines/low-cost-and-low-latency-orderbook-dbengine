@@ -39,8 +39,10 @@ public:
         size_t n = 0;
         for (size_t i = 0; i < loops_; ++i) {
             const Flag& f = flags_[i];
+            // Compared as `stopped_at > now - recent`, not `now - stopped_at < recent`: a loop
+            // that never served stopped at time_point::min(), whose distance from now overflows.
             const bool busy = f.serving.load(std::memory_order_acquire) ||
-                              now - f.stopped_at.load(std::memory_order_relaxed) < recent;
+                              f.stopped_at.load(std::memory_order_relaxed) > now - recent;
             n += busy ? 1 : 0;
         }
         return n;
@@ -51,7 +53,10 @@ public:
 private:
     struct alignas(64) Flag {
         std::atomic<bool> serving{false};
-        std::atomic<Clock::time_point> stopped_at{Clock::time_point{}};
+        /// Never, until it first stops. Not the clock's epoch: steady_clock's is the boot, and on a
+        /// machine up less than the window a loop that never served counted as serving a moment
+        /// ago - as a CI runner a few minutes old showed with a test's window of an hour.
+        std::atomic<Clock::time_point> stopped_at{Clock::time_point::min()};
     };
     std::unique_ptr<Flag[]> flags_;
     size_t loops_;
