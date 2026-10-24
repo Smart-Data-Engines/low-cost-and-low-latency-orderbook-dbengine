@@ -4557,6 +4557,14 @@ Learned the hard way. Check here before debugging.
      as `prev:pid [prio] state ==> next:pid [prio]`.** A parser of the older `prev_comm=` fields
      found no switch at all. A woken thread's CPU is its waking's `target_cpu`, or the `dest_cpu` of
      a `sched_migrate_task` that follows before it runs (`wait_by_holder.py` in #248's evidence).
+624. **Whether a CPU is free for a scan is not what the loops are doing at the instant it decides.**
+     #249's first gate divided a scan while fewer client loops were serving than CPUs, counted at
+     that instant. Four connections asking the bucket query back to back still answered 4.6% fewer
+     queries than with no pool: a loop spends tens of microseconds between two of its connection's
+     queries, a scan deciding in such a gap divided - 2-4% of them did - and each cost one to two
+     queries' time. Two CPUs to spare changed nothing, and a pool that never divided cost nothing,
+     so the cost was those scans. Counting a loop as serving for 2 ms after it stops took them from
+     134 in 5 000 to 4, and the cost to none.
 
 ## Current state and open problems
 

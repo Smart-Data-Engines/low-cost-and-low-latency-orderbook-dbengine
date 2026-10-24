@@ -274,7 +274,9 @@ TEST(LoopLoad, ALoopCountsAsServingWhileItServesAndForAMomentAfter) {
     load.stopped(1);   // a loop that never served: nothing to end
     EXPECT_EQ(load.serving_within(t0 + 2ms, 2ms), 1u);
     load.stopped(2);
-    EXPECT_EQ(load.serving_within(ob::LoopLoad::Clock::now() + 2ms, 2ms), 0u);
+    EXPECT_EQ(load.serving_within(ob::LoopLoad::Clock::now(), 1h), 2u)
+        << "loops 0 and 2 stopped within the hour; one of them did not record when";
+    EXPECT_EQ(load.serving_within(ob::LoopLoad::Clock::now() + 2h, 1h), 0u);
 }
 
 TEST(ScanPool, AScanDividesOnlyWhileACpuIsLeftOverFromTheClientLoops) {

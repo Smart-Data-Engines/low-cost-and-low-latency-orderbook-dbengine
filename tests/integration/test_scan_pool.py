@@ -19,6 +19,7 @@ import re
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -192,5 +193,42 @@ def test_the_default_profile_sizes_the_pool_to_the_machine(tmp_path) -> None:
             parts = node.metric("ob_scan_parts_pooled_total") + node.metric("ob_scan_parts_inline_total")
             assert parts >= SEGMENTS, f"{parts} parts read on a default node, its other loops idle"
             assert node.metric("ob_scan_undivided_total") == 0
+    finally:
+        node.close()
+
+
+def test_a_node_whose_every_loop_serves_keeps_its_scans_on_their_loops(tmp_path) -> None:
+    """#249: with a connection on each of a default node's client loops, every one asking the bucket
+    query back to back, most scans find no CPU to spare and read on their own loop - counted - and
+    every answer is still the bytes of one read without the pool."""
+    printed = subprocess.run([server_binary_path(), "--print-config"], capture_output=True, text=True,
+                             timeout=patience(30), check=True).stdout
+    loops = int(re.search(r"^\s*io-threads\s+(\d+)", printed, re.MULTILINE).group(1))
+    pool = int(re.search(r"^\s*scan-threads\s+(\d+)", printed, re.MULTILINE).group(1))
+    if pool < 2:
+        pytest.skip(f"a scan pool of {pool} thread(s) on this machine: nothing to keep from dividing")
+    node = Node(tmp_path / "busy")
+    try:
+        load(node.port)
+        sql = f"SELECT {AGGREGATES} {ALL} GROUP BY TIME_BUCKET(10m)"
+        expected = ask(node.port, sql)
+        assert expected.startswith(b"OK"), expected[:200]
+        stop_at = time.monotonic() + 3
+        wrong: list[bytes] = []
+
+        def asker() -> None:
+            while time.monotonic() < stop_at:
+                got = ask(node.port, sql)
+                if got != expected:
+                    wrong.append(got[:200])
+
+        threads = [threading.Thread(target=asker) for _ in range(loops)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not wrong, wrong[0]
+        assert node.metric("ob_scan_undivided_total") > 0, \
+            f"{loops} loops each serving a connection, and no scan was kept on its loop"
     finally:
         node.close()
