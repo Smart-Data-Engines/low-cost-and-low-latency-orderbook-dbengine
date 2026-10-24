@@ -803,14 +803,14 @@ TEST(ColumnCodec, ALongRunIsWrittenInBlocksAndNothingPastTheColumnsEnd) {
 
 TEST(ColumnCodec, ALongRunIsRefusedWhereverItsValuesLeaveTheType) {
     // #223: a run longer than a block, written in blocks, is checked at its two ends as a short one is.
-    // Each column is an anchor, a run of twenty from it by a step and a run of twelve holding the last
-    // value - the twenty with room for its three blocks before the column ends - decoded as 8-bit.
+    // Each column is an anchor, a run of twenty from it by one step - with room for its three blocks
+    // before the column ends - and a run of twelve by another, which brings the values back inside
+    // 0 - 255, decoded as 8-bit: only the run of twenty's checks can see a value outside.
     const Encoding delta_runs{Transform::kDelta, Packing::kRuns, Compressor::kNone};
-    const auto refused_as_u8 = [&](uint64_t start, uint64_t step) {
+    const auto refused_as_u8 = [&](uint64_t start, uint64_t step, uint64_t back) {
         std::vector<uint64_t> column{start};
         for (int k = 0; k < 20; ++k) column.push_back(column.back() + step);
-        const uint64_t last = column.back();
-        column.insert(column.end(), 12, last);
+        for (int k = 0; k < 12; ++k) column.push_back(column.back() + back);
         std::string block;
         encode_as(column, delta_runs, 1, block);
         std::vector<uint8_t> as8;
@@ -820,10 +820,11 @@ TEST(ColumnCodec, ALongRunIsRefusedWhereverItsValuesLeaveTheType) {
         EXPECT_EQ(as64, column);
         return !decode_as(bytes(block), column.size(), as8, &why) && why.find("type") != std::string::npos;
     };
-    EXPECT_TRUE(refused_as_u8(200, 3)) << "up past 255: its last value 260";
-    EXPECT_TRUE(refused_as_u8(50, uint64_t{0} - 3)) << "down past 0: its last value -10";
-    EXPECT_TRUE(refused_as_u8(250, 6)) << "its first value 256";
-    EXPECT_FALSE(refused_as_u8(200, 2)) << "the control: from 202 to 240, in range throughout";
+    EXPECT_TRUE(refused_as_u8(200, 3, uint64_t{0} - 12)) << "up past 255: its last value 260, then 248 down to 116";
+    EXPECT_TRUE(refused_as_u8(50, uint64_t{0} - 3, 12)) << "down past 0: its last value -10, then 2 up to 134";
+    EXPECT_TRUE(refused_as_u8(250, uint64_t{1} << 63, 0))
+        << "its first value past 255 and its last 250 again: a step of 2^63, twenty times";
+    EXPECT_FALSE(refused_as_u8(200, 2, uint64_t{0} - 12)) << "the control: 202 up to 240, then down to 96";
 }
 
 TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {
