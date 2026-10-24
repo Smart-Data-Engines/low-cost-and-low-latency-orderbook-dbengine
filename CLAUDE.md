@@ -4571,6 +4571,13 @@ Learned the hard way. Check here before debugging.
      window no machine is; a test asking within an hour passed on the laptop, up for days, and failed
      on a CI runner booted minutes before. "Never" is `time_point::min()`, compared as `stopped_at >
      now - recent`, since `now - min()` overflows.
+626. **A guard that drops a stack object's address does not keep code scanning from reading it as an
+     escape.** #249's `TcpServer::run()` made the loops' `LoopLoad` on its stack and handed its
+     address to the engine, with a guard taking it back on every way out of the frame. CodeQL's
+     `cpp/stack-address-escape` raised alert 114 on the engine's store all the same, and its review
+     thread held the pull request. The server owns the object now, declared before the engine so it
+     outlives it; the next analysis closes the alert and its thread - nothing dismissed, as with
+     pitfall 618.
 
 ## Current state and open problems
 
@@ -4618,7 +4625,7 @@ row answer on the pool takes about half the time it did on the x86 host (pitfall
 **#249 is closed** (PR #292): `boost` gives the pool a thread per usable CPU, and a scan divides only
 while fewer client loops are serving, or served in the last 2 ms, than the CPUs (`LoopLoad`,
 `ScanPool::cpu_to_spare()`), so four connections asking at once answer as many queries as with no
-pool (pitfalls 624-625). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns
+pool (pitfalls 624-626). Three connections on the x86 host answer 3% fewer; `--scan-threads 0` turns
 it off.
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
