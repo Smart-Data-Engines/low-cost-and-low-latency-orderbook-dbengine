@@ -546,6 +546,10 @@ public:
 
 private:
     ServerConfig             config_;
+    /// The client loops' load the engine's scan pool divides against (#249): made by run() for its
+    /// reactors, and declared before the engine so that it outlives it - the engine holds its
+    /// address only while run() does, and drops it on every way out.
+    std::unique_ptr<LoopLoad> loop_load_;
     std::unique_ptr<Engine>  engine_;
     std::unique_ptr<MetricsServer> metrics_server_;
 

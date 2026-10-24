@@ -3940,14 +3940,15 @@ void TcpServer::run() {
     ServerStats stats;
     std::vector<Reactor*> dealt_to;
     std::mutex            admin_mtx;
-    // The loops' load, for the scan pool to divide against (#249): the engine holds it only while
-    // the reactors run, which this frame outlives.
-    LoopLoad loop_load(config_.io_threads);
+    // The loops' load, for the scan pool to divide against (#249). The server owns it, so it is no
+    // address on this frame's stack that the engine holds; the engine holds it only while the
+    // reactors run.
+    loop_load_ = std::make_unique<LoopLoad>(config_.io_threads);
     ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
-                         &dealt_to, admin_mtx, backups.get(), &loop_load};
+                         &dealt_to, admin_mtx, backups.get(), loop_load_.get()};
     const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
-    engine_->set_loop_load(&loop_load, cpus);
+    engine_->set_loop_load(loop_load_.get(), cpus);
     struct Unload {
         Engine* engine;
         ~Unload() { engine->set_loop_load(nullptr, 0); }
