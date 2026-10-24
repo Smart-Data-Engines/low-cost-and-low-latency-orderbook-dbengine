@@ -4523,6 +4523,40 @@ Learned the hard way. Check here before debugging.
      raised alert 113 on it, and its review thread held the pull request, which requires threads
      resolved. Made a member of the struct it merges, as `BucketFiller::take()` is, the next analysis
      closed the alert and its thread - nothing dismissed.
+619. **A free CPU does not keep a woken loop off a pool thread's.** #248's first measure was a pool a
+     CPU smaller than the machine, so that a client loop always had one to wake on: at the floors,
+     three threads on four CPUs cost a writer 9% of its rate beside one query against four threads'
+     13%, and 15% beside another at either. That fits how the scheduler places a woken task, which
+     the runs did not trace: it counts a CPU running only `SCHED_IDLE` tasks as idle
+     (`sched_idle_cpu()` beside `available_idle_cpu()`), so a loop goes back to the CPU it last ran
+     on, a pool thread's, as readily as to a free one.
+620. **Under lazy preemption what a thread beside the loops costs them is how long it works between
+     entries to the kernel.** A loop woken onto the CPU a `SCHED_IDLE` pool thread holds runs when
+     that thread next enters the kernel, or at the tick. On the x86 host, beside 1.9 M rows on the
+     pool, a writer's floor was 80% of its rate with no pool at an entry every 2 048 rows (17-18 us
+     of work), 90-95% every 512 (4.4 us), 94.6% every 2 us and 98.7% every microsecond. Rows are not
+     time - 128 rows were 1.1 us of one query and 0.6 us of another - so #248's rule is in time, and
+     adaptive: about every microsecond while an entry has let another thread run within the last
+     millisecond, every 16 us otherwise, since an entry costs 125 ns there and 216 ns on ARM, where
+     nothing waits on a pool thread to begin with.
+621. **A string grown by `resize()` is a stretch with no entry to the kernel, and a copy of all it
+     holds.** With a pool thread entering the kernel every 128 rows, `perf sched` still found it
+     running 62-283 us without a switch while a writer waited on its CPU: the row part's
+     `std::string`, doubled by `resize()`, copied what it held and zeroed the rest, up to some 4 MB,
+     in memory its allocator had already touched - no fault, no syscall. Kept in chunks made with
+     `std::make_unique_for_overwrite` and never copied, `price_all` on the pool took 8.7-9.3 ms
+     against 15.7-16.0: the doubling had been most of it.
+622. **A syscall that does nothing was a cheaper entry than `sched_yield()`, and a worse one.** A
+     return from any syscall runs a resched the kernel has marked lazy, so `getppid()` - 46 ns
+     against 125 on the x86 host - looked like the same entry for less. Beside 1.9 M rows on the pool
+     it left a writer at 95.1% of its rate with no pool against `sched_yield()`'s 97.8%, and in the
+     traced runs the writer waited 10.3 ms behind pool threads against 3.3. `sched_yield()` has the
+     scheduler choose again whether or not anything was marked; which wakeups went unmarked was not
+     traced.
+623. **perf 7.0's `perf sched record` records `sched_waking`, not `sched_wakeup`, and prints a switch
+     as `prev:pid [prio] state ==> next:pid [prio]`.** A parser of the older `prev_comm=` fields
+     found no switch at all. A woken thread's CPU is its waking's `target_cpu`, or the `dest_cpu` of
+     a `sched_migrate_task` that follows before it runs (`wait_by_holder.py` in #248's evidence).
 
 ## Current state and open problems
 
@@ -4561,9 +4595,13 @@ batch at a time - a candidate's columns and the rows chosen from them - and the 
 row answer from the columns (`RowAnswer`); a 190 000-row answer and a bucket query take 1.46 and
 1.93 times less on one core, with the same bytes (pitfalls 609, 610). Stage 2: with
 `--scan-threads N` a query of many rows over several segments reads them on N threads and folds the
-parts in order, the same bytes, 1.6-2.9 times as fast on four. It is off under every profile,
-because on the x86 test host it cost a writer on the same node 8-20% of its rate, where on the ARM
-host it cost nothing measurable; making it cheap on the first is #248 (pitfalls 611-614, 618).
+parts in order, the same bytes (pitfalls 611-614, 618). **#248 is closed** (PR #291): on the x86 test
+host, whose kernel preempts lazily, the pool had cost a writer on the same node 8-20% of its rate. A
+pool thread now hands its part 128 rows at a time and enters the kernel between steps about every
+microsecond while that lets another thread run (`ScanPace`), and a row part keeps its text in chunks
+never copied as it grows, so a writer beside the pool keeps its rate on both test hosts and a large
+row answer on the pool takes about half the time it did on the x86 host (pitfalls 619-623). The pool stays off under every
+profile: four connections asking at once answer 4-10% fewer queries with it.
 
 **#233 and #235 are closed** (PR #275): an update is a set of price levels everywhere. `WHERE AT`,
 `SNAPSHOT` and the series read history by price, starting from a book summary (`book.<time>.v1`)

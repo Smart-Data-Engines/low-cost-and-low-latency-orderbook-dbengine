@@ -168,6 +168,12 @@ public:
     virtual uint64_t rows() const = 0;
 };
 
+/// A batch handed to `part` a step of `ScanPool::kStepRows` rows at a time, with `ScanPool::pace()`
+/// before each, as a pool thread reads its part (#248): what the part says of a step is said of the
+/// batch, a stop at a step's row `at` being a stop at the batch's row `from + at`, and once it stops
+/// it is handed nothing more of the batch.
+BatchVerdict take_in_steps(ScanPart& part, const RowBatch& batch);
+
 /// How a scan divides its candidates among a pool's threads (OB-12, stage 2).
 struct PartsScan {
     /// Where the candidates are read. Null, a pool of no threads, or a scan of one candidate reads

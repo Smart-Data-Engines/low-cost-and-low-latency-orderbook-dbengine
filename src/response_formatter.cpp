@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -399,6 +400,12 @@ namespace {
 /// A part of a row answer (#246, stage 2): one candidate's rows formatted where the candidate is
 /// read, into text of its own - at most `limit` rows, as no part of an answer of `limit` rows needs
 /// more - through the writer add_rows() writes through.
+///
+/// The text is held in chunks, each made with no zeros written and never copied as the part grows
+/// (#248). A string grown by resize() copied what it held and zeroed the rest at every doubling, up
+/// to some 4 MB a part of 190 000 rows: on the x86 host that was most of `price_all`'s time on the
+/// pool - 15.7-16.0 ms against 8.7-9.3 with the chunks - and stretches of hundreds of microseconds
+/// with no entry to the kernel a client loop woken onto the thread's CPU could run at.
 class RowTextPart final : public ScanPart {
 public:
     RowTextPart(const QueryShape& shape, uint64_t limit, size_t row_bytes)
@@ -408,11 +415,17 @@ public:
     BatchVerdict take(const RowBatch& b) override {
         const auto n = static_cast<size_t>(std::min<uint64_t>(b.rows.size(), limit_ - rows_));
         if (n > 0) {
+            // Room for the whole batch at the widest row this shape can write, in one chunk: a row
+            // never spans two.
             const size_t need = n * row_bytes_;
-            if (text_.size() - used_ < need) text_.resize(std::max(text_.size() * 2, used_ + need));
-            char* const base = text_.data();
-            used_ = static_cast<size_t>(
-                write_rows(base + used_, base + text_.size(), b, n, all_seven_, columns_) - base);
+            if (chunks_.empty() || chunks_.back().cap - chunks_.back().used < need) {
+                const size_t cap = std::max(kChunkBytes, need);
+                chunks_.push_back(Chunk{std::make_unique_for_overwrite<char[]>(cap), cap, 0});
+            }
+            Chunk& c = chunks_.back();
+            char* const base = c.bytes.get();
+            c.used = static_cast<size_t>(
+                write_rows(base + c.used, base + c.cap, b, n, all_seven_, columns_) - base);
         }
         rows_ += n;
         if (rows_ == limit_) return {true, n == 0 ? 0 : n - 1};
@@ -420,25 +433,37 @@ public:
     }
     uint64_t rows() const override { return rows_; }
 
-    const char* data() const { return text_.data(); }
-    /// The bytes of its first `n` rows: through the end of the `n`-th, every row being one line.
-    size_t bytes_of(uint64_t n) const {
-        if (n >= rows_) return used_;
-        const char* p = text_.data();
-        const char* const end = p + used_;
-        for (uint64_t r = 0; r < n; ++r) {
-            p = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p))) + 1;
+    /// Its first `n` rows appended to `out`: through the end of the `n`-th, every row being one line.
+    void append_to(std::string& out, uint64_t n) const {
+        for (const Chunk& c : chunks_) {
+            const char* const begin = c.bytes.get();
+            if (n >= rows_) {
+                out.append(begin, c.used);
+                continue;
+            }
+            const char* p = begin;
+            const char* const end = begin + c.used;
+            for (; n > 0 && p < end; --n) {
+                p = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p))) + 1;
+            }
+            out.append(begin, static_cast<size_t>(p - begin));
+            if (n == 0) return;
         }
-        return static_cast<size_t>(p - text_.data());
     }
 
 private:
+    static constexpr size_t kChunkBytes = 256 * 1024;
+    struct Chunk {
+        std::unique_ptr<char[]> bytes;
+        size_t cap;
+        size_t used;
+    };
+
     std::vector<QueryColumn> columns_;
     uint64_t limit_;
     bool all_seven_;
     size_t row_bytes_;
-    std::string text_;
-    size_t used_{0};
+    std::vector<Chunk> chunks_;
     uint64_t rows_{0};
 };
 
@@ -456,11 +481,10 @@ void QueryResponseBuilder::add_part(ScanPart& p, uint64_t n) {
     auto& part = static_cast<RowTextPart&>(p);
     if (n == 0) return;
     if (!started_) start_rows();
-    const size_t bytes = part.bytes_of(n);
     // Appended rather than copied into room made ahead, which a resize fills with zeros first: the
     // copy is the one pass over the bytes this reply makes.
     out_.resize(used_);
-    out_.append(part.data(), bytes);
+    part.append_to(out_, n);
     used_ = out_.size();
 }
 

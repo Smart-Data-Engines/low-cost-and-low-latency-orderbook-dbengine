@@ -7,7 +7,6 @@
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
-#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -2496,6 +2495,18 @@ ColumnarStore::ScanCost ColumnarStore::read_in_order(const ScanSet& set, std::st
     return cost;
 }
 
+BatchVerdict take_in_steps(ScanPart& part, const RowBatch& batch) {
+    // The scan hands a reader no empty batch, so a part sees every batch it is given.
+    RowBatch step = batch;
+    const size_t n = batch.rows.size();
+    for (size_t from = 0; from < n; from += ScanPool::kStepRows) {
+        ScanPool::pace();
+        step.rows = batch.rows.subspan(from, std::min(ScanPool::kStepRows, n - from));
+        if (const BatchVerdict v = part.take(step); v.stop) return {true, from + v.at};
+    }
+    return {};
+}
+
 ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t end_ns,
                                                    std::string_view symbol,
                                                    std::string_view exchange, ColumnSet columns,
@@ -2596,10 +2607,10 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         s.part = how.make_part();
         const BatchReader into = [&s, &stop](const RowBatch& b) -> BatchVerdict {
             if (stop.load(std::memory_order_relaxed)) return {true, 0};
-            // A pool thread gives its CPU up between batches, so a client loop woken onto it waits
-            // for one batch at most rather than for the scheduler's tick (`ScanPool`'s threads).
-            if (s.on_pool) ::sched_yield();
-            return s.part->take(b);
+            // On a pool thread a step at a time, so a client loop woken onto the thread's CPU waits
+            // about a microsecond rather than a batch - or the scheduler's tick, on a kernel that
+            // preempts lazily (#248).
+            return s.on_pool ? take_in_steps(*s.part, b) : s.part->take(b);
         };
         if (s.meta != nullptr) {
             read_segment_rows(*s.meta, columns, start_ns, end_ns, filter, into, ReadMode::kQuery,

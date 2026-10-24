@@ -5,12 +5,16 @@
 // task's work throws reaches the query that waits for it; a task the query no longer needs is
 // dropped without running; and a pool that stops leaves its queued tasks to their queries, which run
 // them, rather than stranding a query. A pool of no threads runs everything where it is waited for.
+//
+// And when its threads enter the kernel between the steps of their work (#248): `ScanPace` held to
+// its rule, and a pool thread that works between steps entering it.
 
 #include "orderbook/scan_pool.hpp"
 
 #include <gtest/gtest.h>
 
 #include <sched.h>
+#include <time.h>
 
 #include <atomic>
 #include <chrono>
@@ -175,4 +179,81 @@ TEST(ScanPool, OneScanAtATimeHoldsTheClaim) {
     pool.release();
     EXPECT_TRUE(pool.claim());
     pool.release();
+}
+
+// ── When a pool thread enters the kernel (#248) ───────────────────────────────────────────────────
+
+namespace {
+
+using Pace = ob::ScanPace;
+const Pace::Clock::time_point kT{std::chrono::seconds{1}};   // a clock a second past its epoch
+constexpr std::chrono::nanoseconds kNs{1};
+
+}  // namespace
+
+TEST(ScanPace, AThreadNobodyWaitsForEntersOnceAQuietIntervalHasPassed) {
+    Pace pace;
+    EXPECT_TRUE(pace.due(kT)) << "a thread's first step did not enter the kernel";
+    EXPECT_FALSE(pace.entered(kT, kT + 100 * kNs)) << "an entry of 100 ns gave the CPU away";
+    const auto e = kT + 100 * kNs;
+    EXPECT_FALSE(pace.due(e + Pace::kBusy));
+    EXPECT_FALSE(pace.due(e + Pace::kQuiet - kNs));
+    EXPECT_TRUE(pace.due(e + Pace::kQuiet));
+}
+
+TEST(ScanPace, AfterAnEntryThatGaveTheCpuAwayItEntersEveryBusyIntervalForAWindow) {
+    Pace pace;
+    ASSERT_TRUE(pace.entered(kT, kT + Pace::kGaveUp)) << "an entry at the threshold kept the CPU";
+    const auto g = kT + Pace::kGaveUp;
+    EXPECT_FALSE(pace.due(g + Pace::kBusy - kNs));
+    EXPECT_TRUE(pace.due(g + Pace::kBusy));
+    // Entries that give nothing away keep the busy interval until the window from the one that did
+    // has passed.
+    auto at = g;
+    while (at + 2 * Pace::kBusy < g + Pace::kWindow) {
+        at += Pace::kBusy;
+        ASSERT_TRUE(pace.due(at));
+        ASSERT_FALSE(pace.entered(at, at + 50 * kNs));
+        at += 50 * kNs;
+    }
+    const auto past = g + Pace::kWindow;
+    ASSERT_FALSE(pace.entered(past, past + 50 * kNs));
+    EXPECT_FALSE(pace.due(past + 50 * kNs + Pace::kBusy)) << "the busy interval outlived its window";
+    EXPECT_TRUE(pace.due(past + 50 * kNs + Pace::kQuiet));
+}
+
+TEST(ScanPace, AnEntryJustShortOfTheThresholdGaveNothingAway) {
+    Pace pace;
+    EXPECT_FALSE(pace.entered(kT, kT + Pace::kGaveUp - kNs));
+    EXPECT_FALSE(pace.due(kT + Pace::kGaveUp - kNs + Pace::kBusy));
+}
+
+TEST(ScanPool, AThreadThatWorksBetweenStepsEntersTheKernel) {
+    // A task only a pool thread runs, working 20 quiet intervals of its own CPU time - so however
+    // long the scheduler keeps it off a CPU - with a step a fraction of a microsecond long, as a
+    // part's reader steps through a batch.
+    ob::ScanPool pool(1, nullptr);
+    std::atomic<uint64_t> spun{0};
+    auto task = pool.submit([&] {
+        const auto cpu_ns = [] {
+            timespec ts{};
+            ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+            return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
+        };
+        const uint64_t from = cpu_ns();
+        uint64_t x = 0;
+        while (cpu_ns() - from < 20 * static_cast<uint64_t>(ob::ScanPace::kQuiet.count())) {
+            for (int i = 0; i < 200; ++i) x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            ob::ScanPool::pace();
+        }
+        spun = x | 1;
+    });
+    for (int i = 0; i < 5000 && !task->done(); ++i) std::this_thread::sleep_for(1ms);
+    ASSERT_TRUE(task->done()) << "no pool thread ran the task";
+    pool.run_or_wait(*task);
+    pool.stop();   // the thread joined, so what it counted is in the pool's counts
+    EXPECT_NE(spun.load(), 0u);
+    EXPECT_GE(pool.entries(), 10u) << "a pool thread worked 20 quiet intervals and entered the kernel "
+                                   << pool.entries() << " time(s)";
+    EXPECT_LE(pool.gave_up(), pool.entries());
 }
