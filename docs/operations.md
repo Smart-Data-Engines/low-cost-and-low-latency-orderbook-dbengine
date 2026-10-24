@@ -318,11 +318,11 @@ gives it two loops.
 
 A node that mostly answers big queries can give them the scan pool (#246, `--scan-threads N`,
 threads named `ob-scan-0` …): a query of many rows spread over several segments is then read on N
-threads at once, 1.6-2.9 times as fast on four. It is off under every profile because on one of the
-two test hosts the pool's reads cost a writer on the same node 8-20% of its rate while they ran -
-measured in
-`docs/cli.md`, "A query on several cores" - so on a node taking writes it is a choice to make, not a
-default; on a replica kept for queries, one thread per CPU.
+threads at once, 1.5-3.7 times as fast on four. Since #248 a writer on the same node keeps its rate
+beside it on both test hosts, the one whose kernel preempts lazily included. It is off under every
+profile because where many connections keep every CPU busy the pool only competes with their loops:
+four connections asking at once answered 4-11% fewer queries with it - measured in `docs/cli.md`,
+"A query on several cores". On a replica kept for big queries, one thread per CPU.
 
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,

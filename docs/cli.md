@@ -445,24 +445,29 @@ segment goes to the pool only while the answer may still need its rows. A scan o
 rows in range, or one whose rows are mostly in one segment, is read on the query's loop, where a
 pool would add its queue and win nothing; and one query divides at a time - another that comes
 meanwhile reads on its own loop. The pool's threads, `ob-scan-0` … `ob-scan-N-1`, run under
-`SCHED_IDLE` and give their CPU up between batches, so a client loop woken onto one waits for a
-batch at most.
+`SCHED_IDLE` and hand a part its rows 128 at a time, entering the kernel between those steps about
+every microsecond of their work while an entry in the last millisecond let another thread run, and
+every 16 µs otherwise (#248). On a kernel that preempts lazily a client loop woken onto a pool
+thread's CPU runs only when that thread next enters the kernel, so that rule is what keeps a writer
+beside the pool at its rate.
 
-**It is off under every profile**, and that is a measured choice: what the pool costs a writer on
-the same node depends on the host. Measured with a 1.9 M-row store, the same build with and without
-four threads:
+**It is off under every profile**, and that is a measured choice: the pool's threads take the CPU
+the client loops leave, and where many connections keep every CPU busy there is little to take.
+Measured with a 1.9 M-row store, the same build with and without four threads
+(`evidence/2026-10-24-scan-pool-writer/` in the workspace, its last run):
 - **x86 test host** (4 cores, kernel 7.0 built to preempt lazily, at 1000 Hz): a query alone took
-  55-61% of the time - 80 one-minute buckets of all of it 3.3-3.7 ms against 6.1, all of it in one
-  column 14.4-15.3 ms against 25.7-26.2 - but **beside a writer it cost the writer 8-20% of its rate
-  and its batch p99 went from about 40 µs to 48-205 µs** while the query ran, and four connections
-  asking the bucket query at once answered 8-10% fewer of them.
+  a third to two thirds of the time - all of it in one column 8.3-12.4 ms against 25.2-26.1, 81
+  one-minute buckets of all of it 3.8-4.1 ms against 6.0 - and **a writer beside it kept its rate**:
+  6.08-6.40 M levels a second beside the buckets against 6.16-6.49 without the pool, 5.74-6.47 M
+  beside the column against 6.08-6.48, its batch p99 36.9-56.1 µs against 37.1-43.0. Four
+  connections asking the bucket query at once answered 11% fewer of them.
 - **ARM test host** (4 Graviton cores, kernel 6.18 built `PREEMPT_NONE`, at 100 Hz): the queries took
-  34-45% of the time - 3.2-3.3 ms against 9.2-9.3, 12.2-13.0 against 28.8-30.2 - and the writer beside
-  them lost nothing measurable, with the buckets beside it answered twice as often.
+  27-38% of the time - 8.1-8.4 ms against 27.7-29.5, 3.3-3.5 against 9.2-9.3 - the writer beside
+  them lost nothing measurable, and four connections answered 4% fewer.
 
-A node that takes writes should choose the pool after measuring it on its own host rather than be
-given it; a node that mostly answers big queries - a replica kept for them - is where to turn it on,
-at one thread per CPU.
+A node whose connections keep every CPU busy answers fewer queries with the pool; a node that answers
+big queries a few at a time - a replica kept for them, or one beside a single stream of writes - is
+where to turn it on, at one thread per CPU.
 `ob_scan_parts_pooled_total` and `ob_scan_parts_inline_total` count the segments read on the pool
 and on the queries' loops, and `ob_scan_threads` is N.
 

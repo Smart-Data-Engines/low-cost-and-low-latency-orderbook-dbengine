@@ -15,14 +15,19 @@ here as `#N`.
   several cores). A query of 32 768 rows in range or more, spread over two segments or more, is
   divided: each segment is read, its rows chosen and formatted - or added to their time buckets - on
   one of the pool's threads, and the query's loop puts the parts together in the segments' order, so
-  the answer is the same bytes, `LIMIT`s and refusals included. **Off under every profile:** on the
-  x86 test host four threads answered 1.9 M rows of one column in 14.4-15.3 ms where the same build
-  took 25.7-26.2 without them, and their 80 one-minute buckets in 3.3-3.7 ms where 6.1, but a writer
-  on the same node wrote 8-20% fewer levels a second while they ran; on the ARM test host the same
-  queries took 34-45% of the time and cost the writer nothing measurable. The threads, `ob-scan-N`, run
-  under `SCHED_IDLE` and give their CPU up between batches, and one query divides at a time. Metrics
-  `ob_scan_parts_pooled_total`, `ob_scan_parts_inline_total` and `ob_scan_threads`;
-  `docs/cli.md`, "A query on several cores".
+  the answer is the same bytes, `LIMIT`s and refusals included. The threads, `ob-scan-N`, run under
+  `SCHED_IDLE` and hand a part its rows 128 at a time, entering the kernel between steps about every
+  microsecond of their work while that has let another thread run, every 16 us otherwise (#248): on
+  a kernel that preempts lazily a client loop woken onto a pool thread's CPU runs only at that
+  thread's next entry, and entering once a batch of 2 048 rows had cost a writer on the same node
+  8-20% of its rate. A row part's text is kept in chunks never copied or zeroed as it grows, which
+  had been most of a large row answer's time on the pool. Measured on the x86 test host, four threads
+  answered 1.9 M rows of one column in 8.3-12.4 ms where the same build took 25.2-26.1 without them,
+  and their 81 one-minute buckets in 3.8-4.1 ms where 6.0, with a writer beside them within the levels
+  a second it wrote without the pool; on the ARM test host the same queries took 27-38% of the time.
+  **Off under every profile:** four connections asking at once answered 4-11% fewer queries with the
+  pool. One query divides at a time. Metrics `ob_scan_parts_pooled_total`,
+  `ob_scan_parts_inline_total` and `ob_scan_threads`; `docs/cli.md`, "A query on several cores".
 - A restore to a moment after the backup (#34, point-in-time recovery). With `--wal-archive-dir
   <DIR>` a node puts every WAL file it closes into `<DIR>/<WAL identity>/`, with its size and CRC32C
   beside it: linked on the WAL's filesystem, copied, synced and read back on another. Retention
