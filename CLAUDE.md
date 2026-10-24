@@ -4586,8 +4586,9 @@ Learned the hard way. Check here before debugging.
      The test now reads the steady clock before each `pace()` and counts the entries the rule owes
      there - one at the first step, one at each step a quiet interval after the step that followed
      the last owed one - and the pool must have made at least those, however long a step takes and
-     however long the thread is off a CPU. With no yield giving the CPU away it made exactly those;
-     a doubled interval it fails only then, and `ScanPace`'s tests, on an explicit clock, always.
+     however long the thread is off a CPU. With no yield giving the CPU away it made 20 to 22 of
+     the 20 it owed, and a doubled interval failed it in exactly those runs, 9 of 100; `ScanPace`'s
+     tests, on an explicit clock, fail a doubled interval always.
 
 ## Current state and open problems
 
