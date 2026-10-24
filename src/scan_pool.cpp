@@ -21,21 +21,15 @@ namespace {
 thread_local uint64_t t_entries = 0;
 thread_local uint64_t t_gave_up = 0;
 
-uint64_t steady_ns() {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now().time_since_epoch())
-                                     .count());
-}
-
 }  // namespace
 
 void ScanPool::pace() {
     thread_local ScanPace pace;
-    const uint64_t now = steady_ns();
+    const auto now = ScanPace::Clock::now();
     if (!pace.due(now)) return;
     ::sched_yield();
     ++t_entries;
-    if (pace.entered(now, steady_ns())) ++t_gave_up;
+    if (pace.entered(now, ScanPace::Clock::now())) ++t_gave_up;
 }
 
 bool ScanPool::Task::take() {

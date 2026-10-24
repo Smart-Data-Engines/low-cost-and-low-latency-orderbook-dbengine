@@ -185,45 +185,47 @@ TEST(ScanPool, OneScanAtATimeHoldsTheClaim) {
 
 namespace {
 
-constexpr uint64_t kT = 1'000'000'000ULL;   // a clock a second past its epoch
+using Pace = ob::ScanPace;
+const Pace::Clock::time_point kT{std::chrono::seconds{1}};   // a clock a second past its epoch
+constexpr std::chrono::nanoseconds kNs{1};
 
 }  // namespace
 
 TEST(ScanPace, AThreadNobodyWaitsForEntersOnceAQuietIntervalHasPassed) {
-    ob::ScanPace pace;
+    Pace pace;
     EXPECT_TRUE(pace.due(kT)) << "a thread's first step did not enter the kernel";
-    EXPECT_FALSE(pace.entered(kT, kT + 100)) << "an entry of 100 ns gave the CPU away";
-    const uint64_t e = kT + 100;
-    EXPECT_FALSE(pace.due(e + ob::ScanPace::kBusyNs));
-    EXPECT_FALSE(pace.due(e + ob::ScanPace::kQuietNs - 1));
-    EXPECT_TRUE(pace.due(e + ob::ScanPace::kQuietNs));
+    EXPECT_FALSE(pace.entered(kT, kT + 100 * kNs)) << "an entry of 100 ns gave the CPU away";
+    const auto e = kT + 100 * kNs;
+    EXPECT_FALSE(pace.due(e + Pace::kBusy));
+    EXPECT_FALSE(pace.due(e + Pace::kQuiet - kNs));
+    EXPECT_TRUE(pace.due(e + Pace::kQuiet));
 }
 
 TEST(ScanPace, AfterAnEntryThatGaveTheCpuAwayItEntersEveryBusyIntervalForAWindow) {
-    ob::ScanPace pace;
-    ASSERT_TRUE(pace.entered(kT, kT + ob::ScanPace::kGaveUpNs)) << "an entry at the threshold kept the CPU";
-    const uint64_t g = kT + ob::ScanPace::kGaveUpNs;
-    EXPECT_FALSE(pace.due(g + ob::ScanPace::kBusyNs - 1));
-    EXPECT_TRUE(pace.due(g + ob::ScanPace::kBusyNs));
+    Pace pace;
+    ASSERT_TRUE(pace.entered(kT, kT + Pace::kGaveUp)) << "an entry at the threshold kept the CPU";
+    const auto g = kT + Pace::kGaveUp;
+    EXPECT_FALSE(pace.due(g + Pace::kBusy - kNs));
+    EXPECT_TRUE(pace.due(g + Pace::kBusy));
     // Entries that give nothing away keep the busy interval until the window from the one that did
     // has passed.
-    uint64_t at = g;
-    while (at + 2 * ob::ScanPace::kBusyNs < g + ob::ScanPace::kWindowNs) {
-        at += ob::ScanPace::kBusyNs;
+    auto at = g;
+    while (at + 2 * Pace::kBusy < g + Pace::kWindow) {
+        at += Pace::kBusy;
         ASSERT_TRUE(pace.due(at));
-        ASSERT_FALSE(pace.entered(at, at + 50));
-        at += 50;
+        ASSERT_FALSE(pace.entered(at, at + 50 * kNs));
+        at += 50 * kNs;
     }
-    const uint64_t past = g + ob::ScanPace::kWindowNs;
-    ASSERT_FALSE(pace.entered(past, past + 50));
-    EXPECT_FALSE(pace.due(past + 50 + ob::ScanPace::kBusyNs)) << "the busy interval outlived its window";
-    EXPECT_TRUE(pace.due(past + 50 + ob::ScanPace::kQuietNs));
+    const auto past = g + Pace::kWindow;
+    ASSERT_FALSE(pace.entered(past, past + 50 * kNs));
+    EXPECT_FALSE(pace.due(past + 50 * kNs + Pace::kBusy)) << "the busy interval outlived its window";
+    EXPECT_TRUE(pace.due(past + 50 * kNs + Pace::kQuiet));
 }
 
 TEST(ScanPace, AnEntryJustShortOfTheThresholdGaveNothingAway) {
-    ob::ScanPace pace;
-    EXPECT_FALSE(pace.entered(kT, kT + ob::ScanPace::kGaveUpNs - 1));
-    EXPECT_FALSE(pace.due(kT + ob::ScanPace::kGaveUpNs - 1 + ob::ScanPace::kBusyNs));
+    Pace pace;
+    EXPECT_FALSE(pace.entered(kT, kT + Pace::kGaveUp - kNs));
+    EXPECT_FALSE(pace.due(kT + Pace::kGaveUp - kNs + Pace::kBusy));
 }
 
 TEST(ScanPool, AThreadThatWorksBetweenStepsEntersTheKernel) {
@@ -240,7 +242,7 @@ TEST(ScanPool, AThreadThatWorksBetweenStepsEntersTheKernel) {
         };
         const uint64_t from = cpu_ns();
         uint64_t x = 0;
-        while (cpu_ns() - from < 20 * ob::ScanPace::kQuietNs) {
+        while (cpu_ns() - from < 20 * static_cast<uint64_t>(ob::ScanPace::kQuiet.count())) {
             for (int i = 0; i < 200; ++i) x = x * 6364136223846793005ULL + 1442695040888963407ULL;
             ob::ScanPool::pace();
         }

@@ -3,6 +3,7 @@
 #include "orderbook/metrics.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -26,36 +27,36 @@ namespace ob {
 /// (`evidence/2026-10-24-scan-pool-writer/` in the workspace, runs 4 and 5): the writer's floor 80%
 /// of its rate with no pool at an entry every 2 048 rows (17-18 us), 90-95% every 512 (4.4 us),
 /// 94.6% every 2 us and 98.7% every microsecond. An entry costs 46-216 ns, so a thread nobody waits
-/// for enters only every `kQuietNs`.
+/// for enters only every `kQuiet`.
 class ScanPace {
 public:
-    /// The interval while an entry in the last `kWindowNs` gave the CPU to another thread.
-    static constexpr uint64_t kBusyNs = 1'000;
+    using Clock = std::chrono::steady_clock;
+    /// The interval while an entry in the last `kWindow` gave the CPU to another thread.
+    static constexpr std::chrono::nanoseconds kBusy{1'000};
     /// The interval otherwise.
-    static constexpr uint64_t kQuietNs = 16'000;
-    static constexpr uint64_t kWindowNs = 1'000'000;
+    static constexpr std::chrono::nanoseconds kQuiet{16'000};
+    static constexpr std::chrono::nanoseconds kWindow{1'000'000};
     /// An entry that took this long gave the CPU away: one that did not takes 46-216 ns, and a loop
     /// that ran in it works for microseconds.
-    static constexpr uint64_t kGaveUpNs = 3'000;
+    static constexpr std::chrono::nanoseconds kGaveUp{3'000};
 
-    /// Whether a thread whose clock reads `now_ns` should enter the kernel now.
-    bool due(uint64_t now_ns) const {
-        const uint64_t interval =
-            gave_up_ && now_ns - gave_up_at_ns_ < kWindowNs ? kBusyNs : kQuietNs;
-        return now_ns - entered_at_ns_ >= interval;
+    /// Whether a thread whose clock reads `now` should enter the kernel now.
+    bool due(Clock::time_point now) const {
+        const auto interval = gave_up_ && now - gave_up_at_ < kWindow ? kBusy : kQuiet;
+        return now - entered_at_ >= interval;
     }
-    /// An entry, from `before_ns` to `after_ns`; true if it gave the CPU away.
-    bool entered(uint64_t before_ns, uint64_t after_ns) {
-        entered_at_ns_ = after_ns;
-        if (after_ns - before_ns < kGaveUpNs) return false;
+    /// An entry, from `before` to `after`; true if it gave the CPU away.
+    bool entered(Clock::time_point before, Clock::time_point after) {
+        entered_at_ = after;
+        if (after - before < kGaveUp) return false;
         gave_up_ = true;
-        gave_up_at_ns_ = after_ns;
+        gave_up_at_ = after;
         return true;
     }
 
 private:
-    uint64_t entered_at_ns_{0};
-    uint64_t gave_up_at_ns_{0};
+    Clock::time_point entered_at_{};
+    Clock::time_point gave_up_at_{};
     bool gave_up_{false};
 };
 
@@ -105,7 +106,7 @@ public:
     unsigned threads() const { return thread_count_; }
 
     /// The rows a pool thread hands a part at a time, a step of a batch: 0.6 us of the buckets and
-    /// 1.1 us of `price_all` on the m8a.xlarge, so that `pace()` between them can keep to `kBusyNs`.
+    /// 1.1 us of `price_all` on the m8a.xlarge, so that `pace()` between them can keep to `kBusy`.
     static constexpr size_t kStepRows = 128;
 
     /// Called by a pool thread between the steps of its work: enters the kernel when `ScanPace`
