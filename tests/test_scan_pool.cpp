@@ -9,6 +9,7 @@
 // And when its threads enter the kernel between the steps of their work (#248): `ScanPace` held to
 // its rule, and a pool thread that works between steps entering it.
 
+#include "orderbook/loop_load.hpp"
 #include "orderbook/scan_pool.hpp"
 
 #include <gtest/gtest.h>
@@ -256,4 +257,48 @@ TEST(ScanPool, AThreadThatWorksBetweenStepsEntersTheKernel) {
     EXPECT_GE(pool.entries(), 10u) << "a pool thread worked 20 quiet intervals and entered the kernel "
                                    << pool.entries() << " time(s)";
     EXPECT_LE(pool.gave_up(), pool.entries());
+}
+
+// ── Whether a CPU is left over from the client loops (#249) ───────────────────────────────────────
+
+TEST(LoopLoad, ALoopCountsAsServingWhileItServesAndForAMomentAfter) {
+    ob::LoopLoad load(3);
+    const auto t0 = ob::LoopLoad::Clock::now();
+    EXPECT_EQ(load.serving_within(t0, 2ms), 0u);
+    load.serving(0);
+    load.serving(2);
+    EXPECT_EQ(load.serving_within(t0, 2ms), 2u);
+    load.stopped_at(0, t0);
+    EXPECT_EQ(load.serving_within(t0 + 1ms, 2ms), 2u) << "a loop that stopped a moment ago counted as idle";
+    EXPECT_EQ(load.serving_within(t0 + 2ms, 2ms), 1u) << "a loop counted as serving past the moment";
+    load.stopped(1);   // a loop that never served: nothing to end
+    EXPECT_EQ(load.serving_within(t0 + 2ms, 2ms), 1u);
+    load.stopped(2);
+    EXPECT_EQ(load.serving_within(ob::LoopLoad::Clock::now() + 2ms, 2ms), 0u);
+}
+
+TEST(ScanPool, AScanDividesOnlyWhileACpuIsLeftOverFromTheClientLoops) {
+    ob::ScanPool pool(2, nullptr);
+    const auto t0 = ob::LoopLoad::Clock::now();
+    EXPECT_TRUE(pool.cpu_to_spare(t0)) << "with no loops to count, a scan divides on its own rules";
+    ob::LoopLoad load(4);
+    pool.set_loop_load(&load, 4);
+    load.serving(0);   // the scan's own loop
+    EXPECT_TRUE(pool.cpu_to_spare(t0));
+    load.serving(1);
+    load.serving(2);
+    EXPECT_TRUE(pool.cpu_to_spare(t0)) << "three loops of four serving leave a CPU";
+    load.serving(3);
+    EXPECT_FALSE(pool.cpu_to_spare(t0));
+    EXPECT_EQ(pool.undivided(), 1u);
+    load.stopped_at(3, t0);
+    EXPECT_FALSE(pool.cpu_to_spare(t0 + ob::ScanPool::kLoopRecent - 1us))
+        << "a loop between two of its connection's requests counted as a CPU to spare";
+    EXPECT_TRUE(pool.cpu_to_spare(t0 + ob::ScanPool::kLoopRecent));
+    EXPECT_EQ(pool.undivided(), 2u);
+    // On fewer CPUs than loops, as under a cgroup limit, the CPUs are what a scan divides against.
+    pool.set_loop_load(&load, 3);
+    EXPECT_FALSE(pool.cpu_to_spare(t0 + ob::ScanPool::kLoopRecent));
+    pool.set_loop_load(nullptr, 0);
+    EXPECT_TRUE(pool.cpu_to_spare(t0));
 }

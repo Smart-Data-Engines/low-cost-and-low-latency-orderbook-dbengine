@@ -599,6 +599,7 @@ void Engine::open() {
     // query engine until close() takes it back.
     if (scan_threads_ > 0 && !scan_pool_) {
         scan_pool_ = std::make_unique<ScanPool>(scan_threads_, &registry_);
+        scan_pool_->set_loop_load(loop_load_, loop_load_cpus_);
         query_engine_->set_scan_pool(scan_pool_.get());
     }
 
@@ -607,6 +608,14 @@ void Engine::open() {
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+}
+
+void Engine::set_loop_load(const LoopLoad* load, unsigned cpus) {
+    loop_load_ = load;
+    loop_load_cpus_ = cpus;
+    if (scan_pool_) scan_pool_->set_loop_load(load, cpus);
+    OB_LOG_DEBUG("engine", "scan pool divides against %zu client loop(s) on %u CPU(s)",
+                 load == nullptr ? size_t{0} : load->loops(), cpus);
 }
 
 void Engine::set_scan_threads(unsigned threads) {

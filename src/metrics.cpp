@@ -155,6 +155,10 @@ MetricsRegistry::MetricsRegistry() {
                                      "Scan parts read on the scan pool's threads (#246)"));
     counters_.push_back(make_counter("ob_scan_parts_inline_total",
                                      "Scan parts read by the query that waited for them (#246)"));
+    // A scan the pool could have divided, read on its own loop because every CPU had a client loop
+    // serving on it, or that had served a moment before (#249).
+    counters_.push_back(make_counter("ob_scan_undivided_total",
+                                     "Scans read on their own loop: every CPU had a client loop serving (#249)"));
     counters_.push_back(make_counter("ob_backup_failures_total",
                                      "Backups that failed, and left nothing that looks like one"));
     // The certificate read again on SIGHUP (#238). A failure leaves the certificate in force, which
