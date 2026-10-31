@@ -900,7 +900,7 @@ bool short_runs_in_blocks(std::span<const uint64_t> lengths, size_t values) {
     size_t repeats = 0;
     for (size_t k = 0; k < kSample; ++k) {
         const size_t r = 2 + k * (runs - 2) / kSample;
-        repeats += static_cast<size_t>((lengths[r] == lengths[r - 1]) | (lengths[r] == lengths[r - 2]));
+        repeats += static_cast<size_t>(lengths[r] == lengths[r - 1]) | static_cast<size_t>(lengths[r] == lengths[r - 2]);
     }
     return repeats * 4 < kSample * 3;
 }
