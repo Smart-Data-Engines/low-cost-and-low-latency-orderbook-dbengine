@@ -7,12 +7,14 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 namespace ob::column_codec {
 
@@ -431,6 +433,41 @@ bool unpack_simple8b(std::span<const char> p, size_t n, std::vector<uint64_t>& o
     return true;
 }
 
+/// Eight values of `W` bits from `base`, whose bit 0 is the first one's: eight take `W` bytes, so each
+/// one's byte and shift are constants, and every value its own expression - no loop, no index (#49).
+template <unsigned W, unsigned... J>
+inline void unpack_eight(const unsigned char* base, uint64_t* o, std::integer_sequence<unsigned, J...>) {
+    constexpr uint64_t mask = (uint64_t{1} << W) - 1;
+    ((o[J] = (load64(base + J * W / 8) >> (J * W % 8)) & mask), ...);
+}
+
+/// A block's `m` values of `W` bits, at most 56 - a value and its shift within the eight bytes read at
+/// its first - from `base`, which has nine bytes readable past the block's last. Eight at a time, then
+/// the rest one by one with the same offsets. The loop this replaces read the width at run time and
+/// worked out every value's byte and shift: about 0.52-0.58 ns a value on the x86 test host and
+/// 0.65-0.80 on the ARM one at any width, a cost of the value, not of its bits.
+template <unsigned W>
+void unpack_block(const unsigned char* base, size_t m, uint64_t* o) {
+    static_assert(W >= 1 && W <= 56, "a value and its shift in the eight bytes read");
+    constexpr uint64_t mask = (uint64_t{1} << W) - 1;
+    size_t k = 0;
+    for (; k + 8 <= m; k += 8, base += W) unpack_eight<W>(base, o + k, std::make_integer_sequence<unsigned, 8>{});
+    for (size_t j = 0; k < m; ++k, ++j) {
+        const size_t bit = j * W;
+        o[k] = (load64(base + (bit >> 3)) >> (bit & 7)) & mask;
+    }
+}
+
+using BlockUnpacker = void (*)(const unsigned char*, size_t, uint64_t*);
+
+template <unsigned... W>
+constexpr std::array<BlockUnpacker, sizeof...(W)> block_unpackers(std::integer_sequence<unsigned, W...>) {
+    return {&unpack_block<W + 1>...};
+}
+
+/// unpack_block<W> for every width from 1 to 56, by width less one.
+constexpr std::array<BlockUnpacker, 56> kBlockUnpackers = block_unpackers(std::make_integer_sequence<unsigned, 56>{});
+
 bool unpack_blocks(std::span<const char> p, size_t n, std::vector<uint64_t>& out, std::string* why) {
     out.resize(n);
     thread_local std::vector<unsigned char> buf;
@@ -462,10 +499,7 @@ bool unpack_blocks(std::span<const char> p, size_t n, std::vector<uint64_t>& out
         uint64_t* o = out.data() + i;
         if (w <= 56) {
             // A value and its shift fit the eight bytes: no ninth to look at.
-            for (size_t k = 0; k < m; ++k) {
-                const size_t bit = k * w;
-                o[k] = (load64(base + (bit >> 3)) >> (bit & 7)) & mask;
-            }
+            kBlockUnpackers[w - 1](base, m, o);
         } else {
             for (size_t k = 0; k < m; ++k) {
                 const size_t bit = k * w;
