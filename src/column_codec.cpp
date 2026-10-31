@@ -895,7 +895,7 @@ bool short_runs_in_blocks(std::span<const uint64_t> lengths, size_t values) {
     if (values <= runs * kRunBlock || runs <= 2) return true;
     // Whether the lengths repeat, judged on a sample: a pass over every run cost binance-top20's
     // columns of runs - ten to forty values a run, decoded at 0.1-0.3 ns a value - 16-34% of their
-    // decode on the x86 test host, where 64 runs cost nothing measurable (#223).
+    // decode on the x86 test host, where 64 runs moved none of them beyond its rounds' spread (#223).
     constexpr size_t kSample = 64;
     size_t repeats = 0;
     for (size_t k = 0; k < kSample; ++k) {
