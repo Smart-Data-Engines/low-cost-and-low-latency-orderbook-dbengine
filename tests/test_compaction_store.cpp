@@ -64,8 +64,9 @@ ob::SnapshotRow row_at(uint64_t ts, int64_t price, uint16_t level = 1) {
     return row;
 }
 
-/// The format the helpers below write segments in (segment format v3): the tests of a short
-/// segment run in both, since each format says how many rows it holds its own way.
+/// The format the helpers below write segments in (segment formats v3 and v4): the tests of a short
+/// segment run in every format, since each says how many rows it holds its own way - 3 and 4 alike,
+/// which a start that took a merged segment of 4 for one of 2 would not.
 uint32_t g_format = ob::kColumnarFormatVersion;
 
 void use_format(ob::ColumnarStore& store) {
@@ -190,7 +191,7 @@ TEST(CompactionStore, AMergeReadsASegmentWholeInTheOrderItHoldsItsRows) {
 }
 
 TEST(CompactionStore, AMergeDoesNotTakeASegmentWithAShortColumn) {
-    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV4}) {
         SCOPED_TRACE(format);
         g_format = format;
         TempDir dir;
@@ -571,32 +572,38 @@ TEST(CompactionStore, ARebuildRemovesAMergeNothingPublished) {
 }
 
 TEST(CompactionStore, ARebuildRemovesTheInputsItFindsBesideTheirMergedSegment) {
-    TempDir dir;
-    std::vector<ob::SnapshotRow> rows_before;
-    {
-        ob::ColumnarStore store(dir.str());
-        const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
-        const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
-        const auto keep = written(dir.str(), "A", {{kBase + 7 * kSec, 7}}, {77, 1, 70, 3});
-        store.merge_segments({a, b, keep});
-        rows_before = delivered(store, "A");
-        auto out = merged(store, dir.str(), {a, b});
-        // Published, and the process gone before it removed the inputs.
-        ASSERT_TRUE(rename_to_segment(out));
+    // In every format: a merged segment of 4 taken for one of 2 would be short of its rows (#250).
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV4}) {
+        SCOPED_TRACE(format);
+        g_format = format;
+        TempDir dir;
+        std::vector<ob::SnapshotRow> rows_before;
+        {
+            ob::ColumnarStore store(dir.str());
+            const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
+            const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
+            const auto keep = written(dir.str(), "A", {{kBase + 7 * kSec, 7}}, {77, 1, 70, 3});
+            store.merge_segments({a, b, keep});
+            rows_before = delivered(store, "A");
+            auto out = merged(store, dir.str(), {a, b});
+            // Published, and the process gone before it removed the inputs.
+            ASSERT_TRUE(rename_to_segment(out));
+        }
+        ob::ColumnarStore reopened(dir.str());
+        reopened.open_existing();
+        EXPECT_EQ(reopened.segment_count(), 2u);
+        EXPECT_EQ(reopened.last_rebuild_removed().superseded, 2u);
+        EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before))
+            << "a row the merge and its inputs both held was delivered twice, or not at all";
+        // And the merged segment is read back as written: its own counts, not an input's.
+        const auto index = reopened.index();
+        ASSERT_EQ(index.size(), 2u);
+        EXPECT_EQ(index[0].row_count, 2u);
+        EXPECT_EQ(index[0].merge_level, 1u);
+        EXPECT_EQ(index[0].seal_epoch, 2u);
+        EXPECT_EQ(index[0].wal_byte_offset, 20u);
     }
-    ob::ColumnarStore reopened(dir.str());
-    reopened.open_existing();
-    EXPECT_EQ(reopened.segment_count(), 2u);
-    EXPECT_EQ(reopened.last_rebuild_removed().superseded, 2u);
-    EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before))
-        << "a row the merge and its inputs both held was delivered twice, or not at all";
-    // And the merged segment is read back as written: its own counts, not an input's.
-    const auto index = reopened.index();
-    ASSERT_EQ(index.size(), 2u);
-    EXPECT_EQ(index[0].row_count, 2u);
-    EXPECT_EQ(index[0].merge_level, 1u);
-    EXPECT_EQ(index[0].seal_epoch, 2u);
-    EXPECT_EQ(index[0].wal_byte_offset, 20u);
+    g_format = ob::kColumnarFormatVersion;
 }
 
 TEST(CompactionStore, ARebuildKeepsASegmentThatTookAnInputsName) {
@@ -653,7 +660,7 @@ TEST(CompactionStore, OnlyAMergesOwnNameAtASegmentsDepthIsAWorkingDirectory) {
 }
 
 TEST(CompactionStore, ARebuildKeepsTheInputsOfAMergedSegmentWhoseColumnsAreShort) {
-    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV4}) {
         SCOPED_TRACE(format);
         g_format = format;
         TempDir dir;
@@ -684,7 +691,7 @@ TEST(CompactionStore, ARebuildKeepsTheInputsOfAMergedSegmentWhoseColumnsAreShort
 }
 
 TEST(CompactionStore, AShortMergedSegmentWhoseInputsAreGoneIsKept) {
-    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3}) {
+    for (const uint32_t format : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV4}) {
         SCOPED_TRACE(format);
         g_format = format;
         TempDir dir;

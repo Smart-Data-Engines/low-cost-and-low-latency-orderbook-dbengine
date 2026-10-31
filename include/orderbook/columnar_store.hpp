@@ -37,18 +37,30 @@ namespace ob {
 /// Version 3 (smart-data-engine-workspace/specs/segment-format-v3/) stores them in one file, `columns.v3`, each
 /// column in the smallest of its candidate encodings (column_codec.hpp) and checksummed: version 2
 /// wrote four of them raw, 25 bytes a row on the comparative dataset where version 3 writes under 2.
+///
+/// Version 4 (#250, smart-data-engine-workspace/specs/segment-format-v4/) is version 3's file and
+/// layout with one more encoding a column may be in, steps/runs, which a reader of version 3 refuses
+/// as an unknown transform: the segment says 4 so that such a reader passes it over whole, as it does
+/// any version it cannot read, rather than a column at a time.
 inline constexpr uint32_t kColumnarFormatV2 = 2;
 inline constexpr uint32_t kColumnarFormatV3 = 3;
-/// The version a store writes unless told otherwise (`segment-format`).
+inline constexpr uint32_t kColumnarFormatV4 = 4;
+/// The version a store writes unless told otherwise (`segment-format`). 3 while the version before
+/// this one (`scripts/previous_version.txt`) cannot read 4: a downgrade would leave out every format-4
+/// segment's rows, which docs/upgrading.md holds to be the failure.
 inline constexpr uint32_t kColumnarFormatVersion = kColumnarFormatV3;
 /// Whether this build reads a segment of `version`.
 inline constexpr bool columnar_format_readable(uint32_t version) {
-    return version == kColumnarFormatV2 || version == kColumnarFormatV3;
+    return version == kColumnarFormatV2 || version == kColumnarFormatV3 || version == kColumnarFormatV4;
 }
-/// The file a version-3 segment holds its columns in.
+/// Whether a segment of `version` keeps its columns in one file, `columns.v3`: 3 and 4 do.
+inline constexpr bool columns_in_one_file(uint32_t version) {
+    return version == kColumnarFormatV3 || version == kColumnarFormatV4;
+}
+/// The file a segment of version 3 or 4 holds its columns in.
 inline constexpr const char* kColumnsV3File = "columns.v3";
-/// Whether `filename` is one of a segment's files, in either format: its `meta.json`, format 2's
-/// column files (`*.col`) or format 3's `columns.v3`, and the book summaries and best tracks beside
+/// Whether `filename` is one of a segment's files, in any format: its `meta.json`, format 2's
+/// column files (`*.col`) or format 3's and 4's `columns.v3`, and the book summaries and best tracks beside
 /// them - what a snapshot, a backup and a shard migration carry. One definition: a snapshot that
 /// matched `*.col` alone shipped format-3 segments without their data, and a replica bootstrapped
 /// from it held none of their rows.
@@ -519,7 +531,7 @@ public:
     void set_own_origin(uint16_t origin) { own_origin_ = origin; }
 
     /// How this store writes a segment (segment format v3, design §3): the format's version, and
-    /// how a version-3 column's encoding is chosen. What a store is not told is a seal's - LZ4 or
+    /// how a column's encoding is chosen - in version 4 with steps/runs among the candidates (#250). What a store is not told is a seal's - LZ4 or
     /// nothing, each column in the encoding its last segment chose and searched for again every
     /// sixteenth - so a store an embedding application makes, which no merge ever rewrites, seals as
     /// the server's do.

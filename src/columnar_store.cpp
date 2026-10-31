@@ -1265,6 +1265,7 @@ void ColumnarStore::write_columns_v3(const std::string& dir) {
         }
         column_codec::EncodeOptions options = segment_format_.search;
         options.hint = search ? nullptr : &last_choice_[c];
+        options.steps = segment_format_.version == kColumnarFormatV4;   // a hint of steps past it in 3
         blocks[c].clear();
         chosen[c] = column_codec::encode(columns[c], options, blocks[c]);
         last_choice_[c] = chosen[c].encoding;
@@ -1333,7 +1334,7 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
 
     uint64_t first_price = 0;
     bool raw_qty = active_has_raw_qty_;
-    if (segment_format_.version == kColumnarFormatV3) {
+    if (columns_in_one_file(segment_format_.version)) {
         write_columns_v3(dir);
         // What format 2 records beside its columns, kept in meta.json for what reads it: the first
         // price, zigzagged, and whether a quantity is too wide for a Simple8b word - from the
@@ -1857,7 +1858,7 @@ bool columns_v3_hold(const std::string& dir, uint64_t rows, std::string& why) {
 /// Whether a merged segment holds every row it says it does: what the start decides a merge cut
 /// short by (#165 part 2b).
 bool segment_holds_its_rows(const SegmentMeta& meta, std::string& why) {
-    if (meta.format_version == kColumnarFormatV3) return columns_v3_hold(meta.dir_path, meta.row_count, why);
+    if (columns_in_one_file(meta.format_version)) return columns_v3_hold(meta.dir_path, meta.row_count, why);
     std::error_code ec;
     const auto ts_bytes = fs::file_size(fs::path(meta.dir_path) / "ts.col", ec);
     if (ec || ts_bytes != meta.row_count * sizeof(uint64_t)) {
@@ -1870,7 +1871,7 @@ bool segment_holds_its_rows(const SegmentMeta& meta, std::string& why) {
 
 /// A segment's timestamps, whatever its format; false when they cannot be read whole.
 bool read_timestamps(const SegmentMeta& meta, std::vector<uint64_t>& ts) {
-    if (meta.format_version == kColumnarFormatV3) {
+    if (columns_in_one_file(meta.format_version)) {
         SegmentReadBuffers b;
         std::string why;
         if (load_columns_v3(meta.dir_path, meta.row_count, ColumnSet{}.add(QueryColumn::TimestampNs), b,
@@ -2077,11 +2078,11 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
     if (!columnar_format_readable(meta.format_version)) {
         OB_LOG_ERROR("columnar",
                      "Skipping segment %s: unsupported format_version=%u "
-                     "(this build reads %u and %u)",
-                     dir.c_str(), meta.format_version, kColumnarFormatV2, kColumnarFormatV3);
+                     "(this build reads %u, %u and %u)",
+                     dir.c_str(), meta.format_version, kColumnarFormatV2, kColumnarFormatV3, kColumnarFormatV4);
         return SegmentRead::kUnreadable;
     }
-    if (meta.format_version == kColumnarFormatV3 && mode == ReadMode::kQuery && meta.decoded) {
+    if (columns_in_one_file(meta.format_version) && mode == ReadMode::kQuery && meta.decoded) {
         return read_held_columns(meta, columns, start_ns, end_ns, filter, read, filtered, stopped);
     }
 
@@ -2109,7 +2110,7 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
     std::vector<uint64_t>& qtys   = b.qtys;
     std::vector<int64_t>&  seqs   = b.seqs;
 
-    if (meta.format_version == kColumnarFormatV3) {
+    if (columns_in_one_file(meta.format_version)) {
         // One file, the columns the read asks for decoded from it, each block checked against its
         // checksum and holding exactly the segment's rows - so nothing below is short.
         std::string why;

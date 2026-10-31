@@ -1497,9 +1497,11 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"write-admission", {"on|off", "Whether writes are taken at the rate the device takes them once "
                                        "a flush tick shows it behind, rather than every writer stopping "
                                        "at a full pending queue (default: on)"}},
-        {"segment-format", {"2|3", "The format new segments are written in (default: 3). A build before "
-                                   "format 3 cannot read a segment written in it: 2 is for a cluster "
-                                   "being upgraded"}},
+        {"segment-format", {"2|3|4", "The format new segments are written in (default: 3). A build before "
+                                     "a format cannot read a segment written in it: 2 is for a cluster "
+                                     "being upgraded from before format 3, and 4 - its timestamps and "
+                                     "sequence numbers in fewer bytes - for one whose every node, and every "
+                                     "build it may go back to, reads it"}},
         {"decoded-cache-mb", {"<N>", "What the decoded columns of format-3 segments may hold between "
                                      "queries, in MiB (default: 256): a query reading a column held "
                                      "reads no file and decodes nothing. 0 holds none"}},
@@ -2046,12 +2048,12 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             }
         } else if (arg == "--segment-format") {
             const std::string val{cursor.value()};
-            if (val == "2" || val == "3") {
+            if (val == "2" || val == "3" || val == "4") {
                 config.segment_format = static_cast<uint32_t>(val[0] - '0');
             } else {
                 // Refused rather than defaulted, as --compaction is: a node meant to write what the
                 // build before reads must not write what it cannot because of a typo.
-                std::fprintf(stderr, "Error: --segment-format expects 2 or 3, got '%s'\n", val.c_str());
+                std::fprintf(stderr, "Error: --segment-format expects 2, 3 or 4, got '%s'\n", val.c_str());
                 std::exit(1);
             }
         } else if (arg == "--decoded-cache-mb") {
