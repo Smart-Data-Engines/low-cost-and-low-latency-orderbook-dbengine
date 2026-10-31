@@ -662,8 +662,9 @@ bool decodes_into_with_guards(const std::string& block, const std::vector<uint64
 }  // namespace
 
 RC_GTEST_PROP(ColumnCodec, RunsOfEveryLengthDecodeIntoEveryColumnType, ()) {
-    // #223: where runs average two to eight values, a run of at most eight values, with room for eight
-    // before the column ends, is written as eight and the next run writes over the rest. Runs of one
+    // #223: where runs average two values or more - past eight, where their lengths follow no pattern -
+    // a run of at most eight values, with room for eight before the column ends, is written as eight
+    // and the next run writes over the rest (short_runs_in_blocks()). Runs of one
     // value up to a longest drawn from one to twenty, so that both ways of writing a column, both ways
     // of writing a run and the column's last slots are reached, in columns every type holds.
     const auto longest = *rc::gen::inRange<size_t>(1, 21);
@@ -832,6 +833,95 @@ TEST(ColumnCodec, ALongRunIsWrittenInBlocksAndNothingPastTheColumnsEnd) {
                 EXPECT_TRUE(decodes_into_with_guards<uint64_t>(block, column)) << what;
                 EXPECT_TRUE(decodes_into_with_guards<int64_t>(block, column)) << what;
             }
+        }
+    }
+}
+
+TEST(ColumnCodec, ShortRunsAreWrittenInBlocksUnlessTheirLengthsRepeat) {
+    // #223, short_runs_in_blocks(): runs a value long or about - a book's prices on a recording of its
+    // changes - value by value; from two values a run, blocks; past a block a run, blocks unless the
+    // lengths repeat, as a book's snapshots' do. The lengths are stored less one.
+    const auto in_blocks = [](const std::vector<uint64_t>& lengths) {
+        size_t values = 0;
+        for (const uint64_t l : lengths) values += static_cast<size_t>(l) + 1;
+        return short_runs_in_blocks(lengths, values);
+    };
+    const auto repeating = [](const std::vector<uint64_t>& pattern, size_t runs) {
+        std::vector<uint64_t> lengths;
+        for (size_t r = 0; r < runs; ++r) lengths.push_back(pattern[r % pattern.size()] - 1);
+        return lengths;
+    };
+    const auto scattered = [](uint64_t longest, size_t runs) {   // from 1 to `longest`, in no pattern
+        std::vector<uint64_t> lengths;
+        uint64_t x = 12345;
+        for (size_t r = 0; r < runs; ++r) {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            lengths.push_back((x >> 33) % longest);
+        }
+        return lengths;
+    };
+    EXPECT_FALSE(in_blocks(repeating({1, 1, 1, 2}, 1000))) << "a value and a quarter a run";
+    EXPECT_TRUE(in_blocks(repeating({2}, 1000))) << "two values a run";
+    EXPECT_TRUE(in_blocks(scattered(6, 1000))) << "three and a half a run, in no pattern";
+    EXPECT_TRUE(in_blocks(repeating({8}, 1000))) << "a block a run: no pattern is asked for";
+    EXPECT_FALSE(in_blocks(repeating({40}, 1000))) << "a book's snapshots' timestamps";
+    EXPECT_FALSE(in_blocks(repeating({19, 1}, 1000))) << "their levels' differences";
+    EXPECT_FALSE(in_blocks(repeating({9}, 1000))) << "a value past a block a run, repeating";
+    EXPECT_TRUE(in_blocks(scattered(30, 1000))) << "fifteen and a half a run, in no pattern";
+    EXPECT_TRUE(in_blocks(repeating({40}, 2))) << "two runs: nothing to judge a pattern on";
+    // One run in four as long as the one before it is no pattern.
+    std::vector<uint64_t> some = scattered(30, 1000);
+    for (size_t r = 4; r < some.size(); r += 4) some[r] = some[r - 1];
+    EXPECT_TRUE(in_blocks(some)) << "a quarter repeating";
+}
+
+TEST(ColumnCodec, RunsAveragingMoreThanABlockInNoPatternDecodeAsWritten) {
+    // #223: where runs average more than a block and their lengths follow no pattern, the short ones
+    // are written a block at a time too, each block's slots past the run the runs after it overwrite,
+    // and the column's last runs value by value where a block does not fit. Two hundred runs of one to
+    // thirty values in no pattern, then none to nine short ones at the column's end - holding a value,
+    // and stepping by one or two, which keeps the column inside 0 - 255 - decoded into every column
+    // type with guards past its end.
+    for (size_t tail = 0; tail <= 9; ++tail) {
+        std::vector<uint64_t> holding;
+        std::vector<uint64_t> stepping{128};
+        std::vector<uint64_t> lengths;   // less one, as a block stores them: the holding column's runs,
+                                         // and the stepping column's runs of differences
+        uint64_t x = 777 + tail;
+        const auto next = [&x] {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            return x >> 33;
+        };
+        int64_t step = 0;
+        const auto add_run = [&](size_t n) {
+            uint64_t value = next() % 256;
+            if (!holding.empty() && value == holding.back()) value = (value + 1) % 256;
+            // Toward 128, and never the run before's step, so that each run stays its own.
+            const int64_t toward = static_cast<int64_t>(stepping.back()) > 128 ? -1 : 1;
+            step = (step == toward) ? 2 * toward : toward;
+            for (size_t k = 0; k < n; ++k) {
+                holding.push_back(value);
+                stepping.push_back(static_cast<uint64_t>(static_cast<int64_t>(stepping.back()) + step));
+            }
+            lengths.push_back(n - 1);
+        };
+        for (size_t r = 0; r < 200; ++r) add_run(1 + next() % 30);
+        for (size_t t = 0; t < tail; ++t) add_run(1 + t % 3);
+        ASSERT_TRUE(short_runs_in_blocks(lengths, holding.size())) << "these runs would not be written in blocks";
+        ASSERT_TRUE(std::all_of(stepping.begin(), stepping.end(), [](uint64_t v) { return v < 256; }));
+        for (const auto& [column, encoding] :
+             {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
+              std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}},
+              std::pair{holding, Encoding{Transform::kFor, Packing::kRuns, Compressor::kNone}},
+              std::pair{holding, Encoding{Transform::kSteps, Packing::kRuns, Compressor::kNone}}}) {
+            std::string block;
+            encode_as(column, encoding, 1, block);
+            const std::string what = encoding.name() + ", " + std::to_string(tail) + " short runs at the end";
+            EXPECT_TRUE(decodes_into_with_guards<uint8_t>(block, column)) << what;
+            EXPECT_TRUE(decodes_into_with_guards<uint16_t>(block, column)) << what;
+            EXPECT_TRUE(decodes_into_with_guards<uint32_t>(block, column)) << what;
+            EXPECT_TRUE(decodes_into_with_guards<uint64_t>(block, column)) << what;
+            EXPECT_TRUE(decodes_into_with_guards<int64_t>(block, column)) << what;
         }
     }
 }

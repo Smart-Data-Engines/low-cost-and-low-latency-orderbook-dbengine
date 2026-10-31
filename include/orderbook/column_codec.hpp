@@ -148,6 +148,22 @@ template <typename T>
 bool decode_into(std::span<const char> block, size_t count, T* out, DecodeScratch& scratch,
                  std::string* why);
 
+/// Whether a block of runs writes each of its short runs as a whole block of values, which the runs
+/// after it overwrite past its end, rather than value by value at a branch its length decides (#223):
+/// a choice of speed alone, the values decoded the same either way. `lengths` are the runs' lengths
+/// less one, as the block stores them, and `values` their sum with the runs.
+///
+/// Where the runs average under two values - a book's prices on a recording of its changes, which move
+/// at almost every row - a block writes eight values for each one it keeps, and the branch is
+/// predicted anyway: value by value. From two values a run it writes blocks, unless the runs average
+/// more than a block and their lengths repeat: three in four of 64 runs spread over the column as long
+/// as the run before or the one before that - a book's snapshots, the forty rows of an update's
+/// timestamps or the nineteen and one of its levels' differences - where the branch is predicted and
+/// value by value writes less. Where they do not repeat - binance-diff's timestamps, whose largest
+/// segments' runs average eleven to fourteen values in no pattern - value by value took a misprediction
+/// about every other run.
+bool short_runs_in_blocks(std::span<const uint64_t> lengths, size_t values);
+
 /// LEB128, as the blocks and the file holding them write their lengths.
 void put_varint(std::string& out, uint64_t v);
 /// The varint at `at`, moving `at` past it; false for one cut short or longer than 64 bits.
