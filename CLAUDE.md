@@ -4589,6 +4589,21 @@ Learned the hard way. Check here before debugging.
      however long the thread is off a CPU. With no yield giving the CPU away it made 20 to 22 of
      the 20 it owed, and a doubled interval failed it in exactly those runs, 9 of 100; `ScanPace`'s
      tests, on an explicit clock, fail a doubled interval always.
+628. **A multiply taken out of a vector can put stores in.** #223's 64-bit block of a run was eight
+     values, `start + (k + 1) * step`, which GCC on the x86 host made a vector multiply of 64-bit
+     lanes - an instruction no x86 unit below AVX-512 has, so three multiplies of halves and their
+     shifts, a quarter of the sequence numbers' decode. Written as scalar sums, the multiply was gone
+     and eight stores were in where there had been two: on ARM the decode gained, and on x86 a loop
+     over binance-diff's sequence numbers, a block for nearly every run, went 29% slower. Pairs of
+     lanes, each the one before plus twice the step - three adds, four stores - gained on both hosts.
+     Count what a change stores as well as what it multiplies, and measure it on both hosts.
+629. **The x86 test host builds for x86-64-v3, and the x86-64 packages for x86-64.** Ubuntu 26.04's
+     GCC 15 targets x86-64-v3 by default (#207), so what that host measures of code the compiler
+     vectorises is AVX2 code; the packages are built by g++-12 on Ubuntu 22.04 for x86-64, without
+     AVX. #223's runs in blocks, measured both ways on the host: binance-diff's columns 5.49-5.52 →
+     4.79-4.84 ns a row built for x86-64-v3, and 5.82-5.84 → 5.10-5.18 for x86-64; binance-top20's
+     2.34-2.36 → 2.18-2.19, and 2.91-2.93 → 2.28-2.29. A number from that host about a decode says
+     which target it was built for, and a change to vectorised code is measured on both.
 
 ## Current state and open problems
 
