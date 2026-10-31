@@ -15,7 +15,10 @@
 //
 //   transform   for     each value minus the column's minimum, the minimum kept as the anchor
 //               delta   each value minus the one before it, zigzagged; the first is the anchor
-//               - both divided by the greatest common divisor of what they produce when it is
+//               steps   runs only, and in segment format 4 only (#250): each run of equal values'
+//                       value minus the run before's, zigzagged; the first run's value is the
+//                       anchor and its step 0
+//               - each divided by the greatest common divisor of what it produces when it is
 //                 more than 1 (a price on a tick, a quantity in lots), the divisor kept
 //   packing     Simple8b, runs (each run of equal values as its value and its length, both in
 //               Simple8b), blocks (128 values at the width of their largest), narrow (each
@@ -25,7 +28,7 @@
 //               writes what stays, takes ZSTD where it saves enough over LZ4 (design §3)
 //
 // Values are uint64. A signed column - the price, the sequence number - is its int64 reinterpreted,
-// and both transforms work modulo 2^64 as encode_prices() does, so every value has an encoding and
+// and the transforms work modulo 2^64 as encode_prices() does, so every value has an encoding and
 // decoding inverts it exactly.
 //
 // A block says how many values it holds, and the decoder is told how many the column has: a block
@@ -39,7 +42,9 @@
 
 namespace ob::column_codec {
 
-enum class Transform : uint8_t { kNone = 0, kFor = 1, kDelta = 2 };
+/// The two bits of a block's encoding byte (#250): `kSteps` took the last value, and a reader of
+/// segment format 3 refuses it as an unknown transform.
+enum class Transform : uint8_t { kNone = 0, kFor = 1, kDelta = 2, kSteps = 3 };
 enum class Packing : uint8_t { kSimple8b = 0, kRuns = 1, kBlocks = 2, kNarrow = 3 };
 enum class Compressor : uint8_t { kNone = 0, kZstd = 1, kLz4 = 2 };
 
@@ -72,8 +77,13 @@ struct EncodeOptions {
     /// two long decodes several times slower as runs than in any other packing, for the few percent
     /// they save. 0 charges nothing: the smallest candidate is chosen.
     unsigned runs_charge_pct{kRunsChargePct};
+    /// Whether `steps/runs` is tried, with each compressor these options try (#250): only for a
+    /// segment of format 4, which a build before it cannot read.
+    bool steps{false};
     /// The encoding to write in without searching - what the column's last segment chose - or
-    /// null to search. One whose compressor these options leave out is searched for instead.
+    /// null to search. One whose compressor these options leave out is searched for instead, and so
+    /// is one in `steps` where these options leave steps out: a node set back to format 3 must not
+    /// write a block its last format-4 segment chose.
     const Encoding* hint{nullptr};
 };
 
