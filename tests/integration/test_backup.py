@@ -419,6 +419,59 @@ def test_a_primary_restored_from_a_backup_makes_its_replica_start_over():
             primary.stop()
 
 
+def format_versions(data_dir: str) -> set[int]:
+    """The `format_version` of every segment under `data_dir`."""
+    found = set()
+    for meta in Path(data_dir).rglob("meta.json"):
+        m = re.search(r'"format_version":(\d+)', meta.read_text(errors="replace"))
+        if m:
+            found.add(int(m.group(1)))
+    return found
+
+
+def test_format_4_segments_go_whole_through_a_backup_and_a_snapshot():
+    """Segment format 4 (#250) is format 3's files, so a backup and a snapshot carry them as they
+    are: a primary writing format 4 is backed up and restored, and a replica of this build that has
+    to catch up from a snapshot - the restored rows are in segments alone - installs them and holds
+    every row."""
+    with tempfile.TemporaryDirectory(prefix="ob_backup_fmt4_") as tmp:
+        repl_port = free_port()
+        primary = Node(f"{tmp}/primary", ["--segment-format", "4", "--backup-dir", f"{tmp}/backups"])
+        restored = Node(f"{tmp}/restored", ["--segment-format", "4", "--replication-port", str(repl_port)])
+        replica = Node(f"{tmp}/replica", ["--primary-host", "127.0.0.1", "--primary-port", str(repl_port)])
+        try:
+            primary.start()
+            wire = Wire(primary.port)
+            for seq in range(200):
+                body = "\n".join(f"{price_of(1, seq, lv)} 1 1" for lv in range(LEVELS))
+                assert wire.ask(f"MINSERT {SYMBOLS[0]} {EXCH} bid {LEVELS}\n{body}").startswith("OK")
+            assert wire.ask("FLUSH").startswith("OK")
+            wire.close()
+            everything = sorted(primary.prices(SYMBOLS[0]))
+            assert len(everything) == 200 * LEVELS, len(everything)
+            assert format_versions(f"{tmp}/primary") == {4}, format_versions(f"{tmp}/primary")
+            name, st = backup_and_wait(primary.port)
+            assert st["state"] == "done", st
+            primary.stop()
+
+            restore(f"{tmp}/backups/{name}", f"{tmp}/restored")
+            assert 4 in format_versions(f"{tmp}/restored"), "the backup did not carry the format-4 segments"
+            restored.start()
+            assert sorted(restored.prices(SYMBOLS[0])) == everything, "the restored node lost rows"
+            replica.start()
+            deadline = time.time() + patience(90)
+            while time.time() < deadline and sorted(replica.prices(SYMBOLS[0]) or []) != everything:
+                time.sleep(0.5)
+            assert sorted(replica.prices(SYMBOLS[0]) or []) == everything, "the replica never held every row"
+            assert "Snapshot installed" in replica.log_text(), (
+                "the replica caught up without a snapshot:\n" + replica.log_text()[-3000:])
+            assert 4 in format_versions(f"{tmp}/replica"), "the snapshot did not carry the format-4 segments"
+        finally:
+            replica.stop()
+            restored.stop()
+            primary.stop()
+
+
 def test_ob_backup_authenticates_and_says_what_happened_by_its_exit_status():
     with tempfile.TemporaryDirectory(prefix="ob_backup_auth_") as tmp:
         secrets = Path(tmp) / "clients"

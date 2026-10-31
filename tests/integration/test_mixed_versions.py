@@ -240,6 +240,32 @@ def test_a_downgrade_after_format_3_keeps_every_row_once():
             again.stop()
 
 
+def test_a_downgrade_after_format_4_leaves_its_segments_out_and_removes_nothing():
+    """A data directory this version wrote with `segment-format = 4` (#250), opened by the previous
+    one, which reads formats 2 and 3: it starts without the rows of the format-4 segment, says so,
+    and removes nothing - this version, started on the directory again, holds every row once. Why
+    format 4 is not the default while the previous version cannot read it."""
+    with tempfile.TemporaryDirectory(prefix="ob_mixed_down4_") as tmp:
+        want = written_then_killed(CURRENT, f"{tmp}/data", "DW4", ["--segment-format", "4"])
+        previous = Node(PREVIOUS, f"{tmp}/data")
+        previous.start()
+        try:
+            held = prices(previous.port, "DW4")
+            assert held != want and set(held) <= set(want), (
+                "the previous version read the format-4 segment, or holds rows nobody wrote")
+            assert "unsupported format_version=4" in previous.log(), (
+                "the previous version left the format-4 segment out without saying so")
+        finally:
+            previous.stop()
+        again = Node(CURRENT, f"{tmp}/data")
+        again.start()
+        try:
+            assert prices(again.port, "DW4") == want, (
+                "this version, started again after the previous one, lost rows or holds some twice")
+        finally:
+            again.stop()
+
+
 # ── Replication ───────────────────────────────────────────────────────────────
 
 def _replicate(primary_binary: str, replica_binary: str, symbol: str) -> None:

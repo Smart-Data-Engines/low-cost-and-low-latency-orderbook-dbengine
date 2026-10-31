@@ -26,6 +26,7 @@ history.
 | A data directory the previous version wrote - segments, and rows only in the WAL after a kill - opened by this one | every row once; writes go on, numbered after them | `test_an_upgrade_in_place_keeps_every_row_once` |
 | A data directory this version wrote in segment format 2 (`segment-format = 2`), opened by the previous one | every row once (the other permitted answer is a refusal to start; a start with part of the rows is the failure) | `test_a_downgrade_keeps_every_row_once_or_refuses_to_start` |
 | A data directory this version wrote in segment format 3, the default, opened by the previous one | every row once, and every row once again when this version starts on it after: v0.1.0 reads format 3 | `test_a_downgrade_after_format_3_keeps_every_row_once` |
+| A data directory this version wrote in segment format 4 (`segment-format = 4`, #250), opened by the previous one | a start without the rows of every format-4 segment - the failure above, which is why format 4 is not the default: the previous version says `unsupported format_version=4` and removes nothing, and this version, started on the directory again, holds every row once | `test_a_downgrade_after_format_4_leaves_its_segments_out_and_removes_nothing` |
 | A primary of the previous version, a replica of this one | the replica holds every row, and no joining record once its catch-up has ended: v0.1.0 says when a catch-up ends (`CAUGHT_UP`, #215) | `test_a_primary_of_the_previous_version_replicates_to_this_one` |
 | A primary of this version, a replica of the previous one | the replica holds every row, and no joining record once its catch-up has ended | `test_a_primary_of_this_version_replicates_to_the_previous_one` |
 | A failover from a previous-version primary to this version's replica, under etcd | no acknowledged write lost; writes go on at the new primary - the replica, its catch-up ended, holds no joining record and stands (#215) | `test_a_failover_from_the_previous_primary_to_this_versions_replica_loses_no_write` |
@@ -62,13 +63,13 @@ because a failover then lands on an upgraded node.
 etcd is not versioned by the engine.
 
 **Going back.** The same order, reversed. A data directory this version wrote in segment format 2
-opens in the previous one (the matrix). One it wrote in format 3, the default, does not whole: the
-previous version leaves out the rows of every format-3 segment, and nothing converts them back. So a
-node that has to keep the way back runs `segment-format = 2` from its upgrade until the previous
-version is no longer one to go back to ("Segment format 3" in `docs/operations.md`). The sections
-of `docs/operations.md` named for a particular change say where an older build than the previous
-one reads a newer directory differently ("Going back to a build before part 2b of #165",
-"Downgrading a mesh node across #189").
+or 3, the default, opens in the previous one (the matrix). One it wrote in format 4 does not whole:
+the previous version leaves out the rows of every format-4 segment, and nothing converts them back.
+So a node that has to keep the way back stays on format 3 until the previous version reads format 4
+("Segment formats 3 and 4" in `docs/operations.md`). The sections of `docs/operations.md` named for
+a particular change say where an older build than the previous one reads a newer directory
+differently ("Going back to a build before part 2b of #165", "Downgrading a mesh node across #189",
+and format 3 for a build before v0.1.0).
 
 ## Listeners after v0.1.0
 

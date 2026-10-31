@@ -8,8 +8,9 @@
 //     copy for the four raw columns, the decoders for price, quantity and sequence number;
 //   - each candidate (design §3): its encode, and its decode into the same type;
 //   - the choice itself, `column_codec::encode()`, under the engine's policies - a seal's (LZ4 or
-//     nothing), a merge's (ZSTD at 3 where it saves 10% over LZ4) and the smallest: what writing
-//     a segment costs, and the decode of what it chose.
+//     nothing), a merge's (ZSTD at 3 where it saves 10% over LZ4) and the smallest, and a seal's and
+//     a merge's in segment format 4, steps/runs among the candidates (`seal4`, `merge4`, #250): what
+//     writing a segment costs, and the decode of what it chose.
 //
 // Bytes in memory on both sides, so this is the codec and nothing of the disk or the page cache.
 // Each timing is the fastest of five passes over every segment, in ns a value.
@@ -131,11 +132,16 @@ std::vector<cc::Encoding> candidates() {
             for (cc::Packing p : {cc::Packing::kRuns, cc::Packing::kNarrow}) out.push_back({t, p, z});
         }
     }
+    // Format 4's (#250): steps are runs only.
+    for (cc::Compressor z : {cc::Compressor::kNone, cc::Compressor::kLz4, cc::Compressor::kZstd}) {
+        out.push_back({cc::Transform::kSteps, cc::Packing::kRuns, z});
+    }
     return out;
 }
 
 /// The engine's two policies (columnar_store.hpp): a seal's, LZ4 or nothing, a runs candidate
-/// charged for its runs, and a merge's, ZSTD at 3 where it saves 10% over LZ4 and nothing charged.
+/// charged for its runs, and a merge's, ZSTD at 3 where it saves 10% over LZ4 and nothing charged -
+/// each in segment format 3 and in format 4, which tries steps/runs as well (#250).
 struct Policy {
     const char* name;
     cc::EncodeOptions options;
@@ -153,7 +159,11 @@ std::vector<Policy> policies() {
     smallest.lz4 = true;
     smallest.zstd_level = 3;
     smallest.runs_charge_pct = 0;
-    return {{"seal", seal}, {"merge", merge}, {"smallest", smallest}};
+    cc::EncodeOptions seal4 = seal;
+    seal4.steps = true;
+    cc::EncodeOptions merge4 = merge;
+    merge4.steps = true;
+    return {{"seal", seal}, {"merge", merge}, {"smallest", smallest}, {"seal4", seal4}, {"merge4", merge4}};
 }
 
 }  // namespace
@@ -247,15 +257,17 @@ int main(int argc, char** argv) {
             const double dec_ns = fastest_ns([&] {
                 for (size_t i = 0; i < segs.size(); ++i) v3_read(c, blocks[i], segs[i].rows);
             }, rows);
-            size_t lz4_segments = 0, zstd_segments = 0;
+            size_t lz4_segments = 0, zstd_segments = 0, steps_segments = 0;
             for (const auto& ch : chosen) {
                 lz4_segments += ch.encoding.compressor == cc::Compressor::kLz4;
                 zstd_segments += ch.encoding.compressor == cc::Compressor::kZstd;
+                steps_segments += ch.encoding.transform == cc::Transform::kSteps;
             }
             std::printf("%s\"%s\": {\"bytes_per_row\": %.3f, \"encode_ns\": %.2f, \"decode_ns\": %.2f, "
-                        "\"segments_lz4\": %zu, \"segments_zstd\": %zu, \"first_choice\": \"%s\"}",
+                        "\"segments_lz4\": %zu, \"segments_zstd\": %zu, \"segments_steps\": %zu, "
+                        "\"first_choice\": \"%s\"}",
                         first ? "" : ", ", policy.name, static_cast<double>(bytes) / rows, enc_ns, dec_ns,
-                        lz4_segments, zstd_segments, chosen[0].encoding.name().c_str());
+                        lz4_segments, zstd_segments, steps_segments, chosen[0].encoding.name().c_str());
             first = false;
         }
         std::printf("}}%s\n", c + 1 < 7 ? "," : "");
