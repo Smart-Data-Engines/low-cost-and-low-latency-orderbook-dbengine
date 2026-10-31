@@ -4507,6 +4507,35 @@ and over showed far more, pitfall 630). It is a change of the segment format, sp
 #250: segment format 4, by option, whose seal's choices decode binance-diff in 4.42-4.81 ns a row on
 the three targets.
 
+**Short runs where runs average past a block, 31 October 2026: in blocks unless their lengths repeat**
+(`evidence/2026-10-31-runs-fill/`). After #250, binance-diff's columns of runs were what format 2 read
+faster, raw: in format 4 its timestamps decoded in 0.89 ns a value where format 2 reads them in 0.14,
+its levels in 0.74 where 0.02 and its side in 0.36 where 0.01 (x86). `perf` put 46-80% of the decode
+of its columns of runs in `runs_inverse()`, and the timestamps' ran at 2.5 instructions a cycle with a
+branch misprediction about every other run. In their four largest segments, three quarters of the rows, runs
+average 10.8-13.5 values, and where runs averaged more than a block the short ones were written value
+by value, at a loop on each run's length - lengths that follow no pattern there. `short_runs_in_blocks()`
+writes them in blocks now unless three in four of 64 runs spread over the column are as long as the
+run before or the one before that, as a book's snapshots' are, exactly (pitfall 633). The rules were
+compared in one build, the rule read from the environment, because two builds moved columns no rule
+reaches by up to 18% (pitfall 634). The seal's choices, all seven columns, ns a row, three rounds, the
+base (PR #296's head) against the change:
+
+| | x86, x86-64-v3 | x86, x86-64 | ARM |
+|---|---|---|---|
+| binance-diff, format 4 | 4.36-4.52 → 4.11-4.19 | 4.69-4.74 → 4.36-4.39 | 4.59-4.66 → 4.36-4.40 |
+| binance-top20, format 4 | 1.85-1.87 → 1.87-1.88 | 1.93-1.95 → 1.93-1.94 | 1.90-1.96 → 1.92-1.94 |
+| binance-diff, format 3 | 4.79-4.87 → 4.76-4.86 | 5.17-5.28 → 5.11-5.17 | 4.93-5.03 → 4.94-4.95 |
+| binance-top20, format 3 | 2.17-2.19 → 2.19-2.20 | 2.26-2.28 → 2.28-2.30 | 2.20 → 2.22-2.25 |
+
+binance-diff's timestamps in format 4 went from 0.89-0.90 to 0.59-0.62 ns a value, from 0.90 to 0.59
+and from 0.79-0.81 to 0.61. Its sequence numbers took 1-10% longer in the probe's loop, where rule 3
+had moved them 0-1.5% in one build; the rest is the two builds' code. On a node, 94 of 96 ranges of the
+change's time over the base's, round by round, held 1.00; binance-diff's first scan after a load in
+format 4 on ARM took 1.03-1.07 of the base's, and binance-top20's warm buckets in format 3 on x86
+1.01-1.04. What is left on binance-diff: 4.8-5.2 ns a row in format 3 and 4.1-4.4 in format 4,
+against format 2's 3.6-3.8.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 
