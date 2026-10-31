@@ -160,8 +160,8 @@ bool decode_into(std::span<const char> block, size_t count, T* out, DecodeScratc
 /// as the run before or the one before that - a book's snapshots, the forty rows of an update's
 /// timestamps or the nineteen and one of its levels' differences - where the branch is predicted and
 /// value by value writes less. Where they do not repeat - binance-diff's timestamps, whose largest
-/// segments' runs average eleven to fourteen values in no pattern - value by value took a misprediction
-/// about every other run.
+/// segments' runs average eleven to fourteen values in no pattern - their decode took a branch
+/// misprediction about every other run.
 bool short_runs_in_blocks(std::span<const uint64_t> lengths, size_t values);
 
 /// LEB128, as the blocks and the file holding them write their lengths.
