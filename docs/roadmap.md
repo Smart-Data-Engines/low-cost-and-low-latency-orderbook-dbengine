@@ -4443,8 +4443,11 @@ buckets 0.71 and 0.40 cold, 0.66 and 0.35 warm, and its first scan 0.87 and 0.83
 
 What is left on binance-diff: 4.8-5.2 ns a row against format 2's 3.5-3.7. A packing of runs of
 values, each run's value as its difference from the run before, would take its timestamps and
-sequence numbers 24-28% smaller and decode them warm in 52-66% of the time (the profile's probe,
-`rundelta`); it is a change of the segment format, to be specified on its own.
+sequence numbers 24-28% smaller, and binance-top20's seven columns 8%. Decoded in a loop over every
+segment against this decoder, its timestamps were 2% faster on x86 and 19% on ARM, and its sequence
+numbers 35% and 14% (the profile's probe, `rdloop` against `loop`; one segment's block decoded over
+and over showed far more, pitfall 630). It is a change of the segment format, to be specified on its
+own.
 
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's

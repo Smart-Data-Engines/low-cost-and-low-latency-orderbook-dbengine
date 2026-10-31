@@ -4604,6 +4604,13 @@ Learned the hard way. Check here before debugging.
      4.79-4.84 ns a row built for x86-64-v3, and 5.82-5.84 → 5.10-5.18 for x86-64; binance-top20's
      2.34-2.36 → 2.18-2.19, and 2.91-2.93 → 2.28-2.29. A number from that host about a decode says
      which target it was built for, and a change to vectorised code is measured on both.
+630. **A block decoded over and over teaches the branch predictor its runs.** #223's probe timed a
+     prototype packing one segment's block at a time, each decoded dozens of times running: its
+     binance-diff timestamps took 0.35 ns a value where the seal's choice took 0.66, on the x86 host.
+     A loop over every segment in turn - as `column_codec_cost` and a query read them - gave 0.78
+     against 0.80. Where a decode's cost is mispredicted run lengths, the same block repeated lets
+     the predictor learn the lengths and the cost goes; a decoder measured that way is measured
+     without the thing it is slow at. Time a branchy decoder over many blocks, as a scan meets them.
 
 ## Current state and open problems
 
