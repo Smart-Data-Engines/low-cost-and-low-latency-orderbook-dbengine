@@ -4611,6 +4611,19 @@ Learned the hard way. Check here before debugging.
      against 0.80. Where a decode's cost is mispredicted run lengths, the same block repeated lets
      the predictor learn the lengths and the cost goes; a decoder measured that way is measured
      without the thing it is slow at. Time a branchy decoder over many blocks, as a scan meets them.
+631. **A branch on the newest format by equality takes the next one for an older one.** Segment
+     format 4 (#250) keeps format 3's file, and five places asked `format_version == 3` and otherwise
+     went to format 2's `*.col` files: this build would have read its own format-4 segments as files
+     they do not have, and a start would have taken a merged one for one cut short and, with its
+     inputs still beside it, removed it. Each asks now what it needs to know - whether a segment
+     keeps its columns in one file, `columns_in_one_file()` - and the tests that ran in formats 2 and
+     3 run in 4 too, the rebuild that finds a merge's inputs beside it among them.
+632. **A choice reused unsearched outlives the option that allowed it.** A seal writes each column in
+     the encoding its last segment chose and searches again every sixteenth segment. A node set back
+     from format 4 to 3 keeps those choices, so a column whose last segment chose `steps/runs` would
+     have been written in it into a format-3 segment, which a reader of format 3 refuses. `encode()`
+     searches past a hint of steps where its options leave steps out (#250), and the test sets a store
+     back from 4 to 3 and reads every block's encoding byte.
 
 ## Current state and open problems
 

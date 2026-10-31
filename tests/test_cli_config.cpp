@@ -518,6 +518,17 @@ TEST(IoProfile, AnUnknownNameIsRefusedRatherThanReadAsTheDefault) {
                 "unknown --profile 'bost'");
 }
 
+TEST(SegmentFormat, TwoThreeOrFourAndThreeUnlessGiven) {
+    // #250: format 4 is written only where it is asked for, since v0.1.0 does not read it, and a
+    // value the parser does not know is refused rather than read as the default: a node meant to
+    // write what the build before reads must not write what it cannot because of a typo.
+    EXPECT_EQ(resolve({}).config.segment_format, 3u);
+    EXPECT_EQ(resolve({"--segment-format", "2"}).config.segment_format, 2u);
+    EXPECT_EQ(resolve({"--segment-format", "4"}).config.segment_format, 4u);
+    EXPECT_EXIT(resolve({"--segment-format", "5"}), ::testing::ExitedWithCode(1),
+                "--segment-format expects 2, 3 or 4, got '5'");
+}
+
 // ── The two lists, against the parser's own source ────────────────────────────
 
 TEST(CliConfigStatic, KnownFlagsMatchTheParser) {

@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <type_traits>
 
 namespace ob::column_codec {
@@ -22,7 +23,8 @@ namespace ob::column_codec {
 //   u8      narrow packing only: the bytes a value takes, 1 - 8
 //   varint  the values in the column - Simple8b pads its last word with zeros, so the words
 //           alone do not say how many there are
-//   varint  the anchor: for - the minimum; delta - the first value; none - absent
+//   varint  the anchor: for - the minimum; delta - the first value; steps - the first run's value;
+//           none - absent
 //   varint  scaled only: the divisor, 2 or more
 //   varint  compressed only: the packed payload's length before compression
 //   ...     the payload, to the end of the block
@@ -30,7 +32,7 @@ namespace ob::column_codec {
 // The payload, by packing (after decompression when compressed):
 //   Simple8b  the words of encode_simple8b()
 //   runs      varint runs, varint the words of their values, those words, then the words of the
-//             runs' lengths less one - each in Simple8b
+//             runs' lengths less one - each in Simple8b; under steps a run's value is its step
 //   blocks    per 128 values: u8 width 0 - 64, then the values in ceil(n * width / 8) bytes, the
 //             lowest bit first
 //   narrow    each value in `width` bytes, little-endian
@@ -161,6 +163,17 @@ void transform_delta(std::span<const uint64_t> v, Stream& s) {
     }
 }
 
+/// The runs payload: how many, the words of their values, those words, then the words of their
+/// lengths less one - each in Simple8b.
+void put_runs(const std::vector<uint64_t>& values, const std::vector<uint64_t>& lengths, std::string& out) {
+    const auto value_words = encode_simple8b(values).words;
+    const auto length_words = encode_simple8b(lengths).words;
+    put_varint(out, values.size());
+    put_varint(out, value_words.size());
+    put_u64_words(out, value_words);
+    put_u64_words(out, length_words);
+}
+
 /// Returns how many runs it packed.
 size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
     thread_local std::vector<uint64_t> values, lengths;
@@ -173,14 +186,49 @@ size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
         lengths.push_back(j - i - 1);
         i = j;
     }
-    const auto value_words = encode_simple8b(values).words;
-    const auto length_words = encode_simple8b(lengths).words;
-    put_varint(out, values.size());
-    put_varint(out, value_words.size());
-    put_u64_words(out, value_words);
-    put_u64_words(out, length_words);
+    put_runs(values, lengths, out);
     const size_t runs = values.size();
     keep_small(values);
+    keep_small(lengths);
+    return runs;
+}
+
+/// `v` as runs of equal values written as steps (#250), laid out as pack_runs() lays out runs: each
+/// run's value its step from the run before's, modulo 2^64, zigzagged and divided by the steps'
+/// greatest common divisor - the stream's scale - the first run's value the anchor and its step 0.
+/// Its own packing rather than runs of a transform's output: two runs a step of 1 apart each, a
+/// book's sequence numbers, would be one run of that output, and decode as one step. Fills `s`'s
+/// header fields and its values, one a run; returns how many runs it packed.
+size_t pack_steps(std::span<const uint64_t> v, Stream& s, std::string& out) {
+    thread_local std::vector<uint64_t> raw, lengths;
+    raw.clear();
+    lengths.clear();
+    s.transform = Transform::kSteps;
+    s.count = v.size();
+    s.anchor = v.empty() ? 0 : v[0];
+    uint64_t before = s.anchor;
+    for (size_t i = 0; i < v.size();) {
+        size_t j = i + 1;
+        while (j < v.size() && v[j] == v[i]) ++j;
+        raw.push_back(v[i] - before);
+        lengths.push_back(j - i - 1);
+        before = v[i];
+        i = j;
+    }
+    // Magnitudes first, the signs taken again below, as transform_delta() takes them: the divisor is
+    // of the magnitudes.
+    s.values.resize(raw.size());
+    for (size_t r = 0; r < raw.size(); ++r) s.values[r] = static_cast<int64_t>(raw[r]) < 0 ? 0 - raw[r] : raw[r];
+    const uint64_t g = common_divisor(s.values);
+    s.scale = g > 1 ? g : 1;
+    const Divisor div(s.scale);
+    for (size_t r = 0; r < raw.size(); ++r) {
+        const uint64_t m = s.scale > 1 ? div.quotient(s.values[r]) : s.values[r];
+        s.values[r] = zigzag(static_cast<int64_t>(raw[r]) < 0, m);
+    }
+    put_runs(s.values, lengths, out);
+    const size_t runs = raw.size();
+    keep_small(raw);
     keep_small(lengths);
     return runs;
 }
@@ -333,12 +381,11 @@ void pack(const Stream& s, Packing p, unsigned width, std::string& out) {
     }
 }
 
-/// `s` packed as `p`, compressed by `c` or not, as a whole block appended to `out`; its size.
-size_t emit(const Stream& s, Packing p, Compressor c, int zstd_level, std::string& out) {
-    const unsigned width = p == Packing::kNarrow ? narrow_width(s.values) : 0;
-    thread_local std::string packed, compressed;
-    packed.clear();
-    pack(s, p, width, packed);
+/// The block of `s` whose payload, packed as `p`, is `packed`: compressed by `c` or not, appended to
+/// `out`; its size.
+size_t emit_packed(const Stream& s, Packing p, unsigned width, Compressor c, int zstd_level,
+                   const std::string& packed, std::string& out) {
+    thread_local std::string compressed;
     const size_t at = out.size();
     if (c != Compressor::kNone && compress(c, packed, zstd_level, compressed)) {
         put_header(out, s, p, width, c, packed.size());
@@ -351,9 +398,19 @@ size_t emit(const Stream& s, Packing p, Compressor c, int zstd_level, std::strin
         put_header(out, s, p, width, Compressor::kNone, 0);
         out += packed;
     }
-    keep_small(packed);
     keep_small(compressed);
     return out.size() - at;
+}
+
+/// `s` packed as `p`, compressed by `c` or not, as a whole block appended to `out`; its size.
+size_t emit(const Stream& s, Packing p, Compressor c, int zstd_level, std::string& out) {
+    const unsigned width = p == Packing::kNarrow ? narrow_width(s.values) : 0;
+    thread_local std::string packed;
+    packed.clear();
+    pack(s, p, width, packed);
+    const size_t bytes = emit_packed(s, p, width, c, zstd_level, packed, out);
+    keep_small(packed);
+    return bytes;
 }
 
 // ── Decoding ─────────────────────────────────────────────────────────────────
@@ -444,11 +501,11 @@ bool read_header(std::span<const char> block, size_t count, Header& h, std::stri
     if ((e & 0x80) != 0 || (e & (kZstdBit | kLz4Bit)) == (kZstdBit | kLz4Bit)) {
         return fail(why, "unknown encoding bits");
     }
-    const auto t = static_cast<uint8_t>(e & 0x3);
-    if (t > 2) return fail(why, "unknown transform");
-    h.transform = static_cast<Transform>(t);
+    // Every value of the transform's two bits is one since #250, and of the packing's two always.
+    h.transform = static_cast<Transform>(e & 0x3);
     const bool scaled = (e & kScaledBit) != 0;
     h.packing = static_cast<Packing>((e >> 3) & 0x3);
+    if (h.transform == Transform::kSteps && h.packing != Packing::kRuns) return fail(why, "steps only as runs");
     h.compressor = (e & kZstdBit) != 0 ? Compressor::kZstd
                  : (e & kLz4Bit) != 0  ? Compressor::kLz4
                                        : Compressor::kNone;
@@ -580,6 +637,8 @@ bool apply_inverse(const Header& h, size_t count, Get get, T* o) {
         }
         break;
     }
+    case Transform::kSteps:
+        return false;   // runs only, which read_header() holds them to; never here
     }
     return above == 0;
 }
@@ -684,17 +743,28 @@ inline void step_block(T* run, uint64_t v, uint64_t d) {
 /// How many of a run's slots its blocks write: its length rounded up to whole blocks.
 inline size_t whole_blocks(size_t len) { return (len + kRunBlock - 1) & ~(kRunBlock - 1); }
 
-/// The runs of a column without delta: each run's value, through the frame of reference when `kFor`
-/// (times `g`, plus the anchor `a`), filled as many times as the run is long - in whole blocks where
-/// runs_inverse() writes the delta runs in them. Nonzero when a value is past T's range.
-template <typename T, bool kFor>
+/// The runs of a column without delta, each run's value filled as many times as the run is long - in
+/// whole blocks where runs_inverse() writes the delta runs in them: as it is under none; through the
+/// frame of reference under for (times `g`, plus the anchor `a`); and under steps (#250) the run
+/// before's plus its step times `g`, from `a`, which holds the run's value so far. Nonzero when a value
+/// is past T's range.
+template <typename T, Transform kT>
 uint64_t value_runs(const uint64_t* values, const uint64_t* lengths, size_t runs, uint64_t g, uint64_t a,
                     bool by_blocks, size_t count, T* o) {
+    static_assert(kT != Transform::kDelta, "delta runs are runs_inverse()'s own");
     constexpr uint64_t kMax = kMaxOf<T>;
     uint64_t above = 0;
     size_t i = 0;
     for (size_t r = 0; r < runs; ++r) {
-        const uint64_t v = kFor ? values[r] * g + a : values[r];
+        uint64_t v;
+        if constexpr (kT == Transform::kFor) {
+            v = values[r] * g + a;
+        } else if constexpr (kT == Transform::kSteps) {
+            a += unzigzag(values[r]) * g;
+            v = a;
+        } else {
+            v = values[r];
+        }
         above |= v > kMax;
         const size_t len = static_cast<size_t>(lengths[r]) + 1;
         if ((by_blocks || len > kRunBlock) && count - i >= whole_blocks(len)) {
@@ -813,9 +883,11 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
             i += len;
         }
     } else if (h.transform == Transform::kFor) {
-        above |= value_runs<T, true>(rv, rl, runs, h.scale, h.anchor, by_blocks, count, o);
+        above |= value_runs<T, Transform::kFor>(rv, rl, runs, h.scale, h.anchor, by_blocks, count, o);
+    } else if (h.transform == Transform::kSteps) {
+        above |= value_runs<T, Transform::kSteps>(rv, rl, runs, h.scale, h.anchor, by_blocks, count, o);
     } else {
-        above |= value_runs<T, false>(rv, rl, runs, 1, 0, by_blocks, count, o);
+        above |= value_runs<T, Transform::kNone>(rv, rl, runs, 1, 0, by_blocks, count, o);
     }
     if (above != 0) return fail(why, "a value past the column's type");
     return true;
@@ -824,7 +896,10 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
 }  // namespace
 
 std::string Encoding::name() const {
-    std::string s = transform == Transform::kNone ? "none" : transform == Transform::kFor ? "for" : "delta";
+    std::string s = transform == Transform::kNone  ? "none"
+                  : transform == Transform::kFor   ? "for"
+                  : transform == Transform::kDelta ? "delta"
+                                                   : "steps";
     s += "/";
     switch (packing) {
     case Packing::kSimple8b: s += "s8b"; break;
@@ -869,12 +944,21 @@ size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int
         break;
     case Transform::kFor:   transform_for(values, s); break;
     case Transform::kDelta: transform_delta(values, s); break;
+    case Transform::kSteps: {
+        if (encoding.packing != Packing::kRuns) throw std::invalid_argument("steps are written as runs only");
+        thread_local std::string packed;
+        packed.clear();
+        pack_steps(values, s, packed);
+        const size_t bytes = emit_packed(s, Packing::kRuns, 0, encoding.compressor, zstd_level, packed, out);
+        keep_small(packed);
+        return bytes;
+    }
     }
     return emit(s, encoding.packing, encoding.compressor, zstd_level, out);
 }
 
 Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, std::string& out) {
-    if (options.hint != nullptr &&
+    if (options.hint != nullptr && (options.hint->transform != Transform::kSteps || options.steps) &&
         (options.hint->compressor == Compressor::kNone ||
          (options.hint->compressor == Compressor::kLz4 && options.lz4) ||
          (options.hint->compressor == Compressor::kZstd && options.zstd_level != 0))) {
@@ -885,14 +969,16 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
         return choice;
     }
     // Design §3: both transforms; uncompressed Simple8b and runs of each, blocks of `for`; and, under
-    // LZ4 and under ZSTD where these options try them, runs and narrow of each. Each payload is
-    // packed once and compressed once per compressor, and the chosen block is written from what was
-    // packed rather than packed again.
-    thread_local Stream streams[2];
-    thread_local std::string s8b[2], runs[2], narrow[2];
-    thread_local std::string compressed[2][2][2];   // [compressor: lz4, zstd][stream][runs, narrow]
+    // LZ4 and under ZSTD where these options try them, runs and narrow of each. With `steps` (#250),
+    // steps/runs too, uncompressed and under each compressor tried. Each payload is packed once and
+    // compressed once per compressor, and the chosen block is written from what was packed rather
+    // than packed again.
+    thread_local Stream streams[3];   // for, delta, steps
+    thread_local std::string s8b[2], runs[3], narrow[2];
+    thread_local std::string compressed[2][3][2];   // [compressor: lz4, zstd][stream][runs, narrow]
     transform_for(values, streams[0]);
     transform_delta(values, streams[1]);
+    const int stream_count = options.steps ? 3 : 2;
 
     enum class What { kS8b, kRuns, kBlocks, kCompressedRuns, kCompressedNarrow };
     struct Best {
@@ -906,9 +992,11 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     // its length decides, so where runs are a value or two long they decode several times slower than
     // any other packing, and on binance-diff's prices and quantities they were chosen for saving a
     // few percent. The charge follows the runs per value, so long runs pay almost nothing.
-    size_t run_count[2] = {0, 0};
+    size_t run_count[3] = {0, 0, 0};
     const auto weigh = [&](size_t bytes, int t, bool is_runs) -> uint64_t {
-        const size_t n = streams[t].values.size();
+        // A steps stream holds a value a run, so its runs are counted against the column's values -
+        // as for/runs's are, which are the same runs.
+        const size_t n = t == 2 ? streams[t].count : streams[t].values.size();
         if (!is_runs || options.runs_charge_pct == 0 || n == 0) return bytes;
         // Runs a thousand values first, so that no charge and no column can overflow the product.
         const uint64_t runs_per_mille = uint64_t{1000} * run_count[t] / n;
@@ -935,6 +1023,12 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
             offer(light, Best{t, What::kBlocks, Compressor::kNone, b_blocks, weigh(b_blocks, t, false)});
         }
     }
+    if (options.steps) {
+        runs[2].clear();
+        run_count[2] = pack_steps(values, streams[2], runs[2]);
+        const size_t b_steps = header_bytes(streams[2], Packing::kRuns, Compressor::kNone, 0) + runs[2].size();
+        offer(light, Best{2, What::kRuns, Compressor::kNone, b_steps, weigh(b_steps, 2, true)});
+    }
     const bool try_lz4 = options.lz4;
     const bool try_zstd = options.zstd_level != 0;
     if (try_lz4 || try_zstd) {
@@ -947,10 +1041,11 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
         const Compressor compressor = c == 0 ? Compressor::kLz4 : Compressor::kZstd;
         if ((c == 0 && !try_lz4) || (c == 1 && !try_zstd)) continue;
         Best& best_here = c == 0 ? lz4 : zstd;
-        for (int t = 0; t < 2; ++t) {
+        for (int t = 0; t < stream_count; ++t) {
             const Stream& s = streams[t];
-            std::string* payloads[2] = {&runs[t], &narrow[t]};
+            std::string* payloads[2] = {&runs[t], t < 2 ? &narrow[t] : nullptr};   // steps: runs only
             for (int k = 0; k < 2; ++k) {
+                if (payloads[k] == nullptr) continue;
                 std::string& z = compressed[c][t][k];
                 if (!compress(compressor, *payloads[k], options.zstd_level, z)) continue;
                 const Packing packing = k == 0 ? Packing::kRuns : Packing::kNarrow;
@@ -1013,11 +1108,13 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     }
     choice.bytes = out.size() - at;
     choice.uncompressed_bytes = light.bytes;
-    for (int k = 0; k < 2; ++k) {
+    for (int k = 0; k < 3; ++k) {
         keep_small(streams[k].values);
-        keep_small(s8b[k]);
         keep_small(runs[k]);
-        keep_small(narrow[k]);
+        if (k < 2) {
+            keep_small(s8b[k]);
+            keep_small(narrow[k]);
+        }
         for (auto& by_packing : compressed) {
             for (std::string& z : by_packing[k]) keep_small(z);
         }

@@ -240,8 +240,9 @@ struct ServerConfig {
     /// tick shows it behind (#190 step 5), rather than every writer stopping at a full queue.
     bool write_admission{true};
 
-    /// --segment-format 2|3: the format new segments are written in (segment format v3). 2 is for
-    /// a cluster being upgraded, whose nodes of the build before cannot read 3.
+    /// --segment-format 2|3|4: the format new segments are written in (segment formats v3 and v4).
+    /// 2 is for a cluster being upgraded from before format 3; 4 (#250) for one whose every node, and
+    /// every build it may go back to, reads it - not yet the default, as the release before cannot.
     uint32_t segment_format{3};
 
     /// --decoded-cache-mb N: what the decoded columns of format-3 segments may hold between queries,

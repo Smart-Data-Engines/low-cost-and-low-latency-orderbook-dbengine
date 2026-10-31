@@ -18,6 +18,7 @@
 #include "orderbook/column_codec.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
+#include "segment_blocks.hpp"
 
 namespace fs = std::filesystem;
 
@@ -1140,32 +1141,7 @@ TEST(ColumnarStoreFormat, SegmentFormat2WritesFormat2) {
 
 namespace {
 
-/// The encoding byte of each block of a format-3 segment, in the order of its file's directory.
-std::vector<uint8_t> block_encodings(const std::string& segment_dir) {
-    std::ifstream in(segment_dir + "/" + ob::kColumnsV3File, std::ios::binary);
-    const std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    const std::span<const char> bytes(file.data(), file.size());
-    EXPECT_EQ(file.substr(0, 4), "OBS3");
-    size_t at = 4;
-    uint64_t rows = 0;
-    EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, rows));
-    const size_t columns = static_cast<uint8_t>(file.at(at++));
-    std::vector<uint64_t> lengths;
-    for (size_t c = 0; c < columns; ++c) {
-        ++at;   // the column's id
-        uint64_t length = 0;
-        EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, length));
-        at += 4;   // the block's CRC32C
-        lengths.push_back(length);
-    }
-    std::vector<uint8_t> encodings;
-    for (const uint64_t length : lengths) {
-        encodings.push_back(static_cast<uint8_t>(file.at(at)));
-        at += static_cast<size_t>(length);
-    }
-    EXPECT_EQ(at, file.size());
-    return encodings;
-}
+using ob::segment_blocks::block_encodings;
 
 constexpr uint8_t kZstdBit = 0x20;
 constexpr uint8_t kLz4Bit = 0x40;
@@ -1184,6 +1160,76 @@ void fill_repeating_snapshots(ob::ColumnarStore& store) {
 }
 
 }  // namespace
+
+TEST(ColumnarStoreFormat, Format4WritesABooksTimesAndNumbersAsStepsAndFormat3Never) {
+    // #250: an update's levels at one time and under one sequence number - runs of equal values, the
+    // updates a step apart - are steps' columns in format 4. Format 3 never writes them, whose readers
+    // refuse the transform: not even from a store set back to it from 4, whose last segment's
+    // encodings it reuses unsearched.
+    using ob::segment_blocks::kSteps;
+    using ob::segment_blocks::kTransformMask;
+    constexpr size_t kTimeColumn = 0;
+    constexpr size_t kSequenceColumn = 6;
+    std::vector<ob::SnapshotRow> written;
+    // The updates' sizes and gaps follow no short period, as a recording's do: a pattern that repeats
+    // every few updates is one LZ4 takes from any packing.
+    uint64_t x = 12345;
+    const auto next = [&x] {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        return x >> 33;
+    };
+    const auto fill = [&](ob::ColumnarStore& store, uint64_t at) {
+        uint64_t seq = 1'000'000 + written.size();
+        for (uint64_t u = 0; u < 300; ++u) {
+            at += 100'000 + next() % 5'000;
+            ++seq;
+            const uint64_t levels = 1 + next() % 19;
+            for (uint64_t l = 0; l < levels; ++l) {
+                auto r = make_row(at, 6'000'000'000LL - static_cast<int64_t>(l) * 1'000'000, 100 + l, 1,
+                                  ob::SIDE_BID, static_cast<uint16_t>(l));
+                r.sequence_number = seq;
+                store.append(r);
+                written.push_back(r);
+            }
+        }
+    };
+    TempDir tmp("format4_steps");
+    {
+        ob::ColumnarStore store(tmp.str());
+        use_format(store, ob::kColumnarFormatV4);
+        fill(store, 1'790'000'000'000'000'000ULL);
+        const auto four = store.flush_segment();
+        ASSERT_TRUE(four.has_value());
+        EXPECT_EQ(four->format_version, ob::kColumnarFormatV4);
+        std::ifstream in(four->dir_path + "/meta.json");
+        const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_NE(json.find("\"format_version\":4"), std::string::npos) << json;
+        const auto in_four = block_encodings(four->dir_path);
+        ASSERT_EQ(in_four.size(), 7u);
+        EXPECT_EQ(in_four[kTimeColumn] & kTransformMask, kSteps) << "the timestamps";
+        EXPECT_EQ(in_four[kSequenceColumn] & kTransformMask, kSteps) << "the sequence numbers";
+
+        use_format(store, ob::kColumnarFormatV3);
+        fill(store, 1'790'000'001'000'000'000ULL);
+        const auto three = store.flush_segment();
+        ASSERT_TRUE(three.has_value());
+        EXPECT_EQ(three->format_version, ob::kColumnarFormatV3);
+        const auto in_three = block_encodings(three->dir_path);
+        for (size_t c = 0; c < in_three.size(); ++c) {
+            EXPECT_NE(in_three[c] & kTransformMask, kSteps) << "column " << c << " in steps in format 3";
+        }
+    }
+    ob::ColumnarStore reopened(tmp.str());
+    reopened.open_existing();
+    const auto rows = scan_all(reopened);
+    ASSERT_EQ(rows.size(), written.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        ASSERT_EQ(rows[i].timestamp_ns, written[i].timestamp_ns) << i;
+        ASSERT_EQ(rows[i].sequence_number, written[i].sequence_number) << i;
+        ASSERT_EQ(rows[i].price, written[i].price) << i;
+        ASSERT_EQ(rows[i].level_index, written[i].level_index) << i;
+    }
+}
 
 TEST(ColumnarStoreFormat, AStoreNotToldOtherwiseSealsAsTheServerDoesWithoutZstd) {
     // An application embedding the engine makes its stores without a format, and nothing merges
@@ -1312,13 +1358,13 @@ TEST(ColumnarStoreReadBuffers, AFormat3ReadsDecodingScratchIsCountedInWhatThePoo
               kRows * (8 + 8 + 8 + 8 + 4 + 1 + 2) + file_bytes + kRows * sizeof(uint64_t));
 }
 
-TEST(ColumnarStoreFormat, SegmentsOfBothFormatsInOneStoreReadAsTheyWereWritten) {
-    TempDir tmp("format_both");
+TEST(ColumnarStoreFormat, SegmentsOfEveryFormatInOneStoreReadAsTheyWereWritten) {
+    TempDir tmp("format_every");
     std::vector<ob::SnapshotRow> written;
     {
         ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
-        for (uint32_t version : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV2,
-                                 ob::kColumnarFormatV3}) {
+        for (uint32_t version : {ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV4,
+                                 ob::kColumnarFormatV2, ob::kColumnarFormatV3, ob::kColumnarFormatV4}) {
             use_format(store, version);
             const uint64_t base = written.size() * 1'000'000ULL;
             for (uint64_t i = 0; i < 50; ++i) {

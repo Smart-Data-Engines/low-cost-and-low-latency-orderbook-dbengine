@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -34,6 +35,10 @@ std::vector<Encoding> all_encodings() {
                 out.push_back(Encoding{t, p, c});
             }
         }
+    }
+    // Steps are runs only (#250).
+    for (Compressor c : {Compressor::kNone, Compressor::kZstd, Compressor::kLz4}) {
+        out.push_back(Encoding{Transform::kSteps, Packing::kRuns, c});
     }
     return out;
 }
@@ -167,7 +172,7 @@ RunsPerTransform runs_of(const std::vector<uint64_t>& v) {
 }
 
 // A candidate's bytes as the choice weighs them: a runs one larger by its charge, the charge being
-// `pct` percent times its runs per value, at most 90%.
+// `pct` percent times its runs per value, at most 90%. Steps' runs are runs of equal values, as for's.
 double weighed(const Encoding& e, size_t bytes, const RunsPerTransform& r, unsigned pct) {
     if (e.packing != Packing::kRuns) return static_cast<double>(bytes);
     const size_t runs = e.transform == Transform::kDelta ? r.delta_runs : r.for_runs;
@@ -178,7 +183,7 @@ double weighed(const Encoding& e, size_t bytes, const RunsPerTransform& r, unsig
     return std::floor(static_cast<double>(bytes) * 1000.0 / (1000.0 - per_mille));
 }
 
-std::vector<Encoding> every_candidate() {
+std::vector<Encoding> every_candidate(bool steps = false) {
     std::vector<Encoding> out = {
         {Transform::kFor, Packing::kSimple8b, Compressor::kNone},
         {Transform::kFor, Packing::kRuns, Compressor::kNone},
@@ -189,6 +194,11 @@ std::vector<Encoding> every_candidate() {
     for (Compressor z : {Compressor::kLz4, Compressor::kZstd}) {
         for (Transform t : {Transform::kFor, Transform::kDelta}) {
             for (Packing p : {Packing::kRuns, Packing::kNarrow}) out.push_back(Encoding{t, p, z});
+        }
+    }
+    if (steps) {   // #250: steps/runs uncompressed and under each compressor
+        for (Compressor z : {Compressor::kNone, Compressor::kLz4, Compressor::kZstd}) {
+            out.push_back(Encoding{Transform::kSteps, Packing::kRuns, z});
         }
     }
     return out;
@@ -232,7 +242,8 @@ std::vector<uint64_t> periodic_runs(unsigned len, unsigned period, size_t n) {
 TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
     // The rule, held exactly (#223): no candidate weighs less than the chosen one, a runs candidate
     // weighed as larger by its charge - for every charge, the default's included, with ZSTD and as a
-    // seal searches, on columns of runs short and long and on the edge columns.
+    // seal searches, with steps and without (#250), on columns of runs short and long and on the edge
+    // columns.
     std::vector<std::vector<uint64_t>> columns = edge_columns();
     for (unsigned repeat : {0u, 300u, 600u, 900u}) columns.push_back(short_runs(5'000, repeat, repeat + 1));
     std::vector<uint64_t> long_runs;
@@ -244,27 +255,34 @@ TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
     columns.push_back({1004001, 1004001, 1004001, 1008002, 1012003, 1016004, 1017958, 1021959, 1025960,
                        1029961, 1029961, 1029961, 1033962, 1035916, 1039917, 1039917, 1043918, 1047826,
                        1051827, 1055828, 1059829, 1063830, 1067831, 1067831, 1067831, 1067831, 1071832});
-    for (const int zstd_level : {3, 0}) {   // with ZSTD, and as a seal searches, without it
-        for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u, std::numeric_limits<unsigned>::max()}) {
-            EncodeOptions options;
-            options.zstd_level = zstd_level;
-            options.runs_charge_pct = pct;
-            for (const auto& column : columns) {
-                SCOPED_TRACE(::testing::Message() << "ZSTD " << zstd_level << ", charge " << pct << "%, "
-                                                  << column.size() << " values");
-                const RunsPerTransform r = runs_of(column);
-                std::string chosen;
-                const Choice c = encode(column, options, chosen);
-                std::vector<uint64_t> back;
-                std::string why;
-                ASSERT_TRUE(decode(bytes(chosen), column.size(), back, &why)) << c.encoding.name() << ": " << why;
-                ASSERT_EQ(back, column);
-                const double mine = weighed(c.encoding, chosen.size(), r, pct);
-                for (const Encoding& e : every_candidate()) {
-                    if (zstd_level == 0 && e.compressor == Compressor::kZstd) continue;
-                    std::string other;
-                    encode_as(column, e, zstd_level, other);
-                    EXPECT_LE(mine, weighed(e, other.size(), r, pct)) << c.encoding.name() << " chosen over " << e.name();
+    for (const bool steps : {false, true}) {   // format 3's candidates, and format 4's (#250)
+        for (const int zstd_level : {3, 0}) {   // with ZSTD, and as a seal searches, without it
+            for (unsigned pct : {0u, 10u, kRunsChargePct, 100u, 300u, std::numeric_limits<unsigned>::max()}) {
+                EncodeOptions options;
+                options.zstd_level = zstd_level;
+                options.runs_charge_pct = pct;
+                options.steps = steps;
+                for (const auto& column : columns) {
+                    SCOPED_TRACE(::testing::Message() << (steps ? "steps, " : "") << "ZSTD " << zstd_level
+                                                      << ", charge " << pct << "%, " << column.size() << " values");
+                    const RunsPerTransform r = runs_of(column);
+                    std::string chosen;
+                    const Choice c = encode(column, options, chosen);
+                    std::vector<uint64_t> back;
+                    std::string why;
+                    ASSERT_TRUE(decode(bytes(chosen), column.size(), back, &why)) << c.encoding.name() << ": " << why;
+                    ASSERT_EQ(back, column);
+                    if (!steps) {
+                        EXPECT_NE(c.encoding.transform, Transform::kSteps) << "steps where left out";
+                    }
+                    const double mine = weighed(c.encoding, chosen.size(), r, pct);
+                    for (const Encoding& e : every_candidate(steps)) {
+                        if (zstd_level == 0 && e.compressor == Compressor::kZstd) continue;
+                        std::string other;
+                        encode_as(column, e, zstd_level, other);
+                        EXPECT_LE(mine, weighed(e, other.size(), r, pct))
+                            << c.encoding.name() << " chosen over " << e.name();
+                    }
                 }
             }
         }
@@ -342,12 +360,14 @@ TEST(ColumnCodec, ACompressedCandidateMustSaveTheMarginToBeChosen) {
 
 TEST(ColumnCodec, AHintIsWrittenInUnlessTheOptionsLeaveItsCompressorOut) {
     // A seal writes in what the column's last segment chose, without a search - whatever the search
-    // would choose - unless the options leave that encoding's compressor out.
+    // would choose - unless the options leave that encoding's compressor out. Steps allowed here; a
+    // hint of them where they are not is StepsAreTriedOnlyWhereTheOptionsAskForThem's.
     std::vector<uint64_t> column;
     for (uint64_t i = 0; i < 1000; ++i) column.push_back(1000 + (i * 7) % 300);
     for (const Encoding& e : all_encodings()) {
         SCOPED_TRACE(e.name());
         EncodeOptions options;
+        options.steps = true;
         options.hint = &e;
         std::string block;
         const Choice c = encode(column, options, block);
@@ -452,11 +472,22 @@ TEST(ColumnCodec, ABlockThatIsNotWhatTheEncoderWritesIsRefused) {
     // Encoding bits no encoder writes.
     std::string block;
     encode_as(column, Encoding{Transform::kFor, Packing::kSimple8b, Compressor::kNone}, 3, block);
-    // Transform 3, ZSTD and LZ4 at once, bit 7.
-    for (uint8_t bad : {uint8_t{0x03}, uint8_t{0x60}, uint8_t{0x80}}) {
+    // ZSTD and LZ4 at once, bit 7.
+    for (uint8_t bad : {uint8_t{0x60}, uint8_t{0x80}}) {
         std::string b = block;
         b[0] = static_cast<char>(static_cast<uint8_t>(b[0]) | bad);
         EXPECT_FALSE(decode(bytes(b), column.size(), out, &why)) << int(bad);
+    }
+    // Steps are runs only (#250): transform 3 on a block of each other packing is refused by name,
+    // and no encoder writes one.
+    for (Packing p : {Packing::kSimple8b, Packing::kBlocks, Packing::kNarrow}) {
+        std::string b;
+        encode_as(column, Encoding{Transform::kFor, p, Compressor::kNone}, 3, b);
+        b[0] = static_cast<char>(static_cast<uint8_t>(b[0]) | 0x03);
+        EXPECT_FALSE(decode(bytes(b), column.size(), out, &why)) << int(p);
+        EXPECT_NE(why.find("steps only as runs"), std::string::npos) << why;
+        EXPECT_THROW(encode_as(column, Encoding{Transform::kSteps, p, Compressor::kNone}, 3, b),
+                     std::invalid_argument);
     }
     // LZ4's bit on a ZSTD block and ZSTD's on an LZ4 one: a block is under one compressor, and one
     // claiming both is refused even where its payload decompresses under one of them.
@@ -656,7 +687,9 @@ RC_GTEST_PROP(ColumnCodec, RunsOfEveryLengthDecodeIntoEveryColumnType, ()) {
          {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
           std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kLz4}},
           std::pair{holding, Encoding{Transform::kFor, Packing::kRuns, Compressor::kNone}},
-          std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kLz4}}}) {
+          std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kLz4}},
+          std::pair{holding, Encoding{Transform::kSteps, Packing::kRuns, Compressor::kNone}},
+          std::pair{holding, Encoding{Transform::kSteps, Packing::kRuns, Compressor::kLz4}}}) {
         std::string block;
         encode_as(column, encoding, 1, block);
         RC_ASSERT(decodes_into_with_guards<uint8_t>(block, column));
@@ -683,7 +716,8 @@ TEST(ColumnCodec, AShortRunNearTheColumnsEndWritesNothingPastIt) {
         }
         for (const auto& [column, encoding] :
              {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
-              std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}}}) {
+              std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}},
+              std::pair{holding, Encoding{Transform::kSteps, Packing::kRuns, Compressor::kNone}}}) {
             std::string block;
             encode_as(column, encoding, 1, block);
             EXPECT_TRUE(decodes_into_with_guards<uint8_t>(block, column)) << encoding.name() << ", " << length;
@@ -786,7 +820,8 @@ TEST(ColumnCodec, ALongRunIsWrittenInBlocksAndNothingPastTheColumnsEnd) {
             // The stepping column's anchor comes before its runs, which are of the differences.
             for (const auto& [column, encoding] :
                  {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
-                  std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}}}) {
+                  std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}},
+                  std::pair{holding, Encoding{Transform::kSteps, Packing::kRuns, Compressor::kNone}}}) {
                 std::string block;
                 encode_as(column, encoding, 1, block);
                 const std::string what = encoding.name() + ", a run of " + std::to_string(len) + " and " +
@@ -825,6 +860,65 @@ TEST(ColumnCodec, ALongRunIsRefusedWhereverItsValuesLeaveTheType) {
     EXPECT_TRUE(refused_as_u8(250, uint64_t{1} << 63, 0))
         << "its first value past 255 and its last 250 again: a step of 2^63, twenty times";
     EXPECT_FALSE(refused_as_u8(200, 2, uint64_t{0} - 12)) << "the control: 202 up to 240, then down to 96";
+}
+
+TEST(ColumnCodec, AStepsRunIsRefusedWhereverItsValueLeavesTheType) {
+    // #250: a run under steps holds one value, the anchor and every step before it added up, and is
+    // checked once. Columns of runs three values long, decoded as 8-bit: a run past 255 between two
+    // inside, a run below 0 between two inside, and a step of 2^63 there and back.
+    const Encoding steps{Transform::kSteps, Packing::kRuns, Compressor::kNone};
+    const auto refused_as_u8 = [&](const std::vector<uint64_t>& run_values) {
+        std::vector<uint64_t> column;
+        for (uint64_t v : run_values) column.insert(column.end(), 3, v);
+        std::string block;
+        encode_as(column, steps, 1, block);
+        std::vector<uint8_t> as8;
+        std::vector<uint64_t> as64;
+        std::string why;
+        EXPECT_TRUE(decode_as(bytes(block), column.size(), as64, &why)) << "the control: " << why;
+        EXPECT_EQ(as64, column);
+        return !decode_as(bytes(block), column.size(), as8, &why) && why.find("type") != std::string::npos;
+    };
+    EXPECT_TRUE(refused_as_u8({100, 200, 300, 200, 100})) << "a run at 300";
+    EXPECT_TRUE(refused_as_u8({5, uint64_t{0} - 5, 5})) << "a run at -5";
+    EXPECT_TRUE(refused_as_u8({250, 250 + (uint64_t{1} << 63), 250})) << "a step of 2^63 there and back";
+    EXPECT_FALSE(refused_as_u8({0, 128, 255, 7})) << "the control: every run inside";
+}
+
+TEST(ColumnCodec, StepsAreTriedOnlyWhereTheOptionsAskForThem) {
+    // #250: a segment of format 3 holds no block its readers cannot read. The timestamps of a book's
+    // changes - an update's levels at one time, one to nineteen of them, the updates about 100 us
+    // apart, a step far narrower than the segment's span - are steps' column: asked for, steps are
+    // chosen there, as a seal searches, and take fewer bytes; left out, never, a hint of them included.
+    std::vector<uint64_t> ts;
+    uint64_t at = 1'790'000'000'000'000'000ULL;
+    for (uint64_t u = 0; u < 1'000; ++u) {
+        at += 100'000 + (u * 7919) % 5'000;
+        ts.insert(ts.end(), 1 + (u * 37) % 19, at);
+    }
+    EncodeOptions without;
+    without.zstd_level = 0;
+    EncodeOptions with = without;
+    with.steps = true;
+    std::string a, b;
+    const Choice off = encode(ts, without, a);
+    const Choice on = encode(ts, with, b);
+    EXPECT_NE(off.encoding.transform, Transform::kSteps) << off.encoding.name();
+    EXPECT_EQ(on.encoding.transform, Transform::kSteps) << on.encoding.name();
+    EXPECT_LT(b.size(), a.size()) << off.encoding.name() << " against " << on.encoding.name();
+    // A hint of steps is searched past where steps are left out, and written in where they are not.
+    const Encoding hint{Transform::kSteps, Packing::kRuns, Compressor::kLz4};
+    without.hint = &hint;
+    with.hint = &hint;
+    std::string c, d;
+    EXPECT_NE(encode(ts, without, c).encoding.transform, Transform::kSteps);
+    EXPECT_EQ(encode(ts, with, d).encoding, hint);
+    for (const std::string* block : {&a, &b, &c, &d}) {
+        std::vector<uint64_t> back;
+        std::string why;
+        ASSERT_TRUE(decode(bytes(*block), ts.size(), back, &why)) << why;
+        EXPECT_EQ(back, ts);
+    }
 }
 
 TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {
