@@ -3507,7 +3507,16 @@ only at half the budget while admission was in force, a fifth of the cap went un
 - by block (`perf` on `block:block_rq_issue`, one more round of each): master wrote 64 MB more to the
   device over the round - 37.7 MB of data, twice the synchronous data writes, and 26.4 MB of metadata.
   A page written twice by address does not tell a file's page written again from a freed block taken
-  by another file; which file each write went to, by inode, is the next measurement.
+  by another file;
+- by file (`iomap:iomap_writeback_folio` and `xfs:xfs_file_fsync`, one more round of each): the WAL's
+  files take the same bytes in both, 1 323 and 1 320 MB, and the segments' within a megabyte. What
+  master adds through the cap is the XFS journal: the synchronous metadata writes its own threads
+  issued, charged to its scope, were 25.1 MB against 5.2 - and those 19.9 MB with its 9.4 MB of extra
+  writes are the 29 MB.
+So the budget's cost under a capped device is mostly the journal forced at each of its syncs, about
+five times as many (749 of the WAL's fsyncs in that round against 155). The WAL is synced with `fsync(2)` and grows by appending, so each sync has a size to log;
+a sync that logs nothing needs a file whose size and blocks are settled before it is written - a
+change to how the WAL lays out its files, to be decided on its own.
 The trace's 100 ms intervals cannot place an idle moment under this cap: the throttle releases
 writes in its own slices - nothing in 39% of master's intervals and 63-65% of the other's, up to 5.3-5.7
 times the cap in one - and only a round's sum reads as the cap.
