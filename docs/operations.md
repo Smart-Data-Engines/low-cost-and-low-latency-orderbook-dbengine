@@ -2125,17 +2125,18 @@ sixteenth - weighs most where each symbol seals only a few times: two million le
 symbols in three seconds took the server 37 - 46% more CPU than in format 2, run for run. A node
 that would rather keep format 2's reads than format 3's bytes runs `segment-format = 2`.
 
-`segment-format = 2|3` (`--segment-format`) says what new segments are written in; `3` is the
-default. Both are read, always. A store written in format 2 is not rewritten: merges write their
-segments again in format 3 as they take them.
+`segment-format = 2|3|4` (`--segment-format`) says what new segments are written in, merged ones
+included; `3` is the default. All three are read, always. A store written in another format is not
+rewritten: merges write their segments again in the node's as they take them.
 
 ### A cluster being upgraded to format 3
 
-A snapshot - a replica's bootstrap, a mesh node joining - and a shard migration send segment files
-as they are, so a node of a build before format 3 can receive one it cannot read. Either upgrade
-every node with `segment-format = 2` in its `ob.conf` and set `3` once every node runs this build,
-or upgrade the nodes that receive snapshots before the nodes that send them: replicas before their
-primary, as before.
+A snapshot - a replica's bootstrap, a mesh node joining - sends segment files as they are, as a
+restored backup brings them, so a node of a build before format 3 can receive one it cannot read; a
+shard migration sends rows, as the writes that stored them (`include/orderbook/symbol_mover.hpp`), and
+is the same in every format. Either upgrade every node with `segment-format = 2` in its `ob.conf` and
+set `3` once every node runs this build, or upgrade the nodes that receive snapshots before the nodes
+that send them: replicas before their primary, as before.
 
 ### Going back to a build before format 3
 
@@ -2154,6 +2155,34 @@ segment is read again (`docs/upgrading.md`, the matrix).
 
 Nothing converts a format-3 segment back. A node that has to keep the way back runs
 `segment-format = 2` from its upgrade on.
+
+### Format 4
+
+Format 4 (#250, `segment-format = 4`) is format 3's file with one more encoding a column may be in:
+runs of equal values, each run's value written as its step from the run before. A book's timestamps
+and sequence numbers are such runs - an update's levels at one time and under one number, the
+updates a step apart - where format 3 keeps each update as two runs of differences, its jump and its
+zeros, or each run's value as its distance from the column's minimum. On recordings of Binance's
+books, as a seal writes them, binance-diff's timestamps take 0.187 bytes a row where format 3 takes
+0.261, its sequence numbers 0.106 where 0.139 and its seven columns 3.690 where 3.797, and
+binance-top20's seven columns 0.481 where 0.525. A merge, under ZSTD, saves less: 2.906 where 2.943,
+and 0.327 where 0.328 (`benchmarks/column_codec_cost`, `seal4` and `merge4` against `seal` and
+`merge`).
+
+It is not the default. A build before format 4 - v0.1.0 among them - reads a format-4 segment's
+`meta.json` and stops at its version, as a build before format 3 stopped at 3:
+
+```
+Skipping segment <dir>: unsupported format_version=4 (this build reads 2 and 3)
+```
+
+with what follows from that above: the segment's rows missing from that build's answers, the
+segment never merged, nothing removed but a merged segment whose inputs are all still beside it. A
+downgrade to such a build would leave rows out, which `docs/upgrading.md` holds to be the failure;
+its matrix has the row. So format 4 is for a cluster whose every node, and every build a node may go
+back to, reads it: upgrade every node keeping format 3, and set 4 after. A node set back from 4 to 3
+writes no block in steps again, though its last segment chose them; what it wrote in format 4 stays
+in format 4 until a merge rewrites it in 3.
 
 ### Decoded columns held between queries
 

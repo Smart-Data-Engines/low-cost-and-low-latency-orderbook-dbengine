@@ -2881,6 +2881,41 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 250. A book's timestamps and sequence numbers in fewer bytes: segment format 4 ✅ **P3**
+
+**Found measuring #223.** A book's timestamps and sequence numbers are runs of equal values - an
+update's levels at one time and under one number - the updates a step apart. Format 3 keeps them as
+delta runs, each update two runs, its jump and its zeros, or as runs of values from the column's
+minimum, some forty bits a timestamp. Format 4 adds `steps/runs`: each run's value as its step from
+the run before, zigzagged and divided by the steps' greatest common divisor, in the runs' own layout,
+the first run's step 0 (spec `smart-data-engine-workspace/specs/segment-format-v4/`).
+- The transform takes the last value of a block's two transform bits, which a reader of format 3
+  refuses as unknown; so a segment that may hold it says `format_version` 4, and such a reader passes
+  it over whole, as any version it cannot read, rather than a column at a time.
+- Steps have their own packer: runs of a transform's output would merge two runs a step of 1 apart,
+  a book's sequence numbers, and decode them as one step.
+- The start's check that a merged segment holds its rows took any version but 3 for format 2, and
+  would have found a merged format-4 segment short; every branch on format 3 asks now whether a
+  segment keeps its columns in one file (pitfall 631).
+
+Bytes as a seal writes them (`benchmarks/column_codec_cost`, `seal4` against `seal`):
+- binance-diff: timestamps 0.261 → 0.187 bytes a row, sequence numbers 0.139 → 0.106, all seven
+  columns 3.797 → 3.690;
+- binance-top20: all seven columns 0.525 → 0.481, its timestamps in steps in all 24 segments;
+- under a merge's ZSTD, less: 2.943 → 2.906 and 0.328 → 0.327.
+
+**Not the default.** v0.1.0, the previous version, cannot read format 4: started on a directory with
+a format-4 segment, it leaves the segment out, says `unsupported format_version=4` and removes
+nothing, and this build started again holds every row once
+(`test_a_downgrade_after_format_4_leaves_its_segments_out_and_removes_nothing`, `docs/upgrading.md`).
+A downgrade leaving rows out is the matrix's failure, so `--segment-format 4` writes format 4 and 3
+stays the default until a release that reads 4 is the previous version. A backup and a snapshot carry
+format-4 segments whole (`test_format_4_segments_go_whole_through_a_backup_and_a_snapshot`); a node
+set back to 3 writes no steps, though its last segment chose them (pitfall 632).
+
+- Effort: M | Impact: a seal's bytes 2.8% (binance-diff) and 8.4% (binance-top20) fewer where a
+  cluster runs format 4
+
 ### 249. Four connections asking at once answered a tenth fewer queries with the scan pool, so it was off by default ✅ **P3**
 
 **Found closing #248.** With a writer's cost gone, what kept the pool off under every profile was
@@ -4635,8 +4670,9 @@ and the file's directory carries each block's CRC32C, checked whenever the colum
 Format 2 is read as before, and `segment-format = 2` keeps writing it for a cluster being upgraded
 and for a node that keeps the way back (`docs/operations.md`, "Segment format 3"; `docs/upgrading.md`).
 A build before format 3 skips a format-3 segment with an `ERROR` naming it and deletes nothing, which
-`test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing` holds against the previous
-build.
+`test_a_downgrade_after_format_3_hides_its_segments_and_removes_nothing` held against the previous
+build; since v0.1.0, which reads format 3, became the previous version, the test is
+`test_a_downgrade_after_format_3_keeps_every_row_once`, and the skip is held for format 4 (#250).
 
 Bytes on disk a row on the m8a.xlarge (Ubuntu 26.04, ext4), measured on 7 October by
 `scripts/measure_storage.py` at master `96d1dd9`, which merged this - the same to two decimals as at

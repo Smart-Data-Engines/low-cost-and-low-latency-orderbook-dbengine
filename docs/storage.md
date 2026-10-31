@@ -41,8 +41,8 @@ Each record:
 
 ## Columnar Store Layout
 
-A segment is written in format 3 unless `segment-format = 2` says otherwise, and both formats are
-read, always (`docs/operations.md`, "Segment format 3"):
+A segment is written in format 3 unless `segment-format = 2` or `4` says otherwise, and every
+format is read, always (`docs/operations.md`, "Segment format 3"):
 
 ```
 <data_dir>/
@@ -50,7 +50,7 @@ read, always (`docs/operations.md`, "Segment format 3"):
     <exchange>/
       <start_ts>_<end_ts>/
         columns.v3         The seven columns, each an encoded block with its CRC32C
-        meta.json          Segment metadata, "format_version": 3
+        meta.json          Segment metadata, "format_version": 3 (or 4)
 ```
 
 `columns.v3` is a directory and the blocks it describes: the magic `OBS3`, the row count, and for
@@ -61,9 +61,10 @@ less the column's minimum or less the value before it, divided by what the value
 Simple8b, as runs of equal values, in fixed-width blocks of 128, or each value in the bytes it
 needs; and under LZ4 at a seal, or ZSTD at a merge where that saves 10% over LZ4. A seal weighs
 runs as larger by half their runs per value, in percent: runs a value or two long decode several
-times slower than any other packing, for the few percent they save (#223). The layout, byte by byte,
-is in `include/orderbook/column_codec.hpp` and in the spec,
-`smart-data-engine-workspace/specs/segment-format-v3/design.md`.
+times slower than any other packing, for the few percent they save (#223). Format 4 is the same file
+with one more encoding, runs of equal values each written as its step from the run before (#250).
+The layout, byte by byte, is in `include/orderbook/column_codec.hpp` and in the specs,
+`smart-data-engine-workspace/specs/segment-format-v3/design.md` and `segment-format-v4/design.md`.
 
 Format 2, which a node writes with `segment-format = 2` and every node reads:
 

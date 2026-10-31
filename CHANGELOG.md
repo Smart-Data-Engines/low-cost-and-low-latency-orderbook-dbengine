@@ -11,6 +11,13 @@ here as `#N`.
 
 ### Added
 
+- Segment format 4, written where `segment-format = 4` (`--segment-format 4`) asks (#250): format 3's
+  file with one more encoding a column may be in, runs of equal values each written as its step from
+  the run before. A book's timestamps and sequence numbers are such runs, and as a seal writes them a
+  recording of an order book's changes keeps its seven columns in 3.690 bytes a row where format 3
+  keeps 3.797, and a recording of its snapshots in 0.481 where 0.525. This build reads formats 2, 3
+  and 4. Format 3 stays the default: v0.1.0 cannot read format 4, and a node going back to it would
+  start without the rows of every format-4 segment - it says so for each and removes nothing.
 - `--scan-threads N`: a query's segments read on N threads at once (#246, stage 2 of a scan on
   several cores). A query of 32 768 rows in range or more, spread over two segments or more, is
   divided: each segment is read, its rows chosen and formatted - or added to their time buckets - on
