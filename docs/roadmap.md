@@ -2904,6 +2904,22 @@ Bytes as a seal writes them (`benchmarks/column_codec_cost`, `seal4` against `se
 - binance-top20: all seven columns 0.525 → 0.481, its timestamps in steps in all 24 segments;
 - under a merge's ZSTD, less: 2.943 → 2.906 and 0.328 → 0.327.
 
+And the decode of the seal's choices, all seven columns, ns a row, three rounds, format 3 against
+format 4 in one build (`evidence/2026-10-31-segment-format-4/`):
+
+| | format 3 | format 4 |
+|---|---|---|
+| binance-diff, x86, x86-64-v3 | 4.79-4.86 | 4.42-4.43 |
+| binance-diff, x86, x86-64 | 5.17-5.33 | 4.71-4.81 |
+| binance-diff, ARM | 4.98-5.01 | 4.63-4.65 |
+| binance-top20, x86, x86-64-v3 | 2.18-2.19 | 1.86 |
+| binance-top20, x86, x86-64 | 2.28-2.29 | 1.93-1.95 |
+| binance-top20, ARM | 2.19-2.20 | 1.91-1.97 |
+
+A merge's choices decode 3.7-9.3% faster too. On a node, every query of the three datasets took 0.88-1.09
+of format 3's time, cold and warm, with the rounds' ranges overlapping, and every variant answered the
+same lines (`decoded_ab_faults.py`, six rounds).
+
 **Not the default.** v0.1.0, the previous version, cannot read format 4: started on a directory with
 a format-4 segment, it leaves the segment out, says `unsupported format_version=4` and removes
 nothing, and this build started again holds every row once
@@ -2913,8 +2929,8 @@ stays the default until a release that reads 4 is the previous version. A backup
 format-4 segments whole (`test_format_4_segments_go_whole_through_a_backup_and_a_snapshot`); a node
 set back to 3 writes no steps, though its last segment chose them (pitfall 632).
 
-- Effort: M | Impact: a seal's bytes 2.8% (binance-diff) and 8.4% (binance-top20) fewer where a
-  cluster runs format 4
+- Effort: M | Impact: where a cluster runs format 4, a seal's bytes 2.8% (binance-diff) and 8.4%
+  (binance-top20) fewer, and their decode 6.6-11.6% and 10.0-15.7% faster
 
 ### 249. Four connections asking at once answered a tenth fewer queries with the scan pool, so it was off by default ✅ **P3**
 
