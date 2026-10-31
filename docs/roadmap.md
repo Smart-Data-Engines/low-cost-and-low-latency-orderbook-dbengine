@@ -3494,6 +3494,19 @@ only at half the budget while admission was in force, a fifth of the cap went un
   (`run242c.sh`): PR #272's merge and the master before PR #275 took 181.2-181.5 k, and PR #275 on
   174.9-179.0 k, with a journal force a tick more. That is #247.
 
+**Master does not idle the device; it writes more (31 October 2026,
+`evidence/2026-10-31-wal-budget-trace/`).** `scripts/measure_vector_refresh.py` traces a round every
+`--trace-ms` now. Master (`c703ecc`) against the master before the budget (`0442ed5`), #190's rounds at
+7 MB/s, twice each:
+- the cap passed 6.986-6.994 MB a second over master's ingest and 6.981-6.998 over the other's:
+  neither leaves the device idle, as the branch above did;
+- with the tail counted, master put 2.1-2.2% more through the cap for the same 36 M levels, and its
+  levels a second over the ingest and its tail are 1.8-2.3% fewer (180.0-180.3 k against 183.7-184.3 k);
+- of the 29 MB more, 9.3-9.6 MB are the server's own writes, beside 3-4% more seals, and 19.4-20.3 MB
+  pass the cap beyond what the server wrote - which writes those are is the next measurement.
+The trace's 100 ms intervals cannot place an idle moment under this cap: the throttle releases
+writes in its own slices, from a tenth of the cap to thirty times it in one interval.
+
 - Effort: M | Impact: 1 - 2% of the levels a second while a device slower than the writes is the
   limit, at 7 - 10 MB/s on this host
 
