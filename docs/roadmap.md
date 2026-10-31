@@ -1691,6 +1691,25 @@ at the run's start and end - and the ARM host's are the measurement. At a millio
 3, 75 MB: most likely the reply's own string, which grows by doubling past the 32 MiB above which
 glibc maps an allocation afresh and unmaps it on free - not measured here.
 
+**Step 4, portable: a block of 1 to 56 bits unpacked by a function of its width** (31 October 2026,
+`evidence/2026-10-31-blocks-per-width/`). The `blocks` packing - 128 values a block, each in the width
+of its widest - was unpacked by one loop that read the width at run time and worked out every value's
+byte and shift: `for/blocks` decoded binance-diff's columns at 0.52-0.61 ns a value on the x86 test
+host and 0.65-0.85 on the ARM one, about the same at any width - a cost of the value, not of its
+bits. `unpack_block<W>`, chosen from a table by the block's width, takes eight values at a time - eight
+take `W` bytes, so each one's byte and shift are constants - and the block's rest one by one; wider
+blocks take the loop as before. Three rounds, the builds alternating:
+| `for/blocks`, binance-diff's columns, ns a value | x86, x86-64-v3 | x86, x86-64 | ARM |
+|---|---|---|---|
+| timestamps, prices, quantities, side, levels, sequence numbers | 0.52-0.61 → 0.37-0.42 | 0.56-0.81 → 0.38-0.65 | 0.65-0.85 → 0.37-0.60 |
+| a seal's choices in format 4, all seven columns, ns a row | 4.10-4.20 → 3.99-4.12 | 4.34-4.40 → 4.34-4.40 | 4.40-4.42 → 4.21-4.24 |
+| a seal's choices in format 3 | 4.78-4.81 → 4.80-4.86 | 5.12-5.16 → 5.08-5.10 | 4.90-4.99 → 4.79-4.82 |
+A seal chooses `blocks` for a few columns' segments - binance-diff's quantities in half of them, its
+side in four of ten - and those took 0.91-0.95 and 0.87-0.93 of the base's time in the probe's loop on
+every target; binance-top20, which the seal does not put in blocks, moved within its rounds. The
+order counts' blocks are nearly all of width 0, filled by code this does not touch; their 0.55-0.57
+→ 0.59-0.61 at x86-64 is the build's (pitfall 634).
+
 ### 50. NUMA awareness and thread pinning
 - Per-socket allocation, pinned io threads, `--cpu-affinity` configuration
 - Effort: M | Impact: Tail latency on multi-socket servers, which is where clients run
