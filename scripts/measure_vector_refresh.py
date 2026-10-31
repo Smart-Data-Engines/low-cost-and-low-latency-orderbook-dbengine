@@ -99,11 +99,16 @@ def charged_bytes(device: str) -> int | None:
     return 0
 
 
-def counters(metrics_port: int) -> dict:
-    """The COSTS counters from a node's /metrics, each summed over its label sets (pitfall 66)."""
+# What the trace reads besides COSTS (#242): the records the WAL took, the ingest's progress, and the
+# budget a writer waits against.
+TRACED = COSTS + ("ob_wal_records_written", "ob_wal_sync_budget_bytes")
+
+
+def counters(metrics_port: int, names: tuple = COSTS) -> dict:
+    """The `names` counters from a node's /metrics, each summed over its label sets (pitfall 66)."""
     import urllib.request
     text = urllib.request.urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=10).read().decode()
-    out = {k: 0 for k in COSTS}
+    out = {k: 0 for k in names}
     for line in text.splitlines():
         if line.startswith("#"):
             continue
@@ -156,6 +161,38 @@ class Trickle(threading.Thread):
         c.close()
 
 
+class Tracer(threading.Thread):
+    """Every `period` seconds while a round's ingest and its tail run, one JSON line into `path`: the
+    seconds since it started, the device's sectors written and milliseconds busy, what passed the cap,
+    the XFS journal's blocks and forces, and the writer's COSTS counters (#242) - whether the device
+    idles beside a sync, and what the writers wait for while it does. The counters come over /metrics,
+    a request each line, which the round's numbers are not to be read beside."""
+
+    def __init__(self, path: str, device: str | None, xfs: str | None, metrics_port: int, period: float):
+        super().__init__(daemon=True)
+        self.path, self.device, self.xfs = path, device, xfs
+        self.metrics_port, self.period = metrics_port, period
+        self.stop_flag = threading.Event()
+
+    def run(self) -> None:
+        started = time.monotonic()
+        with open(self.path, "w") as f:
+            while not self.stop_flag.is_set():
+                row: dict = {"t": round(time.monotonic() - started, 3)}
+                if self.device:
+                    row["sectors"], row["busy_ms"] = device_stat(self.device)
+                    row["charged"] = charged_bytes(self.device)
+                if self.xfs:
+                    _, row["log_blocks"], row["log_forces"] = xfs_log_stat(self.xfs)
+                try:
+                    row.update({k.replace("ob_", "").replace("_total", ""): v
+                                for k, v in counters(self.metrics_port, TRACED).items()})
+                except OSError as e:
+                    row["metrics_error"] = str(e)[:80]
+                f.write(json.dumps(row) + "\n")
+                self.stop_flag.wait(self.period)
+
+
 def probe_run(writer, symbols: int, args) -> dict:
     """One INSERT at a time on the writer for `--probe-seconds`, with the trickle running - from
     `benchmarks/command_latency` when `--latency-probe` names it, whose clock has no interpreter
@@ -195,6 +232,7 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
     os.makedirs(root)
     etcd, url = M.start_etcd(root)
     nodes = [M.Node(server, root, i, url, log_level) for i in range(args.nodes)]
+    tracer = None
     try:
         for n in nodes:
             n.start()
@@ -220,6 +258,10 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
             dev_before = device_stat(args.block_device) if args.block_device else None
             charged_before = charged_bytes(args.block_device) if args.block_device else None
             log_before = xfs_log_stat(args.xfs_stats) if args.xfs_stats else None
+            if args.trace_ms > 0:
+                tracer = Tracer(os.path.join(root, "trace.jsonl"), args.block_device, args.xfs_stats,
+                                writer.ports[1], args.trace_ms / 1000.0)
+                tracer.start()
             began = time.monotonic()
             out = subprocess.run([probe, str(writer.tcp), str(writer.proc.pid),
                                   str(args.connections), str(args.batches), str(args.levels),
@@ -296,6 +338,9 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
                 result["refresh_us_max"] = us[-1]
         return result
     finally:
+        if tracer is not None:
+            tracer.stop_flag.set()
+            tracer.join(timeout=5)
         for n in nodes:
             n.stop()
         etcd.terminate()
@@ -327,6 +372,9 @@ def main() -> int:
                     help="also record what reached /sys/block/NAME and how busy it was")
     ap.add_argument("--xfs-stats", metavar="FS",
                     help="also record what the XFS journal of /sys/fs/xfs/FS wrote, and its forces")
+    ap.add_argument("--trace-ms", type=int, default=0, metavar="MS",
+                    help="every MS milliseconds while the ingest and its tail run, a line of the device's, "
+                         "the cap's, the journal's and the writer's counters into <run>/trace.jsonl (#242)")
     ap.add_argument("--after-quiet", type=float, default=0.0, metavar="SECONDS",
                     help="with --block-device in a capped scope: after the ingest, also record what "
                          "passed the cap until none had for this long")
