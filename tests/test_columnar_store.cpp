@@ -18,6 +18,7 @@
 #include "orderbook/column_codec.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
+#include "segment_blocks.hpp"
 
 namespace fs = std::filesystem;
 
@@ -1140,33 +1141,7 @@ TEST(ColumnarStoreFormat, SegmentFormat2WritesFormat2) {
 
 namespace {
 
-/// The encoding byte of each block of a format-3 or format-4 segment, in the order of its file's
-/// directory.
-std::vector<uint8_t> block_encodings(const std::string& segment_dir) {
-    std::ifstream in(segment_dir + "/" + ob::kColumnsV3File, std::ios::binary);
-    const std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    const std::span<const char> bytes(file.data(), file.size());
-    EXPECT_EQ(file.substr(0, 4), "OBS3");
-    size_t at = 4;
-    uint64_t rows = 0;
-    EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, rows));
-    const size_t columns = static_cast<uint8_t>(file.at(at++));
-    std::vector<uint64_t> lengths;
-    for (size_t c = 0; c < columns; ++c) {
-        ++at;   // the column's id
-        uint64_t length = 0;
-        EXPECT_TRUE(ob::column_codec::get_varint(bytes, at, length));
-        at += 4;   // the block's CRC32C
-        lengths.push_back(length);
-    }
-    std::vector<uint8_t> encodings;
-    for (const uint64_t length : lengths) {
-        encodings.push_back(static_cast<uint8_t>(file.at(at)));
-        at += static_cast<size_t>(length);
-    }
-    EXPECT_EQ(at, file.size());
-    return encodings;
-}
+using ob::segment_blocks::block_encodings;
 
 constexpr uint8_t kZstdBit = 0x20;
 constexpr uint8_t kLz4Bit = 0x40;
@@ -1191,8 +1166,8 @@ TEST(ColumnarStoreFormat, Format4WritesABooksTimesAndNumbersAsStepsAndFormat3Nev
     // updates a step apart - are steps' columns in format 4. Format 3 never writes them, whose readers
     // refuse the transform: not even from a store set back to it from 4, whose last segment's
     // encodings it reuses unsearched.
-    constexpr uint8_t kTransformMask = 0x03;
-    constexpr uint8_t kSteps = 0x03;
+    using ob::segment_blocks::kSteps;
+    using ob::segment_blocks::kTransformMask;
     constexpr size_t kTimeColumn = 0;
     constexpr size_t kSequenceColumn = 6;
     std::vector<ob::SnapshotRow> written;

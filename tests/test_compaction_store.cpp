@@ -27,6 +27,7 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/query_columns.hpp"
 #include "orderbook/scan_pool.hpp"
+#include "segment_blocks.hpp"
 
 namespace fs = std::filesystem;
 
@@ -298,6 +299,78 @@ TEST(CompactionStore, AReplacementSwapsInOneStepAndDeliversTheSameRowsInTheSameO
         << "the merge changed what a scan delivers, or the order it delivers it in";
     // Nothing reads the inputs any more, and nothing held the generation they were copied under.
     EXPECT_TRUE(result.readers_before.expired());
+}
+
+TEST(CompactionStore, InputsOfFormats3And4MergeIntoEitherWithTheirRowsAsTheyWere) {
+    // #250: a node set from format 4 back to 3 merges segments it wrote in both. The merge is in the
+    // format the node writes and holds every input's rows in their order - in 3 with no block in
+    // steps, though its format-4 input had them, since a merge encodes its rows anew and the build
+    // before reads what it wrote. A merge of 4 writes them again.
+    using ob::segment_blocks::block_encodings;
+    using ob::segment_blocks::kSteps;
+    using ob::segment_blocks::kTransformMask;
+    constexpr size_t kTimeColumn = 0;
+    // An update's levels at one time, the updates a step apart and of no short period: timestamps a
+    // seal of 4 writes as steps, as in Format4WritesABooksTimesAndNumbersAsStepsAndFormat3Never.
+    const auto updates = [](uint64_t from, int64_t first_price) {
+        std::vector<std::pair<uint64_t, int64_t>> rows;
+        uint64_t x = from;
+        const auto next = [&x] {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            return x >> 33;
+        };
+        uint64_t at = from;
+        int64_t price = first_price;
+        for (int u = 0; u < 300; ++u) {
+            at += 100'000 + next() % 5'000;
+            const uint64_t levels = 1 + next() % 19;
+            for (uint64_t l = 0; l < levels; ++l) rows.emplace_back(at, price++);
+        }
+        return rows;
+    };
+    for (const uint32_t format : {ob::kColumnarFormatV3, ob::kColumnarFormatV4}) {
+        SCOPED_TRACE(format);
+        TempDir dir;
+        std::vector<ob::SnapshotRow> rows_before;
+        {
+            ob::ColumnarStore store(dir.str());
+            g_format = ob::kColumnarFormatV3;
+            const auto three = written(dir.str(), "A", updates(kBase + 1 * kSec, 1'000), {77, 1, 10, 1});
+            g_format = ob::kColumnarFormatV4;
+            const auto four = written(dir.str(), "A", updates(kBase + 2 * kSec, 100'000), {77, 1, 20, 2});
+            ASSERT_EQ(three.format_version, ob::kColumnarFormatV3);
+            ASSERT_EQ(four.format_version, ob::kColumnarFormatV4);
+            ASSERT_EQ(block_encodings(four.dir_path).at(kTimeColumn) & kTransformMask, kSteps)
+                << "the format-4 input holds no steps for the merge to write anew";
+            store.merge_segments({three, four});
+            rows_before = delivered(store, "A");
+
+            g_format = format;
+            const auto out = merged(store, dir.str(), {three, four});
+            EXPECT_EQ(out.format_version, format);
+            const auto blocks = block_encodings(out.dir_path);
+            ASSERT_EQ(blocks.size(), 7u);
+            if (format == ob::kColumnarFormatV3) {
+                for (size_t c = 0; c < blocks.size(); ++c) {
+                    EXPECT_NE(blocks[c] & kTransformMask, kSteps) << "column " << c << " in steps in format 3";
+                }
+            } else {
+                EXPECT_EQ(blocks[kTimeColumn] & kTransformMask, kSteps) << "a merge of 4 wrote no steps";
+            }
+            const auto result = store.replace_segments({three, four}, out, [](ob::SegmentMeta& m) {
+                return rename_to_segment(m);
+            });
+            ASSERT_EQ(result.outcome, ob::ColumnarStore::Replaced::kYes);
+            EXPECT_TRUE(same_rows(delivered(store, "A"), rows_before))
+                << "the merge changed what a scan delivers, or the order it delivers it in";
+        }
+        // And a start reads the merged segment as it was written.
+        ob::ColumnarStore reopened(dir.str());
+        reopened.open_existing();
+        EXPECT_EQ(reopened.segment_count(), 1u);
+        EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before));
+    }
+    g_format = ob::kColumnarFormatVersion;
 }
 
 TEST(CompactionStore, AReplacementRefusesAnInputThatIsGone) {
