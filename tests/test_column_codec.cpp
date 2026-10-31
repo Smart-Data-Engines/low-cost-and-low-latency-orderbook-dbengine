@@ -701,6 +701,35 @@ RC_GTEST_PROP(ColumnCodec, RunsOfEveryLengthDecodeIntoEveryColumnType, ()) {
     }
 }
 
+TEST(ColumnCodec, EveryBlockWidthGivesItsValuesBack) {
+    // #49: a block of 1 to 56 bits a value is unpacked by a function of its width - eight values at a
+    // time, then the block's rest one by one - and a wider one value by value. Every width, in columns
+    // that end at every distance from a group of eight and from a block of 128 values, with each
+    // width's widest value among them, decoded into a vector and into memory with guards past its end.
+    const Encoding blocks{Transform::kNone, Packing::kBlocks, Compressor::kNone};
+    uint64_t x = 99;
+    const auto next = [&x] {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        return x ^ (x >> 29);
+    };
+    for (unsigned w = 1; w <= 64; ++w) {
+        const uint64_t mask = w == 64 ? ~uint64_t{0} : (uint64_t{1} << w) - 1;
+        for (const size_t n : {size_t{1}, size_t{7}, size_t{8}, size_t{9}, size_t{127}, size_t{128}, size_t{129},
+                               size_t{135}, size_t{256}, size_t{300}}) {
+            std::vector<uint64_t> column(n);
+            for (auto& v : column) v = next() & mask;
+            column[n / 2] = mask;
+            std::string block;
+            encode_as(column, blocks, 1, block);
+            std::vector<uint64_t> back;
+            std::string why;
+            ASSERT_TRUE(decode(bytes(block), n, back, &why)) << w << " bits, " << n << " values: " << why;
+            ASSERT_EQ(back, column) << w << " bits, " << n << " values";
+            ASSERT_TRUE(decodes_into_with_guards<uint64_t>(block, column)) << w << " bits, " << n << " values";
+        }
+    }
+}
+
 TEST(ColumnCodec, AShortRunNearTheColumnsEndWritesNothingPastIt) {
     // #223: a short run is written as a block only where the whole block fits before the column ends.
     // Columns of every length from 1 to 40, of runs two and three values long in turn - long enough on

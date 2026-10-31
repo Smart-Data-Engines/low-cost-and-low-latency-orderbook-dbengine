@@ -214,6 +214,12 @@ here as `#N`.
   recording of its snapshots in 2.18-2.29 where 2.34-2.93, and 2.15-2.17 where 3.18-3.24. On a node,
   the time-bucket query over that recording and over a synthetic set of a million rows took
   0.40-0.75 of the time on its first run after a load and 0.35-0.68 after it.
+- A column packed in blocks decodes 18-52% faster (#49): a block of 1 to 56 bits a value is unpacked
+  by a function of its width, eight values at a time with each one's byte and shift constant, where
+  one loop worked out every value's at run time. On a recording of an order book's changes, whose
+  seal puts its quantities in blocks in half of its segments and its side in four of ten, those
+  columns took 0.87-0.95 of the time, and its seven columns as sealed from as long as before to 5%
+  less.
 - A column of runs averaging more than eight values decodes faster where their lengths follow no
   pattern (#223): its short runs are written eight at a time too, where they were written value by
   value at a branch each run's length decided, mispredicted about every other run on a recording of
