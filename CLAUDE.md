@@ -4644,7 +4644,8 @@ Learned the hard way. Check here before debugging.
      whole, and CI's first job built with Clang - the fuzzers' - stopped at
      `-Wbitwise-instead-of-logical` (#223). Each comparison is cast to an integer before the OR now.
      A file changed in a way a warning might name is compiled with `clang++ -Wall -Wextra -Werror`
-     too before it is pushed: the laptop has Clang 16 and 18.
+     too before it is pushed: the laptop has `clang++-18`, its default `clang++` as the runners', and
+     `clang++-21`.
 
 ## Current state and open problems
 
