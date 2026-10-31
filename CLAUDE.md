@@ -4639,6 +4639,12 @@ Learned the hard way. Check here before debugging.
      timestamps 17-19% slower on ARM under the old rule than the base build did. Rules compared in one
      build show their own share apart from the layout's (#223); the change's own build is still
      measured against its base, and a column moving where the rule does not reach it is the layout's.
+635. **GCC takes what Clang refuses.** `short_runs_in_blocks()` OR'd two comparisons as `bool | bool`,
+     branch-free on purpose; GCC 15 and 12 built it under `-Wall -Wextra -Werror`, and the suite passed
+     whole, and CI's first job built with Clang - the fuzzers' - stopped at
+     `-Wbitwise-instead-of-logical` (#223). Each comparison is cast to an integer before the OR now.
+     A file changed in a way a warning might name is compiled with `clang++ -Wall -Wextra -Werror`
+     too before it is pushed: the laptop has Clang 16 and 18.
 
 ## Current state and open problems
 
