@@ -763,6 +763,70 @@ TEST(ColumnCodec, AShortRunIsRefusedWhereverItsValuesLeaveTheType) {
     EXPECT_TRUE(std::equal(column.begin(), column.end(), as8.begin()));
 }
 
+TEST(ColumnCodec, ALongRunIsWrittenInBlocksAndNothingPastTheColumnsEnd) {
+    // #223: a run longer than a block is written a block at a time where its whole blocks fit before
+    // the column ends, and value by value where they do not. Two short runs, a long one of every length
+    // from 9 to 40, then none to five short runs, so that the long run ends at every distance from the
+    // column's end - in columns whose runs average a block or less and more than one, both ways the
+    // short runs are written - stepping and holding, decoded into every column type.
+    for (size_t len = 9; len <= 40; ++len) {
+        for (size_t tail = 0; tail <= 5; ++tail) {
+            std::vector<uint64_t> stepping{0};
+            std::vector<uint64_t> holding;
+            const auto add_run = [&](size_t n, uint64_t step, uint64_t value) {
+                for (size_t k = 0; k < n; ++k) {
+                    stepping.push_back(stepping.back() + step);
+                    holding.push_back(value);
+                }
+            };
+            add_run(2, 1, 7);
+            add_run(3, 2, 9);
+            add_run(len, 3, 11);
+            for (size_t t = 0; t < tail; ++t) add_run(t % 2 == 0 ? 2 : 1, t % 2 == 0 ? 1 : 0, 13 + t);
+            // The stepping column's anchor comes before its runs, which are of the differences.
+            for (const auto& [column, encoding] :
+                 {std::pair{stepping, Encoding{Transform::kDelta, Packing::kRuns, Compressor::kNone}},
+                  std::pair{holding, Encoding{Transform::kNone, Packing::kRuns, Compressor::kNone}}}) {
+                std::string block;
+                encode_as(column, encoding, 1, block);
+                const std::string what = encoding.name() + ", a run of " + std::to_string(len) + " and " +
+                                         std::to_string(tail) + " after it";
+                EXPECT_TRUE(decodes_into_with_guards<uint8_t>(block, column)) << what;
+                EXPECT_TRUE(decodes_into_with_guards<uint16_t>(block, column)) << what;
+                EXPECT_TRUE(decodes_into_with_guards<uint32_t>(block, column)) << what;
+                EXPECT_TRUE(decodes_into_with_guards<uint64_t>(block, column)) << what;
+                EXPECT_TRUE(decodes_into_with_guards<int64_t>(block, column)) << what;
+            }
+        }
+    }
+}
+
+TEST(ColumnCodec, ALongRunIsRefusedWhereverItsValuesLeaveTheType) {
+    // #223: a run longer than a block, written in blocks, is checked at its two ends as a short one is.
+    // Each column is an anchor, a run of twenty from it by one step - with room for its three blocks
+    // before the column ends - and a run of twelve by another, which brings the values back inside
+    // 0 - 255, decoded as 8-bit: only the run of twenty's checks can see a value outside.
+    const Encoding delta_runs{Transform::kDelta, Packing::kRuns, Compressor::kNone};
+    const auto refused_as_u8 = [&](uint64_t start, uint64_t step, uint64_t back) {
+        std::vector<uint64_t> column{start};
+        for (int k = 0; k < 20; ++k) column.push_back(column.back() + step);
+        for (int k = 0; k < 12; ++k) column.push_back(column.back() + back);
+        std::string block;
+        encode_as(column, delta_runs, 1, block);
+        std::vector<uint8_t> as8;
+        std::vector<uint64_t> as64;
+        std::string why;
+        EXPECT_TRUE(decode_as(bytes(block), column.size(), as64, &why)) << "the control: " << why;
+        EXPECT_EQ(as64, column);
+        return !decode_as(bytes(block), column.size(), as8, &why) && why.find("type") != std::string::npos;
+    };
+    EXPECT_TRUE(refused_as_u8(200, 3, uint64_t{0} - 12)) << "up past 255: its last value 260, then 248 down to 116";
+    EXPECT_TRUE(refused_as_u8(50, uint64_t{0} - 3, 12)) << "down past 0: its last value -10, then 2 up to 134";
+    EXPECT_TRUE(refused_as_u8(250, uint64_t{1} << 63, 0))
+        << "its first value past 255 and its last 250 again: a step of 2^63, twenty times";
+    EXPECT_FALSE(refused_as_u8(200, 2, uint64_t{0} - 12)) << "the control: 202 up to 240, then down to 96";
+}
+
 TEST(ColumnCodec, AThreadThatUsedZstdLeavesNoContextBehind) {
     // A thread keeps one ZSTD context of each kind while it lives and frees them when it ends: a
     // migration's threads and an embedding application's come and go. Under the sanitizers job's

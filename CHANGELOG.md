@@ -198,6 +198,15 @@ here as `#N`.
   vector. On a recording of an order book's changes, its levels, sequence numbers and timestamps
   decoded 21-40% faster on an EPYC and a Graviton host, its seven columns a fifth faster, and the first
   query after a load took 0.89-0.92 of the time.
+- A column of runs decodes faster again (#223), the format unchanged: a run longer than eight values is
+  written eight at a time where it was written value by value, a 64-bit column's eight are added up
+  rather than multiplied, and whether the runs cover the values is checked without an unsigned 64-bit
+  maximum, which neither AVX2 nor NEON has. A recording of an order book's changes, its seven columns
+  as sealed, decodes in 4.79-4.84 ns a row where it took 5.49-5.52 on an EPYC 9R45, in 5.10-5.18 where
+  5.82-5.84 built for x86-64 as the packages are, and in 4.85-4.86 where 5.60-5.64 on a Graviton; a
+  recording of its snapshots in 2.18-2.29 where 2.34-2.93, and 2.15-2.17 where 3.18-3.24. On a node,
+  the time-bucket query over that recording and over a synthetic set of a million rows took
+  0.40-0.75 of the time on its first run after a load and 0.35-0.68 after it.
 - `SIGHUP` does not stop the server (#238). Nothing handled it, so its default action ended the
   process. A node without TLS now logs that there is nothing to reload and goes on, and `SIGTERM` is
   the signal that stops a node.
