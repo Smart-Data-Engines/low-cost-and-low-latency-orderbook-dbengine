@@ -3505,7 +3505,8 @@ only at half the budget while admission was in force, a fifth of the cap went un
 - of the 29 MB more, 9.3-9.6 MB are the server's own writes, beside 3-4% more seals, and 19.4-20.3 MB
   pass the cap beyond what the server wrote - which writes those are is the next measurement.
 The trace's 100 ms intervals cannot place an idle moment under this cap: the throttle releases
-writes in its own slices, from a tenth of the cap to thirty times it in one interval.
+writes in its own slices - nothing in 39% of master's intervals and 63-65% of the other's, up to 5.3-5.7
+times the cap in one - and only a round's sum reads as the cap.
 
 - Effort: M | Impact: 1 - 2% of the levels a second while a device slower than the writes is the
   limit, at 7 - 10 MB/s on this host
