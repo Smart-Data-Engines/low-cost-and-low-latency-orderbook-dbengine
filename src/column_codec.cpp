@@ -746,22 +746,22 @@ inline size_t whole_blocks(size_t len) { return (len + kRunBlock - 1) & ~(kRunBl
 /// The runs of a column without delta, each run's value filled as many times as the run is long - in
 /// whole blocks where runs_inverse() writes the delta runs in them: as it is under none; through the
 /// frame of reference under for (times `g`, plus the anchor `a`); and under steps (#250) the run
-/// before's plus its step times `g`, from `a`. Nonzero when a value is past T's range.
+/// before's plus its step times `g`, from `a`, which holds the run's value so far. Nonzero when a value
+/// is past T's range.
 template <typename T, Transform kT>
 uint64_t value_runs(const uint64_t* values, const uint64_t* lengths, size_t runs, uint64_t g, uint64_t a,
                     bool by_blocks, size_t count, T* o) {
     static_assert(kT != Transform::kDelta, "delta runs are runs_inverse()'s own");
     constexpr uint64_t kMax = kMaxOf<T>;
     uint64_t above = 0;
-    uint64_t at = a;   // under steps, the run's value so far
     size_t i = 0;
     for (size_t r = 0; r < runs; ++r) {
         uint64_t v;
         if constexpr (kT == Transform::kFor) {
             v = values[r] * g + a;
         } else if constexpr (kT == Transform::kSteps) {
-            at += unzigzag(values[r]) * g;
-            v = at;
+            a += unzigzag(values[r]) * g;
+            v = a;
         } else {
             v = values[r];
         }
