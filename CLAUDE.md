@@ -4624,6 +4624,28 @@ Learned the hard way. Check here before debugging.
      have been written in it into a format-3 segment, which a reader of format 3 refuses. `encode()`
      searches past a hint of steps where its options leave steps out (#250), and the test sets a store
      back from 4 to 3 and reads every block's encoding byte.
+633. **An average says nothing about whether a branch is predicted.** Short runs were written value
+     by value wherever a column's runs averaged more than a block, on the reasoning that the long runs
+     carry such a column and their lengths repeat. A book's snapshots bore it out - forty rows an
+     update, nineteen and one - and binance-diff's timestamps did not: their largest segments' runs
+     average eleven to fourteen values in no pattern, and their decode took a branch misprediction
+     about every other run. What decides is whether the lengths repeat, and `short_runs_in_blocks()` asks
+     that of 64 runs spread over the column (#223). A pass over every run had cost binance-top20's
+     cheap columns 16-34% of their decode.
+634. **Two builds compared are two code layouts compared.** A build differing from its base only in
+     which short runs `runs_inverse()` writes in blocks decoded binance-diff's levels 12-18% slower on
+     x86-64, though the rule changes nothing for them - their runs average three to five values,
+     blocks either way - and a build reading the rule from the environment decoded binance-diff's
+     timestamps 17-19% slower on ARM under the old rule than the base build did. Rules compared in one
+     build show their own share apart from the layout's (#223); the change's own build is still
+     measured against its base, and a column moving where the rule does not reach it is the layout's.
+635. **GCC takes what Clang refuses.** `short_runs_in_blocks()` OR'd two comparisons as `bool | bool`,
+     branch-free on purpose; GCC 15 and 12 built it under `-Wall -Wextra -Werror`, and the suite passed
+     whole, and CI's first job built with Clang - the fuzzers' - stopped at
+     `-Wbitwise-instead-of-logical` (#223). Each comparison is cast to an integer before the OR now.
+     A file changed in a way a warning might name is compiled with `clang++ -Wall -Wextra -Werror`
+     too before it is pushed: the laptop has `clang++-18`, its default `clang++` as the runners', and
+     `clang++-21`.
 
 ## Current state and open problems
 

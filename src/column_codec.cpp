@@ -831,17 +831,11 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
     }
     const uint64_t* rv = values.data();
     const uint64_t* rl = lengths.data();
-    // A short run's block pays where the runs average two to kRunBlock values. Where nearly every run is
-    // one value long - a book's prices on a recording of its changes, which move at almost every row - a
-    // block writes eight values for each one it keeps, and the loop's branch is predicted anyway. Where
-    // runs average more than a block, the long ones carry the column and their lengths repeat - twenty
-    // rows an update of a book's snapshots - and the branch is predicted again. Measured on the EPYC
-    // host, a block for every short run: binance-diff's prices decoded 8% slower and binance-top20's
-    // sequence numbers 10%. A run longer than a block is written in blocks wherever they fit: value by
-    // value, the runs of binance-diff's timestamps longer than a block, two thirds of its values, were a
-    // quarter of its decode on both test hosts (#223). Either way a run decodes to the same values; this
-    // decides only how fast.
-    const bool by_blocks = runs * 2 <= n && n <= runs * kRunBlock;
+    // Short runs in blocks or value by value: short_runs_in_blocks(). A run longer than a block is
+    // written in blocks wherever they fit either way: value by value, the runs of binance-diff's
+    // timestamps longer than a block, two thirds of its values, were a quarter of its decode on both
+    // test hosts (#223). Either way a run decodes to the same values; this decides only how fast.
+    const bool by_blocks = short_runs_in_blocks(std::span<const uint64_t>(rl, static_cast<size_t>(runs)), n);
     // A line's two ends bound it while it is shorter than 2^32 values (below).
     const bool lines_bounded = n < (uint64_t{1} << 32);
     uint64_t above = 0;
@@ -894,6 +888,22 @@ bool runs_inverse(const Header& h, std::span<const char> p, size_t count, T* o, 
 }
 
 }  // namespace
+
+bool short_runs_in_blocks(std::span<const uint64_t> lengths, size_t values) {
+    const size_t runs = lengths.size();
+    if (runs * 2 > values) return false;
+    if (values <= runs * kRunBlock || runs <= 2) return true;
+    // Whether the lengths repeat, judged on a sample: a pass over every run cost binance-top20's
+    // columns of runs - ten to forty values a run, decoded at 0.1-0.3 ns a value - 16-34% of their
+    // decode on the x86 test host, where 64 runs moved none of them beyond its rounds' spread (#223).
+    constexpr size_t kSample = 64;
+    size_t repeats = 0;
+    for (size_t k = 0; k < kSample; ++k) {
+        const size_t r = 2 + k * (runs - 2) / kSample;
+        repeats += static_cast<size_t>(lengths[r] == lengths[r - 1]) | static_cast<size_t>(lengths[r] == lengths[r - 2]);
+    }
+    return repeats * 4 < kSample * 3;
+}
 
 std::string Encoding::name() const {
     std::string s = transform == Transform::kNone  ? "none"

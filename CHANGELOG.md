@@ -214,6 +214,14 @@ here as `#N`.
   recording of its snapshots in 2.18-2.29 where 2.34-2.93, and 2.15-2.17 where 3.18-3.24. On a node,
   the time-bucket query over that recording and over a synthetic set of a million rows took
   0.40-0.75 of the time on its first run after a load and 0.35-0.68 after it.
+- A column of runs averaging more than eight values decodes faster where their lengths follow no
+  pattern (#223): its short runs are written eight at a time too, where they were written value by
+  value at a branch each run's length decided, mispredicted about every other run on a recording of
+  an order book's changes. Where the lengths repeat, as a book's snapshots' do, nothing changes. In
+  segment format 4 that recording's seven columns, as sealed, decode in 4.11-4.19 ns a row where they
+  took 4.36-4.52 on an EPYC 9R45, 4.36-4.39 where 4.69-4.74 built for x86-64 as the packages are, and
+  4.36-4.40 where 4.59-4.66 on a Graviton; in format 3, and the snapshots' in either format, within
+  2.3% of before.
 - `SIGHUP` does not stop the server (#238). Nothing handled it, so its default action ended the
   process. A node without TLS now logs that there is nothing to reload and goes on, and `SIGTERM` is
   the signal that stops a node.
