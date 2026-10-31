@@ -2929,6 +2929,12 @@ stays the default until a release that reads 4 is the previous version. A backup
 format-4 segments whole (`test_format_4_segments_go_whole_through_a_backup_and_a_snapshot`); a node
 set back to 3 writes no steps, though its last segment chose them (pitfall 632).
 
+- Tests: the codec's round trips and refusals take steps among every encoding; a format-4 segment
+  holds a book's times and numbers in steps and format 3 never does; inputs of 3 and 4 merge into
+  either; `--segment-format` takes 2, 3 or 4 and is 3 unless given; v0.1.0 against format 4; a backup
+  and a snapshot. Mutations: eleven killed and the control survived; four more against the two tests
+  added last, the default set to 4 among them, killed too.
+
 - Effort: M | Impact: where a cluster runs format 4, a seal's bytes 2.8% (binance-diff) and 8.4%
   (binance-top20) fewer, and their decode 6.6-11.6% and 10.0-15.7% faster
 
