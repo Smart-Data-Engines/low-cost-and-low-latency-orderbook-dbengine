@@ -3503,7 +3503,11 @@ only at half the budget while admission was in force, a fifth of the cap went un
 - with the tail counted, master put 2.1-2.2% more through the cap for the same 36 M levels, and its
   levels a second over the ingest and its tail are 1.8-2.3% fewer (180.0-180.3 k against 183.7-184.3 k);
 - of the 29 MB more, 9.3-9.6 MB are the server's own writes, beside 3-4% more seals, and 19.4-20.3 MB
-  pass the cap beyond what the server wrote - which writes those are is the next measurement.
+  pass the cap beyond what the server wrote;
+- by block (`perf` on `block:block_rq_issue`, one more round of each): master wrote 64 MB more to the
+  device over the round - 37.7 MB of data, twice the synchronous data writes, and 26.4 MB of metadata.
+  A page written twice by address does not tell a file's page written again from a freed block taken
+  by another file; which file each write went to, by inode, is the next measurement.
 The trace's 100 ms intervals cannot place an idle moment under this cap: the throttle releases
 writes in its own slices - nothing in 39% of master's intervals and 63-65% of the other's, up to 5.3-5.7
 times the cap in one - and only a round's sum reads as the cap.
