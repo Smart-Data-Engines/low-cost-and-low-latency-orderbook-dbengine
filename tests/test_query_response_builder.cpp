@@ -180,7 +180,13 @@ TEST(QueryResponseBuilder, AReplyWrittenInRoomItIsGivenIsTheSameBytesAndKeepsThe
         const size_t capacity = room.capacity();
         ob::QueryResponseBuilder in_room(shape, std::move(room));
         const std::string reply = write(in_room);
-        EXPECT_EQ(reply, expected) << "in a room of " << room_bytes << " bytes";
+        // Compared with ==, and where they part reported: EXPECT_EQ on two replies of 50 000 lines
+        // diffs them line by line, and a failing one took the laptop's memory (pitfall 637).
+        const auto parted = std::mismatch(reply.begin(), reply.end(), expected.begin(), expected.end());
+        EXPECT_TRUE(reply == expected)
+            << "in a room of " << room_bytes << " bytes the reply of " << reply.size()
+            << " bytes parts from the expected " << expected.size() << " at byte "
+            << (parted.first - reply.begin());
         EXPECT_GE(reply.capacity(), capacity) << "the room was not given back with the reply";
     }
 }
