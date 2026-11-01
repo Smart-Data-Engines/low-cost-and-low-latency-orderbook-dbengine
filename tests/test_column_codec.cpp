@@ -292,7 +292,7 @@ TEST(ColumnCodec, TheChoiceIsTheSmallestWithARunsCandidateChargedForItsRuns) {
 TEST(ColumnCodec, RunsAValueOrTwoLongAreNotChosenForAFewPercent) {
     // Values each repeated with probability 0.43: 0.7 runs a value. Runs store a value and a length
     // a run, fewer bytes than any packing that stores every value - which made them the choice by
-    // size - and their decode takes a step a run. Charged 35%, they lose to one of those.
+    // size - and their decode takes a step a run. Charged 70%, they lose to one of those.
     const auto column = short_runs(10'000, 430, 7);
     const RunsPerTransform r = runs_of(column);
     ASSERT_GT(r.for_runs * 10, r.for_values * 6) << "the column's runs are not short: " << r.for_runs;
@@ -308,8 +308,8 @@ TEST(ColumnCodec, RunsAValueOrTwoLongAreNotChosenForAFewPercent) {
 }
 
 TEST(ColumnCodec, LongRunsKeepTheirRunsUnderTheCharge) {
-    // Runs twenty values long, as a book's timestamps are - 0.05 runs a value, a charge of 2.5% -
-    // are chosen as they were by size.
+    // Runs twenty values long, as a book's timestamps are - 0.05 runs a value, a charge of 5% - are
+    // chosen as they were by size.
     std::vector<uint64_t> ts;
     for (uint64_t u = 0; u < 500; ++u) {
         for (int l = 0; l < 20; ++l) ts.push_back(1'790'000'000'000'000'000ULL + u * 50'000'000ULL + (u % 7) * 13);
