@@ -1142,6 +1142,15 @@ TEST(SessionOutput, ALargeAnswerWithNothingPendingIsTakenAndTheOthersAreCopied) 
     EXPECT_EQ(got, std::string(200 * 1024, 'L') + std::string(100 * 1024, 'B'));
     ASSERT_FALSE(session.has_pending_output());
 
+    // Once all of it has gone, the buffer is empty again, and the next large answer is taken too.
+    std::string again(150 * 1024, 'M');
+    ASSERT_EQ(session.take_answer(std::move(again)), ob::Session::Queued::Yes);
+    EXPECT_TRUE(again.empty()) << "a large answer after the buffer drained was copied, not taken";
+    got.clear();
+    drain_into(session, fd_client, got, 150 * 1024);
+    EXPECT_EQ(got, std::string(150 * 1024, 'M'));
+    ASSERT_FALSE(session.has_pending_output());
+
     std::string small(64, 's');
     ASSERT_EQ(session.take_answer(std::move(small)), ob::Session::Queued::Yes);
     EXPECT_EQ(small, std::string(64, 's')) << "a small answer was taken, giving up the buffer's room";
