@@ -118,6 +118,13 @@ public:
     /// session of a client that was reading perfectly well, with nothing but EOF to say why.
     Queued queue_answer(std::string_view response);
 
+    /// `queue_answer()`, taking the answer itself where it can (#252): a large answer with nothing
+    /// pending and nothing to frame it becomes the send buffer and is not copied, and `response` is
+    /// left empty. Otherwise it is queued as `queue_answer()` queues it, and `response` is left as it
+    /// was - so a refusal can still say how large it was. A name of its own rather than an overload,
+    /// which would make every call with a string literal ambiguous.
+    Queued take_answer(std::string&& response);
+
     /// The most bytes a session may hold queued, and so the largest answer it can ever be sent.
     static constexpr size_t max_queued_bytes() { return kMaxSendBuffer; }
 
@@ -309,6 +316,20 @@ private:
     /// Holds already-framed bytes, so in compressed mode a partial write cannot
     /// split an LZ4 frame: the next flush resumes exactly where it stopped.
     std::string send_buf_;
+    /// The first byte of `send_buf_` the socket, TLS or the ring has not taken (#252). A partial
+    /// send moves this rather than erasing what went: the erase moved every byte still pending to
+    /// the front, and a slow reader of a 45 MB answer cost its reactor 0.44 s of `memmove`, a few
+    /// milliseconds at each wakeup, with every other session on the reactor waiting behind it.
+    size_t      send_off_{0};
+
+    /// The bytes still to send.
+    size_t pending_bytes() const { return send_buf_.size() - send_off_; }
+    /// `n` more bytes taken: past them, and the buffer emptied, its capacity kept, once all are.
+    void sent(size_t n);
+    /// Before an append: the bytes already sent dropped from the front once they are as many as
+    /// those still to send, so the buffer holds at most twice what is pending and a pending byte
+    /// is moved at most once for each byte it waited behind.
+    void drop_sent_before_append();
     bool        close_after_flush_{false};
 
     /// A slow client asking for huge scans must not grow the server's memory without
@@ -316,6 +337,8 @@ private:
     /// 1.7 million rows of response, far beyond a sensible query without LIMIT, and
     /// generous enough that merely reading slowly never reaches it.
     static constexpr size_t kMaxSendBuffer = 64u * 1024u * 1024u;
+    /// The smallest answer `take_answer()` takes rather than copies (#252).
+    static constexpr size_t kTakeAnswerBytes = 64u * 1024u;
     uint64_t    queries_{0};
     uint64_t    inserts_{0};
     bool        compressed_{false};
