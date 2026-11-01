@@ -7,9 +7,9 @@
 // thousand until it runs out, then writes it two digits at a time from the end, each pair a division
 // by a hundred that waits for the one before. A 19-digit timestamp is a chain of about fourteen.
 //
-// Here a number below 100 is a pair from a table, and a longer one is cut into eights by one or two
-// divisions by 10^8, which the compiler makes multiplications. Each eight is written with no chain:
-// split into two halves of four, each half into two pairs and each pair into two digits by
+// Here a number below 10 000 is a pair or two from a table, and a longer one is cut into eights by
+// one or two divisions by 10^8, which the compiler makes multiplications. Each eight is written with
+// no chain: split into two halves of four, each half into two pairs and each pair into two digits by
 // multiplications that work on every lane of a 64-bit word at once, and the word is stored whole,
 // its leading zeros counted from the word itself and shifted out.
 //
@@ -94,6 +94,17 @@ inline constexpr std::array<char, 200> kPairs = [] {
         const auto one = static_cast<std::size_t>(v < 10);
         std::memcpy(p, kPairs.data() + 2 * v + one, 2);
         return p + 2 - one;
+    }
+    if (v < 10000) {
+        // Three digits or four, two pairs, the first without its leading zero for three: cheaper than
+        // a word of eight, and on the x86 test host than `to_chars` too, which the word was not.
+        const auto hundreds = static_cast<uint32_t>(v) / 100U;
+        const auto rest     = static_cast<uint32_t>(v) - hundreds * 100U;
+        const auto one      = static_cast<std::size_t>(hundreds < 10);
+        std::memcpy(p, kPairs.data() + 2 * hundreds + one, 2);
+        p += 2 - one;
+        std::memcpy(p, kPairs.data() + 2 * rest, 2);
+        return p + 2;
     }
     if (v < k1e8) {
         return put_leading(p, eight_digits(static_cast<uint32_t>(v)));
