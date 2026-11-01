@@ -2900,17 +2900,36 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 253. A row answer's reply grows by doubling, copying what it holds and zeroing the room ahead **P3**
+### 253. A row answer's reply grew by doubling, copying what it held and zeroing twice what its rows used ✅ **P3**
 
-**Left by #252** (`evidence/2026-11-01-reply-digits/profile/after/`). `QueryResponseBuilder::add_rows()`
-makes the reply longer ahead of its rows by `resize()`, doubling: each growth past the string's
-capacity copies what is written, and every growth zeroes the room it adds. Under full-range `SELECT`s
-of 100 000 rows on the x86 test host, with #251's digits, those were 4.0% and 6.2% of a node's
-samples at the hottest address of each. Room the session keeps from one answer to the next, grown to
-what a batch needs rather than doubled, would take the copies and half the zeroing; a buffer whose
-room is not zeroed ahead would take the rest.
+**Left by #252** (`evidence/2026-11-01-reply-room/`). `QueryResponseBuilder::add_rows()` made the
+reply longer ahead of its rows by `resize()` to twice its size: each growth past the string's
+capacity copied what was written, and every growth zeroed the room it added - room for a batch's
+widest rows, of which its rows use about half. Under full-range `SELECT`s of 100 000 rows on the x86
+test host, with #251's digits, those were 4.0% and 6.2% of a node's samples at the hottest address of
+each (`evidence/2026-11-01-reply-digits/profile/after/callers.txt`).
 
-- Effort: S-M | Impact: a large row answer's CPU, by up to a tenth
+`Session::lend_room()` gives the builder the send buffer itself when nothing is pending - emptied,
+with the capacity the session's last large answer needed - and `Session::take_answer()` takes back
+any answer with more room than the buffer has, so the room returns with the reply: a session's
+large answers are written where its last one was. Within the capacity the reply grows to exactly
+what a batch needs; past it the capacity doubles first.
+
+The base is #252's head; three rounds, the builds alternating, on both hosts
+(`scripts/r253_measure.sh`): `scripts/measure_select_scan.py`, a fresh node, 200 full-range `SELECT`s
+of 100 000 rows over one connection:
+
+| | x86 | ARM |
+|---|---|---|
+| the server's CPU a query | 2.30-2.35 → 2.00-2.05 ms | 2.65-2.75 → 2.10-2.20 ms |
+| the engine's time | 1.892-1.895 → 1.659-1.667 ms | 1.904-1.962 → 1.707-1.741 ms |
+| the client's p50 | 4.590-4.635 → 4.574-4.686 ms | 5.525-5.934 → 5.220-5.384 ms |
+
+The engine's time moves because it includes formatting the reply, which is written into the room.
+#252's slow reader moved within its rounds. What is left on the way to the socket is the kernel's
+copy into it, and the room each batch still zeroes ahead of its rows.
+
+- Effort: S | Impact: a large row answer's CPU, by 11-24%
 
 ### 252. A partial send moved every byte still pending, and a large answer was copied into the send buffer ✅ **P2**
 
@@ -2950,8 +2969,8 @@ The `PING`s' maximum is the `SELECT` itself, a million rows formatted on the rea
 of its 45 MB, no longer made. A large query holds its reactor for as long as it formats; that is not
 this item.
 
-What is left of the way to the socket is #253, the reply's growth, and the kernel's copy into the
-socket, which this does not touch.
+What was left of the way to the socket was #253, the reply's growth, and the kernel's copy into
+the socket, which this does not touch.
 
 - Effort: S | Impact: the latency of every session on a reactor with a large answer going out
   slowly, and a large answer's CPU
@@ -16323,7 +16342,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #253.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -16466,7 +16485,6 @@ The capability items are in the table below.
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P3** | Signed release tags (#42, what is left of it) | S | v0.1.0 went out unsigned; a signed tag lets a user check it is ours without trusting the host it came from |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
-| **P3** | A row answer's reply grows by doubling, copying what it holds and zeroing the room ahead (#253) | S–M | A full-range `SELECT` of 100 000 rows spends a tenth of a node's CPU growing its reply |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 

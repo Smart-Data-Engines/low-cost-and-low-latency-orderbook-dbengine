@@ -158,6 +158,12 @@ here as `#N`.
 
 ### Changed
 
+- **A session's large answers are written where its last one was** (#253): a row answer is written in
+  the session's send buffer's room, lent to it when nothing is pending and taken back with the answer,
+  and grows to what a batch needs within that room, where it grew by doubling, copying what it held
+  and zeroing up to twice what its rows used. A full-range `SELECT` of 100 000 rows takes the server
+  11-15% less CPU on the x86 test host and 17-24% less on the ARM one.
+
 - **A large answer going out slowly no longer stalls its reactor** (#252). A partial send erased what
   went from the front of the session's send buffer, moving every byte still pending - up to tens of
   megabytes at each wakeup of a slow reader's large answer - while every other session on the
