@@ -163,7 +163,18 @@ std::vector<Policy> policies() {
     seal4.steps = true;
     cc::EncodeOptions merge4 = merge;
     merge4.steps = true;
-    return {{"seal", seal}, {"merge", merge}, {"smallest", smallest}, {"seal4", seal4}, {"merge4", merge4}};
+    // A seal's at other charges on its runs candidates (#223): where the engine's 50 sits on the
+    // curve of bytes against decode, in format 3 and in format 4.
+    const auto charged = [](cc::EncodeOptions o, unsigned pct) {
+        o.runs_charge_pct = pct;
+        return o;
+    };
+    return {{"seal", seal}, {"merge", merge}, {"smallest", smallest}, {"seal4", seal4}, {"merge4", merge4},
+            {"seal@0", charged(seal, 0)}, {"seal@25", charged(seal, 25)}, {"seal@75", charged(seal, 75)},
+            {"seal@100", charged(seal, 100)}, {"seal@150", charged(seal, 150)}, {"seal@200", charged(seal, 200)},
+            {"seal4@0", charged(seal4, 0)}, {"seal4@25", charged(seal4, 25)}, {"seal4@75", charged(seal4, 75)},
+            {"seal4@100", charged(seal4, 100)}, {"seal4@150", charged(seal4, 150)},
+            {"seal4@200", charged(seal4, 200)}};
 }
 
 }  // namespace

@@ -57,8 +57,12 @@ struct Encoding {
     bool operator==(const Encoding&) const = default;
 };
 
-/// The charge a seal puts on a runs candidate, `EncodeOptions::runs_charge_pct` (#223).
-inline constexpr unsigned kRunsChargePct = 50;
+/// The charge a seal puts on a runs candidate, `EncodeOptions::runs_charge_pct` (#223). 100 since
+/// 1 November 2026, where it was 50: measured over every segment of both recordings at charges from 0
+/// to 200, it is where binance-diff's seal decodes 8-12% faster in segment format 3 for 2.5% more
+/// bytes, and 5-10% in format 4 for 1.2%, and binance-top20's moves in neither; past it the bytes keep
+/// growing and the decode does not keep falling.
+inline constexpr unsigned kRunsChargePct = 100;
 
 struct EncodeOptions {
     /// Whether runs and narrow of each transform are tried under LZ4.
