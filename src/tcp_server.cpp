@@ -859,7 +859,9 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
     session.increment_commands();
     if (engine.is_bootstrapping()) return format_error("bootstrapping");
     const auto started = std::chrono::steady_clock::now();
-    QueryResponseBuilder reply(shape);
+    // Written in the session's send buffer's room, which take_answer() gives back with the reply
+    // (#253): a session's large answers are written where the last one was.
+    QueryResponseBuilder reply(shape, session.lend_room());
     try {
         // The builder twice: as a row callback for whatever arrives one result at a time, and as
         // the place a row answer's batches go (OB-12).
@@ -3545,8 +3547,11 @@ void Reactor::run_loop() {
                             // One answer into the session's buffer. False: the session is to
                             // close, because a client that has stopped reading cannot be sent
                             // more.
-                            const auto enqueue = [&](const std::string& response) -> bool {
-                                const Session::Queued queued = session->queue_answer(response);
+                            //
+                            // Handed over, so that a large answer becomes the send buffer rather
+                            // than a copy in it (#252); left as it was when it is refused.
+                            const auto enqueue = [&](std::string&& response) -> bool {
+                                const Session::Queued queued = session->take_answer(std::move(response));
                                 if (queued == Session::Queued::TooLargeAlone) {
                                     // No client could be sent this, however fast it reads, so the
                                     // session is not the thing that failed: it gets an error in
@@ -3579,8 +3584,10 @@ void Reactor::run_loop() {
                                                &engine_->registry(), shard_coord_,
                                                write_answers_);
                                 pending_writes_.clear();
-                                for (const std::string& answer : write_answers_) {
-                                    if (!enqueue(answer)) return false;
+                                // Every slot of `write_answers_` is written again by the next
+                                // batch, so its answers can be handed over.
+                                for (std::string& answer : write_answers_) {
+                                    if (!enqueue(std::move(answer))) return false;
                                 }
                                 return true;
                             };
@@ -3640,7 +3647,7 @@ void Reactor::run_loop() {
                                     break;
                                 }
 
-                                if (!enqueue(response)) {
+                                if (!enqueue(std::move(response))) {
                                     queue_refused = true;
                                     break;
                                 }

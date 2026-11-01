@@ -4654,6 +4654,11 @@ Learned the hard way. Check here before debugging.
      writes in 0.5-2.3 ns, cost 2.4-3.0 ns as a word (#251). A writer is measured where
      it runs, in the row and on the server, and the calls in its loop's disassembly counted, before a
      loop over one column is believed.
+637. **A failing `EXPECT_EQ` on two long strings of many lines can take the machine's memory.**
+     googletest diffs two strings with newlines line by line, in memory that grows with the product of
+     their lines: a mutant that made a reply of 50 000 lines differ from the one expected killed its
+     test with SIGKILL - the out-of-memory killer - rather than failing an assertion (#253). Large
+     strings are compared with `==`, and where they part is what the message reports.
 
 ## Current state and open problems
 

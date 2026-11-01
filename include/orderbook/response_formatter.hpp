@@ -146,6 +146,14 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
 class QueryResponseBuilder : public RowAnswer {
 public:
     explicit QueryResponseBuilder(const QueryShape& shape) : shape_(shape) {}
+    /// The same, writing the reply in `room` - emptied, its capacity kept: the session's send buffer
+    /// from `Session::lend_room()`, which finish()'s string, handed back by `Session::take_answer()`,
+    /// returns to it (#253). A session's next large answer is written where its last one was, not
+    /// grown again by doubling, each growth a copy of what was written.
+    QueryResponseBuilder(const QueryShape& shape, std::string room)
+        : shape_(shape), out_(std::move(room)) {
+        out_.clear();
+    }
     QueryResponseBuilder(const QueryResponseBuilder&) = delete;
     QueryResponseBuilder& operator=(const QueryResponseBuilder&) = delete;
 
@@ -170,6 +178,8 @@ private:
     void start_rows();
     void start_buckets();
     void room_for_a_row();
+    /// The reply `n` bytes long, the room past `used_` for rows to be written in (#253).
+    void grow_to(size_t n);
     void add_narrow(const QueryResult& r);
     void add_bucket(const QueryResult& r);
 

@@ -270,12 +270,13 @@ Session::Queued Session::queue_answer(std::string_view response) {
                         fd_, 4 + compressed.size(), kMaxSendBuffer);
             return Queued::TooLargeAlone;
         }
-        if (send_buf_.size() + 4 + compressed.size() > kMaxSendBuffer) {
+        if (pending_bytes() + 4 + compressed.size() > kMaxSendBuffer) {
             OB_LOG_ERROR("session",
                          "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
-                         fd_, send_buf_.size(), 4 + compressed.size(), kMaxSendBuffer);
+                         fd_, pending_bytes(), 4 + compressed.size(), kMaxSendBuffer);
             return Queued::CapExceeded;
         }
+        drop_sent_before_append();
         send_buf_.push_back(static_cast<char>((frame_len >> 24) & 0xFF));
         send_buf_.push_back(static_cast<char>((frame_len >> 16) & 0xFF));
         send_buf_.push_back(static_cast<char>((frame_len >> 8) & 0xFF));
@@ -288,15 +289,59 @@ Session::Queued Session::queue_answer(std::string_view response) {
                         response.size(), kMaxSendBuffer);
             return Queued::TooLargeAlone;
         }
-        if (send_buf_.size() + response.size() > kMaxSendBuffer) {
+        if (pending_bytes() + response.size() > kMaxSendBuffer) {
             OB_LOG_ERROR("session",
                          "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
-                         fd_, send_buf_.size(), response.size(), kMaxSendBuffer);
+                         fd_, pending_bytes(), response.size(), kMaxSendBuffer);
             return Queued::CapExceeded;
         }
+        drop_sent_before_append();
         send_buf_.append(response.data(), response.size());
     }
     return Queued::Yes;
+}
+
+Session::Queued Session::take_answer(std::string&& response) {
+    // An answer with nothing queued before it, and no frame to put it in, is the bytes to send:
+    // taken, not copied (#252). The copy was a `SELECT`'s whole reply, 2.6% of a node's samples
+    // answering 100 000 rows at a time. The buffer it replaces holds nothing pending - `sent()`
+    // empties it once all is taken - and is let go with `response`. Only a large answer: a small
+    // one is copied into the room the buffer kept, where taking it would give that room up and
+    // the answers after it - a pipelined batch's sixty-four - would grow a buffer again.
+    //
+    // And an answer whose string has more room than the buffer, whatever its size: written in the
+    // room lend_room() gave, it brings that room back, which copying it would let go (#253).
+    if (!compressed_ && send_buf_.empty() && response.size() <= kMaxSendBuffer &&
+        (response.size() >= kTakeAnswerBytes || response.capacity() > send_buf_.capacity())) {
+        send_buf_.swap(response);
+        send_off_ = 0;
+        std::string().swap(response);
+        return Queued::Yes;
+    }
+    return queue_answer(std::string_view(response));
+}
+
+std::string Session::lend_room() {
+    if (!send_buf_.empty()) return {};
+    std::string room;
+    room.swap(send_buf_);
+    return room;
+}
+
+void Session::sent(size_t n) {
+    send_off_ += n;
+    if (send_off_ == send_buf_.size()) {
+        send_buf_.clear();
+        send_off_ = 0;
+    }
+}
+
+void Session::drop_sent_before_append() {
+    if (send_off_ == 0 || send_off_ < send_buf_.size() - send_off_) return;
+    OB_LOG_DEBUG("session", "fd=%d: %zu bytes sent dropped from the front of the send buffer, %zu "
+                 "still pending", fd_, send_off_, pending_bytes());
+    send_buf_.erase(0, send_off_);
+    send_off_ = 0;
 }
 
 // Out of line, and the attribute is the point rather than a hint - the numbers and the reasoning
@@ -307,8 +352,6 @@ Session::Queued Session::queue_answer(std::string_view response) {
 }
 
 bool Session::flush_output_tls() {
-    size_t sent_total = 0;
-
     if (tls_handshaking_) {
         // Reached before a single byte has arrived from the client: the banner is queued at
         // accept and `send_response()` flushes. `SSL_write` here would begin the handshake from
@@ -319,12 +362,12 @@ bool Session::flush_output_tls() {
         // handshake has one owner, and the loop flushes the banner the moment it completes.
         return true;
     }
-    while (sent_total < send_buf_.size()) {
+    while (send_off_ < send_buf_.size()) {
         ERR_clear_error();
-        const int n = SSL_write(ssl_.get(), send_buf_.data() + sent_total,
-                                static_cast<int>(send_buf_.size() - sent_total));
+        const int n = SSL_write(ssl_.get(), send_buf_.data() + send_off_,
+                                static_cast<int>(send_buf_.size() - send_off_));
         if (n > 0) {
-            sent_total += static_cast<size_t>(n);
+            sent(static_cast<size_t>(n));
             io_want_ = IoWant::Read;
             continue;
         }
@@ -336,17 +379,16 @@ bool Session::flush_output_tls() {
             io_want_ = IoWant::Read;
             break;
         }
-        if (sent_total > 0) send_buf_.erase(0, sent_total);
         OB_LOG_WARN("tls", "write failed: fd=%d conn_id=%llu %s: %s pending=%zu",
                     fd_, static_cast<unsigned long long>(conn_id_),
-                    tls_error_name(err), tls_last_error().c_str(), send_buf_.size());
+                    tls_error_name(err), tls_last_error().c_str(), pending_bytes());
         return false;
     }
-    // The erase is what makes SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER load-bearing: it moves the
-    // pending bytes to a different address, and a retry presenting a different address is
-    // refused with `bad write retry` without that mode. Measured -
-    // benchmarks/tls/ssl_write_retry.c.
-    if (sent_total > 0) send_buf_.erase(0, sent_total);
+    // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER stays load-bearing with the offset (#252): an answer
+    // appended between a WANT_WRITE and its retry can reallocate the buffer, or drop what was sent
+    // from its front, and either moves the pending bytes to a different address - and a retry
+    // presenting a different address is refused with `bad write retry` without that mode.
+    // Measured - benchmarks/tls/ssl_write_retry.c.
     // Stated rather than inferred, the same line as the plaintext path below. Today the loop
     // body always runs when there is data and leaves `Read` behind, so this is redundant - and
     // that is exactly the kind of correctness that survives by circumstance: called with an
@@ -358,17 +400,15 @@ bool Session::flush_output_tls() {
 }
 
 bool Session::flush_output_plain() {
-    size_t sent_total = 0;
-
-    while (sent_total < send_buf_.size()) {
+    while (send_off_ < send_buf_.size()) {
         // send() with MSG_NOSIGNAL, not write(): a client that disconnects while we
         // are writing raises SIGPIPE, whose default action kills the whole server
         // process — every other session with it. Every other socket writer in this
         // repository already does this; this one did not.
-        ssize_t written = ::send(fd_, send_buf_.data() + sent_total,
-                                 send_buf_.size() - sent_total, MSG_NOSIGNAL);
+        ssize_t written = ::send(fd_, send_buf_.data() + send_off_,
+                                 send_buf_.size() - send_off_, MSG_NOSIGNAL);
         if (written > 0) {
-            sent_total += static_cast<size_t>(written);
+            sent(static_cast<size_t>(written));
             continue;
         }
 
@@ -387,10 +427,9 @@ bool Session::flush_output_plain() {
                 io_want_ = IoWant::Write;
                 break;
             }
-            if (sent_total > 0) send_buf_.erase(0, sent_total);
             OB_LOG_WARN("session",
                         "Send failed: fd=%d errno=%s pending=%zu",
-                        fd_, std::strerror(err), send_buf_.size());
+                        fd_, std::strerror(err), pending_bytes());
             return false;
         }
 
@@ -398,15 +437,14 @@ bool Session::flush_output_plain() {
         break;
     }
 
-    if (sent_total > 0) send_buf_.erase(0, sent_total);
     // Fully drained: nothing to wait for on the write side.
     if (send_buf_.empty()) io_want_ = IoWant::Read;
     return true;
 }
 
-bool Session::has_pending_output() const { return !send_buf_.empty(); }
+bool Session::has_pending_output() const { return pending_bytes() > 0; }
 
-size_t Session::pending_output_bytes() const { return send_buf_.size(); }
+size_t Session::pending_output_bytes() const { return pending_bytes(); }
 
 void Session::request_close_after_flush() { close_after_flush_ = true; }
 
@@ -511,8 +549,9 @@ Session::IoResult Session::receive_rings(char* buf, size_t len, size_t& out_n) {
 bool Session::flush_output_rings() {
     RingTransport& r = *rings_;
     size_t done = 0;
-    while (done < send_buf_.size()) {
-        const size_t n = r.answers.write(send_buf_.data() + done, send_buf_.size() - done);
+    while (send_off_ + done < send_buf_.size()) {
+        const size_t n = r.answers.write(send_buf_.data() + send_off_ + done,
+                                         send_buf_.size() - send_off_ - done);
         if (n == 0) break;
         done += n;
     }
@@ -526,7 +565,7 @@ bool Session::flush_output_rings() {
             ring::ring_bell(r.client_bell);
             ++*r.bells_rung;
         }
-        send_buf_.erase(0, done);
+        sent(done);
     }
     // A full ring is what a full socket buffer is: not an error, and the caller waits for room.
     io_want_ = send_buf_.empty() ? IoWant::Read : IoWant::Write;

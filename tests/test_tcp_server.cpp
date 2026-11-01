@@ -1073,6 +1073,149 @@ TEST(SessionOutput, SmallResponseLeavesNothingQueued) {
     ::close(fd_server);
 }
 
+namespace {
+
+/// Reads from `fd` until `got` holds `want` bytes, flushing `session` before each read as the loop
+/// does at EPOLLOUT. The reads do not block, and the loop is bounded: a session that has lost bytes
+/// ends it short of `want` rather than leaving it waiting for them.
+void drain_into(ob::Session& session, int fd, std::string& got, size_t want) {
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    std::vector<char> buf(8192);
+    for (int guard = 0; guard < 200000 && got.size() < want; ++guard) {
+        ASSERT_TRUE(session.flush_output());
+        const ssize_t n = ::read(fd, buf.data(), buf.size());
+        if (n > 0) got.append(buf.data(), static_cast<size_t>(n));
+    }
+}
+
+} // namespace
+
+// #252: a partial send moves an offset past what went rather than erasing it, which moved every
+// pending byte to the front each time. Answers queued behind a partial send - the first of them
+// once more has gone than is pending, so that what went is dropped from the front - arrive after
+// it, every byte in order.
+TEST(SessionOutput, AnswersQueuedBehindAPartialSendArriveWholeAndInOrder) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    std::string first(300 * 1024, '\0');
+    for (size_t i = 0; i < first.size(); ++i) first[i] = static_cast<char>('a' + i % 26);
+    ASSERT_TRUE(session.send_response(first));
+    ASSERT_TRUE(session.has_pending_output());
+
+    std::string got;
+    drain_into(session, fd_client, got, 250 * 1024);
+    ASSERT_LT(session.pending_output_bytes(), first.size() / 2)
+        << "the premise: more of the first answer sent than still pending";
+    const size_t before = session.pending_output_bytes();
+    ASSERT_TRUE(session.queue_response("second\n"));
+    ASSERT_TRUE(session.queue_response("third\n"));
+    EXPECT_EQ(session.pending_output_bytes(), before + 13);
+
+    drain_into(session, fd_client, got, first.size() + 13);
+    EXPECT_EQ(got, first + "second\nthird\n");
+    EXPECT_FALSE(session.has_pending_output());
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+// #252: a large answer with nothing pending is taken rather than copied - the string it came in is
+// left empty - and goes out whole. One behind pending bytes, a small one, one in compressed mode and
+// one too large ever to send are queued as `queue_answer()` queues them, and left as they were.
+TEST(SessionOutput, ALargeAnswerWithNothingPendingIsTakenAndTheOthersAreCopied) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    std::string large(200 * 1024, 'L');
+    ASSERT_EQ(session.take_answer(std::move(large)), ob::Session::Queued::Yes);
+    EXPECT_TRUE(large.empty()) << "a large answer with nothing pending was copied, not taken";
+    EXPECT_EQ(session.pending_output_bytes(), 200u * 1024u);
+
+    std::string behind(100 * 1024, 'B');
+    ASSERT_EQ(session.take_answer(std::move(behind)), ob::Session::Queued::Yes);
+    EXPECT_EQ(behind, std::string(100 * 1024, 'B')) << "an answer behind pending bytes was taken";
+    EXPECT_EQ(session.pending_output_bytes(), 300u * 1024u);
+
+    std::string got;
+    drain_into(session, fd_client, got, 300 * 1024);
+    EXPECT_EQ(got, std::string(200 * 1024, 'L') + std::string(100 * 1024, 'B'));
+    ASSERT_FALSE(session.has_pending_output());
+
+    // Once all of it has gone, the buffer is empty again, and the next large answer is taken too.
+    std::string again(150 * 1024, 'M');
+    ASSERT_EQ(session.take_answer(std::move(again)), ob::Session::Queued::Yes);
+    EXPECT_TRUE(again.empty()) << "a large answer after the buffer drained was copied, not taken";
+    got.clear();
+    drain_into(session, fd_client, got, 150 * 1024);
+    EXPECT_EQ(got, std::string(150 * 1024, 'M'));
+    ASSERT_FALSE(session.has_pending_output());
+
+    std::string small(64, 's');
+    ASSERT_EQ(session.take_answer(std::move(small)), ob::Session::Queued::Yes);
+    EXPECT_EQ(small, std::string(64, 's')) << "a small answer was taken, giving up the buffer's room";
+    got.clear();
+    drain_into(session, fd_client, got, 64);
+    EXPECT_EQ(got, std::string(64, 's'));
+
+    std::string too_large(ob::Session::max_queued_bytes() + 1, 'x');
+    EXPECT_EQ(session.take_answer(std::move(too_large)), ob::Session::Queued::TooLargeAlone);
+    EXPECT_EQ(too_large.size(), ob::Session::max_queued_bytes() + 1)
+        << "a refused answer was not left as it was, so the refusal cannot say its size";
+    EXPECT_FALSE(session.has_pending_output());
+
+    session.set_compressed(true);
+    std::string framed(200 * 1024, 'C');
+    ASSERT_EQ(session.take_answer(std::move(framed)), ob::Session::Queued::Yes);
+    EXPECT_EQ(framed, std::string(200 * 1024, 'C')) << "an answer to be framed was taken unframed";
+    EXPECT_TRUE(session.has_pending_output());
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+// #253: with nothing pending the send buffer's room is lent - empty, with the capacity the last
+// large answer gave it - and an answer written in it is taken back, small or not, so the room is the
+// session's again; with something pending nothing is lent, and the pending bytes stay where they are.
+TEST(SessionOutput, TheSendBuffersRoomIsLentWithNothingPendingAndComesBackWithTheAnswer) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    ASSERT_EQ(session.take_answer(std::string(200 * 1024, 'L')), ob::Session::Queued::Yes);
+    std::string got;
+    drain_into(session, fd_client, got, 200 * 1024);
+    ASSERT_FALSE(session.has_pending_output());
+
+    std::string room = session.lend_room();
+    EXPECT_TRUE(room.empty());
+    EXPECT_GE(room.capacity(), 200u * 1024u) << "the room of the last large answer was not lent";
+    room.assign(100, 'r');   // a small answer, written in the room
+    ASSERT_EQ(session.take_answer(std::move(room)), ob::Session::Queued::Yes);
+    EXPECT_TRUE(room.empty()) << "an answer written in the lent room was copied, and the room let go";
+    got.clear();
+    drain_into(session, fd_client, got, 100);
+    EXPECT_EQ(got, std::string(100, 'r'));
+    ASSERT_FALSE(session.has_pending_output());
+    EXPECT_GE(session.lend_room().capacity(), 200u * 1024u) << "the room did not come back";
+
+    ASSERT_TRUE(session.queue_response(std::string(300 * 1024, 'P')));
+    ASSERT_TRUE(session.flush_output());
+    ASSERT_TRUE(session.has_pending_output()) << "the premise: bytes pending";
+    const size_t pending = session.pending_output_bytes();
+    EXPECT_EQ(session.lend_room().capacity(), std::string().capacity())
+        << "room was lent with bytes still pending in it";
+    EXPECT_EQ(session.pending_output_bytes(), pending);
+    got.clear();
+    drain_into(session, fd_client, got, 300 * 1024);
+    EXPECT_EQ(got.size(), 300u * 1024u);
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
 TEST(SessionOutput, BufferCapIsEnforced) {
     auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
     ASSERT_GE(fd_server, 0);
@@ -1610,7 +1753,8 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     //
     // Since #155 that call is in one lambda, `enqueue`, which the loop and the held writes both
     // answer through - so the lambda is read too, and held to the same rule as the loop: a send or
-    // a flush inside it is a send per response, whoever calls it.
+    // a flush inside it is a send per response, whoever calls it. Since #252 it hands the answer
+    // over, `take_answer()`, which tells the two refusals apart as `queue_answer()` does.
     const auto lambda_body = [&](const std::string& header) {
         const std::size_t at = path.find(header);
         if (at == std::string::npos || at > header_pos_of(path)) return std::string();
@@ -1622,15 +1766,15 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
         }
         return std::string();
     };
-    const std::string enqueue = lambda_body("const auto enqueue = [&](const std::string& response)");
+    const std::string enqueue = lambda_body("const auto enqueue = [&](std::string&& response)");
     ASSERT_FALSE(enqueue.empty()) << "the read path no longer queues its answers through enqueue()";
-    EXPECT_NE(enqueue.find("= session->queue_answer(response);"), std::string::npos)
+    EXPECT_NE(enqueue.find("= session->take_answer(std::move(response));"), std::string::npos)
         << "the commands of a read are no longer answered into the session's buffer";
-    EXPECT_NE(body.find("enqueue(response)"), std::string::npos)
+    EXPECT_NE(body.find("enqueue(std::move(response))"), std::string::npos)
         << "the loop over the commands of a read does not queue their answers through enqueue()";
     const std::string held = lambda_body("const auto apply_held_writes = [&]()");
     ASSERT_FALSE(held.empty()) << "the read path no longer applies the writes it held (#155)";
-    EXPECT_NE(held.find("enqueue(answer)"), std::string::npos)
+    EXPECT_NE(held.find("enqueue(std::move(answer))"), std::string::npos)
         << "the answers to the held writes are not queued through enqueue()";
     for (const std::string* part : {&body, &enqueue, &held}) {
         EXPECT_EQ(part->find("send_response("), std::string::npos)
