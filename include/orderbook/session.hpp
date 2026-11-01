@@ -318,8 +318,9 @@ private:
     std::string send_buf_;
     /// The first byte of `send_buf_` the socket, TLS or the ring has not taken (#252). A partial
     /// send moves this rather than erasing what went: the erase moved every byte still pending to
-    /// the front, and a slow reader of a 45 MB answer cost its reactor 0.44 s of `memmove`, a few
-    /// milliseconds at each wakeup, with every other session on the reactor waiting behind it.
+    /// the front, up to tens of megabytes at each wakeup of a slow reader's large answer, and every
+    /// other session on the reactor waited for it - a `PING` beside a 45 MB answer read 64 KiB
+    /// every 5 ms waited 316-783 us at p99.9 on the x86 test host, and 61-83 with this.
     size_t      send_off_{0};
 
     /// The bytes still to send.
