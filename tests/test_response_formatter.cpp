@@ -15,8 +15,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -101,6 +103,53 @@ TEST(ResponseFormatter, EveryFieldAtItsTypesLimitRoundTripsExactly) {
     EXPECT_EQ(ls[2],
               "18446744073709551615\t-9223372036854775808\t18446744073709551615\t"
               "4294967295\t255\t65535\t18446744073709551615");
+}
+
+namespace {
+
+/// A row as the formatter before #251 wrote it, field by field with `std::to_string`.
+std::string to_string_row(const ob::QueryResult& r) {
+    return std::to_string(r.timestamp_ns) + "\t" + std::to_string(r.price) + "\t" +
+           std::to_string(r.quantity) + "\t" + std::to_string(r.order_count) + "\t" +
+           std::to_string(r.side) + "\t" + std::to_string(r.level) + "\t" +
+           std::to_string(r.sequence_number);
+}
+
+/// A value of `digits` digits, 1 to 20, uniformly within them.
+uint64_t of_length(std::mt19937_64& gen, int digits) {
+    uint64_t lo = 1;
+    for (int i = 1; i < digits; ++i) lo *= 10;
+    const uint64_t hi = digits == 20 ? std::numeric_limits<uint64_t>::max() : lo * 10 - 1;
+    return std::uniform_int_distribution<uint64_t>(digits == 1 ? 0 : lo, hi)(gen);
+}
+
+}  // namespace
+
+// #251 writes a row's numbers eight digits at a time where its buffer has the room. Rows with every
+// field at every length it can have are the bytes `std::to_string` wrote for them - in a reply and
+// in a subscription's push, which writes its row through the same field writer.
+TEST(ResponseFormatter, RowsOfEveryLengthAreTheBytesToStringWrote) {
+    std::mt19937_64 gen(251);
+    std::vector<ob::QueryResult> rows;
+    for (int i = 0; i < 4000; ++i) {
+        // Up to nineteen digits, as far as an int64_t holds them.
+        const auto price = static_cast<int64_t>(std::min<uint64_t>(
+            of_length(gen, 1 + (i / 20) % 19), std::numeric_limits<int64_t>::max()));
+        rows.push_back(row(of_length(gen, 1 + i % 20),
+                           (i / 7) % 2 == 0 ? price : -price,
+                           of_length(gen, 1 + (i / 3) % 20),
+                           static_cast<uint32_t>(of_length(gen, 1 + i % 10)),
+                           static_cast<uint8_t>(gen()),
+                           static_cast<uint16_t>(gen()),
+                           of_length(gen, 1 + (i / 11) % 20)));
+    }
+    const auto ls = lines_of(ob::format_query_response(rows, ob::all_query_columns()));
+    ASSERT_EQ(ls.size(), rows.size() + 4);   // OK, the header, the rows and the blank line's two
+    for (size_t i = 0; i < rows.size(); ++i) {
+        ASSERT_EQ(ls[2 + i], to_string_row(rows[i])) << "row " << i;
+        ASSERT_EQ(ob::format_push(i, rows[i]),
+                  "PUSH " + std::to_string(i) + "\t" + to_string_row(rows[i]) + "\n") << "row " << i;
+    }
 }
 
 // A negative price is the one signed field, and the sign has to survive.
