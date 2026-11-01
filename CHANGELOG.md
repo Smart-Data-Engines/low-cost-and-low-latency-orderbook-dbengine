@@ -158,6 +158,14 @@ here as `#N`.
 
 ### Changed
 
+- **A reply's numbers are written eight digits at a time** (#251): a number below 10 000 as one pair
+  or two from a table, a longer one as words of eight digits, split by multiplications that work on
+  every lane of a 64-bit word at once. Writing a row answer's text had been seven tenths of the
+  server's time answering a full-range `SELECT`; on the x86 test host one of 100 000 rows takes the
+  engine 1.87 ms where it took 2.42-2.43, and on the ARM one 1.92-1.95 where 4.27-4.29. A
+  subscription's push of a row is written the same way and takes half the time or less. The bytes
+  are the same.
+
 - **A book summary is written with no sync of its own** (#247). Since #233 a busy symbol's summary
   fell due at nearly every seal, and each was synced, the file and then its directory: on a device
   capped at 7 MB/s that was a journal force a tick more, and a writer to a few symbols took 2.7%

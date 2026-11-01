@@ -1,5 +1,6 @@
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/capabilities.hpp"
+#include "orderbook/decimal_text.hpp"
 #include "orderbook/version.hpp"
 
 #include <algorithm>
@@ -67,30 +68,14 @@ static constexpr size_t kMaxQueryRowBytes = 105;
 /// came from - and the temporaries were visible beside it as `basic_string::_M_construct` at
 /// 5.53%, `memcpy` at 24.27%, and malloc/free at 6.84%. After this, three of those five symbols
 /// are not in the profile at all.
+///
+/// It is `decimal_text::put()` since #251, which writes the digits eight at a time where it has
+/// `decimal_text::kWriteRoom` bytes, and every buffer a reply's rows are written into keeps that much
+/// past its widest row: a full-range `SELECT` of 100 000 rows spent 70% of the server's time in
+/// `to_chars`'s digits. With less room left they are `to_chars`'s, the same bytes.
 template <typename T>
 static char* put_field(char* p, char* end, T value, char sep) {
-    // `end` is the buffer's real end rather than `p + 24`. The fixed window was correct only
-    // because the buffer was always wider than any one field; handing `to_chars` a pointer past
-    // the allocation is the kind of detail that is fine until a caller sizes the buffer tightly.
-    //
-    // The separator's byte is held back from `to_chars` rather than assumed to be spare. The
-    // callers size their buffers so that it is, but that is an argument made two functions away,
-    // and GCC 11 says so out loud: `writing 1 byte into a region of size 0` on the store below.
-    // Reserving it here makes the guarantee local and provable instead of true-by-inspection.
-    //
-    // `side` is a `uint8_t`, which is a character type: handing it to `to_chars` unwidened invites
-    // an overload that would write a byte rather than a number. Widen every integer to the type
-    // `to_chars` cannot misread.
-    char* const digits_end = end - 1;
-    if constexpr (std::is_signed_v<T>) {
-        const auto res = std::to_chars(p, digits_end, static_cast<long long>(value));
-        p = res.ptr;
-    } else {
-        const auto res = std::to_chars(p, digits_end, static_cast<unsigned long long>(value));
-        p = res.ptr;
-    }
-    *p++ = sep;
-    return p;
+    return decimal_text::put(p, end, value, sep);
 }
 
 /// One field of one row, chosen by column. Separated from the loop so that the seven-column path
@@ -176,8 +161,9 @@ static char* put_column(char* p, char* end, const RowBatch& b, uint32_t i, Query
                                                  const std::vector<QueryColumn>& columns) {
     // One allocation for the whole response, sized from this query's own list because a repeated
     // column repeats its width - `SELECT sequence_number, sequence_number, ...` at twenty repeats
-    // needs 420 bytes where seven distinct columns need 105.
-    std::vector<char> buf(max_row_bytes(columns));
+    // needs 420 bytes where seven distinct columns need 105. Past it the room put_field() writes its
+    // digits a word at a time in (#251).
+    std::vector<char> buf(max_row_bytes(columns) + decimal_text::kWriteRoom);
     char* const buf_end = buf.data() + buf.size();
     const size_t last = columns.size() - 1;
     for (const auto& r : rows) {
@@ -215,7 +201,7 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
     // had become a pointer that might point at the heap; and moving the narrow path out of line
     // is what let `to_chars` inline again.
     if (columns == all_query_columns()) {
-        char line[kMaxQueryRowBytes];
+        char line[kMaxQueryRowBytes + decimal_text::kWriteRoom];
         for (const auto& r : rows) {
             char* p = put_seven(line, line + sizeof(line), r);
             out.append(line, static_cast<size_t>(p - line));
@@ -302,11 +288,13 @@ void QueryResponseBuilder::start_rows() {
 }
 
 // The rows are written where the reply ends, so the reply has to be longer than its rows ahead of
-// them. Grown by doubling, as an appended string grows: the bytes past `used_` are zeros nobody
-// reads, and finish() cuts them off.
+// them - by the widest row and the room put_field() writes its digits a word at a time in (#251).
+// Grown by doubling, as an appended string grows: the bytes past `used_` are nothing anybody reads,
+// and finish() cuts them off.
 void QueryResponseBuilder::room_for_a_row() {
-    if (out_.size() - used_ >= row_bytes_) return;
-    out_.resize(std::max(out_.size() * 2, used_ + row_bytes_));
+    const size_t room = row_bytes_ + decimal_text::kWriteRoom;
+    if (out_.size() - used_ >= room) return;
+    out_.resize(std::max(out_.size() * 2, used_ + room));
 }
 
 void QueryResponseBuilder::add(const QueryResult& r) {
@@ -360,12 +348,36 @@ void QueryResponseBuilder::add(const QueryResult& r) {
     return p;
 }
 
-// A function a batch, out of line, so that put_seven() has this one caller and is inlined into its
-// loop. Called a row at a time from two writers - a reply's and a part's (#246, stage 2) - it was
+// The seven with each field's room checked, for a buffer without the room of a batch's widest rows,
+// which none of a reply's writers hands over (#251): out of line, so that the loop below stays the
+// size of its fields.
+[[gnu::noinline]] static char* write_seven_rows_checked(char* p, char* end, const RowBatch& b, size_t n) {
+    for (const uint32_t i : b.rows.first(n)) p = put_seven(p, end, b, i);
+    return p;
+}
+
+// A function a batch, out of line, so that the row's writer has this one caller and is inlined into
+// its loop. Called a row at a time from two writers - a reply's and a part's (#246, stage 2) - it was
 // kept out of line (GCC 15.2, -O3): a call a row of every `SELECT *` answer, where stage 1's one
 // caller had it inlined.
+//
+// The room is checked once for the batch, against `n` of the widest rows and the word a field stores
+// past its last digit, and the rows are then written with no check a field (#251): a check a field
+// is a branch a field, and with the fallback it guards inlined beside each, a loop GCC no longer
+// inlined the digits' writer into.
 [[gnu::noinline]] static char* write_seven_rows(char* p, char* end, const RowBatch& b, size_t n) {
-    for (const uint32_t i : b.rows.first(n)) p = put_seven(p, end, b, i);
+    if (end - p < static_cast<std::ptrdiff_t>(n * kMaxQueryRowBytes + decimal_text::kWriteRoom)) {
+        return write_seven_rows_checked(p, end, b, n);
+    }
+    for (const uint32_t i : b.rows.first(n)) {
+        p = decimal_text::put_in_room(p, b.ts[i],                           '\t');
+        p = decimal_text::put_in_room(p, b.price[i],                        '\t');
+        p = decimal_text::put_in_room(p, b.qty[i],                          '\t');
+        p = decimal_text::put_in_room(p, b.cnt[i],                          '\t');
+        p = decimal_text::put_in_room(p, b.side[i],                         '\t');
+        p = decimal_text::put_in_room(p, b.level[i],                        '\t');
+        p = decimal_text::put_in_room(p, static_cast<uint64_t>(b.seq[i]), '\n');
+    }
     return p;
 }
 
@@ -385,9 +397,10 @@ static char* write_rows(char* p, char* end, const RowBatch& b, size_t n, bool al
 void QueryResponseBuilder::add_rows(const RowBatch& b) {
     if (b.rows.empty()) return;
     if (!started_) start_rows();
-    // Room for the whole batch at once, at the widest row this shape can write, grown by doubling
-    // as an appended string grows; finish() cuts off what the rows did not use.
-    const size_t need = b.rows.size() * row_bytes_;
+    // Room for the whole batch at once, at the widest row this shape can write, and for the word
+    // put_field() stores past a row's last digit (#251), grown by doubling as an appended string
+    // grows; finish() cuts off what the rows did not use.
+    const size_t need = b.rows.size() * row_bytes_ + decimal_text::kWriteRoom;
     if (out_.size() - used_ < need) out_.resize(std::max(out_.size() * 2, used_ + need));
     char* const reply = out_.data();
     char* const end   = reply + out_.size();
@@ -416,8 +429,8 @@ public:
         const auto n = static_cast<size_t>(std::min<uint64_t>(b.rows.size(), limit_ - rows_));
         if (n > 0) {
             // Room for the whole batch at the widest row this shape can write, in one chunk: a row
-            // never spans two.
-            const size_t need = n * row_bytes_;
+            // never spans two. And for the word put_field() stores past a row's last digit (#251).
+            const size_t need = n * row_bytes_ + decimal_text::kWriteRoom;
             if (chunks_.empty() || chunks_.back().cap - chunks_.back().used < need) {
                 const size_t cap = std::max(kChunkBytes, need);
                 chunks_.push_back(Chunk{std::make_unique_for_overwrite<char[]>(cap), cap, 0});
@@ -531,27 +544,15 @@ std::string format_agg_response(const std::vector<AggValue>& values) {
 
 // ── format_push ───────────────────────────────────────────────────────────────
 
+// The subscription's id and then the row as a reply's row is written, through put_seven(): the
+// bytes eight `std::to_string`s wrote, which a test holds it to, without a string for each (#251).
 std::string format_push(uint64_t subscription_id, const QueryResult& row) {
-    std::string out;
-    out.reserve(96);
-    out += "PUSH ";
-    out += std::to_string(subscription_id);
-    out += '\t';
-    out += std::to_string(row.timestamp_ns);
-    out += '\t';
-    out += std::to_string(row.price);
-    out += '\t';
-    out += std::to_string(row.quantity);
-    out += '\t';
-    out += std::to_string(row.order_count);
-    out += '\t';
-    out += std::to_string(row.side);
-    out += '\t';
-    out += std::to_string(row.level);
-    out += '\t';
-    out += std::to_string(row.sequence_number);
-    out += '\n';
-    return out;
+    static constexpr std::string_view kPush = "PUSH ";
+    char line[kPush.size() + 21 + kMaxQueryRowBytes + decimal_text::kWriteRoom];
+    std::memcpy(line, kPush.data(), kPush.size());
+    char* p = put_field(line + kPush.size(), std::end(line), subscription_id, '\t');
+    p = put_seven(p, std::end(line), row);
+    return std::string(line, p);
 }
 
 std::string format_error(std::string_view message) {

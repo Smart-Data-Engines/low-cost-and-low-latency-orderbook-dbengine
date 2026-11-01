@@ -4646,6 +4646,14 @@ Learned the hard way. Check here before debugging.
      A file changed in a way a warning might name is compiled with `clang++ -Wall -Wextra -Werror`
      too before it is pushed: the laptop has `clang++-18`, its default `clang++` as the runners', and
      `clang++-21`.
+636. **A function faster in a loop of its own can be slower in the loop it is for.** The first version
+     of `decimal_text::write()` wrote a column of timestamps 31% faster than `std::to_chars` in a loop
+     over that column, and a full-range `SELECT` took the x86 node 21-27% more CPU. In the row's loop,
+     seven of it inlined beside their `to_chars` fallbacks, GCC kept it out of line - four calls a row,
+     which `objdump -dr` of `write_seven_rows()` counts - and a row's short numbers, which `to_chars`
+     writes in 0.5-2.3 ns, cost 2.4-3.0 ns as a word (#251). A writer is measured where
+     it runs, in the row and on the server, and the calls in its loop's disassembly counted, before a
+     loop over one column is believed.
 
 ## Current state and open problems
 

@@ -111,6 +111,14 @@ endif()
 add_executable(column_codec_cost column_codec_cost.cpp)
 target_link_libraries(column_codec_cost PRIVATE orderbook_column_codec)
 
+# ── What a reply's numbers cost to write (#251) ───────────────────────────────
+#
+# Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object,
+# each column written by `std::to_chars` and by `decimal_text::write()` in this one build, and a whole
+# `SELECT *` reply over the same rows.
+add_executable(reply_format_cost reply_format_cost.cpp)
+target_link_libraries(reply_format_cost PRIVATE orderbook_tcp_server_lib)
+
 # ── What a version vector costs to send, receive and compare as it grows (#177) ──
 #
 # Compiled, deliberately not run: it prints a table, and the numbers in the roadmap came from it.

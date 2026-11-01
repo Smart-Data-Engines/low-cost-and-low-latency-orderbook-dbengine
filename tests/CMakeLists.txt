@@ -598,6 +598,12 @@ ob_add_tcp_test(test_response_formatter
     test_response_formatter.cpp
 )
 
+# The decimal text of a reply's numbers, eight digits at a time (#251): every write held to the
+# bytes `std::to_chars` writes, at every length, and to the room it promises to stay inside.
+ob_add_test(test_decimal_text
+    test_decimal_text.cpp
+)
+
 # A SELECT's reply built as the engine hands rows over (#49 step 3): the same bytes as the reply
 # formatted from collected rows, and the engine's promise that a query's shape is filled before its
 # first row, which building it at the first row relies on.
