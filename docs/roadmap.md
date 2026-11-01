@@ -3464,7 +3464,7 @@ not know the file. The control, a reworded warning, survived.
 - Effort: M | Impact: a series over a long range costs 7-12 times what it did before #233, for a
   writer of whole sides; a writer of diffs got a wrong answer before
 
-### 242. The WAL's budget costs 1 - 2% of the levels a second on a device at 7 - 10 MB/s **P3**
+### 242. The WAL's budget costs 1 - 2% of the levels a second on a device at 7 - 10 MB/s ✅ **P3**
 
 **Found closing #190.** Step 9 of #190 bounds the WAL waiting for a sync.
 - At a write limit its syncs come 3.5-5 times as often as master's. Each forces the XFS journal,
@@ -3539,6 +3539,18 @@ change to how the WAL lays out its files, to be decided on its own.
 The trace's 100 ms intervals cannot place an idle moment under this cap: the throttle releases
 writes in its own slices - nothing in 39% of master's intervals and 63-65% of the other's, up to 5.3-5.7
 times the cap in one - and only a round's sum reads as the cap.
+
+**Closed on 1 November 2026: the cost is the budget's, and kept.** What a sync of the WAL forces is
+the journal's record of a file that grew, and each way of a sync that records nothing costs more than
+it saves, or more than this project changes for it:
+- WAL files written full of zeros before their records - the layout that lets a sync find nothing new
+  to record - write every byte of the WAL twice, where the journal is about 1.8% of what passes a cap;
+- WAL files used again, as some databases do, need each record to say which use it is from: a change
+  of the WAL's record format;
+- `fdatasync(2)` still records an appended file's size, which is the change these syncs log, and would
+  take the WAL off the call the storage-fault suite injects its failures at.
+The budget bounds what is acknowledged and not yet on the device to about a second of its writing
+(#190, step 9); 1.8-2.3% of the levels a second at 7 MB/s is what that bound costs on XFS.
 
 - Effort: M | Impact: 1 - 2% of the levels a second while a device slower than the writes is the
   limit, at 7 - 10 MB/s on this host
@@ -16176,7 +16188,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223, #242.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -16319,7 +16331,6 @@ The capability items are in the table below.
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P3** | Signed release tags (#42, what is left of it) | S | v0.1.0 went out unsigned; a signed tag lets a user check it is ours without trusting the host it came from |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
-| **P3** | The WAL's budget keeps the device busy with fewer syncs (#242) | M | On a device slower than the writes, at 7 - 10 MB/s, its syncs' journal costs 1 - 2% of the levels a second |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
