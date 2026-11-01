@@ -214,6 +214,12 @@ here as `#N`.
   recording of its snapshots in 2.18-2.29 where 2.34-2.93, and 2.15-2.17 where 3.18-3.24. On a node,
   the time-bucket query over that recording and over a synthetic set of a million rows took
   0.40-0.75 of the time on its first run after a load and 0.35-0.68 after it.
+- A seal weighs a candidate of short runs twice as heavily as it did (#223): runs decode a step a
+  run, and charged 100% of their runs per value where they were charged 50, they are chosen only
+  where they save that much more. A recording of an order book's changes decodes 8-12% faster in
+  segment format 3, as sealed, for 2.5% more bytes on disk (3.82 → 3.92 a row); a recording of its
+  snapshots and the comparative dataset are as they were. The README's storage figures are measured
+  again with it.
 - A column packed in blocks decodes 18-52% faster (#49): a block of 1 to 56 bits a value is unpacked
   by a function of its width, eight values at a time with each one's byte and shift constant, where
   one loop worked out every value's at run time. On a recording of an order book's changes, whose

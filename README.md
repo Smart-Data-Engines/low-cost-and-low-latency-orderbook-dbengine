@@ -146,28 +146,34 @@ what this compares is the cost of loading the data each way it is loaded, not of
 Python as much as the protocol, and a C++ client sends the same updates with a fraction of it - see
 `benchmarks/wire_load.cpp` and [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
 And the bytes it keeps: by [`scripts/measure_storage.py`](scripts/measure_storage.py) on the same
-machine, versions and day, each dataset loaded, flushed and left 90 s for the merges, bytes on disk a
-row - the engine's segments, ClickHouse's table as the harness creates it and with five codec sets
-an expert might choose, TimescaleDB's hypertable compressed, in one chunk spanning the data:
+machine, each dataset loaded, flushed and left 90 s for the merges, bytes on disk a row - the
+engine's segments, measured again on **1 November 2026** at `ed39e60` (#223), and on 7 October,
+the same versions as above, ClickHouse's table as the harness creates it and with five codec sets
+an expert might choose, and TimescaleDB's hypertable compressed, in one chunk spanning the data:
 
 | dataset | rows | **orderbook** | ClickHouse as installed | ClickHouse, the best of five codec sets | TimescaleDB, compressed |
 |---|---|---|---|---|---|
-| Binance, diff stream: 10 pairs, 10 minutes | 266,717 | **3.78** | 7.04 | 4.31 - `GCD` before `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(3)` | 17.29 |
-| Binance, top 20 snapshots: the same pairs and minutes | 1,347,400 | **0.53** | 1.17 | 0.87 - `ZSTD(1)`, `DoubleDelta` on the time | 12.45 |
-| the comparative dataset: 50 synthetic symbols | 200,000 | **1.89** | 4.23 | 1.87 - `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(9)` | 7.86 |
+| Binance, diff stream: 10 pairs, 10 minutes | 266,717 | **3.92** | 7.04 | 4.31 - `GCD` before `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(3)` | 17.29 |
+| Binance, top 20 snapshots: the same pairs and minutes | 1,347,400 | **0.55** | 1.17 | 0.87 - `ZSTD(1)`, `DoubleDelta` on the time | 12.45 |
+| the comparative dataset: 50 synthetic symbols | 200,000 | **1.90** | 4.23 | 1.87 - `Delta` or `T64`, `DoubleDelta` on the time, `ZSTD(9)` | 7.86 |
 
-On the two recordings of real books the engine keeps **45 - 54%** of what ClickHouse keeps as
-installed, and **61 - 88%** of what it keeps under the best of the five codec sets measured for each;
-on the comparative dataset's random walks it is level with that best (1.89 against 1.87) and keeps
-45% of ClickHouse as installed. These are a seal's bytes: each symbol's data is one segment here, so
-nothing merges, and a merge's ZSTD tier takes the recordings to about 2.94 and 0.33 bytes a row (#219).
-As the file system allocates them, the comparative dataset's fifty segments of 4,000 rows pay a 4 KiB
-block twice each - 3.07 bytes a row against ClickHouse's best 2.09 - where the recordings' larger
-segments take 3.99 and 0.61 against 4.47 and 0.95. The figures come with their reading cost: a format-3
-read decodes every column format 2 read raw. A segment's decoded columns are then held between
-queries (`--decoded-cache-mb`, #220). A query asked again on the recordings takes 0.20 - 0.85 of format
-2's time from the page cache on the m9g.xlarge and the m8a.xlarge (medians of three rounds' p50).
-A segment's first read takes 1.25 - 1.55 times format 2's (#223).
+On the two recordings of real books the engine keeps **47 - 56%** of what ClickHouse keeps as
+installed, and **64 - 91%** of what it keeps under the best of the five codec sets measured for each;
+on the comparative dataset's random walks it is within 2% of that best (1.90 against 1.87) and keeps
+45% of ClickHouse as installed. These are a seal's bytes, and since 1 November a seal charges a
+candidate of short runs twice what it did, which takes binance-diff's decode 8 - 12% faster for 2.5%
+more of its bytes and moves the others in neither (#223). A symbol's data is one segment here, or two
+or three of binance-top20's, sealed by size - fewer than a merge takes, so nothing merges - and a
+merge's ZSTD tier takes the recordings to about 2.94 and 0.33 bytes a row (#219). binance-top20's
+figure counts the book summaries and best-price tracks its segments keep beside their columns since
+#275 and #279, 0.02 bytes a row. As the file system allocates them, the comparative dataset's fifty
+segments of 4,000 rows pay a 4 KiB block twice each - 3.07 bytes a row against ClickHouse's best 2.09 -
+where the recordings' larger segments take 4.13 and 0.70 against 4.47 and 0.95. The figures come with
+their reading cost: a format-3 read decodes every column format 2 read raw. A segment's decoded
+columns are then held between queries (`--decoded-cache-mb`, #220). A query asked again on the
+recordings takes 0.20 - 0.85 of format 2's time from the page cache on the m9g.xlarge and the
+m8a.xlarge (medians of three rounds' p50). On 9 October a segment's first read took 1.25 - 1.55 times
+format 2's; the roadmap's #223 has what its decoders have taken back of that since.
 
 The engine's share of the query column, its reply against its parse, is **measured in each run** and
 stated in its results file rather than subtracted. An earlier version of this page carried a parsing

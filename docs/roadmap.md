@@ -4594,6 +4594,19 @@ format 4 on ARM took 1.03-1.07 of the base's, and binance-top20's warm buckets i
 1.01-1.04. What is left on binance-diff: 4.8-5.2 ns a row in format 3 and 4.1-4.4 in format 4,
 against format 2's 3.6-3.8.
 
+**The runs charge at 100, 1 November 2026** (`evidence/2026-11-01-runs-charge/`). PR #263 set a seal's
+charge on a runs candidate at 50% of its runs per value. `column_codec_cost` now weighs the seal's
+choices at charges from 0 to 200 too, all in one build, and over both recordings on both hosts and
+both x86 targets 100 is the knee: from 50, binance-diff's seal decodes 8.1-12.0% faster in format 3
+for 2.5% more bytes (3.797 → 3.893) and 4.6-10.4% faster in format 4 for 1.2%, and binance-top20 moves
+in neither; past 100 at most 3.2% more for 0.5-2.4% more bytes, and at 200 binance-top20's format 3
+decodes up to 7.5% slower. `kRunsChargePct` is 100. On a node, 93 of 96 ranges of the change's time
+over master's held 1.00 - the three, a query of a few hundredths of a millisecond twice and a warm
+query of held columns the charge does not reach. By `measure_storage.py` the engine keeps
+binance-diff in 3.92 bytes a row, where master kept 3.82, and the comparative set and binance-top20
+as master did, 1.90 and 0.55; the README carries these now, re-measured, beside the competitors' of 7
+October. What is left on binance-diff's seal: 4.2-4.6 ns a row in format 3 and 3.6-4.1 in format 4.
+
 - Effort: M | Impact: the first query over a range costs up to half again what format 2's did; a
   repeated one costs less than format 2's
 
