@@ -1076,8 +1076,10 @@ TEST(SessionOutput, SmallResponseLeavesNothingQueued) {
 namespace {
 
 /// Reads from `fd` until `got` holds `want` bytes, flushing `session` before each read as the loop
-/// does at EPOLLOUT, so that the blocking read always has bytes to take.
+/// does at EPOLLOUT. The reads do not block, and the loop is bounded: a session that has lost bytes
+/// ends it short of `want` rather than leaving it waiting for them.
 void drain_into(ob::Session& session, int fd, std::string& got, size_t want) {
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     std::vector<char> buf(8192);
     for (int guard = 0; guard < 200000 && got.size() < want; ++guard) {
         ASSERT_TRUE(session.flush_output());
