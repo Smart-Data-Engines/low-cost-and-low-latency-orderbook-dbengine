@@ -294,7 +294,16 @@ void QueryResponseBuilder::start_rows() {
 void QueryResponseBuilder::room_for_a_row() {
     const size_t room = row_bytes_ + decimal_text::kWriteRoom;
     if (out_.size() - used_ >= room) return;
-    out_.resize(std::max(out_.size() * 2, used_ + room));
+    grow_to(std::max(out_.size() * 2, used_ + room));
+}
+
+// Within the string's capacity, exactly `n`: `resize()` zeroes what it adds, and what a batch adds is
+// room for its widest rows, of which its rows use about half, so growing by doubling zeroed up to
+// twice what was written. Past the capacity, twice the capacity first, so that what was written is
+// copied a number of times that grows with the logarithm of the reply, not with its batches (#253).
+void QueryResponseBuilder::grow_to(size_t n) {
+    if (n > out_.capacity()) out_.reserve(std::max(out_.capacity() * 2, n));
+    out_.resize(n);
 }
 
 void QueryResponseBuilder::add(const QueryResult& r) {
@@ -398,10 +407,11 @@ void QueryResponseBuilder::add_rows(const RowBatch& b) {
     if (b.rows.empty()) return;
     if (!started_) start_rows();
     // Room for the whole batch at once, at the widest row this shape can write, and for the word
-    // put_field() stores past a row's last digit (#251), grown by doubling as an appended string
-    // grows; finish() cuts off what the rows did not use.
+    // put_field() stores past a row's last digit (#251), grown to what the batch needs within the
+    // reply's capacity and by doubling the capacity past it (#253); finish() cuts off what the rows
+    // did not use.
     const size_t need = b.rows.size() * row_bytes_ + decimal_text::kWriteRoom;
-    if (out_.size() - used_ < need) out_.resize(std::max(out_.size() * 2, used_ + need));
+    if (out_.size() - used_ < need) grow_to(used_ + need);
     char* const reply = out_.data();
     char* const end   = reply + out_.size();
     used_ = static_cast<size_t>(write_rows(reply + used_, end, b, b.rows.size(), all_seven_,

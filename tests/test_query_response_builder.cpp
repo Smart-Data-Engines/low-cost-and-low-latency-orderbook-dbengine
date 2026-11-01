@@ -140,6 +140,51 @@ RC_GTEST_PROP(QueryResponseBuilderProperty, RowsFromBatchesAreTheBytesOfTheSameR
     RC_ASSERT(from_batches.finish() == built(results, columns));
 }
 
+// #253: a reply written in room it is given - the session's send buffer, lent - is the bytes a reply
+// written in a string of its own is, whatever the room held, and gives the room back: finish()'s
+// string has at least its capacity. Batches of every size, so that the reply grows within the room
+// and, with less room than it needs, past it.
+TEST(QueryResponseBuilder, AReplyWrittenInRoomItIsGivenIsTheSameBytesAndKeepsTheRoom) {
+    const size_t n = 50'000;
+    std::vector<uint64_t> ts(n), qty(n);
+    std::vector<int64_t> price(n), seq(n);
+    std::vector<uint32_t> cnt(n);
+    std::vector<uint8_t> side(n);
+    std::vector<uint16_t> level(n);
+    std::vector<uint32_t> chosen(n);
+    for (size_t i = 0; i < n; ++i) {
+        ts[i] = 1'790'000'000'000'000'000ULL + i * 1'000'003ULL;
+        price[i] = (i % 3 == 0 ? -1 : 1) * static_cast<int64_t>(i * 7919);
+        qty[i] = i * i;
+        cnt[i] = static_cast<uint32_t>(i % 100);
+        side[i] = static_cast<uint8_t>(i % 2);
+        level[i] = static_cast<uint16_t>(i % 20);
+        seq[i] = static_cast<int64_t>(i);
+        chosen[i] = static_cast<uint32_t>(i);
+    }
+    ob::QueryShape shape;
+    shape.columns = ob::all_query_columns();
+    const auto write = [&](ob::QueryResponseBuilder& reply) {
+        for (size_t at = 0, take = 1; at < n; at += take, take = std::min(take * 3, size_t{2048})) {
+            take = std::min(take, n - at);
+            reply.add_rows(ob::RowBatch{ts, price, qty, cnt, side, level, seq,
+                                        std::span<const uint32_t>(chosen.data() + at, take)});
+        }
+        return reply.finish();
+    };
+    ob::QueryResponseBuilder plain(shape);
+    const std::string expected = write(plain);
+    for (const size_t room_bytes : {size_t{0}, size_t{4096}, size_t{1} << 20, size_t{8} << 20}) {
+        std::string room(64, 'r');   // what the room held is not the reply's
+        room.reserve(room_bytes);
+        const size_t capacity = room.capacity();
+        ob::QueryResponseBuilder in_room(shape, std::move(room));
+        const std::string reply = write(in_room);
+        EXPECT_EQ(reply, expected) << "in a room of " << room_bytes << " bytes";
+        EXPECT_GE(reply.capacity(), capacity) << "the room was not given back with the reply";
+    }
+}
+
 // #246, stage 2: a part of an answer formats at most its LIMIT of rows - no part of an answer of N
 // rows needs more - and stops there, and the first n of its rows copied onto a reply are the bytes
 // add_rows() writes for them.

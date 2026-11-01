@@ -1176,6 +1176,46 @@ TEST(SessionOutput, ALargeAnswerWithNothingPendingIsTakenAndTheOthersAreCopied) 
     ::close(fd_server);
 }
 
+// #253: with nothing pending the send buffer's room is lent - empty, with the capacity the last
+// large answer gave it - and an answer written in it is taken back, small or not, so the room is the
+// session's again; with something pending nothing is lent, and the pending bytes stay where they are.
+TEST(SessionOutput, TheSendBuffersRoomIsLentWithNothingPendingAndComesBackWithTheAnswer) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    ASSERT_EQ(session.take_answer(std::string(200 * 1024, 'L')), ob::Session::Queued::Yes);
+    std::string got;
+    drain_into(session, fd_client, got, 200 * 1024);
+    ASSERT_FALSE(session.has_pending_output());
+
+    std::string room = session.lend_room();
+    EXPECT_TRUE(room.empty());
+    EXPECT_GE(room.capacity(), 200u * 1024u) << "the room of the last large answer was not lent";
+    room.assign(100, 'r');   // a small answer, written in the room
+    ASSERT_EQ(session.take_answer(std::move(room)), ob::Session::Queued::Yes);
+    EXPECT_TRUE(room.empty()) << "an answer written in the lent room was copied, and the room let go";
+    got.clear();
+    drain_into(session, fd_client, got, 100);
+    EXPECT_EQ(got, std::string(100, 'r'));
+    ASSERT_FALSE(session.has_pending_output());
+    EXPECT_GE(session.lend_room().capacity(), 200u * 1024u) << "the room did not come back";
+
+    ASSERT_TRUE(session.queue_response(std::string(300 * 1024, 'P')));
+    ASSERT_TRUE(session.flush_output());
+    ASSERT_TRUE(session.has_pending_output()) << "the premise: bytes pending";
+    const size_t pending = session.pending_output_bytes();
+    EXPECT_EQ(session.lend_room().capacity(), std::string().capacity())
+        << "room was lent with bytes still pending in it";
+    EXPECT_EQ(session.pending_output_bytes(), pending);
+    got.clear();
+    drain_into(session, fd_client, got, 300 * 1024);
+    EXPECT_EQ(got.size(), 300u * 1024u);
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
 TEST(SessionOutput, BufferCapIsEnforced) {
     auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
     ASSERT_GE(fd_server, 0);

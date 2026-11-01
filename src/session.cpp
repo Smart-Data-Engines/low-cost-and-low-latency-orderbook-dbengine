@@ -308,14 +308,24 @@ Session::Queued Session::take_answer(std::string&& response) {
     // empties it once all is taken - and is let go with `response`. Only a large answer: a small
     // one is copied into the room the buffer kept, where taking it would give that room up and
     // the answers after it - a pipelined batch's sixty-four - would grow a buffer again.
-    if (!compressed_ && send_buf_.empty() && response.size() >= kTakeAnswerBytes &&
-        response.size() <= kMaxSendBuffer) {
+    //
+    // And an answer whose string has more room than the buffer, whatever its size: written in the
+    // room lend_room() gave, it brings that room back, which copying it would let go (#253).
+    if (!compressed_ && send_buf_.empty() && response.size() <= kMaxSendBuffer &&
+        (response.size() >= kTakeAnswerBytes || response.capacity() > send_buf_.capacity())) {
         send_buf_.swap(response);
         send_off_ = 0;
         std::string().swap(response);
         return Queued::Yes;
     }
     return queue_answer(std::string_view(response));
+}
+
+std::string Session::lend_room() {
+    if (!send_buf_.empty()) return {};
+    std::string room;
+    room.swap(send_buf_);
+    return room;
 }
 
 void Session::sent(size_t n) {
