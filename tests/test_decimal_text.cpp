@@ -143,6 +143,32 @@ TEST(DecimalText, PutWritesTheSameTextWithAnyRoomFromJustEnoughUp) {
     }
 }
 
+// And with any room at all, too little for the text included - where `to_chars` writes nothing and
+// the separator takes the last byte - nothing at or past `end` is written: write()'s words go only
+// where they fit whole.
+TEST(DecimalText, PutWritesNothingAtOrPastItsEnd) {
+    constexpr size_t kGuard = 32;
+    const std::vector<uint64_t> values{0, 7, 42, 12'345'678, 99'999'999, 100'000'000,
+                                       1'234'567'890'123'456'789ULL, std::numeric_limits<uint64_t>::max()};
+    const auto guarded = [&](auto v, size_t room) {
+        std::vector<char> buf(room + kGuard, '\x5A');
+        char* const end = dt::put(buf.data(), buf.data() + room, v, '\t');
+        bool past = true;
+        for (size_t i = room; i < buf.size(); ++i) past = past && buf[i] == '\x5A';
+        EXPECT_TRUE(past) << v << " in " << room << " bytes wrote past them";
+        EXPECT_LE(end, buf.data() + room) << v << " in " << room << " bytes";
+    };
+    for (size_t room = 1; room <= dt::kWriteRoom + 8; ++room) {
+        for (const uint64_t v : values) {
+            guarded(v, room);
+            if (v <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                guarded(-static_cast<int64_t>(v), room);
+            }
+        }
+        guarded(std::numeric_limits<int64_t>::min(), room);
+    }
+}
+
 // The narrow types a row carries are widened, so a side of 1 is the digit 1 and not the byte 1.
 TEST(DecimalText, PutWritesANarrowIntegerAsANumber) {
     char buf[dt::kWriteRoom];

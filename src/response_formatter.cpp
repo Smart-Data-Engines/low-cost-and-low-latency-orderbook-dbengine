@@ -348,12 +348,36 @@ void QueryResponseBuilder::add(const QueryResult& r) {
     return p;
 }
 
-// A function a batch, out of line, so that put_seven() has this one caller and is inlined into its
-// loop. Called a row at a time from two writers - a reply's and a part's (#246, stage 2) - it was
+// The seven with each field's room checked, for a buffer without the room of a batch's widest rows,
+// which none of a reply's writers hands over (#251): out of line, so that the loop below stays the
+// size of its fields.
+[[gnu::noinline]] static char* write_seven_rows_checked(char* p, char* end, const RowBatch& b, size_t n) {
+    for (const uint32_t i : b.rows.first(n)) p = put_seven(p, end, b, i);
+    return p;
+}
+
+// A function a batch, out of line, so that the row's writer has this one caller and is inlined into
+// its loop. Called a row at a time from two writers - a reply's and a part's (#246, stage 2) - it was
 // kept out of line (GCC 15.2, -O3): a call a row of every `SELECT *` answer, where stage 1's one
 // caller had it inlined.
+//
+// The room is checked once for the batch, against `n` of the widest rows and the word a field stores
+// past its last digit, and the rows are then written with no check a field (#251): a check a field
+// is a branch a field, and with the fallback it guards inlined beside each, a loop GCC no longer
+// inlined the digits' writer into.
 [[gnu::noinline]] static char* write_seven_rows(char* p, char* end, const RowBatch& b, size_t n) {
-    for (const uint32_t i : b.rows.first(n)) p = put_seven(p, end, b, i);
+    if (end - p < static_cast<std::ptrdiff_t>(n * kMaxQueryRowBytes + decimal_text::kWriteRoom)) {
+        return write_seven_rows_checked(p, end, b, n);
+    }
+    for (const uint32_t i : b.rows.first(n)) {
+        p = decimal_text::put_in_room(p, b.ts[i],                           '\t');
+        p = decimal_text::put_in_room(p, b.price[i],                        '\t');
+        p = decimal_text::put_in_room(p, b.qty[i],                          '\t');
+        p = decimal_text::put_in_room(p, b.cnt[i],                          '\t');
+        p = decimal_text::put_in_room(p, b.side[i],                         '\t');
+        p = decimal_text::put_in_room(p, b.level[i],                        '\t');
+        p = decimal_text::put_in_room(p, static_cast<uint64_t>(b.seq[i]), '\n');
+    }
     return p;
 }
 
