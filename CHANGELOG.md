@@ -158,6 +158,14 @@ here as `#N`.
 
 ### Changed
 
+- **A large answer going out slowly no longer stalls its reactor** (#252). A partial send erased what
+  went from the front of the session's send buffer, moving every byte still pending - up to tens of
+  megabytes at each wakeup of a slow reader's large answer - while every other session on the
+  reactor waited. The buffer keeps an offset of its first unsent byte now. With one client loop and a
+  45 MB answer read 64 KiB every 5 ms, a `PING` beside it waited 61-83 us at p99.9 where it waited
+  316-783 on the x86 test host, and 194-220 where 1 280-1 326 on the ARM one. An answer of 64 KiB or
+  more with nothing queued before it becomes the send buffer rather than a copy in it.
+
 - **A reply's numbers are written eight digits at a time** (#251): a number below 10 000 as one pair
   or two from a table, a longer one as words of eight digits, split by multiplications that work on
   every lane of a 64-bit word at once. Writing a row answer's text had been seven tenths of the
