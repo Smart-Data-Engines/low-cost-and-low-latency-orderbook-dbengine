@@ -158,6 +158,16 @@ here as `#N`.
 
 ### Changed
 
+- **Breaking: a listener with no secret listens on 127.0.0.1 unless told where** (#256). The client
+  port without `--auth-secret-file` and `--bind`, and the replication and multi-master ports without
+  `--cluster-secret-file` and their own bind flags, listened on every interface - which is what the
+  package's configuration, with no secret in it, installed: a node anyone who reached it could read
+  and write, and whose replication port streamed the whole WAL. They listen on `127.0.0.1` now, as
+  PostgreSQL, MongoDB, ClickHouse and Redis do until told otherwise. `*` in a bind flag is every
+  interface of both families - the way back - and a node announced through a coordinator at another
+  host, with a port it needs on loopback by this rule, does not start. `--print-config` and the
+  startup log say where each listener listens and why. `docs/upgrading.md` has what to change.
+
 - **A session's large answers are written where its last one was** (#253): a row answer is written in
   the session's send buffer's room, lent to it when nothing is pending and taken back with the answer,
   and grows to what a batch needs within that room, where it grew by doubling, copying what it held

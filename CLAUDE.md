@@ -4665,6 +4665,13 @@ Learned the hard way. Check here before debugging.
      write, read it without, against a failover thread that builds and destroys the client under that
      lock (#254). A pointer replaced under a lock gets its readers from `grep`, every one, and a reader
      on a hot path gets a value of its own rather than the pointer.
+639. **A second function of one name in a file can be the one that runs, and not the one the tests
+     ask.** `tcp_server.cpp` kept a file-local `is_loopback_host(const std::string&)` matching a
+     `"127."` prefix, and #256 added a public `is_loopback_host(std::string_view)`: in that file every
+     call with a `std::string` chose the old one - an exact match beats a conversion - while the tests,
+     which see only the header, asked the new one. The refusal answered by a predicate no test asked,
+     and a node announced at `::ffff:127.0.0.1` was refused. Before adding a function, `grep` its name
+     in the file it goes into; the old one is removed, not shadowed.
 
 ## Current state and open problems
 

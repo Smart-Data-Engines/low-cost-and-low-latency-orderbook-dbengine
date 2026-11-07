@@ -103,6 +103,14 @@ grep -q "data-dir .*/var/lib/orderbook .*(file)" "$WORK/resolved.txt" \
     || fail "the shipped configuration did not take effect: data-dir is not from the file"
 ok "the packaged binary accepts the packaged configuration, and the file's values reach it"
 
+# What the package installs is a node with no secret, and since #256 such a node serves this host only:
+# the client port and the replication port on 127.0.0.1, until the operator writes a secret or an address.
+grep -qE "^  bind +127\.0\.0\.1 - this host only" "$WORK/resolved.txt" \
+    || fail "the shipped configuration's client port is not on 127.0.0.1 (#256): $(grep -E '^  bind ' "$WORK/resolved.txt")"
+grep -qE "^  replication-bind +127\.0\.0\.1 - this host only" "$WORK/resolved.txt" \
+    || fail "the shipped configuration's replication port is not on 127.0.0.1 (#256)"
+ok "the shipped configuration listens on this host only (#256)"
+
 # The backup tools (#34) run from the package: a binary missing a shared library it links would be
 # found by the operator restoring a node, which is the worst moment to find it.
 "$WORK/usr/bin/ob_restore" --help > /dev/null || fail "the packaged ob_restore does not run"

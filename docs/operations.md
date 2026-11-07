@@ -102,6 +102,14 @@ The procedure, per host, with three hosts as the example:
 #    mm-replication-port   = 9092            # the same on each host is fine; they differ by address
 #    coordinator-endpoints = http://10.0.0.1:2379,http://10.0.0.2:2379,http://10.0.0.3:2379
 #    multi-master          = true
+#
+#    And where its ports listen. Since #256 a port whose surface has no secret listens on 127.0.0.1,
+#    and a node announced at 10.0.0.1 with such a port does not start. A secret opens its surface;
+#    the same files on every host (Security, below):
+#    cluster-secret-file   = /etc/orderbook/secrets/cluster   # the mesh port
+#    auth-secret-file      = /etc/orderbook/secrets/clients   # the client port
+#    Or, on a network you trust, name the address instead: mm-bind = 10.0.0.1, bind = 10.0.0.1
+#    (10.0.0.2, 10.0.0.3), or * for every interface.
 
 # 3. Confirm what each node resolved before starting it. This is the step that catches a typo in a
 #    file you edited on three machines by hand.
@@ -110,7 +118,10 @@ ob_tcp_server --config /etc/orderbook/ob.conf --print-config
 # 4. Start them.
 sudo systemctl enable --now ob_tcp_server
 
-# 5. Confirm the mesh from any node, rather than trusting that three services started.
+# 5. Confirm the mesh from any node, rather than trusting that three services started. Where the
+#    client port authenticates, nc cannot answer its challenge and the Python client can, with an
+#    identity of the clients file: OrderbookEngine(host="10.0.0.1", port=9090,
+#    auth=("grafana", secret)).mm_peers(). Where it does not:
 printf 'MM_PEERS\nQUIT\n' | nc 10.0.0.1 9090
 ```
 
@@ -147,16 +158,19 @@ with `OB_HOST`, three rounds each way).
 
 ### IPv6
 
-Every port listens on both families unless a flag says otherwise. With no `bind`, `replication-bind`,
-`mm-bind` or `metrics-bind`, a listener is `::` with `IPV6_V6ONLY` off. That takes IPv4 clients too,
-as mapped addresses, which the log and `STATUS` show as the IPv4 address they are. A host without
-IPv6 - compiled out, or `disable_ipv6` - gets IPv4 listeners, and its log says so once a port.
+A port on every interface listens on both families: `::` with `IPV6_V6ONLY` off. That takes IPv4
+clients too, as mapped addresses, which the log and `STATUS` show as the IPv4 address they are. A
+host without IPv6 - compiled out, or `disable_ipv6` - gets IPv4 listeners, and its log says so once a
+port. A port is on every interface when its flag says `*`, or when it has no flag and its surface
+authenticates - `bind` with `auth-secret-file`, `replication-bind` and `mm-bind` with
+`cluster-secret-file`; with neither, it listens on `127.0.0.1` (#256). `metrics-bind` with no value
+is every interface, as it always was.
 
 An address in a bind flag listens on its own family alone, written bare or in brackets (`::1`,
 `[::1]`). So `0.0.0.0` is every IPv4 interface and nothing else, and `::` every IPv6 one - whatever
 the host's `net.ipv6.bindv6only` says.
 
-**A firewall that covers IPv4 alone does not cover a port with no bind flag.** v0.1.0 listened on
+**A firewall that covers IPv4 alone does not cover a port on every interface.** v0.1.0 listened on
 `0.0.0.0` there. Put `0.0.0.0` in the flag to keep a port on IPv4, or extend the rules to IPv6
 ("Listeners after v0.1.0" in `docs/upgrading.md`).
 
@@ -174,10 +188,10 @@ The coordinator's endpoints are URLs and go to libcurl as they are, with an IPv6
 
 `tests/integration/test_ipv6.py` holds this on `::1`:
 - a node bound to it, with the Python client given `::1` and `[::1]`;
-- a node bound to nothing, answering both families;
+- a node bound to `*`, answering both families;
 - the C++ client, given `::1` and `[::1]`;
 - a replica following its primary, and the primary's `STATUS` naming it `[::1]:<port>`;
-- an IPv4 replica of a port with no bind, named by its IPv4 address;
+- an IPv4 replica of a replication port bound to `*`, named by its IPv4 address;
 - a mesh pair that finds each other through an etcd on `[::1]`;
 - a pool that keeps its connection to a shard at `[::1]:<port>` across a refresh of the shard map.
 
@@ -188,12 +202,15 @@ shard of a cluster points at the same etcd (#175):
 
 ```bash
 ob_tcp_server --shard-id s0 --node-id s0-a --port 9090 --replication-port 9091 \
-    --coordinator-endpoints http://10.0.0.1:2379 --advertise-host 10.0.0.11
+    --coordinator-endpoints http://10.0.0.1:2379 --advertise-host 10.0.0.11 \
+    --auth-secret-file /etc/orderbook/secrets/clients --cluster-secret-file /etc/orderbook/secrets/cluster
 ```
 
 `--advertise-host` is the host clients and the shard's replicas reach the node by: what it writes into
 the shard map and into its group's leader key. It is `127.0.0.1` by default, which is right on one
-machine only - and was the only choice before #195, for failover as for the map.
+machine only - and was the only choice before #195, for failover as for the map. A node announced at
+another host has to be reachable there, so it needs the secrets that open its ports - or the address
+in `--bind` and `--replication-bind` - and does not start without them (#256).
 
 What a shard does with etcd, and what each line of its log means:
 

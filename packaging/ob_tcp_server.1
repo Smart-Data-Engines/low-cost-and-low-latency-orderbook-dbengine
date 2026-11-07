@@ -46,6 +46,20 @@ output and in
 .BI \-\-port " n"
 TCP port for clients. Default 9090.
 .TP
+.BI \-\-bind " address"
+Where the client port listens: an IPv4 or IPv6 address, or
+.B *
+for every interface of both families. Without it, every interface when
+.B \-\-auth\-secret\-file
+is given and 127.0.0.1 when it is not: a node that authenticates nobody serves this host only until
+told otherwise.
+.B \-\-replication\-bind
+and
+.B \-\-mm\-bind
+are the same for the node links, with
+.B \-\-cluster\-secret\-file
+as their secret.
+.TP
 .BI \-\-data\-dir " path"
 Where the write-ahead log and columnar segments live. Default
 .IR /tmp/ob_data ,

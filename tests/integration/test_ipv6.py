@@ -154,9 +154,11 @@ def test_a_node_bound_to_ipv6_loopback_serves_the_python_client():
             node.stop()
 
 
-def test_a_node_with_no_bind_takes_both_families():
+def test_a_node_bound_to_every_interface_takes_both_families():
+    # `--bind *`: since #256 a node with no secret and no bind listens on 127.0.0.1 alone, and `*`
+    # is the flag that asks for every interface of both families, on one socket.
     with tempfile.TemporaryDirectory(prefix="ob_ipv6_dual_") as d:
-        node = Node(d, "127.0.0.1")
+        node = Node(d, "127.0.0.1", ["--bind", "*"])
         node.start()
         try:
             for host, symbol in (("127.0.0.1", "DUAL4"), ("::1", "DUAL6")):
@@ -230,13 +232,14 @@ def test_a_replica_follows_a_primary_over_ipv6():
             primary.stop()
 
 
-def test_an_ipv4_replica_of_a_port_with_no_bind_is_shown_as_ipv4():
-    """A port with no bind takes IPv4 as addresses mapped into IPv6, `::ffff:127.0.0.1`; the log and
-    STATUS show the replica as the IPv4 address it dialled from."""
+def test_an_ipv4_replica_of_a_port_on_every_interface_is_shown_as_ipv4():
+    """A port on every interface takes IPv4 as addresses mapped into IPv6, `::ffff:127.0.0.1`; the log
+    and STATUS show the replica as the IPv4 address it dialled from. `--replication-bind *`, since a
+    replication port with no cluster secret and no bind listens on 127.0.0.1 alone (#256)."""
     with tempfile.TemporaryDirectory(prefix="ob_ipv6_mapped_p_") as pd, \
             tempfile.TemporaryDirectory(prefix="ob_ipv6_mapped_r_") as rd:
         repl_port = free_port()
-        primary = Node(pd, "127.0.0.1", ["--replication-port", str(repl_port)])
+        primary = Node(pd, "127.0.0.1", ["--replication-port", str(repl_port), "--replication-bind", "*"])
         replica = Node(rd, "127.0.0.1", ["--bind", "127.0.0.1", "--primary-host", "127.0.0.1",
                                          "--primary-port", str(repl_port)])
         primary.start()

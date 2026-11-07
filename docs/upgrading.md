@@ -73,12 +73,36 @@ and format 3 for a build before v0.1.0).
 
 ## Listeners after v0.1.0
 
-A port with no bind flag listens on IPv6 as well as IPv4 in this version: `::`, both families on one
-socket, where v0.1.0 listened on `0.0.0.0` (#236). A host whose firewall covers IPv4 alone -
+A port on every interface listens on IPv6 as well as IPv4 in this version: `::`, both families on one
+socket, where v0.1.0 listened on `0.0.0.0` (#236). Since #256 a port is on every interface with `*` in
+its bind flag, or with no bind flag and its surface's secret; with neither it is on `127.0.0.1` (the
+next section). A host whose firewall covers IPv4 alone -
 iptables rules and no ip6tables ones, say - exposes such a port on IPv6 once the node is upgraded.
 Either extend the firewall to IPv6 first, or keep the port where it was with `0.0.0.0` in its bind
 flag: `bind`, `replication-bind`, `mm-bind`, `metrics-bind`. Clients, replicas and peers that reach a
 node over IPv4 notice nothing.
+
+## Listeners with no secret, from #256
+
+A port whose surface has no secret listens on `127.0.0.1` unless its bind flag names an address: the
+client port without `auth-secret-file` and `bind`, the replication and multi-master ports without
+`cluster-secret-file` and `replication-bind` / `mm-bind`. Before, such a port listened on every
+interface - which is what the package's configuration, with no secret in it, did. Two kinds of
+deployment notice:
+
+- **A node with no authentication serving clients on other hosts.** Its clients are refused after the
+  upgrade. Give it `auth-secret-file` (recommended), or `bind = *` to listen on every interface as it
+  did, or `bind` with one address.
+- **A cluster across hosts with a coordinator and no secrets.** A node announced through the
+  coordinator at a host other than loopback, whose client port or node link would listen on
+  `127.0.0.1` by this rule, does not start, and says which flag to give: the surface's secret file
+  (recommended), or its bind flag.
+- **A primary with replicas on other hosts, no coordinator and no cluster secret.** The primary
+  starts - nothing tells it where its replicas are - and its log says replicas on other hosts cannot
+  connect; the replicas are refused their connection. Give the primary `cluster-secret-file`
+  (recommended, and the replicas the same file), or `replication-bind`.
+
+`ob_tcp_server --print-config` shows where each listener will listen and why, before anything starts.
 
 ## When a change breaks a row
 
