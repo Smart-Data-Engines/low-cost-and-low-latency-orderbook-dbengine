@@ -284,6 +284,13 @@ here as `#N`.
 
 ### Fixed
 
+- **A read on a node being demoted or promoted no longer reaches a replication client being built or
+  destroyed** (#254). Every `SELECT`, `FLUSH`, write and backup asks whether the node is installing a
+  snapshot, on its client loop, and it asked the replication client through a pointer the failover
+  thread replaces: ThreadSanitizer reported the read of a client being built, and the same read of a
+  client being destroyed is a use after free. The answer is a flag of the engine's, which the client
+  keeps.
+
 - The embedded engine of the C API, which the Python client's local mode loads, replays its WAL
   when it opens (#245). A process that ended without `ob_flush()` or `ob_engine_destroy()` lost
   every write since the last of them, because an open read no record of the WAL.
