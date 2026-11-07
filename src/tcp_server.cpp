@@ -1522,9 +1522,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"max-subscriber-queue-bytes", {"<N>", "Per-subscriber queue ceiling; past it the session closes"}},
         {"max-subscriptions-per-session", {"<N>", "Subscription limit per session (default: 16)"}},
         {"metrics-bind", {"<ADDR>", "Address the metrics listener binds to (default: every interface)"}},
-        {"bind", {"<ADDR>", "IPv4 address the client port listens on (default: every interface)"}},
-        {"replication-bind", {"<ADDR>", "IPv4 address the replication port listens on (default: every interface)"}},
-        {"mm-bind", {"<ADDR>", "IPv4 address the multi-master port listens on (default: every interface)"}},
+        {"bind", {"<ADDR>", "IPv4 or IPv6 address the client port listens on (default: every interface with --auth-secret-file, 127.0.0.1 without it; * is every interface)"}},
+        {"replication-bind", {"<ADDR>", "IPv4 or IPv6 address the replication port listens on (default: every interface with --cluster-secret-file, 127.0.0.1 without it; * is every interface)"}},
+        {"mm-bind", {"<ADDR>", "IPv4 or IPv6 address the multi-master port listens on (default: every interface with --cluster-secret-file, 127.0.0.1 without it; * is every interface)"}},
         {"metrics-port", {"<PORT>", "Prometheus metrics port; 0 disables the endpoint"}},
         {"mm-max-catchup-bytes", {"<N>", "WAL bytes one catch-up round reads for a peer (default: 8 MiB)"}},
         {"mm-max-peer-send-buffer", {"<N>", "Per-peer send buffer ceiling; past it the peer is dropped"}},
@@ -1982,10 +1982,16 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             // Checked here rather than at the bind (#203): an address that does not parse is a
             // refusal to start, said with the flag that carried it - not a listener on every
             // interface, the opposite of what was asked, and not a failure deep in a manager's start.
+            //
+            // `*` is every interface of both families (#256): what an empty flag meant before a
+            // listener with no secret moved to 127.0.0.1, and which neither literal says - `::` is
+            // IPv6 alone and `0.0.0.0` IPv4 alone since #236. PostgreSQL's `listen_addresses` spells it
+            // the same way.
             const std::string val{cursor.value()};
-            if (val.empty() || !net::valid_bind(val)) {
+            if (val.empty() || (val != kEveryInterface && !net::valid_bind(val))) {
                 std::fprintf(stderr,
-                             "Error: %s expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, got '%s'\n",
+                             "Error: %s expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, or * "
+                             "for every interface, got '%s'\n",
                              std::string(arg).c_str(), val.c_str());
                 std::exit(1);
             }
@@ -2297,6 +2303,14 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                     config.anti_entropy_interval_sec);
     }
 
+    // A node announced where its listeners do not listen (#256, requirement 3): refused here, before
+    // a port opens or a coordinator hears of it.
+    if (const std::string refusal = listen_refusal(config); !refusal.empty()) {
+        OB_LOG_ERROR("cli", "Refusing to start: %s", refusal.c_str());
+        std::fprintf(stderr, "Error: %s\n", refusal.c_str());
+        std::exit(1);
+    }
+
     // How many CPUs this process can use. Read here, where every other fact the configuration is
     // resolved from is read, so the log line and `--print-config` say what the node was sized
     // against - and before the profile, which sizes the loops and the spin to it.
@@ -2441,11 +2455,16 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("max-sessions", std::to_string(c.max_sessions));
     line("max-subscriber-queue-bytes", std::to_string(c.max_subscriber_queue_bytes));
     line("max-subscriptions-per-session", std::to_string(c.max_subscriptions_per_session));
-    // The address each listener binds (#203): empty is every interface, which says so.
+    // The address each listener binds (#203): empty is every interface, which says so. The three a
+    // node's data goes through say where they listen and why (#256), which a flag left empty no
+    // longer tells alone.
+    const auto listens = [](const ListenAddress& at) {
+        return (at.address.empty() ? std::string("(every interface)") : at.address) + " - " + at.reason;
+    };
     line("metrics-bind", c.metrics_bind.empty() ? "(every interface)" : c.metrics_bind);
-    line("bind", c.bind.empty() ? "(every interface)" : c.bind);
-    line("replication-bind", c.replication_bind.empty() ? "(every interface)" : c.replication_bind);
-    line("mm-bind", c.mm_bind.empty() ? "(every interface)" : c.mm_bind);
+    line("bind", listens(client_listen_address(c)));
+    line("replication-bind", listens(replication_listen_address(c)));
+    line("mm-bind", listens(mesh_listen_address(c)));
     line("metrics-port", std::to_string(c.metrics_port));
     line("mm-max-catchup-bytes", std::to_string(c.mm_max_catchup_bytes));
     line("mm-max-peer-send-buffer", std::to_string(c.mm_max_peer_send_buf_bytes));
@@ -2523,6 +2542,84 @@ std::string remote_coordinator_for_loopback_advertise(const ServerConfig& config
     return {};
 }
 
+// ── Where the listeners listen (#256) ─────────────────────────────────────────
+
+ListenAddress listen_address(const std::string& given, bool authenticates, std::string_view bind_flag,
+                             std::string_view secret_flag) {
+    const std::string bind = "--" + std::string(bind_flag);
+    const std::string secret = "--" + std::string(secret_flag);
+    if (given == kEveryInterface) {
+        return {"", "every interface: " + bind + " *"};
+    }
+    if (!given.empty()) {
+        return {given, bind + " " + given};
+    }
+    if (authenticates) {
+        return {"", "every interface: " + secret + " is given and " + bind + " is not"};
+    }
+    return {"127.0.0.1", "this host only: no " + secret + " and no " + bind + " (#256)"};
+}
+
+ListenAddress client_listen_address(const ServerConfig& c) {
+    return listen_address(c.bind, !c.auth_secret_file.empty(), "bind", "auth-secret-file");
+}
+
+ListenAddress replication_listen_address(const ServerConfig& c) {
+    return listen_address(c.replication_bind, !c.cluster_secret_file.empty(), "replication-bind",
+                          "cluster-secret-file");
+}
+
+ListenAddress mesh_listen_address(const ServerConfig& c) {
+    return listen_address(c.mm_bind, !c.cluster_secret_file.empty(), "mm-bind", "cluster-secret-file");
+}
+
+bool is_loopback_host(std::string_view host) {
+    std::string h(host);
+    if (h.size() >= 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
+    if (h == "localhost") return true;
+    in_addr v4{};
+    if (::inet_pton(AF_INET, h.c_str(), &v4) == 1) {
+        return (ntohl(v4.s_addr) >> 24) == 127U;
+    }
+    in6_addr v6{};
+    if (::inet_pton(AF_INET6, h.c_str(), &v6) == 1) {
+        if (IN6_IS_ADDR_LOOPBACK(&v6)) return true;
+        return IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127U;
+    }
+    return false;
+}
+
+std::string listen_refusal(const ServerConfig& c) {
+    // Only a node that announces itself: without a coordinator nobody is told where it is, and a
+    // node announced at loopback is announced to this host only.
+    if (c.coordinator_endpoints.empty() || is_loopback_host(c.advertise_host)) return {};
+    struct Surface {
+        const char*        name;
+        const std::string& given;
+        bool               authenticates;
+        const char*        secret;
+        const char*        bind;
+        bool               listens;
+    };
+    const Surface surfaces[] = {
+        {"client port", c.bind, !c.auth_secret_file.empty(), "--auth-secret-file", "--bind", true},
+        {"replication port", c.replication_bind, !c.cluster_secret_file.empty(), "--cluster-secret-file",
+         "--replication-bind", !c.multi_master && c.replication_port > 0},
+        {"multi-master port", c.mm_bind, !c.cluster_secret_file.empty(), "--cluster-secret-file",
+         "--mm-bind", c.multi_master},
+    };
+    for (const Surface& s : surfaces) {
+        // Loopback by the rule and not by a flag: an operator who named 127.0.0.1 chose it, behind a
+        // proxy on this host, say, and is not second-guessed.
+        if (!s.listens || !s.given.empty() || s.authenticates) continue;
+        return "--advertise-host " + c.advertise_host + " announces this node to clients and peers, but "
+               "with no " + s.secret + " and no " + s.bind + " its " + s.name +
+               " listens on 127.0.0.1 only (#256). Give " + s.secret + " (recommended), or " + s.bind +
+               " with the address to listen on";
+    }
+    return {};
+}
+
 ServerConfig parse_cli_args(int argc, char* argv[]) {
     return resolve_cli_args(argc, argv).config;
 }
@@ -2561,12 +2658,28 @@ TcpServer::TcpServer(ServerConfig config)
     ReplicationConfig repl_config{};
     if (!config_.multi_master) {
         repl_config.port = config_.replication_port;
-        repl_config.bind_address = config_.replication_bind;
+        // By #256's rule where no --replication-bind names an address: 127.0.0.1 without a cluster
+        // secret, every interface with one.
+        const ListenAddress repl_at = replication_listen_address(config_);
+        repl_config.bind_address = repl_at.address;
+        if (config_.replication_port > 0) {
+            OB_LOG_INFO("tcp_server", "the replication port %u listens on %s%s",
+                        static_cast<unsigned>(config_.replication_port), repl_at.reason.c_str(),
+                        repl_at.address == "127.0.0.1" && config_.replication_bind.empty()
+                            ? ": replicas on other hosts cannot connect" : "");
+        }
         repl_config.compress = config_.replication_compress;
         repl_config.cluster_secret = secrets_.cluster;
         repl_config.tls_server = tls_.replication_server;
     }
     // In MM mode, repl_config.port stays 0 → Engine won't create ReplicationManager
+    if (config_.multi_master) {
+        const ListenAddress mesh_at = mesh_listen_address(config_);
+        OB_LOG_INFO("tcp_server", "the multi-master port %u listens on %s%s",
+                    static_cast<unsigned>(config_.mm_replication_port), mesh_at.reason.c_str(),
+                    mesh_at.address == "127.0.0.1" && config_.mm_bind.empty()
+                        ? ": peers on other hosts cannot connect" : "");
+    }
 
     ReplicationClientConfig repl_client_config{};
     repl_client_config.primary_host = config_.primary_host;
@@ -2619,7 +2732,7 @@ TcpServer::TcpServer(ServerConfig config)
                                        MultiMasterConfig{
                                            .node_id = config_.mm_node_id,
                                            .replication_port = config_.mm_replication_port,
-                                           .bind_address = config_.mm_bind,
+                                           .bind_address = mesh_listen_address(config_).address,
                                            .enabled = config_.multi_master,
                                            .compress = config_.replication_compress,
                                            .max_catchup_bytes = config_.mm_max_catchup_bytes,
@@ -3876,14 +3989,15 @@ void TcpServer::run() {
         backups = std::make_unique<BackupRunner>(*engine_, config_.backup_dir, engine_->registry());
     }
 
-    // 1-4. The client port's listener: every interface of both families unless --bind names one
-    //      (#203), non-blocking, backlog 128. The address parsed when the flag was read; a config
-    //      built without the parser is checked here.
-    if (!net::valid_bind(config_.bind)) {
+    // 1-4. The client port's listener: where --bind names, or by #256's rule every interface with
+    //      authentication and 127.0.0.1 without it (#203, #256), non-blocking, backlog 128. The
+    //      address parsed when the flag was read; a config built without the parser is checked here.
+    if (config_.bind != kEveryInterface && !net::valid_bind(config_.bind)) {
         throw std::runtime_error("invalid --bind address '" + config_.bind + "'");
     }
+    const ListenAddress client_at = client_listen_address(config_);
     std::string listen_error;
-    listen_fd_ = net::listen_on(config_.bind, config_.port, 128, SOCK_NONBLOCK, listen_error);
+    listen_fd_ = net::listen_on(client_at.address, config_.port, 128, SOCK_NONBLOCK, listen_error);
     if (listen_fd_ < 0) {
         throw std::runtime_error(listen_error);
     }
@@ -3892,9 +4006,13 @@ void TcpServer::run() {
     // and through the logger so it reaches the operator's file when it happens rather than at exit.
     // The tool's banner says "starting" and cannot know this (#90).
     OB_LOG_INFO("tcp_server", "listening on port %u (%s), version %s, data-dir: %s",
-                static_cast<unsigned>(config_.port),
-                config_.bind.empty() ? "every interface" : config_.bind.c_str(),
+                static_cast<unsigned>(config_.port), client_at.reason.c_str(),
                 std::string(version()).c_str(), config_.data_dir.c_str());
+    if (client_at.address == "127.0.0.1" && config_.bind.empty()) {
+        OB_LOG_INFO("tcp_server", "clients on other hosts cannot connect to port %u: give "
+                    "--auth-secret-file, or --bind with the address to listen on (#256)",
+                    static_cast<unsigned>(config_.port));
+    }
 
     // The Unix socket (#52), beside the port and after it, so a port that would not bind leaves no
     // file behind. Its file goes on every way out of run() from here - but only while it is still

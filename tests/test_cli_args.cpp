@@ -291,13 +291,15 @@ TEST(CliArgs, WithoutTheFlagsEveryListenerTakesEveryInterface) {
 TEST(CliArgsDeath, AnAddressThatDoesNotParseIsARefusalNotEveryInterface) {
     // Listening on 0.0.0.0 because a typed address did not parse is the opposite of what was asked.
     EXPECT_EXIT(parse({"--bind", "127.0.0.256"}), ::testing::ExitedWithCode(1),
-                "--bind expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, got '127.0.0.256'");
+                "--bind expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, or .* for every "
+                "interface, got '127.0.0.256'");
     EXPECT_EXIT(parse({"--replication-bind", "localhost"}), ::testing::ExitedWithCode(1),
                 "--replication-bind expects an IPv4 or IPv6 address");
     EXPECT_EXIT(parse({"--mm-bind", ""}), ::testing::ExitedWithCode(1),
                 "--mm-bind expects an IPv4 or IPv6 address");
     EXPECT_EXIT(parse({"--bind", "::1:"}), ::testing::ExitedWithCode(1),
-                "--bind expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, got '::1:'");
+                "--bind expects an IPv4 or IPv6 address such as 127.0.0.1 or ::1, or .* for every "
+                "interface, got '::1:'");
 }
 
 TEST(CliArgs, AnIPv6AddressIsABindAddress) {
@@ -351,4 +353,148 @@ TEST(CliArgsDeath, AUnixSocketModeThatIsNotAnOctalModeIsRefused) {
                     "--unix-socket-mode expects an octal mode from 0 to 0777")
             << bad;
     }
+}
+
+// ── #256: a listener with no secret and no address listens on this host only ───────────────────
+
+TEST(ListenAddress, AnAddressGivenIsTheAddressWithOrWithoutASecret) {
+    for (const bool authenticates : {false, true}) {
+        const auto at = ob::listen_address("10.0.0.7", authenticates, "bind", "auth-secret-file");
+        EXPECT_EQ(at.address, "10.0.0.7");
+        EXPECT_EQ(at.reason, "--bind 10.0.0.7");
+    }
+    EXPECT_EQ(ob::listen_address("::", false, "bind", "auth-secret-file").address, "::")
+        << "an IPv6 literal is IPv6 alone (#236), with or without a secret";
+}
+
+TEST(ListenAddress, AStarIsEveryInterfaceOfBothFamiliesWithoutASecret) {
+    // The way back to the listener an empty flag gave before #256, which no literal says.
+    const auto at = ob::listen_address("*", false, "bind", "auth-secret-file");
+    EXPECT_EQ(at.address, "") << "empty is every interface of both families to net::listen_on()";
+    EXPECT_EQ(at.reason, "every interface: --bind *");
+    EXPECT_EQ(ob::client_listen_address(parse({"--bind", "*"})).address, "");
+    EXPECT_EQ(ob::replication_listen_address(parse({"--replication-bind", "*"})).address, "");
+    EXPECT_EQ(ob::mesh_listen_address(parse({"--mm-bind", "*"})).address, "");
+}
+
+TEST(ListenAddress, WithASecretAndNoAddressItIsEveryInterface) {
+    const auto at = ob::listen_address("", true, "bind", "auth-secret-file");
+    EXPECT_EQ(at.address, "") << "empty is every interface of both families to net::listen_on()";
+    EXPECT_EQ(at.reason, "every interface: --auth-secret-file is given and --bind is not");
+}
+
+TEST(ListenAddress, WithNeitherItIsThisHostOnly) {
+    const auto at = ob::listen_address("", false, "bind", "auth-secret-file");
+    EXPECT_EQ(at.address, "127.0.0.1");
+    EXPECT_EQ(at.reason, "this host only: no --auth-secret-file and no --bind (#256)");
+}
+
+TEST(ListenAddress, EachListenerTakesItsOwnFlagAndItsOwnSecret) {
+    const auto none = parse({});
+    EXPECT_EQ(ob::client_listen_address(none).address, "127.0.0.1");
+    EXPECT_EQ(ob::replication_listen_address(none).address, "127.0.0.1");
+    EXPECT_EQ(ob::mesh_listen_address(none).address, "127.0.0.1");
+
+    // A client secret opens the client port and nothing else: the node links have their own secret.
+    auto clients = none;
+    clients.auth_secret_file = "/etc/orderbook/secrets/clients";
+    EXPECT_EQ(ob::client_listen_address(clients).address, "");
+    EXPECT_EQ(ob::replication_listen_address(clients).address, "127.0.0.1");
+    EXPECT_EQ(ob::mesh_listen_address(clients).address, "127.0.0.1");
+
+    auto cluster = none;
+    cluster.cluster_secret_file = "/etc/orderbook/secrets/cluster";
+    EXPECT_EQ(ob::client_listen_address(cluster).address, "127.0.0.1");
+    EXPECT_EQ(ob::replication_listen_address(cluster).address, "");
+    EXPECT_EQ(ob::mesh_listen_address(cluster).address, "");
+
+    const auto bound = parse({"--bind", "10.0.0.1", "--replication-bind", "10.0.0.2", "--mm-bind", "::1"});
+    EXPECT_EQ(ob::client_listen_address(bound).address, "10.0.0.1");
+    EXPECT_EQ(ob::replication_listen_address(bound).address, "10.0.0.2");
+    EXPECT_EQ(ob::mesh_listen_address(bound).address, "::1");
+    EXPECT_EQ(ob::replication_listen_address(bound).reason, "--replication-bind 10.0.0.2");
+}
+
+TEST(ListenAddress, LoopbackIsTheLoopbackOfEitherFamilyOrItsName) {
+    for (const char* host : {"127.0.0.1", "127.255.0.9", "::1", "[::1]", "localhost", "::ffff:127.0.0.1"}) {
+        EXPECT_TRUE(ob::is_loopback_host(host)) << host;
+    }
+    for (const char* host : {"10.0.0.1", "0.0.0.0", "::", "128.0.0.1", "126.255.255.255",
+                             "::ffff:10.0.0.1", "example.com", "", "localhost.example.com"}) {
+        EXPECT_FALSE(ob::is_loopback_host(host)) << host;
+    }
+}
+
+namespace {
+
+/// A node announced through a coordinator, as an HA cluster across hosts configures one.
+ob::ServerConfig announced_at(const std::string& host) {
+    auto c = parse({});
+    c.coordinator_endpoints = {"http://127.0.0.1:2379"};
+    c.advertise_host = host;
+    return c;
+}
+
+}  // namespace
+
+TEST(ListenRefusal, ANodeNotAnnouncedOrAnnouncedAtLoopbackIsNotRefused) {
+    auto alone = parse({});
+    alone.advertise_host = "10.0.0.5";
+    EXPECT_EQ(ob::listen_refusal(alone), "") << "without a coordinator nobody is told where it is";
+    EXPECT_EQ(ob::listen_refusal(announced_at("127.0.0.1")), "");
+    EXPECT_EQ(ob::listen_refusal(announced_at("localhost")), "");
+}
+
+TEST(ListenRefusal, AClientPortOnLoopbackByTheRuleIsRefusedWhereTheNodeIsAnnounced) {
+    const std::string why = ob::listen_refusal(announced_at("10.0.0.5"));
+    EXPECT_EQ(why, "--advertise-host 10.0.0.5 announces this node to clients and peers, but with no "
+                   "--auth-secret-file and no --bind its client port listens on 127.0.0.1 only (#256). "
+                   "Give --auth-secret-file (recommended), or --bind with the address to listen on");
+}
+
+TEST(ListenRefusal, ANodeLinkOnLoopbackByTheRuleIsRefusedWhereTheNodeIsAnnounced) {
+    auto replica = announced_at("10.0.0.5");
+    replica.auth_secret_file = "/etc/orderbook/secrets/clients";
+    replica.replication_port = 9091;
+    const std::string why = ob::listen_refusal(replica);
+    EXPECT_NE(why.find("its replication port listens on 127.0.0.1 only"), std::string::npos) << why;
+    EXPECT_NE(why.find("Give --cluster-secret-file (recommended), or --replication-bind"), std::string::npos)
+        << why;
+
+    auto mesh = announced_at("10.0.0.5");
+    mesh.auth_secret_file = "/etc/orderbook/secrets/clients";
+    mesh.multi_master = true;
+    mesh.replication_port = 9091;   // not listened on in multi-master mode, so not asked about
+    const std::string mesh_why = ob::listen_refusal(mesh);
+    EXPECT_NE(mesh_why.find("its multi-master port listens on 127.0.0.1 only"), std::string::npos)
+        << mesh_why;
+    EXPECT_NE(mesh_why.find("--mm-bind"), std::string::npos) << mesh_why;
+}
+
+TEST(ListenRefusal, ASecretOrAnAddressNamedIsNotRefused) {
+    auto secrets = announced_at("10.0.0.5");
+    secrets.auth_secret_file = "/etc/orderbook/secrets/clients";
+    secrets.cluster_secret_file = "/etc/orderbook/secrets/cluster";
+    secrets.replication_port = 9091;
+    EXPECT_EQ(ob::listen_refusal(secrets), "");
+
+    // 127.0.0.1 named by the operator is their choice - behind a proxy on this host, say.
+    auto named = announced_at("10.0.0.5");
+    named.bind = "127.0.0.1";
+    named.replication_bind = "10.0.0.5";
+    named.replication_port = 9091;
+    EXPECT_EQ(ob::listen_refusal(named), "");
+
+    // A replication port that is not listened on is not asked about.
+    auto no_replication = announced_at("10.0.0.5");
+    no_replication.auth_secret_file = "/etc/orderbook/secrets/clients";
+    no_replication.replication_port = 0;
+    EXPECT_EQ(ob::listen_refusal(no_replication), "");
+}
+
+TEST(CliArgsDeath, ANodeAnnouncedWhereItsClientPortDoesNotListenIsRefused) {
+    EXPECT_EXIT(parse({"--coordinator-endpoints", "http://127.0.0.1:2379", "--advertise-host", "192.0.2.10"}),
+                ::testing::ExitedWithCode(1),
+                "--advertise-host 192.0.2.10 announces this node to clients and peers, but with no "
+                "--auth-secret-file and no --bind its client port listens on 127.0.0.1 only");
 }

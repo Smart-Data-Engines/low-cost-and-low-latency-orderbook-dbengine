@@ -23,6 +23,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ob {
@@ -712,6 +713,44 @@ const std::vector<std::string>& boolean_flags();
 /// the emitted name would report the key the operator wrote as coming from the default.
 std::vector<std::string> config_file_to_args(const std::string& path,
                                              std::set<std::string>* keys_seen = nullptr);
+
+/// `--bind *`, `--replication-bind *`, `--mm-bind *`: every interface of both families, which no
+/// address says - `::` is IPv6 alone and `0.0.0.0` IPv4 alone (#236) - and which an empty flag no
+/// longer means where the surface has no secret (#256).
+inline constexpr std::string_view kEveryInterface = "*";
+
+/// Where one of a node's listeners listens, and why (#256).
+struct ListenAddress {
+    /// What `net::listen_on()` gets: empty is every interface of both families.
+    std::string address;
+    /// Why, for the startup log and `--print-config`.
+    std::string reason;
+};
+
+/// A listener's address: the one its flag names, if it names one - `*` being every interface; every
+/// interface, if the surface authenticates; 127.0.0.1 otherwise (#256). A node with no authentication used to listen on every
+/// interface, and the package's configuration has none - which is how a database ends up readable
+/// by whoever reaches it, and why PostgreSQL, MongoDB, ClickHouse and Redis listen on loopback until
+/// told otherwise. `bind_flag` and `secret_flag` name the flags, for the reason.
+ListenAddress listen_address(const std::string& given, bool authenticates, std::string_view bind_flag,
+                             std::string_view secret_flag);
+
+/// The client port's: `--bind`, authenticated by `--auth-secret-file`.
+ListenAddress client_listen_address(const ServerConfig& c);
+/// The replication port's: `--replication-bind`, authenticated by `--cluster-secret-file`.
+ListenAddress replication_listen_address(const ServerConfig& c);
+/// The multi-master port's: `--mm-bind`, authenticated by `--cluster-secret-file`.
+ListenAddress mesh_listen_address(const ServerConfig& c);
+
+/// True for an address or name of this host's loopback: 127.0.0.0/8, ::1, an IPv4-mapped
+/// 127.0.0.0/8 and `localhost`.
+bool is_loopback_host(std::string_view host);
+
+/// Why this node must not start, or nothing (#256, requirement 3): it announces itself to clients
+/// and peers through its coordinator at a host other than loopback, while a listener they need would
+/// listen on loopback only because no secret and no address was given for it. A node registered
+/// where nobody can reach it is a cluster failing in silence.
+std::string listen_refusal(const ServerConfig& c);
 
 /// Parse CLI arguments into a ServerConfig. Applies defaults for missing args.
 ///
