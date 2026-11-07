@@ -82,6 +82,7 @@ tests/integration/
 ├── test_edge_cases.py                # input the server should refuse
 ├── test_large_response.py            # responses larger than the socket send buffer
 ├── test_answer_ceiling.py            # an answer past the session's ceiling refused where it passed it (#257)
+├── test_large_answer_isolation.py    # a large read answered off the client loop, the sessions beside it served (#260)
 ├── test_compression.py               # LZ4 session compression, negotiated and lossless
 ├── test_cli_tool.py                  # the interactive CLI refuses what it does not understand (#110)
 ├── test_cpp_client.py                # the native C++ client against a running server

@@ -126,6 +126,21 @@ public:
     /// literal ambiguous.
     Queued take_answer(std::string&& response);
 
+    /// A large read of this session is being answered off the client loop (#260): set when the loop
+    /// hands one out, cleared when its answer is queued. While it is set the loop reads nothing more
+    /// of this session - the socket keeps the rest, and TCP tells the client to wait.
+    bool reading_off_loop() const { return reading_off_loop_; }
+    void set_reading_off_loop(bool reading) { reading_off_loop_ = reading; }
+    /// The commands of a read that came after a large read handed off (#260), in order: run once its
+    /// answer is queued, before anything more is read from the socket.
+    void hold_lines(std::vector<std::string> lines) { held_lines_ = std::move(lines); }
+    bool has_held_lines() const { return !held_lines_.empty(); }
+    std::vector<std::string> take_held_lines() {
+        std::vector<std::string> out;
+        out.swap(held_lines_);
+        return out;
+    }
+
     /// The next answer take_answer() is given is an LZ4 frame already, its length in front (#257):
     /// a row answer built as its text was written, so that the frame could be measured as it grew.
     /// It is queued as it is - taken, with nothing pending - against the cap on its own size, and
@@ -360,6 +375,8 @@ private:
     uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
     uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
     bool        framed_next_{false};     // the next answer taken is a frame already (#257)
+    bool        reading_off_loop_{false};          // a large read answered off the loop (#260)
+    std::vector<std::string> held_lines_;          // the commands waiting behind it
     uint64_t    framed_text_bytes_{0};
     /// take_answer() for an answer that is a frame already (#257).
     Queued take_framed(std::string&& framed, uint64_t text_bytes);

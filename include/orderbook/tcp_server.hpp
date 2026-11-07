@@ -191,6 +191,10 @@ struct ServerConfig {
     /// client loops (#249). `boost` sets one thread per usable CPU; 0, `eco`'s and the struct's,
     /// reads every segment on the query's loop, which is what this server always did.
     uint32_t    scan_threads{0};
+    /// --large-read-threads: the threads a large `SELECT` is answered on, off the client loops
+    /// (#260), so that a loop goes on serving its other sessions while one reads millions of rows.
+    /// 0 answers every read on its loop, as this server always did.
+    uint32_t    large_read_threads{2};
     /// The CPUs this process may use, as `detect_machine()` found them (#156): what a scan on the
     /// pool divides against. 0 until the command line is read, and then the client loops' count.
     uint32_t    usable_cpus{0};

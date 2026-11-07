@@ -170,6 +170,9 @@ MetricsRegistry::MetricsRegistry() {
     // The client secrets and permissions read again on SIGHUP (#258). A refused reload leaves the
     // credentials in force - an identity meant to be revoked still authenticates - so the failure
     // count is what an alert reads.
+    // Large reads answered off the client loops (#260).
+    counters_.push_back(make_counter("ob_off_loop_reads_total",
+                                     "SELECTs answered off their client loop: the index put their scan past the threshold (#260)"));
     counters_.push_back(make_counter("ob_auth_reloads_total",
                                      "Client credential reloads that put the files read in force (#258)"));
     counters_.push_back(make_counter("ob_auth_reload_failures_total",
@@ -296,6 +299,8 @@ MetricsRegistry::MetricsRegistry() {
                                  "Milliseconds the last backup held merges and retention back"));
     gauges_.push_back(make_gauge("ob_active_sessions",
                                  "Number of active client sessions, over TCP and the Unix socket"));
+    gauges_.push_back(make_gauge("ob_off_loop_reads_in_flight",
+                                 "SELECTs handed to the threads off the client loops whose answer has not come back (#260)"));
     gauges_.push_back(make_gauge("ob_ring_bytes",
                                  "Shared memory the sessions in rings hold, in bytes"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
