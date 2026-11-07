@@ -443,6 +443,11 @@ TEST(ListenRefusal, ANodeNotAnnouncedOrAnnouncedAtLoopbackIsNotRefused) {
     EXPECT_EQ(ob::listen_refusal(alone), "") << "without a coordinator nobody is told where it is";
     EXPECT_EQ(ob::listen_refusal(announced_at("127.0.0.1")), "");
     EXPECT_EQ(ob::listen_refusal(announced_at("localhost")), "");
+    // Loopback as is_loopback_host() reads it, which a predicate of its own in the server, matching
+    // a "127." prefix, did not: the refusal and the test of the rule read the same function.
+    EXPECT_EQ(ob::listen_refusal(announced_at("::ffff:127.0.0.1")), "");
+    EXPECT_EQ(ob::listen_refusal(announced_at("[::1]")), "");
+    EXPECT_NE(ob::listen_refusal(announced_at("127.example.com")), "") << "a name, not an address";
 }
 
 TEST(ListenRefusal, AClientPortOnLoopbackByTheRuleIsRefusedWhereTheNodeIsAnnounced) {

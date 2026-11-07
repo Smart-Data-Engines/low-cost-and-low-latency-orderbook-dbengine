@@ -2515,10 +2515,6 @@ std::string format_config(const ResolvedConfig& resolved) {
 
 namespace {
 
-bool is_loopback_host(const std::string& host) {
-    return host == "localhost" || host.rfind("127.", 0) == 0 || host == "::1" || host == "[::1]";
-}
-
 /// The host of an endpoint URL: `http://10.0.0.1:2379` gives `10.0.0.1`, `[::1]:2379` gives `[::1]`.
 std::string endpoint_host(const std::string& url) {
     std::string rest = url;
