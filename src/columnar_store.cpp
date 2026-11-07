@@ -2508,6 +2508,40 @@ BatchVerdict take_in_steps(ScanPart& part, const RowBatch& batch) {
     return {};
 }
 
+namespace {
+
+/// The rows a segment may give a range, from its metadata, as if spread evenly over its time - all of
+/// them when its range is one instant (#246, #260).
+uint64_t segment_rows_in_range(const SegmentMeta& m, uint64_t start_ns, uint64_t end_ns) {
+    const uint64_t lo = std::max(m.start_ts_ns, start_ns);
+    const uint64_t hi = std::min(m.end_ts_ns, end_ns);
+    const uint64_t span = m.end_ts_ns - m.start_ts_ns;
+    if (hi < lo) return 0;
+    if (span == 0) return m.row_count;
+    return static_cast<uint64_t>(static_cast<double>(m.row_count) *
+                                 (static_cast<double>(hi - lo) + 1.0) /
+                                 (static_cast<double>(span) + 1.0));
+}
+
+}  // namespace
+
+uint64_t ColumnarStore::rows_in_range_at_most(uint64_t start_ns, uint64_t end_ns,
+                                              std::string_view symbol,
+                                              std::string_view exchange) const {
+    ScanCost cost;
+    ScanSet set;
+    if (!scan_set(start_ns, end_ns, symbol, exchange, set, cost)) return 0;
+    uint64_t rows = 0;
+    for (const SegmentMeta& m : set.segments) rows += segment_rows_in_range(m, start_ns, end_ns);
+    for (const auto& b : set.blocks) rows += b->rows.size();
+    OB_LOG_DEBUG("columnar", "%.*s.%.*s [%llu, %llu]: at most %llu row(s) in %zu segment(s) and %zu "
+                 "block(s)", static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(start_ns), static_cast<unsigned long long>(end_ns),
+                 static_cast<unsigned long long>(rows), set.segments.size(), set.blocks.size());
+    return rows;
+}
+
 ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t end_ns,
                                                    std::string_view symbol,
                                                    std::string_view exchange, ColumnSet columns,
@@ -2556,16 +2590,7 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
     uint64_t in_range = 0;
     uint64_t largest = 0;
     for (Slot& s : slots) {
-        const SegmentMeta& m = *s.meta;
-        const uint64_t lo = std::max(m.start_ts_ns, start_ns);
-        const uint64_t hi = std::min(m.end_ts_ns, end_ns);
-        const uint64_t span = m.end_ts_ns - m.start_ts_ns;
-        const uint64_t rows =
-            span == 0 || hi < lo
-                ? (hi < lo ? 0 : m.row_count)
-                : static_cast<uint64_t>(static_cast<double>(m.row_count) *
-                                        (static_cast<double>(hi - lo) + 1.0) /
-                                        (static_cast<double>(span) + 1.0));
+        const uint64_t rows = segment_rows_in_range(*s.meta, start_ns, end_ns);
         in_range += rows;
         largest = std::max(largest, rows);
     }

@@ -231,6 +231,13 @@ public:
     /// the aggregates, the buckets and every other answer still arrive through `cb`.
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows);
 
+    /// The rows a query would scan from the store, at most, read from the index before it runs
+    /// (#260): for a row query - cut to its LIMIT - and for time buckets and rolling windows, which
+    /// read rows too. Nothing for what does not scan the store: a query that does not parse, the
+    /// live book's functions, a snapshot of the book. What a client loop asks to decide whether a
+    /// query is large enough to answer off the loop.
+    std::optional<uint64_t> estimated_scan_rows(std::string_view sql);
+
     /// The live book for one symbol, as rows. Error string on failure, empty on success.
     ///
     /// The engine's central data structure is `SoABuffer` - per side a depth and its levels,

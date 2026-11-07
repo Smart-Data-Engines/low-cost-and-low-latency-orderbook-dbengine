@@ -2119,6 +2119,10 @@ std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& sh
     return query_engine_->execute(sql, std::move(cb), shape, rows);
 }
 
+std::optional<uint64_t> Engine::estimated_scan_rows(std::string_view sql) {
+    return query_engine_->estimated_scan_rows(sql);
+}
+
 std::string Engine::read_book(const std::string& symbol, const std::string& exchange,
                               uint32_t depth, RowCallback cb) {
     return query_engine_->read_book(symbol, exchange, depth, std::move(cb));

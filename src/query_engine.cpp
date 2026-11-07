@@ -1229,6 +1229,26 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     return execute(sql, std::move(cb), shape, nullptr);
 }
 
+std::optional<uint64_t> QueryEngine::estimated_scan_rows(std::string_view sql) {
+    QueryAST ast;
+    if (!parse(sql, ast).empty() || ast.type != QueryType::SELECT || ast.snapshot_ts_ns.has_value()) {
+        return std::nullopt;
+    }
+    const bool scans_buckets = ast.bucket_ns.has_value() || ast.rolling_ns.has_value();
+    bool has_agg = false;
+    for (const auto& expr : ast.select_exprs) {
+        if (is_agg_expr(expr)) { has_agg = true; break; }
+    }
+    // The live book's functions read the book, not the store.
+    if (has_agg && !scans_buckets) return std::nullopt;
+    uint64_t rows = store_.rows_in_range_at_most(ast.ts_start_ns.value_or(0),
+                                                 ast.ts_end_ns.value_or(UINT64_MAX), ast.symbol,
+                                                 ast.exchange);
+    // A row query reads no more than its LIMIT; a bucket query's LIMIT counts buckets, not rows.
+    if (!scans_buckets && ast.limit.has_value()) rows = std::min(rows, *ast.limit);
+    return rows;
+}
+
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShape& shape,
                                  RowAnswer* rows) {
     QueryAST ast;

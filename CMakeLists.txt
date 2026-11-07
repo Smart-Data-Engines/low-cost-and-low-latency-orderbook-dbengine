@@ -584,6 +584,7 @@ endif()
 # ── TCP Server library (testable components) ──────────────────────────────────
 add_library(orderbook_tcp_server_lib STATIC
     src/tcp_server.cpp
+    src/off_loop_reads.cpp
     src/command_parser.cpp
     src/response_formatter.cpp
     src/session.cpp

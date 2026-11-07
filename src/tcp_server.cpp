@@ -959,54 +959,63 @@ std::string answer_too_large(uint64_t rows_within) {
 }
 
 /// A read's answer - `SELECT` and `BOOK` - with what both do around the engine's call: the refusal
-/// during a snapshot bootstrap, the rows formatted as the engine hands them over, and the latency
-/// and counters every read shares. `read` makes the call with the row callback it is given and
-/// returns the engine's refusal, empty when there is none.
+/// during a snapshot bootstrap, the rows formatted as the engine hands them over, measured against what
+/// the session may be sent (#257), and the latency and the registry's count every read shares. `read`
+/// makes the call with the row callback it is given and returns the engine's refusal, empty when there
+/// is none. No session in it (#260): a thread off the client loop builds a large read's answer here as
+/// the loop builds the others, and the caller does the session's part.
 ///
 /// Refused during a bootstrap because a replica installing a snapshot is replacing the store under
 /// itself (#142), and an answer composed across that is an answer about two trees. Each row is
 /// formatted as it arrives (#49 step 3), not collected first: the vector of rows that was replaced
 /// was three quarters of a turned-over heap's page faults, so the latency includes formatting.
+struct ReadAnswer {
+    std::string answer;
+    bool        framed{false};      ///< an LZ4 frame already (#257)
+    uint64_t    text_bytes{0};      ///< the text a frame holds
+    bool        counted{false};     ///< a query that ran, which the session and the server count
+};
+
 template <typename Read>
-std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
-                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
-    session.increment_commands();
-    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+ReadAnswer build_read_answer(const char* what, int fd, Engine& engine, MetricsRegistry* registry,
+                             QueryShape& shape, std::string room, AnswerCeiling ceiling, Read&& read) {
+    ReadAnswer out;
+    if (engine.is_bootstrapping()) {
+        out.answer = format_error("bootstrapping");
+        return out;
+    }
     const auto started = std::chrono::steady_clock::now();
-    // Written in the session's send buffer's room, which take_answer() gives back with the reply
-    // (#253): a session's large answers are written where the last one was. Measured against what
-    // the session may be sent as it is built (#257) - its frame, where the session compresses - so
-    // that an answer past it stops being read and formatted there, rather than at its last row.
-    QueryResponseBuilder reply(shape, session.lend_room(),
-                               AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()});
+    QueryResponseBuilder reply(shape, std::move(room), ceiling);
     try {
         // The builder twice: as a row callback for whatever arrives one result at a time, and as
         // the place a row answer's batches go (OB-12).
         const std::string err = read([&](const QueryResult& r) { reply.add(r); },
                                      static_cast<RowAnswer&>(reply));
         if (!err.empty()) {
-            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, session.fd(),
+            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, fd,
                          sanitise_for_log(err, 256).c_str());
-            return format_error(err);
+            out.answer = format_error(err);
+            return out;
         }
     } catch (const std::exception& e) {
-        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, session.fd(),
-                     sanitise_for_log(e.what(), 256).c_str());
-        return format_error(e.what());
+        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, fd, sanitise_for_log(e.what(), 256).c_str());
+        out.answer = format_error(e.what());
+        return out;
     }
     if (reply.full()) {
         // No client could be sent this however fast it reads: refused as #152 refuses it, with the
         // session left open - but now where it passed the ceiling, not after its last row (#257).
         OB_LOG_INFO("tcp_server", "%s from fd=%d passed its answer's ceiling of %zu bytes after %llu "
                     "row(s), %zu byte(s) built (%s): refused, the first %llu row(s) within it", what,
-                    session.fd(), Session::max_queued_bytes(),
-                    static_cast<unsigned long long>(reply.rows_taken()), reply.bytes_built(),
-                    reply.framed() ? "an LZ4 frame" : "text",
+                    fd, ceiling.bytes, static_cast<unsigned long long>(reply.rows_taken()),
+                    reply.bytes_built(), reply.framed() ? "an LZ4 frame" : "text",
                     static_cast<unsigned long long>(reply.rows_within()));
-        return format_error(answer_too_large(reply.rows_within()));
+        out.answer = format_error(answer_too_large(reply.rows_within()));
+        return out;
     }
-    std::string answer = reply.finish();
-    if (reply.framed()) session.next_answer_framed(reply.text_bytes());
+    out.answer     = reply.finish();
+    out.framed     = reply.framed();
+    out.text_bytes = reply.text_bytes();
     if (registry) {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -1016,9 +1025,27 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
         registry->observe_histogram("ob_query_latency_seconds", secs);
         registry->increment_counter("ob_total_queries");
     }
-    session.increment_queries();
-    stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-    return answer;
+    out.counted = true;
+    return out;
+}
+
+/// build_read_answer() on the loop, with the session's part: its command and query counted, the
+/// answer written in its send buffer's room (#253), and a frame marked for take_answer() (#257).
+template <typename Read>
+std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
+                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
+    session.increment_commands();
+    // Before the room is lent, so that a refused read leaves the session the room it had.
+    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+    ReadAnswer r = build_read_answer(what, session.fd(), engine, registry, shape, session.lend_room(),
+                                     AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()},
+                                     std::forward<Read>(read));
+    if (r.framed) session.next_answer_framed(r.text_bytes);
+    if (r.counted) {
+        session.increment_queries();
+        stats.total_queries.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::move(r.answer);
 }
 
 /// `STATUS`, from a snapshot taken for this answer rather than from the `ServerStats` every
@@ -1123,7 +1150,8 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord,
                             SubscriptionHub* hub,
                             const SecretStore* client_secrets,
-                            BackupRunner* backups) {
+                            BackupRunner* backups,
+                            OffLoopReads* off_loop) {
     // ── Authentication gate ───────────────────────────────────────────────────
     //
     // Before the switch, not as a branch inside each case. A per-case check means the next command
@@ -1195,6 +1223,9 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::SELECT: {
+        // Past the gate: a read the index puts past kOffLoopReadRows goes to the threads off the loop,
+        // and the loop goes on with its other sessions (#260).
+        if (off_loop != nullptr && off_loop->take(cmd, session)) return std::string(kAnsweredOffLoop);
         // An aggregate query calls the callback exactly once, with agg_values set and the row
         // fields left at zero, and the builder answers it as aggregates. Formatting that as a data
         // row is what made SPREAD, MID_PRICE, IMBALANCE and VWAP return zeros to every network

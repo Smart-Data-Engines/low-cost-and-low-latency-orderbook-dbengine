@@ -651,6 +651,21 @@ private:
 ///
 /// When backups is non-null, BACKUP starts one and BACKUP STATUS reports it (#34); when it is null,
 /// BACKUP is refused and BACKUP STATUS answers `state: idle`.
+/// Where a large read is answered instead of the loop that runs execute_command() (#260). Asked for a
+/// `SELECT` after the authentication gate and the permissions have passed it - so nothing reaches the
+/// threads off the loop that the loop would have refused. True: the read was taken, its answer comes
+/// back to the loop, and execute_command() answers kAnsweredOffLoop, which the loop never queues.
+class OffLoopReads {
+public:
+    virtual ~OffLoopReads() = default;
+    virtual bool take(const Command& cmd, Session& session) = 0;
+};
+
+/// execute_command()'s answer to a read an OffLoopReads took: not an answer of the protocol - none
+/// begins with a NUL - and the loop's alone to see.
+inline constexpr std::string_view kAnsweredOffLoop{"\0answered off the loop",
+                                                 sizeof("\0answered off the loop") - 1};
+
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -660,7 +675,8 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord = nullptr,
                             SubscriptionHub* hub = nullptr,
                             const SecretStore* client_secrets = nullptr,
-                            BackupRunner* backups = nullptr);
+                            BackupRunner* backups = nullptr,
+                            OffLoopReads* off_loop = nullptr);
 
 /// Execute `INSERT` and `MINSERT` commands as one batch - the writes a client sent in one read.
 ///
