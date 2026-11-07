@@ -273,8 +273,11 @@ TEST(AdvertiseHostInConfig, ALoopbackAddressWithACoordinatorElsewhereIsNamed) {
         << "one endpoint on another machine is enough";
     EXPECT_EQ(with({"--coordinator-endpoints", "http://10.0.0.1:2379", "--advertise-host", "localhost"}),
               "http://10.0.0.1:2379");
-    // The controls: an address peers can reach, a coordinator on this machine, no coordinator.
-    EXPECT_EQ(with({"--coordinator-endpoints", "http://10.0.0.1:2379", "--advertise-host", "10.0.0.11"}),
+    // The controls: an address peers can reach, a coordinator on this machine, no coordinator. The
+    // first listens there too - announced at 10.0.0.11 with its client port on 127.0.0.1, a node does
+    // not start since #256.
+    EXPECT_EQ(with({"--coordinator-endpoints", "http://10.0.0.1:2379", "--advertise-host", "10.0.0.11",
+                    "--bind", "10.0.0.11"}),
               "");
     EXPECT_EQ(with({"--coordinator-endpoints", "http://127.0.0.1:2379"}), "");
     EXPECT_EQ(with({"--coordinator-endpoints", "http://localhost:2379"}), "");
