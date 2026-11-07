@@ -1725,7 +1725,7 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
 
     // The read path runs from the line the session hands back to the label the loop jumps to.
-    const std::size_t from = source.find("auto lines = session->feed(buf, got);");
+    const std::size_t from = source.find("lines = session->feed(buf, got);");
     ASSERT_NE(from, std::string::npos) << "the read path moved; this test would check nothing";
     const std::size_t to = source.find("next_event:;", from);
     ASSERT_NE(to, std::string::npos);
@@ -1810,7 +1810,7 @@ TEST(ReadLoopStatic, TheWritesOfAReadAreHeldAndAnsweredBeforeAnythingElse) {
     };
     const std::string source = read("src/tcp_server.cpp");
     ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
-    const std::size_t from = source.find("auto lines = session->feed(buf, got);");
+    const std::size_t from = source.find("lines = session->feed(buf, got);");
     ASSERT_NE(from, std::string::npos) << "the read path moved; this test would check nothing";
     const std::size_t to = source.find("next_event:;", from);
     ASSERT_NE(to, std::string::npos);
@@ -2118,7 +2118,11 @@ TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
     std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
     const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(src.empty());
-    const auto at = src.find("if (queued == Session::Queued::TooLargeAlone) {");
+    // In the read loop's `enqueue`: the answers off the loop (#260) are queued by a branch of their
+    // own, held by the battery's isolation module.
+    const auto loop_enqueue = src.find("const auto enqueue = [&](std::string&& response) -> bool {");
+    ASSERT_NE(loop_enqueue, std::string::npos) << "the read loop has no enqueue any more";
+    const auto at = src.find("if (queued == Session::Queued::TooLargeAlone) {", loop_enqueue);
     ASSERT_NE(at, std::string::npos) << "the read loop does not tell an answer too large to send "
                                         "from a client that stopped reading";
     // The branch, by brace matching. Since #155 it is the first half of `enqueue`, which the loop

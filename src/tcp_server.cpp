@@ -3350,6 +3350,10 @@ int Reactor::take_off_loop_answers(int nfds) {
             close_session(a.fd, "send failed");
             continue;
         }
+        // Armed here, as the end of a read's batch arms it: an answer larger than the socket takes in
+        // one send is finished by EPOLLOUT, and the read the resumed session makes next would leave
+        // nothing armed to finish it - its receive() says it wants to read.
+        if (s->has_pending_output()) arm_epollout(a.fd);
         resume_.push_back(a.fd);
     }
     // As if readable and writable: the answer flushed, the commands held behind it run, and the socket
