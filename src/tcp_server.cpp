@@ -3690,8 +3690,8 @@ void Reactor::run_loop() {
                                     // No client could be sent this, however fast it reads, so the
                                     // session is not the thing that failed: it gets an error in
                                     // the answer's place and stays open (#152).
-                                    return session->queue_response(
-                                        format_error(answer_too_large(0)));
+                                    const std::string refusal = format_error(answer_too_large(0));
+                                    return session->queue_response(refusal);
                                 }
                                 // The send buffer cap: a client that has stopped reading. EPIPE
                                 // and ECONNRESET surface in the flush.

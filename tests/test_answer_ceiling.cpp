@@ -289,19 +289,43 @@ struct Store {
 
 const char* const kAll = "SELECT * FROM 'CE'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
 
+/// The builder, with the rows the scan offered it counted: a full builder takes no more rows, so
+/// only what was offered says whether the scan went on reading after the answer was full.
+class Offered final : public ob::RowAnswer {
+public:
+    explicit Offered(ob::QueryResponseBuilder& reply) : reply_(reply) {}
+    void add_rows(const ob::RowBatch& batch) override {
+        offered += batch.rows.size();
+        reply_.add_rows(batch);
+    }
+    std::unique_ptr<ob::ScanPart> part(uint64_t limit) override { return reply_.part(limit); }
+    void add_part(ob::ScanPart& part, uint64_t n) override {
+        offered += n;
+        reply_.add_part(part, n);
+    }
+    bool full() const override { return reply_.full(); }
+
+    uint64_t offered = 0;
+
+private:
+    ob::QueryResponseBuilder& reply_;
+};
+
 }  // namespace
 
 TEST(AnswerCeiling, TheScanStopsAtTheBatchThatMadeItsAnswerFull) {
     Store s;
     ob::QueryShape shape;
     ob::QueryResponseBuilder reply(shape, std::string(), ob::AnswerCeiling{100'000, false});
+    Offered offered(reply);
     const std::string err =
-        s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &reply);
+        s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &offered);
     ASSERT_TRUE(err.empty()) << err;
     EXPECT_TRUE(reply.full());
-    EXPECT_LT(reply.rows_taken(), 20'000u) << "the scan read on past a full answer";
+    EXPECT_EQ(offered.offered, reply.rows_taken()) << "the scan read on past a full answer";
     EXPECT_LE(reply.rows_taken() - reply.rows_within(), ob::kScanBatchRows)
         << "more than the batch that passed the ceiling was taken";
+    EXPECT_LT(reply.rows_taken(), 20'000u);
 
     // The control: the same query with room for its answer reads every row.
     ob::QueryShape whole_shape;
@@ -318,14 +342,16 @@ TEST(AnswerCeiling, ADividedScanStopsAtThePartThatMadeItsAnswerFull) {
     s.engine.set_scan_pool(&pool, /*divide_small=*/true);
     ob::QueryShape shape;
     ob::QueryResponseBuilder reply(shape, std::string(), ob::AnswerCeiling{300'000, false});
+    Offered offered(reply);
     const std::string err =
-        s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &reply);
+        s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &offered);
     ASSERT_TRUE(err.empty()) << err;
     EXPECT_TRUE(reply.full());
     // A part is a segment of 5000 rows: the first fits in 300 000 bytes and the second does not, so
-    // the answer took one part and the scan folded no more.
+    // the answer took one part, was offered the second, and the scan folded no more.
     EXPECT_EQ(reply.rows_taken(), 5000u);
     EXPECT_EQ(reply.rows_within(), 5000u);
+    EXPECT_EQ(offered.offered, 10'000u) << "the scan folded parts past a full answer";
 
     ob::QueryShape whole_shape;
     ob::QueryResponseBuilder whole(whole_shape, std::string(), ob::AnswerCeiling{64u << 20, false});
