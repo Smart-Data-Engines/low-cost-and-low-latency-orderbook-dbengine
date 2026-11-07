@@ -172,17 +172,20 @@ def authenticated(port: int, identity: str, secret: str) -> socket.socket:
 
 
 def answers(s: socket.socket, n: int) -> list[bytes]:
-    """The next `n` answers: `OK` through its empty line, or one line of anything else."""
+    """The next `n` answers: `OK` through its empty line, or one line of anything else. An answer's
+    end is looked for in what came since the last look, so taking megabytes in is not quadratic."""
     out: list[bytes] = []
     buf = bytearray()
+    looked = 0
     while len(out) < n:
         chunk = s.recv(1 << 20)
         assert chunk, "the session was closed"
         buf += chunk
         while len(out) < n and buf:
             if buf.startswith(b"OK"):
-                end = buf.find(b"\n\n")
+                end = buf.find(b"\n\n", max(0, looked - 1))
                 if end < 0:
+                    looked = len(buf)
                     break
                 out.append(bytes(buf[:end + 2]))
                 del buf[:end + 2]
@@ -192,6 +195,7 @@ def answers(s: socket.socket, n: int) -> list[bytes]:
                     break
                 out.append(bytes(buf[:end + 1]))
                 del buf[:end + 1]
+            looked = 0
     return out
 
 
@@ -403,10 +407,11 @@ def test_an_answer_whose_session_was_closed_goes_to_no_session_after_it(tmp_path
 
 
 def test_a_tls_sessions_large_read_is_the_answer_a_plain_session_is_given(tmp_path):
-    """Off the loop and through TLS: the bytes a plain session on the node's Unix socket is given.
-    To a reader that keeps up the answer goes in slices of a megabyte, the loop serving its other
-    sessions between them; through a 4 kB window, in records the socket takes a few at a time, each
-    write that stopped asked again for at least what it asked before (#260)."""
+    """Off the loop and through TLS: the bytes a plain session on the node's Unix socket is given, 6.7 MB
+    to a reader that keeps up - in slices of a megabyte, the loop serving its other sessions between
+    them (#260). A write that stops at a full socket and is asked again for more than it asked is
+    tests/test_tls_session.cpp's: on the loopback the node's send buffer grows to megabytes, and only a
+    buffer made small there makes such a write certain."""
     cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
                     "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
@@ -429,22 +434,19 @@ def test_a_tls_sessions_large_read_is_the_answer_a_plain_session_is_given(tmp_pa
             (expected,) = answers(plain, 1)
         finally:
             plain.close()
-        assert expected.startswith(b"OK\ntimestamp_ns\t") and len(expected) > (1 << 20), expected[:80]
+        assert expected.startswith(b"OK\ntimestamp_ns\t"), expected[:80]
+        assert len(expected) > 4 * (1 << 20), "the answer is not several slices"
 
         context = ssl.create_default_context(cafile=str(cert))
         context.minimum_version = ssl.TLSVersion.TLSv1_3
-        for window in (0, 4096):
-            raw = socket.create_connection(("127.0.0.1", node.port), timeout=patience(120))
-            if window:
-                raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, window)
-            s = context.wrap_socket(raw, server_hostname="127.0.0.1")
-            try:
-                banner(s).sendall(query)
-                (got,) = answers(s, 1)
-            finally:
-                s.close()
-            assert got == expected, f"through TLS, window {window or 'default'}: {len(got)} bytes, " \
-                                    f"{len(expected)} expected"
-        assert node.metric("ob_off_loop_reads_total") == before + 3, "a read stayed on the loop"
+        s = context.wrap_socket(socket.create_connection(("127.0.0.1", node.port), timeout=patience(120)),
+                                server_hostname="127.0.0.1")
+        try:
+            banner(s).sendall(query)
+            (got,) = answers(s, 1)
+        finally:
+            s.close()
+        assert got == expected, f"through TLS: {len(got)} bytes, {len(expected)} expected"
+        assert node.metric("ob_off_loop_reads_total") == before + 2, "a read stayed on the loop"
     finally:
         node.stop()
