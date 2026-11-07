@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -362,17 +363,65 @@ struct ServerConfig {
 /// The credential stores a node runs with. Either may be empty, meaning that surface does not
 /// authenticate.
 struct LoadedSecrets {
-    SecretStore clients;   ///< --auth-secret-file
+    /// --auth-secret-file with --auth-acl-file applied: never null, empty when client
+    /// authentication is off. Shared, because a reload replaces it whole (#258).
+    std::shared_ptr<const SecretStore> clients{std::make_shared<const SecretStore>()};
     SecretStore cluster;   ///< --cluster-secret-file
 
-    bool client_auth_enabled() const { return !clients.empty(); }
+    bool client_auth_enabled() const { return !clients->empty(); }
     bool cluster_auth_enabled() const { return !cluster.empty(); }
 
     /// The pointer execute_command() wants: null when client authentication is off.
     const SecretStore* client_store() const {
-        return clients.empty() ? nullptr : &clients;
+        return clients->empty() ? nullptr : clients.get();
     }
 };
+
+/// The client credentials in force (#258): a store replaced whole by a reload and never changed in
+/// place, so a reader holding one reads a store that stays as it was, and a generation each
+/// replacement moves, which a client loop compares with the one it holds once a pass.
+class ClientCredentials {
+public:
+    explicit ClientCredentials(std::shared_ptr<const SecretStore> store);
+
+    struct Current {
+        std::shared_ptr<const SecretStore> store;
+        uint64_t                           generation;
+    };
+    /// The store in force and its generation, read together.
+    Current current() const;
+    /// The generation in force, without the store: what a loop reads every pass.
+    uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+    /// `store` in force from now, and the generation moved.
+    void replace(std::shared_ptr<const SecretStore> store);
+
+private:
+    mutable std::mutex                 mtx_;
+    std::shared_ptr<const SecretStore> store_;
+    std::atomic<uint64_t>              generation_{0};
+};
+
+/// What a reload of the client credentials did (#258).
+enum class CredentialReload {
+    Reloaded,          ///< the files just read are in force, and every loop checks its sessions
+    Refused,           ///< the files were refused, and the credentials in force are what they were
+    NothingToReload,   ///< no --auth-secret-file: client authentication is off, and stays off
+};
+
+/// Read --auth-secret-file and --auth-acl-file again into `credentials` (#258): refused as the start
+/// refuses them, and on one more ground - --migration-identity's secret changed, which the shard
+/// coordinator holds from the start. On success the store is replaced whole, and each client loop at
+/// its next pass closes the sessions of the identities the files took away or changed. Counts
+/// `ob_auth_reloads_total` or `ob_auth_reload_failures_total` in `registry` when it is given.
+CredentialReload reload_client_credentials(const ServerConfig& config, const SecretStore& cluster,
+                                           ClientCredentials& credentials, MetricsRegistry* registry);
+
+/// The client store a node runs with, read from `config` and checked as the start checks it (#258):
+/// --auth-secret-file, --auth-acl-file applied, no secret shared with `cluster`, and
+/// --migration-identity an admin of it reaching every symbol. Empty without --auth-secret-file.
+/// Throws std::runtime_error with the reason, naming the file - never a secret.
+std::shared_ptr<const SecretStore> load_client_secrets(const ServerConfig& config,
+                                                       const SecretStore& cluster);
 
 /// Load both secret files, or print a refusal and exit.
 ///
@@ -546,6 +595,14 @@ public:
     /// watches for SIGHUP while `run()` serves.
     TlsReload reload_tls();
 
+    /// reload_client_credentials() on this node's configuration, cluster secret and credentials
+    /// (#258). Thread-safe: `ob_tcp_server` calls it from the thread that watches for SIGHUP, after
+    /// reload_tls().
+    CredentialReload reload_credentials();
+
+    /// The client credentials in force, for the loops and for a test.
+    const ClientCredentials& credentials() const { return credentials_; }
+
 private:
     ServerConfig             config_;
     /// The client loops' load the engine's scan pool divides against (#249): made by run() for its
@@ -561,6 +618,8 @@ private:
     /// loaded in the constructor so a bad secret file refuses to start the process rather than
     /// failing on the first client.
     LoadedSecrets            secrets_;
+    /// The client store in force: `secrets_.clients` at the start, replaced by reload_credentials().
+    ClientCredentials        credentials_;
 
     /// The TLS contexts, one per surface and role. Built at construction so a bad
     /// certificate stops the start rather than failing every handshake.

@@ -167,6 +167,15 @@ MetricsRegistry::MetricsRegistry() {
                                      "TLS reloads that put new contexts in force (#238)"));
     counters_.push_back(make_counter("ob_tls_reload_failures_total",
                                      "TLS reloads refused, each leaving the certificate in force (#238)"));
+    // The client secrets and permissions read again on SIGHUP (#258). A refused reload leaves the
+    // credentials in force - an identity meant to be revoked still authenticates - so the failure
+    // count is what an alert reads.
+    counters_.push_back(make_counter("ob_auth_reloads_total",
+                                     "Client credential reloads that put the files read in force (#258)"));
+    counters_.push_back(make_counter("ob_auth_reload_failures_total",
+                                     "Client credential reloads refused, each leaving the credentials in force (#258)"));
+    counters_.push_back(make_counter("ob_auth_reload_sessions_closed_total",
+                                     "Sessions closed because a reload removed or changed their identity (#258)"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.

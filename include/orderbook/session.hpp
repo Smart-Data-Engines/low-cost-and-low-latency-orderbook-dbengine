@@ -427,6 +427,10 @@ public:
     /// Number of active sessions.
     int active_count() const;
 
+    /// The descriptor and identity of every authenticated session (#258), for a reload of the
+    /// client credentials to check against the store it brings.
+    std::vector<std::pair<int, std::string>> authenticated() const;
+
     /// Bytes queued for sending across all sessions.
     ///
     /// The operator-facing view of a slow client: output piles up here long before a

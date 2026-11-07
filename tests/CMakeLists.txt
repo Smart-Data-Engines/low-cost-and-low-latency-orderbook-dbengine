@@ -1292,6 +1292,12 @@ ob_add_tcp_test(test_tls_reload
     test_tls_reload.cpp
 )
 
+# #258: the client secrets and permissions read again on SIGHUP - in force whole, or refused and the
+# credentials in force kept, for every refusal the start makes and the migration identity's secret.
+ob_add_tcp_test(test_credential_reload
+    test_credential_reload.cpp
+)
+
 # The C++ client's TLS path against a real handshake, plus the name check that turns chain
 # verification into peer verification.
 add_executable(test_tls_client test_tls_client.cpp)
