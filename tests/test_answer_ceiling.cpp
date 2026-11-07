@@ -182,6 +182,29 @@ TEST(AnswerCeiling, APartThatWouldPassTheCeilingIsNotCopied) {
     EXPECT_LT(over.bytes_built(), 100u) << "more than the header was built";
 }
 
+// A part of a text answer stops being formatted once it is past the ceiling - past it whatever came
+// before it, so its fold refuses the answer - rather than format a candidate of millions of rows; a
+// part of an LZ4 answer is formatted whole, as its text may still compress under the ceiling.
+TEST(AnswerCeiling, APartOfATextAnswerStopsAtTheCeiling) {
+    const Rows rows(6144, false);
+    const ob::QueryShape shape = seven();
+    ob::QueryResponseBuilder reply(shape, std::string(), ob::AnswerCeiling{50'000, false});
+    auto part = reply.part(UINT64_MAX);
+    const ob::BatchVerdict first = part->take(rows.batch(0, 2048));
+    EXPECT_TRUE(first.stop) << "a part past the ceiling went on";
+    EXPECT_EQ(first.at, 2047u);
+    EXPECT_EQ(part->rows(), 2048u);
+    reply.add_part(*part, part->rows());
+    EXPECT_TRUE(reply.full());
+
+    ob::QueryResponseBuilder framed(shape, std::string(), ob::AnswerCeiling{50'000, true});
+    auto whole = framed.part(UINT64_MAX);
+    for (size_t at = 0; at < 6144; at += 2048) {
+        EXPECT_FALSE(whole->take(rows.batch(at, 2048)).stop) << "a part of an LZ4 answer stopped";
+    }
+    EXPECT_EQ(whole->rows(), 6144u);
+}
+
 // On a session that compresses, a row answer is its LZ4 frame: the plain answer's text, its length
 // in front - with no rows, past the megabyte the text is compressed at, and many times past it.
 TEST(AnswerCeiling, AnLz4AnswerIsTheFrameOfThePlainOnesText) {

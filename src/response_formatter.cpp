@@ -534,9 +534,12 @@ namespace {
 /// with no entry to the kernel a client loop woken onto the thread's CPU could run at.
 class RowTextPart final : public ScanPart {
 public:
-    RowTextPart(const QueryShape& shape, uint64_t limit, size_t row_bytes)
+    /// `budget`, when not 0, is the most text the part is worth formatting (#257): the ceiling of
+    /// an answer in text, which a part past it passes whatever came before it - so the part stops
+    /// there, and its fold refuses the answer, rather than format a candidate of millions of rows.
+    RowTextPart(const QueryShape& shape, uint64_t limit, size_t row_bytes, size_t budget)
         : columns_(shape.columns), limit_(limit), all_seven_(shape.columns == all_query_columns()),
-          row_bytes_(row_bytes) {}
+          row_bytes_(row_bytes), budget_(budget) {}
 
     BatchVerdict take(const RowBatch& b) override {
         const auto n = static_cast<size_t>(std::min<uint64_t>(b.rows.size(), limit_ - rows_));
@@ -550,11 +553,14 @@ public:
             }
             Chunk& c = chunks_.back();
             char* const base = c.bytes.get();
+            const size_t before = c.used;
             c.used = static_cast<size_t>(
                 write_rows(base + c.used, base + c.cap, b, n, all_seven_, columns_) - base);
+            bytes_ += c.used - before;
         }
         rows_ += n;
         if (rows_ == limit_) return {true, n == 0 ? 0 : n - 1};
+        if (budget_ != 0 && bytes_ > budget_) return {true, n == 0 ? 0 : n - 1};
         return {};
     }
     uint64_t rows() const override { return rows_; }
@@ -609,6 +615,8 @@ private:
     uint64_t limit_;
     bool all_seven_;
     size_t row_bytes_;
+    size_t budget_;
+    size_t bytes_{0};
     std::vector<Chunk> chunks_;
     uint64_t rows_{0};
 };
@@ -619,8 +627,11 @@ std::unique_ptr<ScanPart> QueryResponseBuilder::part(uint64_t limit) {
     // Made on whichever thread reads the candidate: it reads the shape, which the engine filled
     // before the scan began and nothing changes during it, and writes nothing of the builder's.
     const bool seven = shape_.columns == all_query_columns();
+    // In text, a part past the ceiling is past it whatever came before; in LZ4 it may still compress
+    // under it, so a part of a framed answer is formatted whole, as before (#257).
     return std::make_unique<RowTextPart>(shape_, limit,
-                                         seven ? kMaxQueryRowBytes : max_row_bytes(shape_.columns));
+                                         seven ? kMaxQueryRowBytes : max_row_bytes(shape_.columns),
+                                         ceiling_.lz4 ? 0 : ceiling_.bytes);
 }
 
 void QueryResponseBuilder::add_part(ScanPart& p, uint64_t n) {
