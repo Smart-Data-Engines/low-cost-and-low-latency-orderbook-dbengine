@@ -266,22 +266,38 @@ def test_a_read_leaves_the_loop_when_the_index_puts_its_scan_at_the_threshold(no
 
 def test_a_sessions_answers_come_in_the_order_it_asked(nodes):
     off, _ = nodes
+    ahead = [connect(off.port) for _ in range(4)]
     s = connect(off.port)
     try:
-        # One write: a row made visible, the large read, a row made visible after it, and a small
-        # read. The large read sees the first row and not the second; the small one sees both.
+        before = off.metric("ob_off_loop_reads_total")
+        # Four reads ahead of this session's on the two threads off the loop, so that its own waits
+        # there long enough for a second write to come while it does.
+        for a in ahead:
+            a.sendall((WHOLE + "\n").encode())
+        # A row made visible, the large read and a row made visible after it, in one write...
         s.sendall(b"INSERT ISO EX ask 7770001 1 1\nFLUSH\n" + (WHOLE + "\n").encode() +
-                  b"INSERT ISO EX ask 7770002 1 1\nFLUSH\n" +
-                  b"SELECT price FROM 'ISO'.'EX' WHERE side = 1 AND timestamp BETWEEN 0 AND 9999999999999999999\n")
-        got = answers(s, 6)
+                  b"INSERT ISO EX ask 7770002 1 1\nFLUSH\n")
+        deadline = time.monotonic() + patience(10)
+        while off.metric("ob_off_loop_reads_total") < before + 5:
+            assert time.monotonic() < deadline, "the read did not leave the loop"
+            time.sleep(0.001)
+        assert off.metric("ob_off_loop_reads_in_flight") >= 1
+        # ...and, while the read waits off the loop, a second one: a read of both rows and a PING. The
+        # socket keeps them until the large read's answer is queued.
+        s.sendall(b"SELECT price FROM 'ISO'.'EX' WHERE side = 1 AND timestamp BETWEEN 0 AND "
+                  b"9999999999999999999\nPING\n")
+        got = answers(s, 7)
         assert got[0] == b"OK\n\n" and got[1] == b"OK\n\n"
         assert got[2].startswith(b"OK\ntimestamp_ns\t"), got[2][:80]
         assert b"\t7770001\t" in got[2], "the large read did not see a write sent before it"
         assert b"\t7770002\t" not in got[2], "the large read saw a write sent after it"
         assert got[3] == b"OK\n\n" and got[4] == b"OK\n\n"
         assert b"7770001" in got[5] and b"7770002" in got[5], got[5]
+        assert got[6] == b"PONG\n", got[6][:80]
     finally:
         s.close()
+        for a in ahead:
+            a.close()
 
 
 def test_a_compressed_sessions_large_read_is_the_plain_answer_framed(nodes):
