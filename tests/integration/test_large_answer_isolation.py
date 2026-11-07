@@ -19,6 +19,7 @@ import json
 import re
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -106,8 +107,11 @@ class Node:
             assert time.monotonic() < deadline, f"the node never logged {pattern!r} {count} time(s)"
             time.sleep(0.01)
 
-    def load(self, auth: tuple[str, str] | None = None) -> None:
-        client = OrderbookEngine(host="127.0.0.1", port=self.port, timeout=patience(120), auth=auth)
+    def load(self, auth: tuple[str, str] | None = None, unix_socket: Path | None = None) -> None:
+        if unix_socket is not None:
+            client = OrderbookEngine(unix_socket=str(unix_socket), timeout=patience(120))
+        else:
+            client = OrderbookEngine(host="127.0.0.1", port=self.port, timeout=patience(120), auth=auth)
         for sent in range(0, ROWS, 500):
             count = min(500, ROWS - sent)
             client.insert("ISO", "EX", "bid", [1_000_000 + (sent + i) % 900_000 for i in range(count)],
@@ -132,6 +136,13 @@ class Node:
                 self.proc.kill()
                 self.proc.wait()
         self.log.close()
+
+
+def banner(s: socket.socket) -> socket.socket:
+    buf = b""
+    while b"\n\n" not in buf:
+        buf += s.recv(65536)
+    return s
 
 
 def connect(port: int) -> socket.socket:
@@ -388,4 +399,52 @@ def test_an_answer_whose_session_was_closed_goes_to_no_session_after_it(tmp_path
     finally:
         for s in sessions:
             s.close()
+        node.stop()
+
+
+def test_a_tls_sessions_large_read_is_the_answer_a_plain_session_is_given(tmp_path):
+    """Off the loop and through TLS: the bytes a plain session on the node's Unix socket is given.
+    To a reader that keeps up the answer goes in slices of a megabyte, the loop serving its other
+    sessions between them; through a 4 kB window, in records the socket takes a few at a time, each
+    write that stopped asked again for at least what it asked before (#260)."""
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+                    "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
+                    "-addext", "subjectAltName=IP:127.0.0.1"],
+                   check=True, capture_output=True, timeout=patience(60))
+    key.chmod(0o600)
+    path = tmp_path / "ob.sock"
+    node = Node(tmp_path, "--tls-client", "--tls-cert-file", str(cert), "--tls-key-file", str(key),
+                "--unix-socket", str(path))
+    try:
+        node.load(unix_socket=path)
+        query = (WHOLE + " LIMIT 150000\n").encode()
+        before = node.metric("ob_off_loop_reads_total")
+
+        plain = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        plain.settimeout(patience(120))
+        plain.connect(str(path))
+        try:
+            banner(plain).sendall(query)
+            (expected,) = answers(plain, 1)
+        finally:
+            plain.close()
+        assert expected.startswith(b"OK\ntimestamp_ns\t") and len(expected) > (1 << 20), expected[:80]
+
+        context = ssl.create_default_context(cafile=str(cert))
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        for window in (0, 4096):
+            raw = socket.create_connection(("127.0.0.1", node.port), timeout=patience(120))
+            if window:
+                raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, window)
+            s = context.wrap_socket(raw, server_hostname="127.0.0.1")
+            try:
+                banner(s).sendall(query)
+                (got,) = answers(s, 1)
+            finally:
+                s.close()
+            assert got == expected, f"through TLS, window {window or 'default'}: {len(got)} bytes, " \
+                                    f"{len(expected)} expected"
+        assert node.metric("ob_off_loop_reads_total") == before + 3, "a read stayed on the loop"
+    finally:
         node.stop()
