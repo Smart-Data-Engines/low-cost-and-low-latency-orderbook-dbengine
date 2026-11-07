@@ -4679,6 +4679,12 @@ Learned the hard way. Check here before debugging.
      cache, and reading the scan's parts at DEBUG put most of it in the answer's own last doubling:
      32 MiB copied into a string of 64, both held. Measure warm and cold apart, and read the layout the
      code took, before changing anything for memory.
+641. **`clang++ -fsyntax-only` does not report a private field nobody reads.** `-Wunused-private-field`
+     is decided when Clang compiles, and a syntax-only pass stops before: #258's branch removed the
+     last read of `Reactor::secrets_`, passed the local check of pitfall 635 run with `-fsyntax-only`,
+     and went red in CI's `clang-build` and `CodeQL` - a strict `master` and a round of CI lost (PR
+     #309). The check compiles: `clang++-18 -std=c++20 -Wall -Wextra -Werror -c -o /dev/null
+     -Iinclude '-DOB_VERSION="0"' <file>`.
 
 ## Current state and open problems
 

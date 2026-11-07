@@ -598,11 +598,6 @@ add_library(orderbook_client STATIC src/client.cpp)
 # null registry.
 target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics orderbook_query_columns orderbook_net)
 
-option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
-if(OB_CLIENT_LZ4)
-    target_compile_definitions(orderbook_client PUBLIC OB_CLIENT_LZ4)
-    target_link_libraries(orderbook_client PUBLIC orderbook_compression)
-endif()
 
 # ── TCP Server executable ─────────────────────────────────────────────────────
 add_executable(ob_tcp_server tools/ob_tcp_server.cpp)

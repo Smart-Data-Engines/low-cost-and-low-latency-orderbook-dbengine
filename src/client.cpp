@@ -69,7 +69,6 @@ OrderbookClient::OrderbookClient(OrderbookClient&& other) noexcept
     , send_buf_(std::move(other.send_buf_))
     , recv_buf_(std::move(other.recv_buf_))
     , sock_buf_(std::move(other.sock_buf_))
-    , compressed_(other.compressed_)
     , rings_(std::move(other.rings_))
 {
     other.fd_ = -1;
@@ -83,7 +82,6 @@ OrderbookClient& OrderbookClient::operator=(OrderbookClient&& other) noexcept {
         send_buf_   = std::move(other.send_buf_);
         recv_buf_   = std::move(other.recv_buf_);
         sock_buf_   = std::move(other.sock_buf_);
-        compressed_ = other.compressed_;
         rings_      = std::move(other.rings_);
         other.fd_   = -1;
     }
@@ -101,9 +99,14 @@ Result<void> OrderbookClient::connect() {
                                  "rings without unix_socket: a session moves to rings through the "
                                  "node's Unix socket");
     }
-    if (config_.rings.enabled && config_.compress) {
+    // The C++ client sends and reads plain text (#259). Its LZ4 path compared the server's answer to
+    // `COMPRESS LZ4` with a line the server never sends and framed nothing it sent or read, so no
+    // build of it could ever compress a session; asked for, it is refused here, by name.
+    if (config_.compress) {
+        OB_LOG_WARN("client", "compress requested: the C++ client does not compress (#259)");
         return Result<void>::err(OB_ERR_INVALID_ARG,
-                                 "rings with compress: a compressed session cannot move to rings");
+                                 "compress: the C++ client sends and reads plain text; LZ4 sessions "
+                                 "are the Python client's (compress=True)");
     }
     if (config_.tls && !config_.unix_socket.empty()) {
         return Result<void>::err(OB_ERR_INVALID_ARG,
@@ -223,14 +226,6 @@ Result<void> OrderbookClient::connect() {
         }
     }
 
-    // Optional LZ4 compression negotiation
-    if (config_.compress) {
-        auto cr = negotiate_compression();
-        if (!cr) {
-            close_transport();
-            return cr;
-        }
-    }
 
     return Result<void>::ok();
 }
@@ -519,13 +514,10 @@ Result<std::string_view> OrderbookClient::recv_response() {
              sv.starts_with("STANDALONE")) && sv.back() == '\n')
             return Result<std::string_view>::ok(sv);
 
-        // Compression negotiation: "OK COMPRESS LZ4\n"
-        if (sv == "OK COMPRESS LZ4\n")
-            return Result<std::string_view>::ok(sv);
     }
 }
 
-// ── 4.2  read_banner() / negotiate_compression() ─────────────────────────────
+// ── 4.2  read_banner() ───────────────────────────────────────────────────────
 
 Result<void> OrderbookClient::read_banner() {
     // Server sends a welcome banner terminated by \n\n. Read and discard.
@@ -587,27 +579,6 @@ Result<void> OrderbookClient::authenticate() {
                                  "authentication failed: " + std::string(ar.value()));
     }
     return Result<void>::ok();
-}
-
-
-Result<void> OrderbookClient::negotiate_compression() {
-#ifdef OB_CLIENT_LZ4
-    static constexpr char cmd[] = "COMPRESS LZ4\n";
-    send_buf_.assign(cmd, sizeof(cmd) - 1);
-    auto sr = send_all(send_buf_.size());
-    if (!sr) return sr;
-
-    auto rr = recv_response();
-    if (!rr) return Result<void>::err(rr.error_code(), rr.error_message());
-
-    if (rr.value() == "OK COMPRESS LZ4\n") {
-        compressed_ = true;
-        return Result<void>::ok();
-    }
-    return Result<void>::err(OB_ERR_IO, "server does not support LZ4 compression");
-#else
-    return Result<void>::err(OB_ERR_IO, "LZ4 compression not compiled in");
-#endif
 }
 
 
@@ -1235,9 +1206,6 @@ Result<size_t> OrderbookClient::minsert_many(const std::vector<MinsertWrite>& wr
                                              std::string& refusal) {
     refusal.clear();
     if (writes.empty()) return Result<size_t>::ok(0);
-    if (compressed_) {
-        return Result<size_t>::err(OB_ERR_INVALID_ARG, "minsert_many on a compressed connection");
-    }
     for (const MinsertWrite& w : writes) {
         if (w.n_levels == 0) return Result<size_t>::err(OB_ERR_INVALID_ARG, "empty levels");
         if (w.n_levels > 1000) return Result<size_t>::err(OB_ERR_INVALID_ARG, "too many levels");
