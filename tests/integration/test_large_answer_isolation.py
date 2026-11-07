@@ -249,6 +249,7 @@ def test_a_read_leaves_the_loop_when_the_index_puts_its_scan_at_the_threshold(no
     s = connect(off.port)
     try:
         before = off.metric("ob_off_loop_reads_total")
+        waits = off.metric("ob_off_loop_read_wait_seconds_count")
         # A row query reads no more than its LIMIT: one row short of the threshold stays on the loop.
         s.sendall((WHOLE + " LIMIT 99999\n").encode())
         (short,) = answers(s, 1)
@@ -260,6 +261,7 @@ def test_a_read_leaves_the_loop_when_the_index_puts_its_scan_at_the_threshold(no
         assert at.count(b"\n") == short.count(b"\n") + 1
         assert off.metric("ob_off_loop_reads_total") == before + 1, "a read at the threshold stayed on it"
         assert off.metric("ob_off_loop_reads_in_flight") == 0
+        assert off.metric("ob_off_loop_read_wait_seconds_count") == waits + 1, "its wait was not observed"
     finally:
         s.close()
 

@@ -3317,7 +3317,12 @@ void Reactor::take(const Command& cmd, Session& session, uint64_t rows_at_most) 
     MetricsRegistry* registry = &engine_->registry();
     std::shared_ptr<OffLoopMailbox> mailbox = mailbox_;
     const int index = index_;
-    off_loop_pool_->submit([fd, conn_id, ceiling, engine, registry, mailbox, index, sql = cmd.raw_sql] {
+    const auto handed = std::chrono::steady_clock::now();
+    off_loop_pool_->submit([fd, conn_id, ceiling, engine, registry, mailbox, index, handed,
+                            sql = cmd.raw_sql] {
+        registry->observe_histogram(
+            "ob_off_loop_read_wait_seconds",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
         // The answer as the loop builds it, in a buffer of the read's own: a session is the loop's.
         OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false};
         try {
