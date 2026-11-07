@@ -315,9 +315,13 @@ consequences worth knowing:
   reason logged. This bounds server memory: without a cap, one client that never reads would grow the
   process without limit.
 - **One answer larger than the cap is refused, not sent** — to any client, however fast it reads.
-  The session gets `ERR answer of N bytes is larger than the 67108864 a session may have queued;
-  narrow the query or add LIMIT` in its place and stays open (#152). Before that, the connection
-  was closed with nothing but EOF to say why.
+  The session gets `ERR answer is larger than the 67108864 bytes a session may have queued, past its
+  first N rows; narrow the query or add LIMIT` in its place and stays open (#152): a `LIMIT N` fits.
+  Before #152 the connection was closed with nothing but EOF to say why.
+- **The answer is measured as it is built** (#257): a row answer stops being read and formatted at
+  the batch that passes the cap, so a query over any range costs the node about the cap in memory,
+  not the size of the range. On a session with `COMPRESS LZ4` the cap is on the frame, and a row
+  answer is compressed as its rows come - text past the cap in a frame under it is still an answer.
 
 `ob_session_pending_bytes` in `/metrics` reports the bytes queued across all sessions. It is the
 signal that a client is not keeping up, and it should sit at zero in a healthy system.
