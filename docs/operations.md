@@ -2361,7 +2361,48 @@ ops      role=admin
   - `--auth-acl-file` without `--auth-secret-file`;
   - a `--migration-identity` that is not an admin without lists, since a migration runs `ADOPT` on
     the other shard.
-- **The file is read at start.** A change takes a restart, as a change of the secret file does.
+- **The file is read again on `SIGHUP`**, with the secret file (#258): "Changing who may connect",
+  below.
+
+### Changing who may connect
+
+`systemctl reload` (`SIGHUP`) reads `--auth-secret-file` and `--auth-acl-file` again, after the
+certificate (#258). No restart, and no connection is dropped that the change does not concern:
+
+```bash
+sudoedit /etc/orderbook/secrets/clients      # add, rotate or remove an identity's line
+sudo systemctl reload ob_tcp_server
+journalctl -u ob_tcp_server -n 20 | grep -E 'credentials|credential reload'
+```
+
+```
+client credentials reloaded: 3 identities (was 3); added: none; removed: none; changed: ingest. Sessions of the removed and the changed close at their loop's next pass
+reactor 1: closing fd=17 of identity 'ingest': credential changed by a reload
+```
+
+- **A file the start would refuse is refused, and nothing changes.** The same checks, in the same
+  function: the file's mode, a short secret, an identity twice, a client secret that is the cluster's,
+  the permissions file, the migration identity. The ERROR line names the file and the reason - never
+  a secret - and every session and every next `AUTH` is answered by what was in force.
+- **A file it takes is in force for the next `AUTH`.** Every client loop compares the store with the
+  one it holds once a pass and closes the sessions of the
+  identities the file took away (`credential revoked by a reload`) or whose secret or permissions it
+  changed (`credential changed by a reload`). They get no answer they did not ask for: the protocol
+  has no message that is not an answer, and an `ERR` sent unasked would be read as the answer to the
+  command in flight. A client that reconnects authenticates by the new file. Every other session goes
+  on, on its connection. All of it within about 200 ms of the signal: the thread that watches for it
+  looks every 100 ms, and a loop with nothing to do passes at least as often.
+- **What a reload does not change**: whether client authentication is on - a node started without
+  `--auth-secret-file` has nothing to reload, and one with it cannot be left without - and the
+  cluster secret, which every node holds at once and so takes a restart of the cluster. Nor
+  `--migration-identity`'s secret: the shard coordinator moves symbols with the one it started with,
+  so a file that changes it is refused.
+- **Revoking a compromised client** is removing its line and reloading: its open sessions close at
+  their loop's next pass, and it cannot authenticate again.
+
+`ob_auth_reloads_total`, `ob_auth_reload_failures_total` and `ob_auth_reload_sessions_closed_total`
+follow it, and `OrderbookAuthReloadFailed` pages on a refused reload - an identity meant to be revoked
+still authenticates until the file is fixed.
 
 ### Clients
 
@@ -2586,8 +2627,9 @@ TLS reloaded, new connections present subject /CN=db1.internal, valid until 2027
   even the client port when the refusal is a CA bundle, which only the node links read - so a node
   never presents one certificate on one surface and another on the next.
 - **What is read again is the three files.** The paths, `--tls-peer-names` and the `--tls-*` flags
-  are what the node started with, and changing them is a restart. So are the secret files and the
-  permissions file.
+  are what the node started with, and changing them is a restart. The client secret file and the
+  permissions file are read again too since #258 ("Changing who may connect"); the cluster secret
+  is not.
 
 Three metrics follow it: `ob_tls_reloads_total`, `ob_tls_reload_failures_total`, and
 `ob_tls_certificate_not_after_seconds`, when the certificate in force expires in Unix time (0 on a

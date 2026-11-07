@@ -1617,8 +1617,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"election-lease-wait-ms", {"<N>", "Wait after the leader key vanishes before standing"}},
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
         {"backup-dir", {"<DIR>", "Where BACKUP writes this node's backups, one directory each; not the data or the WAL directory, nor inside either. Without it BACKUP is refused (#34)"}},
-        {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
-        {"auth-acl-file", {"<PATH>", "Each identity's permissions, '<identity> role=read|write|admin [symbols=A,B*] [exchanges=X*]' per line (#31). Empty: every identity is admin and reaches everything"}},
+        {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication. Read again on SIGHUP (#258)"}},
+        {"auth-acl-file", {"<PATH>", "Each identity's permissions, '<identity> role=read|write|admin [symbols=A,B*] [exchanges=X*]' per line (#31). Empty: every identity is admin and reaches everything. Read again on SIGHUP (#258)"}},
         {"migration-identity", {"<IDENTITY>", "The identity from --auth-secret-file a shard authenticates as on another shard's client port, moving a symbol there"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "

@@ -11,6 +11,14 @@ here as `#N`.
 
 ### Added
 
+- **The client secrets and permissions are read again on `SIGHUP`** (#258), after the certificate:
+  adding a client, rotating a secret or revoking one no longer takes a restart. A file the start
+  would refuse is refused and the credentials in force stay; one it takes is in force for the next
+  `AUTH`, and the open sessions of the identities it removed or changed are closed at their loop's
+  next pass, with no answer they did not ask for. The cluster secret, and `--migration-identity`'s
+  secret, still take a restart. `ob_auth_reloads_total`, `ob_auth_reload_failures_total`,
+  `ob_auth_reload_sessions_closed_total` and the `OrderbookAuthReloadFailed` alert.
+
 - Segment format 4, written where `segment-format = 4` (`--segment-format 4`) asks (#250): format 3's
   file with one more encoding a column may be in, runs of equal values each written as its step from
   the run before. A book's timestamps and sequence numbers are such runs, and as a seal writes them a
