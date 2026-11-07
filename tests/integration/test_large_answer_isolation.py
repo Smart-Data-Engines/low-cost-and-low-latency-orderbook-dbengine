@@ -11,11 +11,14 @@ the same node with `--large-read-threads 0`, as every node was before #260.
 """
 from __future__ import annotations
 
+import json
+import re
 import socket
 import struct
 import subprocess
-import threading
+import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import lz4.frame
@@ -29,14 +32,37 @@ pytestmark = pytest.mark.large_response
 ROWS = 600_000
 WHOLE = "SELECT * FROM 'ISO'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999"
 
+# A PING every half millisecond on a session of its own, until a line comes on stdin; then each PING's
+# send time and round trip, in nanoseconds of the monotonic clock every process on the machine reads.
+PINGER = r"""
+import json, select, socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=float(sys.argv[2]))
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+buf = b""
+while b"\n\n" not in buf:
+    buf += s.recv(65536)
+print("ready", flush=True)
+samples = []
+while not select.select([sys.stdin], [], [], 0)[0]:
+    sent = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    s.sendall(b"PING\n")
+    got = b""
+    while not got.endswith(b"\n"):
+        got += s.recv(64)
+    samples.append((sent, time.clock_gettime_ns(time.CLOCK_MONOTONIC) - sent))
+    time.sleep(0.0005)
+print(json.dumps(samples), flush=True)
+"""
+
 
 class Node:
     def __init__(self, tmp: Path, *extra: str) -> None:
         self.port = free_port()
+        self.metrics_port = free_port()
         self.log = open(tmp / "node.log", "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [server_binary_path(), "--port", str(self.port), "--data-dir", str(tmp / "data"),
-             "--metrics-port", "0", "--io-threads", "1", *extra],
+             "--metrics-port", str(self.metrics_port), "--io-threads", "1", *extra],
             stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + patience(30)
         while time.monotonic() < deadline:
@@ -57,6 +83,14 @@ class Node:
                           [10 + (sent + i) % 5000 for i in range(count)])
         client.flush()
         client.close()
+
+    def metric(self, name: str) -> float:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.metrics_port}/metrics",
+                                    timeout=patience(10)) as resp:
+            body = resp.read().decode(errors="replace")
+        match = re.search(rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)$", body, re.M)
+        assert match, f"{name} is not exported"
+        return float(match.group(1))
 
     def stop(self) -> None:
         if self.proc.poll() is None:
@@ -103,36 +137,37 @@ def answers(s: socket.socket, n: int) -> list[bytes]:
 
 
 def longest_ping_beside(port: int, query: str) -> tuple[float, int]:
-    """The longest PING round trip, in seconds, on a second session while `query` is answered on the
-    first - and the bytes of that answer."""
-    reader, pinger = connect(port), connect(port)
+    """The longest round trip, in seconds, of a PING sent on a second session while `query` is
+    answered on the first - and the bytes of that answer.
+
+    The PINGs come from a process of their own, and only those sent while the read was answered
+    count. A thread of this process waited for the interpreter's lock while this one took the
+    answer in, so the round trips it measured were the client's, not the node's.
+    """
+    clock = time.CLOCK_MONOTONIC
+    pinger = subprocess.Popen([sys.executable, "-c", PINGER, str(port), str(patience(120))],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
-        done = threading.Event()
-        rtts: list[float] = []
-
-        def ping() -> None:
-            while not done.is_set():
-                t = time.perf_counter()
-                pinger.sendall(b"PING\n")
-                got = b""
-                while not got.endswith(b"\n"):
-                    got += pinger.recv(64)
-                rtts.append(time.perf_counter() - t)
-                time.sleep(0.002)
-
-        th = threading.Thread(target=ping)
-        th.start()
-        time.sleep(0.1)
-        reader.sendall((query + "\n").encode())
-        (answer,) = answers(reader, 1)
-        time.sleep(0.05)
-        done.set()
-        th.join()
-        assert answer.startswith(b"OK\n"), answer[:100]
-        return max(rtts), len(answer)
+        assert pinger.stdout is not None
+        assert pinger.stdout.readline().strip() == "ready", "the pinger did not connect"
+        reader = connect(port)
+        try:
+            time.sleep(0.05)
+            began = time.clock_gettime_ns(clock)
+            reader.sendall((query + "\n").encode())
+            (answer,) = answers(reader, 1)
+            ended = time.clock_gettime_ns(clock)
+        finally:
+            reader.close()
+        out, _ = pinger.communicate("stop\n", timeout=patience(30))
     finally:
-        reader.close()
-        pinger.close()
+        if pinger.poll() is None:
+            pinger.kill()
+            pinger.wait()
+    assert answer.startswith(b"OK\n"), answer[:100]
+    during = [rtt for sent, rtt in json.loads(out) if began <= sent <= ended]
+    assert len(during) >= 3, f"{len(during)} PING(s) sent while the read was answered"
+    return max(during) / 1e9, len(answer)
 
 
 @pytest.fixture(scope="module")
@@ -159,6 +194,26 @@ def test_a_large_read_does_not_hold_the_sessions_beside_it(nodes):
     # On the loop a PING waits for the whole read; off it, for no more than a tenth of that.
     assert beside < held / 10, f"a PING beside the read waited {beside * 1000:.1f} ms, " \
                                f"{held * 1000:.1f} ms with the read on the loop"
+
+
+def test_a_read_leaves_the_loop_when_the_index_puts_its_scan_at_the_threshold(nodes):
+    off, _ = nodes
+    s = connect(off.port)
+    try:
+        before = off.metric("ob_off_loop_reads_total")
+        # A row query reads no more than its LIMIT: one row short of the threshold stays on the loop.
+        s.sendall((WHOLE + " LIMIT 99999\n").encode())
+        (short,) = answers(s, 1)
+        assert short.startswith(b"OK\n"), short[:100]
+        assert off.metric("ob_off_loop_reads_total") == before, "a read below the threshold left the loop"
+        s.sendall((WHOLE + " LIMIT 100000\n").encode())
+        (at,) = answers(s, 1)
+        assert at.startswith(b"OK\n"), at[:100]
+        assert at.count(b"\n") == short.count(b"\n") + 1
+        assert off.metric("ob_off_loop_reads_total") == before + 1, "a read at the threshold stayed on it"
+        assert off.metric("ob_off_loop_reads_in_flight") == 0
+    finally:
+        s.close()
 
 
 def test_a_sessions_answers_come_in_the_order_it_asked(nodes):
