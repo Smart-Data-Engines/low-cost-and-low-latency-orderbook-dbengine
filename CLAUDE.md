@@ -4659,6 +4659,12 @@ Learned the hard way. Check here before debugging.
      their lines: a mutant that made a reply of 50 000 lines differ from the one expected killed its
      test with SIGKILL - the out-of-memory killer - rather than failing an assertion (#253). Large
      strings are compared with `==`, and where they part is what the message reports.
+638. **A comment saying every reader holds the lock is a claim about the readers somebody looked at.**
+     `promote_to_primary()` said of `repl_client_` that every reader holds `mtx_`, and `stats()` and
+     the metrics' tick did - while `is_bootstrapping()`, asked on the io threads by every read and
+     write, read it without, against a failover thread that builds and destroys the client under that
+     lock (#254). A pointer replaced under a lock gets its readers from `grep`, every one, and a reader
+     on a hot path gets a value of its own rather than the pointer.
 
 ## Current state and open problems
 

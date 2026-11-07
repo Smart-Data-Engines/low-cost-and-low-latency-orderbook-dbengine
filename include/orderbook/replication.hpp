@@ -894,6 +894,10 @@ private:
 
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};
+    /// `bootstrapping_`, and the engine's own copy of it with it (#254): the engine answers
+    /// `is_bootstrapping()` from its copy, on the io threads, without reaching this client through
+    /// a pointer the failover thread replaces.
+    void set_bootstrapping(bool bootstrapping);
     /// A snapshot was installed, so the connection ends to ask for the stream from the snapshot's
     /// position - which `run_loop()` does at once rather than after the delay it leaves after an
     /// error (#214). Read and cleared on the replication thread only.

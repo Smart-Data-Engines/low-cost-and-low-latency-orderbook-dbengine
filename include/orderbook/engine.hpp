@@ -197,12 +197,21 @@ public:
     /// writable. A test seam.
     /// Called on the sealing thread as a call of `write_seals()` begins, with no engine lock held
     /// by the engine: what a test uses to write while a snapshot's seals are being written (#34).
-    void while_sealing_for_test(std::function<void()> hook) { while_sealing_for_test_ = std::move(hook); }
+    ///
+    /// Set under `flush_mtx_`, which every caller of the hook holds, so that a tick never calls a hook
+    /// being replaced: ThreadSanitizer reported exactly that of the hook below on 18 October, a test
+    /// clearing it while a flush tick called it (#255). Not while the caller holds
+    /// `hold_flush_for_test()`, nor from inside a hook.
+    void while_sealing_for_test(std::function<void()> hook) {
+        std::lock_guard<std::mutex> no_flush(flush_mtx_);
+        while_sealing_for_test_ = std::move(hook);
+    }
 
     /// Called between the two holds of `take_pending_synced()` - the rows taken, the WAL's `fsync` not
     /// yet begun - with no engine lock held: what a test uses to write while a FLUSH or a snapshot's
-    /// cut syncs the WAL (#190).
+    /// cut syncs the WAL (#190). Set under `flush_mtx_`, for the reason above.
     void while_syncing_wal_for_test(std::function<void()> hook) {
+        std::lock_guard<std::mutex> no_flush(flush_mtx_);
         while_syncing_wal_for_test_ = std::move(hook);
     }
 
@@ -656,7 +665,17 @@ public:
     void adopt_store_on_disk();
 
     /// Returns true if the replica is currently bootstrapping from a snapshot.
+    ///
+    /// From the engine's own flag, which the replication client keeps (#254): every read and write
+    /// asks this on an io thread, and it used to ask the client through `repl_client_`, which the
+    /// failover thread replaces under `mtx_` - `demote_to_replica()` builds a client and
+    /// `promote_to_primary()` destroys it. ThreadSanitizer reported the read of a client being
+    /// built in the integration battery; a client destroyed under the same read is a use after free.
     bool is_bootstrapping() const;
+
+    /// The replication client's bootstrap, kept for `is_bootstrapping()`: set when a client begins
+    /// installing a snapshot and cleared wherever it stops, by `ReplicationClient` alone (#254).
+    void set_replica_bootstrapping(bool bootstrapping);
 
     /// True when this node holds nothing at all: no sequence state, no stored segment, no
     /// pending row.
@@ -1086,6 +1105,9 @@ private:
     ReplicationClientConfig              repl_client_config_;
     std::unique_ptr<ReplicationManager>  repl_mgr_;
     std::unique_ptr<ReplicationClient>   repl_client_;
+    /// Whether a replication client of this engine is installing a snapshot (#254). Its own, so that
+    /// `is_bootstrapping()` reads no pointer the failover thread replaces.
+    std::atomic<bool>                    replica_bootstrapping_{false};
 
     // Failover (optional, disabled when coordinator endpoints are empty)
     FailoverConfig                       failover_config_;

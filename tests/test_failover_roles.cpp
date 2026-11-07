@@ -297,3 +297,44 @@ TEST(FailoverRoles, ConcurrentDemotionsLeaveOneNodeAndNoWreckage) {
     EXPECT_EQ(engine.handle_role_command().rfind("REPLICA", 0), 0u);
     engine.close();
 }
+
+// ── The replication client replaced while every read asks about it (#254) ─────
+//
+// `is_bootstrapping()` is asked on the io threads by every read, flush and write, while the failover
+// thread replaces the replication client under `mtx_`: `demote_to_replica()` builds one and
+// `promote_to_primary()` stops and destroys it. It asked the client through `repl_client_` without
+// the lock - ThreadSanitizer reported it in the integration battery, an atomic of a client being
+// built read with nothing ordering it after the construction, and a client destroyed under the same
+// read would be a use after free. Under ThreadSanitizer, the sanitizers job's build, that is a report
+// and this test fails; elsewhere it runs the transitions beside the reads.
+TEST(FailoverRoles, BootstrappingIsAskedSafelyWhileTheReplicationClientIsReplaced) {
+    TempDir dir;
+    // A port nothing listens on: each client the demotions build connects, is refused and retries,
+    // until the promotion after it stops it. Taken from this file's range and never bound.
+    static std::atomic<uint16_t> next_port{ob::test::kPortsFailoverRoles + 40};
+    const uint16_t nobody = next_port.fetch_add(1, std::memory_order_relaxed);
+    const std::string primary = "127.0.0.1:" + std::to_string(nobody);
+
+    ob::Engine engine(dir.path);
+    engine.open();
+
+    std::atomic<bool> done{false};
+    std::atomic<uint64_t> asked{0};
+    std::thread reads([&] {
+        while (!done.load(std::memory_order_acquire)) {
+            EXPECT_FALSE(engine.is_bootstrapping()) << "no client here ever reaches a primary";
+            asked.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    for (uint64_t epoch = 1; epoch <= 25; ++epoch) {
+        engine.demote_to_replica(primary);
+        ASSERT_EQ(engine.node_role(), ob::NodeRole::REPLICA);
+        engine.promote_to_primary(ob::EpochValue{epoch});
+        ASSERT_EQ(engine.node_role(), ob::NodeRole::PRIMARY);
+    }
+    done.store(true, std::memory_order_release);
+    reads.join();
+
+    EXPECT_GT(asked.load(), 0u) << "the reads never ran beside the transitions";
+    engine.close();
+}

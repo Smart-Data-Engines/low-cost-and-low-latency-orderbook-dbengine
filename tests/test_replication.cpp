@@ -2469,6 +2469,10 @@ struct SnapshotBootstrapOutcome {
     std::string           resume_line;
     /// Whether the engine holds a joining record once the install is done (#215).
     bool joining_after_install{false};
+    /// The engine's `is_bootstrapping()` once the replica has asked for the snapshot, and once the
+    /// install is done (#254): the engine answers from its own flag, which the client keeps.
+    bool engine_bootstrapping_while_sent{false};
+    bool engine_bootstrapping_after_install{true};
 };
 
 /// What the mock primary does besides the stream it always sends.
@@ -2528,6 +2532,14 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     EXPECT_GT(::send(peer_fd, truncated, std::strlen(truncated), MSG_NOSIGNAL), 0);
     const std::string request = recv_line(peer_fd, 5000);
     EXPECT_EQ(request, "SNAPSHOT_REQUEST") << "got: " << request;
+    // The client marks its bootstrap before it sends the request, so the engine says so by now;
+    // waited for a little all the same, since the socket orders nothing for the memory model.
+    for (int i = 0; i < 200 && !out.engine_bootstrapping_while_sent; ++i) {
+        out.engine_bootstrapping_while_sent = engine.is_bootstrapping();
+        if (!out.engine_bootstrapping_while_sent) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
 
     const std::string a_body = "AAAAA";
     const std::string b_body = "BBBBB";
@@ -2625,6 +2637,7 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
 
     out.first_file_installed  = std::filesystem::exists(dir + "/SNAPA/EXCH/seg/a.col");
     out.joining_after_install = engine.joining_stream().has_value();
+    out.engine_bootstrapping_after_install = engine.is_bootstrapping();
     out.second_file_installed = std::filesystem::exists(dir + "/SNAPB/EXCH/seg/b.col");
     {
         std::ifstream in(cfg.state_file);
@@ -2660,6 +2673,11 @@ TEST_F(ReplicationClientTest, ASnapshotBootstrapInstallsWhatThePrimarySends) {
     const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/false);
     EXPECT_TRUE(out.first_file_installed) << "the first snapshot file was not installed";
     EXPECT_TRUE(out.second_file_installed) << "the second snapshot file was not installed";
+    // #254: the engine answers reads and writes `bootstrapping` from a flag the client keeps.
+    EXPECT_TRUE(out.engine_bootstrapping_while_sent)
+        << "the engine did not say it was bootstrapping while its client installed a snapshot";
+    EXPECT_FALSE(out.engine_bootstrapping_after_install)
+        << "the engine still said it was bootstrapping once the install was done";
 }
 
 TEST_F(ReplicationClientTest, AHeartbeatBeforeSnapshotBeginIsNotTheAnswer) {
