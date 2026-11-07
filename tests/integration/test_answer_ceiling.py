@@ -142,9 +142,11 @@ def test_an_answer_past_the_ceiling_is_refused_where_it_passed_it(node):
         assert 800_000 < within < ROWS, within
         if not instrumented_run():
             # Built to the ceiling and a batch past it, not to the 84 MB of the whole answer - whose
-            # last doubling alone held 192 MiB before #257.
+            # last doubling alone held 192 MiB before #257. 60-65 MB on the m9g.xlarge, and about
+            # twice that with the text doubling to its ceiling rather than jumping to it.
             grew = (peak - before) * 1024
-            assert grew < 2 * CEILING, f"the refused answer took the node up by {grew} bytes"
+            print(f"the refused answer took the node up by {grew} bytes")
+            assert grew < 1.5 * CEILING, f"the refused answer took the node up by {grew} bytes"
 
         # The session is open, and a LIMIT of the rows within the ceiling is answered whole.
         s.sendall(b"PING\n")
