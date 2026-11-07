@@ -2526,19 +2526,43 @@ uint64_t segment_rows_in_range(const SegmentMeta& m, uint64_t start_ns, uint64_t
 }  // namespace
 
 uint64_t ColumnarStore::rows_in_range_at_most(uint64_t start_ns, uint64_t end_ns,
-                                              std::string_view symbol,
-                                              std::string_view exchange) const {
-    ScanCost cost;
-    ScanSet set;
-    if (!scan_set(start_ns, end_ns, symbol, exchange, set, cost)) return 0;
+                                              std::string_view symbol, std::string_view exchange,
+                                              uint64_t enough) const {
+    // scan_set()'s walk of the index without its copies, and no further than `enough`: asked before
+    // every read a client loop may hand off (#260), most of them small, which pay for this walk.
     uint64_t rows = 0;
-    for (const SegmentMeta& m : set.segments) rows += segment_rows_in_range(m, start_ns, end_ns);
-    for (const auto& b : set.blocks) rows += b->rows.size();
+    size_t   segments = 0;
+    size_t   blocks = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        const auto it = by_symbol_.find(index_key(symbol, exchange));
+        if (it == by_symbol_.end()) return 0;
+        for (const auto& b : it->second.blocks) {
+            if (rows >= enough) break;
+            if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) {
+                rows += b->rows.size();
+                ++blocks;
+            }
+        }
+        for (const WidthTier& tier : it->second.tiers) {
+            const auto& v = tier.segments;
+            const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
+            auto i = std::lower_bound(
+                v.begin(), v.end(), from,
+                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+            for (; rows < enough && i != v.end() && i->start_ts_ns <= end_ns; ++i) {
+                if (i->end_ts_ns < start_ns) continue;
+                rows += segment_rows_in_range(*i, start_ns, end_ns);
+                ++segments;
+            }
+        }
+    }
     OB_LOG_DEBUG("columnar", "%.*s.%.*s [%llu, %llu]: at most %llu row(s) in %zu segment(s) and %zu "
-                 "block(s)", static_cast<int>(symbol.size()), symbol.data(),
+                 "block(s)%s", static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
                  static_cast<unsigned long long>(start_ns), static_cast<unsigned long long>(end_ns),
-                 static_cast<unsigned long long>(rows), set.segments.size(), set.blocks.size());
+                 static_cast<unsigned long long>(rows), segments, blocks,
+                 rows >= enough ? ", counted no further" : "");
     return rows;
 }
 

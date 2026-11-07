@@ -128,6 +128,26 @@ struct QueryAST {
     std::optional<uint64_t>  rolling_ns;
 };
 
+// ── ReadGate ──────────────────────────────────────────────────────────────────
+
+/// What a client loop asks execute() for (#260): a read large enough to answer off the loop handed
+/// back before it reads a row. Asked once the query is parsed and found, of the queries that scan
+/// the store - rows, time buckets, rolling windows - and from the index alone: the rows its scan
+/// may read, at most, as the store's metadata puts them. A row query that sets no condition on its
+/// rows reads no more than its LIMIT, so a small LIMIT decides it without the index; with a price,
+/// side or level condition the scan reads the range to find them, and a bucket query's LIMIT counts
+/// buckets. The live book's functions and snapshots read the book, and are never taken.
+struct ReadGate {
+    /// Taken away from this many rows on.
+    uint64_t take_from{UINT64_MAX};
+    /// Set when it was: the count that decided it - counting stops once it reaches `take_from`.
+    uint64_t rows_at_most{0};
+};
+
+/// What execute() returns for a read its gate took away: nothing was read, and the caller answers
+/// it elsewhere. Not a refusal, and never a client's to see - none begins with a NUL.
+inline constexpr std::string_view kReadTakenAway{"\0taken away", sizeof("\0taken away") - 1};
+
 // ── RowCallback ───────────────────────────────────────────────────────────────
 
 using RowCallback = std::function<void(const QueryResult&)>;
@@ -228,15 +248,12 @@ public:
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
 
     /// As above, and a row answer's rows a batch at a time into `rows` when it is given (OB-12):
-    /// the aggregates, the buckets and every other answer still arrive through `cb`.
-    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows);
-
-    /// The rows a query would scan from the store, at most, read from the index before it runs
-    /// (#260): for a row query - cut to its LIMIT - and for time buckets and rolling windows, which
-    /// read rows too. Nothing for what does not scan the store: a query that does not parse, the
-    /// live book's functions, a snapshot of the book. What a client loop asks to decide whether a
-    /// query is large enough to answer off the loop.
-    std::optional<uint64_t> estimated_scan_rows(std::string_view sql);
+    /// the aggregates, the buckets and every other answer still arrive through `cb`. With a `gate`,
+    /// a row query or a time-bucket query whose scan may read `gate->take_from` rows or more is
+    /// taken away before it reads one (#260): kReadTakenAway is returned, nothing reaches `cb` or
+    /// `rows`, and `gate->rows_at_most` says why.
+    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows,
+                        ReadGate* gate = nullptr);
 
     /// The live book for one symbol, as rows. Error string on failure, empty on success.
     ///

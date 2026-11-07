@@ -270,10 +270,10 @@ public:
 
     /// As above, and report the shape of the answer in `shape` before the first row.
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
-    /// And a row answer's rows a batch at a time into `rows` (OB-12): `QueryEngine::execute()`.
-    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows);
-    /// QueryEngine::estimated_scan_rows() (#260).
-    std::optional<uint64_t> estimated_scan_rows(std::string_view sql);
+    /// And a row answer's rows a batch at a time into `rows` (OB-12), and a large read taken away
+    /// through `gate` (#260): `QueryEngine::execute()`.
+    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows,
+                        ReadGate* gate = nullptr);
 
     /// The live book for one symbol, as rows. Error string on failure, empty on success.
     ///

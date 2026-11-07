@@ -1,10 +1,12 @@
 // #260: a large read answered off the client loop.
 //
-// A read is large by the index's count of the rows its scan may read, asked before it runs: this file
-// holds that count - a row query's range and its LIMIT, time buckets, nothing for the live book's
-// functions - and the threads and the mailbox a large read goes through. What the loop does with them
-// - a session paused behind its read, its later commands run after the answer, the sessions beside it
-// served meanwhile - is held on a live node, in tests/integration/test_large_answer_isolation.py.
+// A read is large by the index's count of the rows its scan may read, which the engine's ReadGate asks
+// once the query is parsed and before it reads a row: this file holds that count, the gate's decision -
+// a row query's LIMIT when it sets no condition on its rows, its range otherwise, time buckets by their
+// range, never the live book's functions - and the threads and the mailbox a large read goes through.
+// What the loop does with them - a session paused behind its read, its later commands run after the
+// answer, the sessions beside it served meanwhile - is held on a live node, in
+// tests/integration/test_large_answer_isolation.py.
 
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
@@ -20,6 +22,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,44 +77,86 @@ struct Store {
     }
 };
 
-std::string range(uint64_t from_row, uint64_t to_row) {
-    return "WHERE timestamp BETWEEN " + std::to_string(kBase + from_row * 1'000'000) + " AND " +
-           std::to_string(kBase + to_row * 1'000'000);
+/// One query through execute() with a gate at `take_from`: what it returned, the gate after it, and
+/// the rows and buckets the callback was given.
+struct Asked {
+    std::string err;
+    ob::ReadGate gate;
+    uint64_t delivered{0};
+};
+
+Asked ask(Store& s, const std::string& sql, uint64_t take_from) {
+    Asked a;
+    a.gate.take_from = take_from;
+    ob::QueryShape shape;
+    a.err = s.engine.execute(sql, [&](const ob::QueryResult&) { ++a.delivered; }, shape, nullptr, &a.gate);
+    return a;
 }
+
+bool taken(const Asked& a) { return a.err == ob::kReadTakenAway; }
 
 }  // namespace
 
-TEST(OffLoopReads, TheEstimateIsTheRowsInRangeCutToTheLimit) {
+TEST(OffLoopReads, TheIndexCountsTheRowsInRangeAndStopsWhereItIsToldEnough) {
     Store s;
-    const auto all = s.engine.estimated_scan_rows("SELECT * FROM 'OL'.'EX'");
-    ASSERT_TRUE(all.has_value());
-    EXPECT_EQ(*all, 20'000u);
-
+    const uint64_t last = kBase + 19'999 * 1'000'000;
+    EXPECT_EQ(s.store.rows_in_range_at_most(0, UINT64_MAX, "OL", "EX"), 20'000u);
     // Half of one segment, by the metadata's even spread: within a row or two of 2500.
-    const auto half = s.engine.estimated_scan_rows("SELECT * FROM 'OL'.'EX' " + range(0, 2499));
-    ASSERT_TRUE(half.has_value());
-    EXPECT_NEAR(static_cast<double>(*half), 2500.0, 2.0);
-
-    // A row query reads no more than its LIMIT.
-    const auto limited = s.engine.estimated_scan_rows("SELECT price FROM 'OL'.'EX' LIMIT 10");
-    ASSERT_TRUE(limited.has_value());
-    EXPECT_EQ(*limited, 10u);
-
+    EXPECT_NEAR(static_cast<double>(s.store.rows_in_range_at_most(kBase, kBase + 2499 * 1'000'000, "OL", "EX")),
+                2500.0, 2.0);
     // Outside every segment, and a book nobody wrote.
-    EXPECT_EQ(s.engine.estimated_scan_rows("SELECT * FROM 'OL'.'EX' " + range(100'000, 200'000)), 0u);
-    EXPECT_EQ(s.engine.estimated_scan_rows("SELECT * FROM 'NONE'.'EX'"), 0u);
+    EXPECT_EQ(s.store.rows_in_range_at_most(last + 1, UINT64_MAX, "OL", "EX"), 0u);
+    EXPECT_EQ(s.store.rows_in_range_at_most(0, UINT64_MAX, "NONE", "EX"), 0u);
+    // Told that 6000 is enough, it stops at the segment that reaches it: the second of four.
+    EXPECT_EQ(s.store.rows_in_range_at_most(0, UINT64_MAX, "OL", "EX", 6000), 10'000u);
 }
 
-TEST(OffLoopReads, BucketsScanRowsAndTheLiveBooksFunctionsDoNot) {
+TEST(OffLoopReads, AReadIsTakenAwayFromTheGatesRowsOnAndReadsNothing) {
     Store s;
-    // Time buckets read rows: the range, whatever their LIMIT, which counts buckets.
-    const auto buckets = s.engine.estimated_scan_rows(
-        "SELECT COUNT(*) FROM 'OL'.'EX' GROUP BY TIME_BUCKET(1s) LIMIT 1");
-    ASSERT_TRUE(buckets.has_value());
-    EXPECT_EQ(*buckets, 20'000u);
-    // A function of the live book reads the book, and a query that does not parse reads nothing.
-    EXPECT_FALSE(s.engine.estimated_scan_rows("SELECT SPREAD(*) FROM 'OL'.'EX'").has_value());
-    EXPECT_FALSE(s.engine.estimated_scan_rows("SELEKT * FROM 'OL'.'EX'").has_value());
+    const Asked at = ask(s, "SELECT * FROM 'OL'.'EX'", 20'000);
+    EXPECT_TRUE(taken(at)) << at.err;
+    EXPECT_EQ(at.delivered, 0u) << "a read taken away read rows";
+    EXPECT_EQ(at.gate.rows_at_most, 20'000u);
+
+    const Asked below = ask(s, "SELECT * FROM 'OL'.'EX'", 20'001);
+    EXPECT_EQ(below.err, "");
+    EXPECT_EQ(below.delivered, 20'000u) << "a read below the gate was not answered";
+    EXPECT_EQ(below.gate.rows_at_most, 0u);
+}
+
+TEST(OffLoopReads, ALimitDecidesARowQueryWithNoConditionAndNotOneWithThem) {
+    Store s;
+    // No condition on the rows: the scan stops at the LIMIT, and the gate needs nothing more.
+    EXPECT_TRUE(taken(ask(s, "SELECT price FROM 'OL'.'EX' LIMIT 10", 10)));
+    const Asked small = ask(s, "SELECT price FROM 'OL'.'EX' LIMIT 10", 11);
+    EXPECT_EQ(small.err, "");
+    EXPECT_EQ(small.delivered, 10u);
+    // A condition reads the range to find its rows, whatever the LIMIT.
+    for (const char* q : {"SELECT price FROM 'OL'.'EX' WHERE price < 10005 LIMIT 10",
+                          "SELECT price FROM 'OL'.'EX' WHERE side = 1 LIMIT 10",
+                          "SELECT price FROM 'OL'.'EX' WHERE level BETWEEN 2 AND 3 LIMIT 10"}) {
+        const Asked a = ask(s, q, 20'000);
+        EXPECT_TRUE(taken(a)) << q << ": " << a.err;
+        EXPECT_EQ(a.gate.rows_at_most, 20'000u) << q;
+    }
+    // LIMIT 0 reads nothing, and is nothing to take.
+    const Asked none = ask(s, "SELECT price FROM 'OL'.'EX' LIMIT 0", 1);
+    EXPECT_EQ(none.err, "");
+    EXPECT_EQ(none.delivered, 0u);
+}
+
+TEST(OffLoopReads, BucketsAreTakenByTheirRangeAndTheLiveBooksFunctionsNever) {
+    Store s;
+    // Time buckets read every row of the range, whatever their LIMIT, which counts buckets.
+    const Asked buckets = ask(s, "SELECT COUNT(*) FROM 'OL'.'EX' GROUP BY TIME_BUCKET(1s) LIMIT 1", 20'000);
+    EXPECT_TRUE(taken(buckets)) << buckets.err;
+    EXPECT_EQ(buckets.delivered, 0u);
+    // The live book's functions read the book; a query that does not parse or names no book reads
+    // nothing - each answered as it was, none taken.
+    for (const char* q : {"SELECT SPREAD(*) FROM 'OL'.'EX'", "SELEKT * FROM 'OL'.'EX'",
+                          "SELECT * FROM 'NONE'.'EX'"}) {
+        EXPECT_FALSE(taken(ask(s, q, 1))) << q;
+    }
 }
 
 TEST(OffLoopReads, TheMailboxGivesBackWhatWasPostedAndWakesItsLoop) {

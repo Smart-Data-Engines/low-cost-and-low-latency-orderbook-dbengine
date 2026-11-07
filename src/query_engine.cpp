@@ -1229,28 +1229,29 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     return execute(sql, std::move(cb), shape, nullptr);
 }
 
-std::optional<uint64_t> QueryEngine::estimated_scan_rows(std::string_view sql) {
-    QueryAST ast;
-    if (!parse(sql, ast).empty() || ast.type != QueryType::SELECT || ast.snapshot_ts_ns.has_value()) {
-        return std::nullopt;
-    }
-    const bool scans_buckets = ast.bucket_ns.has_value() || ast.rolling_ns.has_value();
-    bool has_agg = false;
-    for (const auto& expr : ast.select_exprs) {
-        if (is_agg_expr(expr)) { has_agg = true; break; }
-    }
-    // The live book's functions read the book, not the store.
-    if (has_agg && !scans_buckets) return std::nullopt;
-    uint64_t rows = store_.rows_in_range_at_most(ast.ts_start_ns.value_or(0),
-                                                 ast.ts_end_ns.value_or(UINT64_MAX), ast.symbol,
-                                                 ast.exchange);
-    // A row query reads no more than its LIMIT; a bucket query's LIMIT counts buckets, not rows.
-    if (!scans_buckets && ast.limit.has_value()) rows = std::min(rows, *ast.limit);
-    return rows;
+namespace {
+
+/// A ReadGate's question (#260), asked once a query that scans the store is parsed and found and
+/// before it reads a row: true takes it away. `cap` bounds the scan beside its range - the LIMIT of
+/// a row query with no condition on its rows - and decides a small read without the index.
+bool taken_away(ReadGate& gate, const ColumnarStore& store, const QueryAST& ast, uint64_t cap) {
+    if (cap < gate.take_from) return false;
+    const uint64_t at_most = std::min(
+        cap, store.rows_in_range_at_most(ast.ts_start_ns.value_or(0), ast.ts_end_ns.value_or(UINT64_MAX),
+                                         ast.symbol, ast.exchange, gate.take_from));
+    if (at_most < gate.take_from) return false;
+    gate.rows_at_most = at_most;
+    OB_LOG_DEBUG("query", "SELECT %s.%s taken away before its scan: the index puts %llu row(s) or more "
+                 "in it, the gate %llu", ast.symbol.c_str(), ast.exchange.c_str(),
+                 static_cast<unsigned long long>(at_most),
+                 static_cast<unsigned long long>(gate.take_from));
+    return true;
 }
 
+}  // namespace
+
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShape& shape,
-                                 RowAnswer* rows) {
+                                 RowAnswer* rows, ReadGate* gate) {
     QueryAST ast;
     if (auto err = parse(sql, ast); !err.empty()) return err;
 
@@ -1285,7 +1286,13 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     // Before the live book's checks: these aggregates read rows, so a condition on time, price,
     // side or level narrows what they read rather than being refused as it is beside a function
     // of the book.
-    if (ast.bucket_ns.has_value()) return execute_buckets(ast, cb, shape);
+    if (ast.bucket_ns.has_value()) {
+        // A bucket query reads every row of its range, whatever its LIMIT, which counts buckets.
+        if (gate != nullptr && taken_away(*gate, store_, ast, UINT64_MAX)) {
+            return std::string(kReadTakenAway);
+        }
+        return execute_buckets(ast, cb, shape);
+    }
 
     // ── Determine if any select_expr is an aggregation call ──────────────────
     bool has_agg = false;
@@ -1623,6 +1630,14 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
 
     // LIMIT 0 asks for no row, and reads none (#47 step 2).
     if (lim == 0) return {};
+    // A large read is the client loop's to hand off, before a row is read (#260). A condition on the
+    // rows reads the range to find them, so only a query with none is bounded by its LIMIT.
+    const bool conditions = ast.price_lo.has_value() || ast.price_hi.has_value() ||
+                            ast.side_lo.has_value() || ast.side_hi.has_value() ||
+                            ast.level_lo.has_value() || ast.level_hi.has_value();
+    if (gate != nullptr && taken_away(*gate, store_, ast, conditions ? UINT64_MAX : lim)) {
+        return std::string(kReadTakenAway);
+    }
     // A batch at a time (OB-12). The scan hands over only the rows within the range and the
     // conditions - `filter_of()` and the time are its own checks - so nothing here checks a row
     // again; what is left is LIMIT. The answer is whole at LIMIT rows and the scan opens nothing

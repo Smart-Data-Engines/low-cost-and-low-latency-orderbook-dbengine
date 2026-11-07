@@ -975,6 +975,7 @@ struct ReadAnswer {
     bool        framed{false};      ///< an LZ4 frame already (#257)
     uint64_t    text_bytes{0};      ///< the text a frame holds
     bool        counted{false};     ///< a query that ran, which the session and the server count
+    bool        taken_away{false};  ///< no answer: the engine's ReadGate handed it back (#260)
 };
 
 template <typename Read>
@@ -992,6 +993,10 @@ ReadAnswer build_read_answer(const char* what, int fd, Engine& engine, MetricsRe
         // the place a row answer's batches go (OB-12).
         const std::string err = read([&](const QueryResult& r) { reply.add(r); },
                                      static_cast<RowAnswer&>(reply));
+        if (err == kReadTakenAway) {
+            out.taken_away = true;
+            return out;
+        }
         if (!err.empty()) {
             OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, fd,
                          sanitise_for_log(err, 256).c_str());
@@ -1041,6 +1046,7 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
     ReadAnswer r = build_read_answer(what, session.fd(), engine, registry, shape, session.lend_room(),
                                      AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()},
                                      std::forward<Read>(read));
+    if (r.taken_away) return std::string(kAnsweredOffLoop);
     if (r.framed) session.next_answer_framed(r.text_bytes);
     if (r.counted) {
         session.increment_queries();
@@ -1224,19 +1230,26 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::SELECT: {
-        // Past the gate: a read the index puts past kOffLoopReadRows goes to the threads off the loop,
-        // and the loop goes on with its other sessions (#260).
-        if (off_loop != nullptr && off_loop->take(cmd, session)) return std::string(kAnsweredOffLoop);
         // An aggregate query calls the callback exactly once, with agg_values set and the row
         // fields left at zero, and the builder answers it as aggregates. Formatting that as a data
         // row is what made SPREAD, MID_PRICE, IMBALANCE and VWAP return zeros to every network
         // client while the engine computed them correctly. The engine fills `shape` in as it
         // parses the query.
         QueryShape shape;
-        return answer_read("SELECT", engine, session, stats, registry, shape,
-                           [&](auto row, RowAnswer& rows) {
-                               return engine.execute(cmd.raw_sql, row, shape, &rows);
-                           });
+        // A read the index puts at kOffLoopReadRows or more goes to the threads off the loop, and
+        // the loop goes on with its other sessions (#260). The engine hands it back once it has
+        // parsed the query and before it reads a row, so a small read pays for the question alone.
+        ReadGate gate{kOffLoopReadRows, 0};
+        ReadGate* const asked = off_loop != nullptr && off_loop->may_take(session) ? &gate : nullptr;
+        std::string answer = answer_read("SELECT", engine, session, stats, registry, shape,
+                                         [&](auto row, RowAnswer& rows) {
+                                             return engine.execute(cmd.raw_sql, row, shape, &rows,
+                                                                   asked);
+                                         });
+        if (asked != nullptr && answer == kAnsweredOffLoop) {
+            off_loop->take(cmd, session, gate.rows_at_most);
+        }
+        return answer;
     }
 
     case CommandType::BOOK: {
@@ -3039,10 +3052,12 @@ private:
     /// which is why a session dying in the middle of a large response left no trace.
     void close_session(int fd, const char* reason);
 
-    /// A large read handed to the threads off the loop (#260), after execute_command()'s gate: true
-    /// when the index puts its scan at kOffLoopReadRows or more and the session is one the loop can
-    /// pause - not one in rings, whose events the loop makes itself.
-    bool take(const Command& cmd, Session& session) override;
+    /// A session whose large reads may go off the loop (#260): one the loop can pause - not one in
+    /// rings, whose events the loop makes itself - on a node with threads to answer them.
+    bool may_take(const Session& session) const override;
+    /// A large read handed to the threads off the loop, which the engine gave back before its scan
+    /// (#260), and its session paused.
+    void take(const Command& cmd, Session& session, uint64_t rows_at_most) override;
     /// The answers that came back off the loop, each queued on its session, and the sessions resumed:
     /// an event as if readable and writable appended for each to the `nfds` of this pass, so that the
     /// answer is flushed, the commands held behind it run and the socket is read again. Returns the
@@ -3290,11 +3305,11 @@ Reactor::~Reactor() {
     }
 }
 
-bool Reactor::take(const Command& cmd, Session& session) {
-    if (off_loop_pool_ == nullptr || session.in_rings()) return false;
-    const std::optional<uint64_t> rows = engine_->estimated_scan_rows(cmd.raw_sql);
-    if (!rows || *rows < kOffLoopReadRows) return false;
+bool Reactor::may_take(const Session& session) const {
+    return off_loop_pool_ != nullptr && !session.in_rings();
+}
 
+void Reactor::take(const Command& cmd, Session& session, uint64_t rows_at_most) {
     const int fd = session.fd();
     const uint64_t conn_id = session.conn_id();
     const AnswerCeiling ceiling{Session::max_queued_bytes(), session.is_compressed()};
@@ -3304,21 +3319,33 @@ bool Reactor::take(const Command& cmd, Session& session) {
     const int index = index_;
     off_loop_pool_->submit([fd, conn_id, ceiling, engine, registry, mailbox, index, sql = cmd.raw_sql] {
         // The answer as the loop builds it, in a buffer of the read's own: a session is the loop's.
-        QueryShape shape;
-        ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::string(), ceiling,
-                                         [&](auto row, RowAnswer& rows) {
-                                             return engine->execute(sql, row, shape, &rows);
-                                         });
+        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false};
+        try {
+            QueryShape shape;
+            ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::string(),
+                                             ceiling, [&](auto row, RowAnswer& rows) {
+                                                 return engine->execute(sql, row, shape, &rows);
+                                             });
+            out.answer     = std::move(r.answer);
+            out.framed     = r.framed;
+            out.text_bytes = r.text_bytes;
+            out.counted    = r.counted;
+        } catch (const std::exception& e) {
+            // The session is paused until an answer comes, so one comes whatever fails: a failure
+            // past the engine's call - the answer's buffer, its frame - answers as a refusal does.
+            OB_LOG_ERROR("tcp_server", "reactor %d: a read off the loop for fd=%d failed past the "
+                         "engine's call: %s", index, fd, e.what());
+            out = OffLoopAnswer{fd, conn_id, format_error(e.what()), false, 0, false};
+        }
         OB_LOG_DEBUG("tcp_server", "reactor %d: an answer off the loop for fd=%d, %zu byte(s)%s", index,
-                     fd, r.answer.size(), r.framed ? " in an LZ4 frame" : "");
-        mailbox->post(OffLoopAnswer{fd, conn_id, std::move(r.answer), r.framed, r.text_bytes, r.counted});
+                     fd, out.answer.size(), out.framed ? " in an LZ4 frame" : "");
+        mailbox->post(std::move(out));
     });
     session.set_reading_off_loop(true);
     engine_->registry().increment_counter("ob_off_loop_reads_total");
     engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", 1);
     OB_LOG_DEBUG("tcp_server", "reactor %d: SELECT from fd=%d answered off the loop: the index puts %llu "
-                 "row(s) in its scan", index_, fd, static_cast<unsigned long long>(*rows));
-    return true;
+                 "row(s) or more in its scan", index_, fd, static_cast<unsigned long long>(rows_at_most));
 }
 
 int Reactor::take_off_loop_answers(int nfds) {
@@ -3333,7 +3360,7 @@ int Reactor::take_off_loop_answers(int nfds) {
             continue;
         }
         s->set_reading_off_loop(false);
-        s->increment_commands();
+        // Its command was counted when the loop asked the engine: only the query is counted here.
         if (a.counted) {
             s->increment_queries();
             stats_.total_queries.fetch_add(1, std::memory_order_relaxed);

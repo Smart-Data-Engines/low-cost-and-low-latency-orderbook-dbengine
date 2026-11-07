@@ -2115,12 +2115,8 @@ std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& sh
 }
 
 std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& shape,
-                            RowAnswer* rows) {
-    return query_engine_->execute(sql, std::move(cb), shape, rows);
-}
-
-std::optional<uint64_t> Engine::estimated_scan_rows(std::string_view sql) {
-    return query_engine_->estimated_scan_rows(sql);
+                            RowAnswer* rows, ReadGate* gate) {
+    return query_engine_->execute(sql, std::move(cb), shape, rows, gate);
 }
 
 std::string Engine::read_book(const std::string& symbol, const std::string& exchange,
