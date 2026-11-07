@@ -1843,7 +1843,8 @@ TEST(ReadLoopStatic, TheWritesOfAReadAreHeldAndAnsweredBeforeAnythingElse) {
     EXPECT_LT(cleared, header);
 
     // Held, and nothing else done with it.
-    const std::size_t held = body.find("if (deferrable_write(cmd, *session, secrets_.client_store()))");
+    // The loop's own copy of the client store (#258), which a reload replaces between passes.
+    const std::size_t held = body.find("if (deferrable_write(cmd, *session, client_store()))");
     ASSERT_NE(held, std::string::npos) << "the loop does not hold the writes of a read";
     const std::size_t pushed = body.find("pending_writes_.push_back(std::move(cmd));", held);
     ASSERT_NE(pushed, std::string::npos);

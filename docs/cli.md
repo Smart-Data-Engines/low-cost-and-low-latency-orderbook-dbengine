@@ -642,8 +642,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 |------|----------|---------|
 | `--advertise-host` | `<HOST>` | The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1). A name, an IPv4 or an IPv6 address; an IPv6 one is published in brackets, `[::1]:21591` |
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
-| `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
-| `--auth-acl-file` | `<PATH>` | Each identity's permissions, `<identity> role=read\|write\|admin [symbols=A,B*] [exchanges=X*]` per line (#31). A regular file only its owner, the server's user or root, may write. Empty: every identity is admin and reaches every symbol. `docs/operations.md`, "Permissions" |
+| `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication; read again on `SIGHUP` (#258) |
+| `--auth-acl-file` | `<PATH>` | Each identity's permissions, `<identity> role=read\|write\|admin [symbols=A,B*] [exchanges=X*]` per line (#31). A regular file only its owner, the server's user or root, may write. Empty: every identity is admin and reaches every symbol. `docs/operations.md`, "Permissions"; read again on `SIGHUP` (#258) |
 | `--backup-dir` | `<DIR>` | Where `BACKUP` writes this node's backups, one directory each: hard links on the data directory's filesystem, a checked copy on another. Not the data or the WAL directory, inside either or holding either - the start is refused. Without it `BACKUP` is refused (#34; `docs/operations.md`, "Backing up and restoring a node") |
 | `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |
 | `--book-huge-pages` | `on\|off` | Whether the books - one a symbol, 48 KB each - are made in 2 MiB regions the kernel is asked to back with transparent huge pages (default: on). It pays at thousands of symbols, where a write to a book otherwise walks the page table; `off` makes each book on the heap, as before #51. `docs/operations.md`, "Huge pages for the books" |
@@ -923,7 +923,7 @@ because a depth limit answers "how deep" when the question is "why".
 | Signal | What `ob_tcp_server` does |
 |---|---|
 | `SIGTERM`, `SIGINT` | stops: new connections are refused, open sessions get up to `--drain-timeout-ms`, and the exit is 0 |
-| `SIGHUP` | reads the TLS certificate, key and CA again from the paths it started with, for the connections after it (#238): "Replacing a certificate" in `docs/operations.md`. Files it refuses leave the certificate in force. Without TLS it logs `nothing to reload` |
+| `SIGHUP` | reads the TLS certificate, key and CA again from the paths it started with, for the connections after it (#238): "Replacing a certificate" in `docs/operations.md`. Then the client secret file and the permissions file (#258): the next `AUTH` is answered by them, and the open sessions of an identity they removed or changed close - "Changing who may connect". Files it refuses leave what was in force. Without TLS, or without client authentication, that part logs `nothing to reload` |
 | `SIGPIPE` | ignored: a client that leaves in the middle of a response ends its own session, not the server |
 
 `systemctl reload ob_tcp_server` sends `SIGHUP`. Until #238 nothing handled it, and its default

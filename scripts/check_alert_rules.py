@@ -54,6 +54,7 @@ FAULTS = {
     # A certificate that ends ten days after t=0.
     "OrderbookCertificateExpiring": ([("ob_tls_certificate_not_after_seconds", "864000x20")], 10),
     "OrderbookTlsReloadFailed": ([("ob_tls_reload_failures_total", "0 0 0 1 1 1")], 4),
+    "OrderbookAuthReloadFailed": ([("ob_auth_reload_failures_total", "0 0 0 1 1 1")], 4),
     # Every pass fails from minute 2, with three files waiting.
     "OrderbookWalArchiveFailing": ([("ob_wal_archive_failures_total", "0 0 60+60x12"),
                                     ("ob_wal_archive_pending_files", "0 0 3x12")], 10),
@@ -88,6 +89,8 @@ HEALTHY = [
     ("ob_backup_failures_total", "0x20"), ("ob_backup_last_success_timestamp_seconds", "600x20"),
     # A certificate with thirty days left, and no refused reload.
     ("ob_tls_certificate_not_after_seconds", "2592000x20"), ("ob_tls_reload_failures_total", "0x20"),
+    # No refused reload of the client credentials.
+    ("ob_auth_reload_failures_total", "0x20"),
     # An archive keeping up: nothing waits, and no pass fails.
     ("ob_wal_archive_failures_total", "0x20"), ("ob_wal_archive_pending_files", "0x20"),
     ("ob_wal_archive_oldest_pending_seconds", "0x20"),

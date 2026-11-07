@@ -469,6 +469,13 @@ const Credential& SecretStore::sole() const {
     return credentials_.front();
 }
 
+std::vector<std::string> SecretStore::identities() const {
+    std::vector<std::string> out;
+    out.reserve(credentials_.size());
+    for (const auto& c : credentials_) out.push_back(c.identity);
+    return out;
+}
+
 bool stores_share_a_secret(const SecretStore& a, const SecretStore& b) {
     for (const auto& x : a.credentials_) {
         for (const auto& y : b.credentials_) {

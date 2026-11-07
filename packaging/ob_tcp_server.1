@@ -152,9 +152,11 @@ and the exit status is 0.
 .TP
 .B SIGHUP
 Read the TLS certificate, key and CA again from the paths the server started with, for the
-connections opened after it. Files it refuses leave the certificate in force, and the log says why.
+connections opened after it, and then the client secret file and the permissions file: the next
+AUTH is answered by them, and the open sessions of an identity they removed or changed are closed.
+Files it refuses leave what was in force, and the log says why.
 .B systemctl reload
-sends it. Without TLS it is logged and changes nothing.
+sends it. Without TLS, or without client authentication, that part is logged and changes nothing.
 .SH EXIT STATUS
 .TP
 .B 0

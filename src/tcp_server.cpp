@@ -220,73 +220,73 @@ int64_t tls_certificate_not_after(const LoadedTlsContexts& tls) {
     return ctx->certificate_not_after().value_or(0);
 }
 
+std::shared_ptr<const SecretStore> load_client_secrets(const ServerConfig& config,
+                                                       const SecretStore& cluster) {
+    auto clients = std::make_shared<SecretStore>();
+    if (!config.auth_secret_file.empty()) {
+        *clients = SecretStore::load_client_file(config.auth_secret_file);
+    }
+    if (!config.auth_acl_file.empty()) {
+        // Permissions of identities nobody can authenticate as would be a file that does
+        // nothing, which an operator takes for a policy in force (#31).
+        if (config.auth_secret_file.empty()) {
+            throw std::runtime_error("--auth-acl-file '" + config.auth_acl_file + "' names the "
+                                     "permissions of identities, and there are none without "
+                                     "--auth-secret-file");
+        }
+        clients->apply_acl_file(config.auth_acl_file);
+    }
+
+    if (!clients->empty() && !cluster.empty() && stores_share_a_secret(*clients, cluster)) {
+        // Refused rather than warned about. Sharing the secret means client authentication grants
+        // node privileges: a client presenting itself as a replica streams the entire write-ahead
+        // log, and nothing on either surface looks wrong while it happens.
+        throw std::runtime_error("the cluster secret in '" + config.cluster_secret_file +
+                                 "' is also a client secret in '" + config.auth_secret_file +
+                                 "'. A client holding it can present itself as a replica and stream "
+                                 "the whole write-ahead log. Generate separate secrets.");
+    }
+
+    if (!config.migration_identity.empty() &&
+        (clients->empty() || clients->find(config.migration_identity) == nullptr)) {
+        // Refused at the start rather than at the first MIGRATE, which would fail without moving a
+        // row and say why only in a status line.
+        throw std::runtime_error("--migration-identity '" + config.migration_identity +
+                                 "' is not an identity in --auth-secret-file" +
+                                 (clients->empty() ? ", which is not given" : "") +
+                                 ": a shard moving a symbol authenticates to the other shard with its "
+                                 "own copy of the secret.");
+    }
+    if (!config.migration_identity.empty()) {
+        // ADOPT moves a symbol and runs for admins alone, and names symbols any list leaves out
+        // (#31): an identity that may not run it would fail the first MIGRATE, without moving a row.
+        const Permissions& p = clients->find(config.migration_identity)->permissions;
+        if (p.role != Role::Admin || !p.unrestricted()) {
+            throw std::runtime_error("--migration-identity '" + config.migration_identity + "' is " +
+                                     std::string(role_name(p.role)) +
+                                     (p.unrestricted() ? "" : " with a list of symbols or exchanges") +
+                                     " in --auth-acl-file: a shard moving a symbol runs ADOPT on the "
+                                     "other shard, which takes an admin reaching every symbol.");
+        }
+    }
+    return clients;
+}
+
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
     LoadedSecrets out;
     try {
-        if (!config.auth_secret_file.empty()) {
-            out.clients = SecretStore::load_client_file(config.auth_secret_file);
-        }
-        if (!config.auth_acl_file.empty()) {
-            // Permissions of identities nobody can authenticate as would be a file that does
-            // nothing, which an operator takes for a policy in force (#31).
-            if (config.auth_secret_file.empty()) {
-                throw std::runtime_error("--auth-acl-file '" + config.auth_acl_file + "' names the "
-                                         "permissions of identities, and there are none without "
-                                         "--auth-secret-file");
-            }
-            out.clients.apply_acl_file(config.auth_acl_file);
-        }
         if (!config.cluster_secret_file.empty()) {
             out.cluster = SecretStore::load_cluster_file(config.cluster_secret_file);
         }
+        out.clients = load_client_secrets(config, out.cluster);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "Error: %s\n", e.what());
         std::exit(1);
     }
 
-    if (out.client_auth_enabled() && out.cluster_auth_enabled() &&
-        stores_share_a_secret(out.clients, out.cluster)) {
-        // Refused rather than warned about. Sharing the secret means client authentication grants
-        // node privileges: a client presenting itself as a replica streams the entire write-ahead
-        // log, and nothing on either surface looks wrong while it happens.
-        std::fprintf(stderr,
-                     "Error: the cluster secret in '%s' is also a client secret in '%s'. "
-                     "A client holding it can present itself as a replica and stream the whole "
-                     "write-ahead log. Generate separate secrets.\n",
-                     config.cluster_secret_file.c_str(), config.auth_secret_file.c_str());
-        std::exit(1);
-    }
-
-    if (!config.migration_identity.empty() &&
-        (!out.client_auth_enabled() || out.clients.find(config.migration_identity) == nullptr)) {
-        // Refused at the start rather than at the first MIGRATE, which would fail without moving a
-        // row and say why only in a status line.
-        std::fprintf(stderr,
-                     "Error: --migration-identity '%s' is not an identity in --auth-secret-file%s: a "
-                     "shard moving a symbol authenticates to the other shard with its own copy of the "
-                     "secret.\n",
-                     config.migration_identity.c_str(),
-                     out.client_auth_enabled() ? "" : ", which is not given");
-        std::exit(1);
-    }
-    if (!config.migration_identity.empty()) {
-        // ADOPT moves a symbol and runs for admins alone, and names symbols any list leaves out
-        // (#31): an identity that may not run it would fail the first MIGRATE, without moving a row.
-        const Permissions& p = out.clients.find(config.migration_identity)->permissions;
-        if (p.role != Role::Admin || !p.unrestricted()) {
-            std::fprintf(stderr,
-                         "Error: --migration-identity '%s' is %s%s in --auth-acl-file: a shard moving "
-                         "a symbol runs ADOPT on the other shard, which takes an admin reaching every "
-                         "symbol.\n",
-                         config.migration_identity.c_str(), std::string(role_name(p.role)).c_str(),
-                         p.unrestricted() ? "" : " with a list of symbols or exchanges");
-            std::exit(1);
-        }
-    }
-
     if (out.client_auth_enabled()) {
-        OB_LOG_INFO("auth", "client authentication enabled (%zu identities from %s)",
-                    out.clients.size(), config.auth_secret_file.c_str());
+        OB_LOG_INFO("auth", "client authentication enabled (%zu identities from %s); SIGHUP reads it "
+                    "again (#258)", out.clients->size(), config.auth_secret_file.c_str());
     } else {
         OB_LOG_WARN("auth", "client authentication disabled - trusted-network deployment only "
                             "(--auth-secret-file)");
@@ -300,6 +300,110 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
                             "accept any peer (--cluster-secret-file)");
     }
     return out;
+}
+
+// ── Client credentials in force (#258) ────────────────────────────────────────
+
+ClientCredentials::ClientCredentials(std::shared_ptr<const SecretStore> store)
+    : store_(std::move(store)) {}
+
+ClientCredentials::Current ClientCredentials::current() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return {store_, generation_.load(std::memory_order_relaxed)};
+}
+
+void ClientCredentials::replace(std::shared_ptr<const SecretStore> store) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    store_ = std::move(store);
+    generation_.fetch_add(1, std::memory_order_release);
+}
+
+namespace {
+
+/// The identities of `fresh` that `old` does not have, those `old` has that `fresh` does not, and
+/// those in both whose secret or permissions differ (#258): names only, for the log.
+struct CredentialChanges {
+    std::vector<std::string> added;
+    std::vector<std::string> removed;
+    std::vector<std::string> changed;
+};
+
+CredentialChanges compare_credentials(const SecretStore& old, const SecretStore& fresh,
+                                      const std::vector<std::string>& old_names,
+                                      const std::vector<std::string>& fresh_names) {
+    CredentialChanges out;
+    for (const auto& name : fresh_names) {
+        const Credential* was = old.find(name);
+        if (was == nullptr) {
+            out.added.push_back(name);
+        } else if (const Credential* now = fresh.find(name);
+                   was->secret != now->secret || !(was->permissions == now->permissions)) {
+            out.changed.push_back(name);
+        }
+    }
+    for (const auto& name : old_names) {
+        if (fresh.find(name) == nullptr) out.removed.push_back(name);
+    }
+    return out;
+}
+
+std::string joined(const std::vector<std::string>& names) {
+    if (names.empty()) return "none";
+    std::string out;
+    for (const auto& n : names) {
+        if (!out.empty()) out += ", ";
+        out += n;
+    }
+    return out;
+}
+
+}  // namespace
+
+CredentialReload reload_client_credentials(const ServerConfig& config, const SecretStore& cluster,
+                                           ClientCredentials& credentials, MetricsRegistry* registry) {
+    if (config.auth_secret_file.empty()) {
+        OB_LOG_INFO("auth", "credential reload asked for, and no --auth-secret-file is given: client "
+                            "authentication is off and stays off - nothing to reload");
+        return CredentialReload::NothingToReload;
+    }
+    OB_LOG_INFO("auth", "reloading client credentials: %s%s%s", config.auth_secret_file.c_str(),
+                config.auth_acl_file.empty() ? "" : ", permissions ",
+                config.auth_acl_file.c_str());
+    const ClientCredentials::Current was = credentials.current();
+    std::shared_ptr<const SecretStore> fresh;
+    try {
+        fresh = load_client_secrets(config, cluster);
+        // The shard coordinator took --migration-identity's secret at the start, and moves symbols
+        // with it: changed here, the other shards would hold the new one and this one the old.
+        if (!config.migration_identity.empty()) {
+            const Credential* before = was.store->find(config.migration_identity);
+            const Credential* after  = fresh->find(config.migration_identity);
+            if (before == nullptr || after == nullptr || before->secret != after->secret) {
+                throw std::runtime_error("--migration-identity '" + config.migration_identity +
+                                         "' has another secret in the file: this node moves symbols "
+                                         "with the secret it started with, and changing it takes a "
+                                         "restart of every shard");
+            }
+        }
+    } catch (const std::exception& e) {
+        // The reason names the file and why, never a secret: the loaders' messages.
+        OB_LOG_ERROR("auth", "credential reload refused, every session keeps the credentials it had: %s",
+                     e.what());
+        if (registry) registry->increment_counter("ob_auth_reload_failures_total");
+        return CredentialReload::Refused;
+    }
+
+    std::vector<std::string> old_names = was.store->identities();
+    std::vector<std::string> fresh_names = fresh->identities();
+    const CredentialChanges changes = compare_credentials(*was.store, *fresh, old_names, fresh_names);
+    credentials.replace(fresh);
+    OB_LOG_INFO("auth", "client credentials reloaded: %zu identities (was %zu); added: %s; removed: "
+                        "%s; changed: %s. Sessions of the removed and the changed close at their "
+                        "loop's next pass",
+                fresh_names.size(), old_names.size(), joined(changes.added).c_str(),
+                joined(changes.removed).c_str(), joined(changes.changed).c_str());
+    if (registry) registry->increment_counter("ob_auth_reloads_total");
+    return CredentialReload::Reloaded;
 }
 
 // ── execute_command ───────────────────────────────────────────────────────────
@@ -1513,8 +1617,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"election-lease-wait-ms", {"<N>", "Wait after the leader key vanishes before standing"}},
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
         {"backup-dir", {"<DIR>", "Where BACKUP writes this node's backups, one directory each; not the data or the WAL directory, nor inside either. Without it BACKUP is refused (#34)"}},
-        {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
-        {"auth-acl-file", {"<PATH>", "Each identity's permissions, '<identity> role=read|write|admin [symbols=A,B*] [exchanges=X*]' per line (#31). Empty: every identity is admin and reaches everything"}},
+        {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication. Read again on SIGHUP (#258)"}},
+        {"auth-acl-file", {"<PATH>", "Each identity's permissions, '<identity> role=read|write|admin [symbols=A,B*] [exchanges=X*]' per line (#31). Empty: every identity is admin and reaches everything. Read again on SIGHUP (#258)"}},
         {"migration-identity", {"<IDENTITY>", "The identity from --auth-secret-file a shard authenticates as on another shard's client port, moving a symbol there"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "
@@ -2650,6 +2754,7 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
 TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
     , secrets_(load_secrets_or_exit(config_))
+    , credentials_(secrets_.clients)
     , tls_(load_tls_or_exit(config_))
 {
     // Where backups go (#34), checked before the engine opens the data directory: a backup directory
@@ -2814,7 +2919,7 @@ struct ReactorShared {
     const ServerConfig&      config;
     Engine&                  engine;
     const LoadedTlsContexts& tls;
-    const LoadedSecrets&     secrets;
+    const ClientCredentials& credentials;   ///< the client store in force (#258)
     std::atomic<bool>&       running;
     std::atomic<bool>&       draining;
     ServerStats&             stats;
@@ -2885,6 +2990,13 @@ private:
     /// which is why a session dying in the middle of a large response left no trace.
     void close_session(int fd, const char* reason);
 
+    /// The client store in force, taken when its generation moved (#258), and the sessions of the
+    /// identities it took away or changed closed. Once a pass, before the events.
+    void refresh_credentials();
+    /// What execute_command() checks an AUTH and a permission against: null without client
+    /// authentication.
+    const SecretStore* client_store() const { return clients_->empty() ? nullptr : clients_.get(); }
+
     /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
     ///
     /// Armed only after a partial write. Leaving EPOLLOUT armed permanently on an
@@ -2906,7 +3018,10 @@ private:
     std::mutex&              admin_mtx_;
     Engine*                  engine_;
     const LoadedTlsContexts& tls_;
-    const LoadedSecrets&     secrets_;
+    const ClientCredentials& credentials_;
+    /// This loop's copy of the client store in force, and its generation (#258).
+    std::shared_ptr<const SecretStore> clients_;
+    uint64_t                 clients_generation_{0};
     std::atomic<bool>&       running_;
     std::atomic<bool>&       draining_;
     ServerStats&             stats_;
@@ -2997,7 +3112,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , admin_mtx_(shared.admin_mtx)
     , engine_(&shared.engine)
     , tls_(shared.tls)
-    , secrets_(shared.secrets)
+    , credentials_(shared.credentials)
     , running_(shared.running)
     , draining_(shared.draining)
     , stats_(shared.stats)
@@ -3011,6 +3126,11 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , hub_(shared.config.max_subscriber_queue_bytes, shared.config.max_subscriptions_per_session)
     , event_what_("serving a client event on reactor " + std::to_string(index))
     , event_guard_("tcp_server", event_what_.c_str(), &shared.engine.registry()) {
+    {
+        const ClientCredentials::Current now = credentials_.current();
+        clients_            = now.store;
+        clients_generation_ = now.generation;
+    }
     // 5. Create epoll instance.
     epoll_fd_ = ::epoll_create1(0);
     if (epoll_fd_ < 0) {
@@ -3087,6 +3207,36 @@ Reactor::~Reactor() {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }
+}
+
+void Reactor::refresh_credentials() {
+    if (credentials_.generation() == clients_generation_) return;
+    const ClientCredentials::Current now = credentials_.current();
+    // A session keeps no secret, only its identity and the permissions it was given, so what it
+    // authenticated against is this loop's copy: compared with the store in force, a session whose
+    // identity is gone was revoked, and one whose secret or permissions differ was changed - closed
+    // either way, between commands, with no answer it did not ask for (#258). One in neither stays.
+    size_t closed = 0;
+    for (const auto& [fd, identity] : sessions_.authenticated()) {
+        const Credential* was = clients_->find(identity);
+        const Credential* is  = now.store->find(identity);
+        const char* why = nullptr;
+        if (is == nullptr) {
+            why = "credential revoked by a reload";
+        } else if (was == nullptr || was->secret != is->secret || !(was->permissions == is->permissions)) {
+            why = "credential changed by a reload";
+        }
+        if (why == nullptr) continue;
+        OB_LOG_INFO("auth", "reactor %d: closing fd=%d of identity '%s': %s", index_, fd,
+                    identity.c_str(), why);
+        close_session(fd, why);
+        ++closed;
+    }
+    OB_LOG_DEBUG("auth", "reactor %d: client credentials of generation %llu in force, %zu session(s) "
+                 "closed", index_, static_cast<unsigned long long>(now.generation), closed);
+    if (closed > 0) engine_->registry().increment_counter("ob_auth_reload_sessions_closed_total", closed);
+    clients_            = now.store;
+    clients_generation_ = now.generation;
 }
 
 void Reactor::close_session(int fd, const char* reason) {
@@ -3441,6 +3591,10 @@ void Reactor::run_loop() {
             break;
         }
 
+        // A reload of the client credentials, once per iteration and before any command reads them
+        // (#258): one atomic load when nothing changed.
+        refresh_credentials();
+
         // Subscriptions, once per iteration and before the event loop below.
         //
         // Unconditional, and not inside a branch on the wakeup fd — the same decision as
@@ -3738,7 +3892,7 @@ void Reactor::run_loop() {
                                 Command cmd = (line.find('\n') != std::string::npos)
                                                   ? parse_minsert(line)
                                                   : parse_command(line);
-                                if (deferrable_write(cmd, *session, secrets_.client_store())) {
+                                if (deferrable_write(cmd, *session, client_store())) {
                                     pending_writes_.push_back(std::move(cmd));
                                     continue;
                                 }
@@ -3751,7 +3905,7 @@ void Reactor::run_loop() {
                                 // caller at a time, and released before the answer is queued.
                                 std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
                                 if (serialised_across_reactors(cmd.type)) alone.lock();
-                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store(), backups_);
+                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, client_store(), backups_);
                                 if (alone.owns_lock()) alone.unlock();
 
                                 if (response.empty()) {
@@ -3989,7 +4143,7 @@ void TcpServer::run() {
         sc_config.migration_access.tls         = config_.tls_client;
         sc_config.migration_access.tls_ca_file = config_.tls_ca_file;
         if (!config_.migration_identity.empty()) {
-            if (const Credential* own = secrets_.clients.find(config_.migration_identity)) {
+            if (const Credential* own = secrets_.clients->find(config_.migration_identity)) {
                 sc_config.migration_access.identity = own->identity;
                 sc_config.migration_access.secret   = own->secret;
             }
@@ -4088,7 +4242,7 @@ void TcpServer::run() {
     // address on this frame's stack that the engine holds; the engine holds it only while the
     // reactors run.
     loop_load_ = std::make_unique<LoopLoad>(config_.io_threads);
-    ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
+    ReactorShared shared{config_,    *engine_, tls_,  credentials_, running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
                          &dealt_to, admin_mtx, backups.get(), loop_load_.get()};
     const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
@@ -4232,6 +4386,11 @@ DrainVerdict drain_verdict(std::chrono::steady_clock::time_point drain_started,
         std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_started).count();
     if (waited >= static_cast<long long>(drain_timeout_ms)) return DrainVerdict::DeadlineReached;
     return DrainVerdict::KeepWaiting;
+}
+
+CredentialReload TcpServer::reload_credentials() {
+    return reload_client_credentials(config_, secrets_.cluster, credentials_,
+                                     engine_ ? &engine_->registry() : nullptr);
 }
 
 TlsReload TcpServer::reload_tls() {

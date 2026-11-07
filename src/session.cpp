@@ -643,6 +643,15 @@ void SessionManager::close_all() {
     sessions_.clear();
 }
 
+std::vector<std::pair<int, std::string>> SessionManager::authenticated() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<std::pair<int, std::string>> out;
+    for (const auto& [fd, session] : sessions_) {
+        if (session->authenticated()) out.emplace_back(fd, session->identity());
+    }
+    return out;
+}
+
 int SessionManager::active_count() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return static_cast<int>(sessions_.size());
