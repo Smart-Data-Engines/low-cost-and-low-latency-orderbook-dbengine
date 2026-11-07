@@ -263,7 +263,8 @@ TEST(JoiningStreamStatic, TheRecordIsWrittenBeforeTheStoreIsReplaced) {
         function_body(repl, "void ReplicationClient::request_and_receive_snapshot()");
     ASSERT_FALSE(snapshot.empty());
     const size_t snap_record = snapshot.find("engine_.begin_joining(");
-    const size_t begun       = snapshot.find("bootstrapping_.store(true");
+    // Through the setter since #254, which keeps the engine's copy of the flag with the client's.
+    const size_t begun       = snapshot.find("set_bootstrapping(true)");
     ASSERT_NE(snap_record, std::string::npos) << "the snapshot path no longer records joining";
     ASSERT_NE(begun, std::string::npos);
     EXPECT_LT(snap_record, begun) << "the bootstrap begins before the record that says so";
