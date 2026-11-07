@@ -205,6 +205,35 @@ TEST(AnswerCeiling, APartOfATextAnswerStopsAtTheCeiling) {
     EXPECT_EQ(whole->rows(), 6144u);
 }
 
+// Under a ceiling, once doubling would reach kJumpBytes, the text's capacity is the ceiling and a batch
+// past it at once: the last doubling copied 32 MiB into a string of 64 and held both, which was most
+// of what a refused answer cost a node. Capacity nobody writes is never touched. Below the jump, and
+// with no ceiling, the text grows as a string does.
+TEST(AnswerCeiling, PastTheJumpTheTextsCapacityIsTheCeilingAtOnce) {
+    const ob::QueryShape shape = seven();
+    const size_t ceiling = 64u << 20;
+    const Rows big(250'000, false);    // about ten megabytes of text
+    const Rows small(40'000, false);   // under two
+
+    ob::QueryResponseBuilder jumped(shape, std::string(), ob::AnswerCeiling{ceiling, false});
+    add_in_batches(jumped, big, 2048);
+    const std::string answer = jumped.finish();
+    ASSERT_GT(answer.size(), ob::QueryResponseBuilder::kJumpBytes);
+    EXPECT_GE(answer.capacity(), ceiling) << "the text doubled past the jump";
+
+    ob::QueryResponseBuilder unbounded(shape);
+    add_in_batches(unbounded, big, 2048);
+    const std::string doubled = unbounded.finish();
+    EXPECT_LT(doubled.capacity(), ceiling) << "without a ceiling the text jumped";
+    EXPECT_TRUE(doubled == answer) << parted(doubled, answer);
+
+    ob::QueryResponseBuilder under(shape, std::string(), ob::AnswerCeiling{ceiling, false});
+    add_in_batches(under, small, 2048);
+    const std::string short_answer = under.finish();
+    EXPECT_LT(short_answer.capacity(), ob::QueryResponseBuilder::kJumpBytes)
+        << "a text that never reached the jump jumped";
+}
+
 // On a session that compresses, a row answer is its LZ4 frame: the plain answer's text, its length
 // in front - with no rows, past the megabyte the text is compressed at, and many times past it.
 TEST(AnswerCeiling, AnLz4AnswerIsTheFrameOfThePlainOnesText) {
