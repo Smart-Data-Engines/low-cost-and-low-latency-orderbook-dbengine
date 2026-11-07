@@ -2900,6 +2900,84 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 260. A large read held its client loop, and every session on it, for as long as it was answered ✅ **P1**
+
+**Found measuring #257** (spec `smart-data-engine-workspace/specs/large-answer-off-the-loop/`,
+evidence `evidence/2026-11-07-large-answer-off-the-loop/`). A client loop ran a `SELECT` to its last
+byte - scan, formatting, compression, sending - before it served another session, and the sessions on
+it are every Nth connection of the node, the ones writing a feed among them: a `PING` beside a
+`SELECT` of a million rows (45 MB) on the same loop waited 11-22 ms on the m9g.xlarge and 14-17 ms
+on the m8a.xlarge, and 52-56 ms and 48-52 ms in a session with `COMPRESS LZ4`. For a database
+whose point is latency, an analyst's query is not allowed to hold a feed's writes for tens of
+milliseconds.
+
+**A large read is answered on threads of its own** (`--large-read-threads N`, default 2, `ob-read-N`;
+0 is every read on its loop, as before).
+- **The engine hands it back before it reads a row** (`ReadGate`, `QueryEngine::execute()`): once the
+  query is parsed and its book found, a read whose scan the index puts at 100 000 rows or more. A row
+  query with no price, side or level condition is decided by its `LIMIT`, without the index; one with
+  a condition reads the range to find its rows, and time buckets read every row of theirs, so the
+  rows in range decide them (`rows_in_range_at_most()`: the index under its shared lock, nothing
+  copied, counted no further than the threshold). The live book's functions and snapshots read the
+  book and stay.
+- **Its session is paused** until the answer comes back through the loop's mailbox (an eventfd in its
+  epoll): what came behind the read in the same write waits in the session, what comes later waits in
+  the socket, so a session's answers come in the order it asked and a write sent after the read is
+  not in it. The answer is queued as the loop queues its own - LZ4 frame, the ceiling of #257 - and
+  the session is resumed by an event the loop adds to its pass. A session closed meanwhile - a reload
+  that revoked its identity (#258) - has its answer dropped, and not given to the session that has its
+  descriptor now. A session in rings stays on its loop: the loop makes its events, and none would
+  resume it.
+- **One flush sends a megabyte at most** (`Session::kSendSlice`), on the socket and through TLS. With
+  the read off the loop, a `PING` beside it still waited for its sending on the ARM host: 30-48 us
+  while the answer was built, 4.7-10.3 ms while it went out, because a reader as fast as the loop never
+  filled its socket and the flush sent the whole answer. A flush that stops at the slice says so, and
+  the loop arms `EPOLLOUT` again - edge-triggered, nothing else would report the socket - which
+  answers on the next pass, after the pass's other sessions.
+
+Measured with Release builds, eight million rows of one book and one client loop; `master` before
+against the branch, three rounds each, the `PING`s and writes sent by a process of their own and
+counted while the read was answered:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| longest `PING`, `SELECT` of 1M rows | 11.2-21.9 ms | 0.15-0.48 ms | 14.0-16.6 ms | 0.03-0.29 ms |
+| longest `PING`, the same in LZ4 | 52.2-56.2 ms | 0.07-0.33 ms | 47.7-51.8 ms | 0.03-0.26 ms |
+| longest `MINSERT` of 20 levels beside it | 12.7-18.1 ms | 0.30-1.46 ms | 14.4-19.8 ms | 0.18-1.95 ms |
+| `SELECT ... LIMIT 100`, p50 | 22.8-23.8 us | 23.2-23.3 us | 13.7-14.0 us | 13.8-14.1 us |
+| `SELECT` of about a millisecond of the book, p50 | 60.9-62.4 us | 61.8-62.3 us | 64.7-65.0 us | 65.0-65.7 us |
+
+The read itself takes as long: 0.031-0.036 s before and 0.032-0.034 after in text and 0.094-0.099 and
+0.097-0.098 in LZ4 on the m9g.xlarge, 0.038-0.047 and 0.040-0.047, 0.104-0.107 and 0.104-0.108 on the
+m8a.xlarge. A writer beside it takes turns of the loop the read had held - 1.6-2.3 times the batches
+while the read was answered, on the m8a.xlarge - and the read with it took 0.039-0.045 s where 0.035-0.038, and
+0.043-0.056 where 0.038-0.043. A small read's 0.5% on the m8a.xlarge is there with the threads off too
+(65.2-65.5 us), and is not the gate.
+
+**Two versions before this one.** The first asked the index before `execute()`: it parsed the query a
+second time and copied every candidate's metadata, and `LIMIT 100` of a range of eight million rows
+went from 13.6-14.0 to 17.2-17.8 us at p50 (x86) and from 22.7-23.7 to 32.7-32.8 (ARM). It also counted
+a `LIMIT` as what a scan reads under a condition on the rows, which reads the range to find them. The
+first test of isolation measured a `PING` from a thread of the test's own process, which waited for the
+interpreter's lock while the reader took 26 MB in: 18.7 ms beside a read off the loop that the node
+answered beside in 0.05-0.18 ms (pitfall 642).
+
+Tests: `tests/test_off_loop_reads.cpp` (the index's count and where it stops, the gate from its
+threshold on, `LIMIT` with and without a condition, buckets, the live book's functions, the mailbox,
+the pool), `SessionOutput.AFlushSendsASliceAtMostAndSaysWhenItStoppedThere` and
+`TlsSession.AFlushSendsASliceAtMostToAReaderThatKeepsUp`, `tests/integration/test_large_answer_isolation.py`
+(a `PING` beside a read under a tenth of the one on the loop; the threshold read from the metrics; the
+order of a session's answers with a second write while its read is off the loop; LZ4; a session closed
+by a reload; TLS against the Unix socket's plain answer, to a reader that keeps up and through a 4 kB
+window) and `test_rings.py`'s `large_read`, off the loop through the socket and on it through rings.
+Mutation table (`mutations/` in the evidence, on the final tree): 23 mutants, 21 killed, each by the
+test of what it breaks, and the control survives. So does a pass that cannot take every session it
+resumes into its 64 events and sleeps with the rest left: no test fills a pass, and that path is held
+by reading it.
+
+- Effort: L | Impact: an analyst's query no longer holds the writes and reads of the sessions beside
+  it
+
 ### 258. Adding, rotating or revoking a client took a restart ✅ **P2**
 
 **Found asking how an operator takes a compromised client's access away** (spec
