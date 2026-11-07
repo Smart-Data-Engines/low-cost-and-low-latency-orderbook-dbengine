@@ -334,12 +334,21 @@ void QueryResponseBuilder::room_for_a_row() {
 // twice what was written. Past the capacity, twice the capacity first, so that what was written is
 // copied a number of times that grows with the logarithm of the reply, not with its batches (#253).
 void QueryResponseBuilder::grow_to(size_t n) {
-    if (n > out_.capacity()) {
-        size_t want = std::max(out_.capacity() * 2, n);
-        if (capacity_ceiling_ != 0) want = std::max(n, std::min(want, capacity_ceiling_));
-        out_.reserve(want);
-    }
+    if (n > out_.capacity()) out_.reserve(capacity_for(n));
     out_.resize(n);
+}
+
+// Doubling, as a string grows - but under a ceiling, once doubling reaches kJumpBytes, the capacity
+// is the ceiling and a batch past it at once (#257). Each doubling copied what was written into a
+// string twice its size, and the last one, at 32 MiB, held 96 MiB to answer 64; the pages of the
+// capacity nobody writes are never touched, so they are address space, not memory.
+size_t QueryResponseBuilder::capacity_for(size_t n) const {
+    size_t want = std::max(out_.capacity() * 2, n);
+    if (capacity_ceiling_ != 0) {
+        want = want >= kJumpBytes ? capacity_ceiling_ : std::min(want, capacity_ceiling_);
+        want = std::max(want, n);
+    }
+    return want;
 }
 
 // After each batch or part, never inside one: the rows of a batch were written whole, and a check a
@@ -650,9 +659,7 @@ void QueryResponseBuilder::add_part(ScanPart& p, uint64_t n) {
                          static_cast<unsigned long long>(rows_taken_), used_);
             return;
         }
-        if (used_ + adds > out_.capacity()) {
-            out_.reserve(std::max(used_ + adds, std::min(out_.capacity() * 2, capacity_ceiling_)));
-        }
+        if (used_ + adds > out_.capacity()) out_.reserve(capacity_for(used_ + adds));
     }
     // Appended rather than copied into room made ahead, which a resize fills with zeros first: the
     // copy is the one pass over the bytes this reply makes.

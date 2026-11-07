@@ -206,6 +206,8 @@ public:
 
     /// Text written before it is compressed onto an LZ4 answer's frame.
     static constexpr size_t kSpillBytes = 1u << 20;
+    /// Under a ceiling, the capacity past which the text's next growth is to the ceiling (#257).
+    static constexpr size_t kJumpBytes = 8u << 20;
 
 private:
     void start(const QueryResult& first);
@@ -214,6 +216,8 @@ private:
     void room_for_a_row();
     /// The reply `n` bytes long, the room past `used_` for rows to be written in (#253).
     void grow_to(size_t n);
+    /// The capacity to ask for when `n` bytes do not fit (#253, #257).
+    size_t capacity_for(size_t n) const;
     /// `rows` more rows written, measured against the ceiling (#257).
     void measure(uint64_t rows);
     /// The text written so far compressed onto the frame, and the text emptied (#257).

@@ -126,6 +126,10 @@ def framed_answer(s: socket.socket) -> tuple[int, bytes]:
 def test_an_answer_past_the_ceiling_is_refused_where_it_passed_it(node):
     s = connect(node.port)
     try:
+        # Once to read the range: its segments' columns are decoded and held for the next read,
+        # which is the node's cache, not the answer's memory. Then again, measured.
+        s.sendall((WHOLE + "\n").encode())
+        assert TOO_LARGE.match(answer(s).decode())
         node.reset_peak()
         before = node.status_kb("VmRSS")
         s.sendall((WHOLE + "\n").encode())
@@ -137,8 +141,8 @@ def test_an_answer_past_the_ceiling_is_refused_where_it_passed_it(node):
         # About 70 bytes a row: the ceiling holds a little under a million of them.
         assert 800_000 < within < ROWS, within
         if not instrumented_run():
-            # Built to the ceiling and a batch past it, not to the 84 MB of the whole answer - which
-            # the answer's own doubling took past twice the ceiling in resident memory before #257.
+            # Built to the ceiling and a batch past it, not to the 84 MB of the whole answer - whose
+            # last doubling alone held 192 MiB before #257.
             grew = (peak - before) * 1024
             assert grew < 2 * CEILING, f"the refused answer took the node up by {grew} bytes"
 
