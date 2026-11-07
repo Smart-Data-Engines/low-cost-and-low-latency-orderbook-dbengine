@@ -1648,6 +1648,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         how.divide_small = scan_divide_small_;
         how.direct = direct;
         how.make_part = [rows, lim]() { return rows->part(lim); };
+        how.rows_room = [rows]() { return rows->rows_room(); };
         how.fold = [&](ScanPart& part) {
             const uint64_t take = std::min<uint64_t>(part.rows(), lim - count);
             rows->add_part(part, take);

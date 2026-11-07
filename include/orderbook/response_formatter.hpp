@@ -192,6 +192,8 @@ public:
 
     /// Whether a row answer has passed its ceiling (#257).
     bool full() const override { return full_; }
+    /// The rows it may still take, at the bytes a row its rows have taken so far (#257).
+    uint64_t rows_room() const override;
     /// The rows of the answer known to fit within the ceiling: those before the batch or the part
     /// that passed it - in LZ4, those in the frame the last time it was measured.
     uint64_t rows_within() const { return rows_within_; }

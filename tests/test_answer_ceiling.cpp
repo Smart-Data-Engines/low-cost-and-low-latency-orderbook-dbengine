@@ -250,21 +250,21 @@ std::string made(const fs::path& dir) {
     return dir.string();
 }
 
-/// Four segments of 5000 rows of one book.
+/// Segments of 5000 rows of one book, four unless told.
 struct Store {
     fs::path dir;
     ob::ColumnarStore store;
     ob::AggregationEngine agg;
     ob::QueryEngine engine;
 
-    Store()
+    explicit Store(int segments = 4)
         : dir(fs::temp_directory_path() / ("ob_answer_ceiling_" + std::to_string(::getpid()) + "_" +
                                            std::to_string(g_counter.fetch_add(1))))
         , store(made(dir))
         , engine(store, [](const std::string&) -> std::shared_ptr<ob::SoABuffer> { return nullptr; },
                  agg) {
         uint64_t seq = 0;
-        for (int segment = 0; segment < 4; ++segment) {
+        for (int segment = 0; segment < segments; ++segment) {
             store.set_symbol_exchange("CE", "EX");
             for (int i = 0; i < 5000; ++i, ++seq) {
                 ob::SnapshotRow r{};
@@ -298,14 +298,20 @@ public:
         offered += batch.rows.size();
         reply_.add_rows(batch);
     }
-    std::unique_ptr<ob::ScanPart> part(uint64_t limit) override { return reply_.part(limit); }
+    std::unique_ptr<ob::ScanPart> part(uint64_t limit) override { return part_counted(limit); }
     void add_part(ob::ScanPart& part, uint64_t n) override {
         offered += n;
         reply_.add_part(part, n);
     }
     bool full() const override { return reply_.full(); }
+    uint64_t rows_room() const override { return reply_.rows_room(); }
+    std::unique_ptr<ob::ScanPart> part_counted(uint64_t limit) {
+        ++parts;
+        return reply_.part(limit);
+    }
 
     uint64_t offered = 0;
+    std::atomic<uint64_t> parts{0};
 
 private:
     ob::QueryResponseBuilder& reply_;
@@ -360,4 +366,45 @@ TEST(AnswerCeiling, ADividedScanStopsAtThePartThatMadeItsAnswerFull) {
     EXPECT_FALSE(whole.full());
     EXPECT_EQ(whole.rows_taken(), 20'000u);
     s.engine.set_scan_pool(nullptr);
+}
+
+// The pool formats parts ahead of the fold - as many as its threads and one, each a segment - and
+// under a ceiling it hands out only what the answer has room for: at the widest row before any is
+// folded, at the rows' own bytes after. Sixteen segments and four threads, with room for about a
+// segment and a half: four parts are handed out, where the window alone would hand out eight.
+TEST(AnswerCeiling, ADividedScanHandsOutNoMoreThanItsAnswerHasRoomFor) {
+    Store s(16);
+    ob::ScanPool pool(4, nullptr);
+    s.engine.set_scan_pool(&pool, /*divide_small=*/true);
+    ob::QueryShape shape;
+    ob::QueryResponseBuilder reply(shape, std::string(), ob::AnswerCeiling{787'500, false});
+    Offered offered(reply);
+    const std::string err =
+        s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &offered);
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(reply.full());
+    EXPECT_EQ(reply.rows_taken(), 15'000u);
+    EXPECT_LE(offered.parts.load(), 5u) << "parts were formatted past what the answer had room for";
+    s.engine.set_scan_pool(nullptr);
+}
+
+// The estimate the pool reads: at the widest row before any row, at the rows' own bytes after, and
+// none once full; and no estimate without a ceiling.
+TEST(AnswerCeiling, TheRoomIsTheRowsTheCeilingStillHoldsAtTheirBytes) {
+    const ob::QueryShape shape = seven();
+    const Rows rows(4000, false);
+    ob::QueryResponseBuilder unbounded(shape);
+    EXPECT_EQ(unbounded.rows_room(), UINT64_MAX);
+
+    ob::QueryResponseBuilder reply(shape, std::string(), ob::AnswerCeiling{1'050'000, false});
+    EXPECT_EQ(reply.rows_room(), 10'000u) << "before any row: the ceiling at the widest row, 105 bytes";
+    reply.add_rows(rows.batch(0, 2000));
+    const uint64_t per_row = reply.bytes_built() / 2000;
+    EXPECT_EQ(reply.rows_room(), (1'050'000 - reply.bytes_built() - 1) / per_row);
+    EXPECT_GT(reply.rows_room(), 10'000u) << "a row is narrower than the widest it could be";
+
+    ob::QueryResponseBuilder full(shape, std::string(), ob::AnswerCeiling{50'000, false});
+    full.add_rows(rows.batch(0, 2000));
+    ASSERT_TRUE(full.full());
+    EXPECT_EQ(full.rows_room(), 0u);
 }

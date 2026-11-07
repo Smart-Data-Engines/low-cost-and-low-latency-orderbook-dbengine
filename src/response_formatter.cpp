@@ -382,6 +382,32 @@ size_t QueryResponseBuilder::bytes_built() const {
     return frame_ ? frame_->size() : used_;
 }
 
+// From what the rows so far took: text a row, or frame a row compressed. An estimate for handing out
+// parts, never a decision - the ceiling is measured on the bytes themselves.
+uint64_t QueryResponseBuilder::rows_room() const {
+    if (ceiling_.bytes == 0) return UINT64_MAX;
+    if (full_) return 0;
+    if (frame_ && rows_within_ > 0) {
+        const size_t frame = frame_->size() + Lz4FrameWriter::kEndBytes;
+        if (frame >= ceiling_.bytes) return 0;
+        const uint64_t per_row = std::max<uint64_t>(1, frame / rows_within_);
+        const uint64_t room = (ceiling_.bytes - frame) / per_row;
+        const uint64_t staged = rows_taken_ - rows_within_;   // taken, not compressed yet
+        return room > staged ? room - staged : 0;
+    }
+    if (!frame_ && rows_taken_ > 0) {
+        if (used_ + 1 >= ceiling_.bytes) return 0;
+        const uint64_t per_row = std::max<uint64_t>(1, used_ / rows_taken_);
+        return (ceiling_.bytes - used_ - 1) / per_row;
+    }
+    // No row measured yet - the scan's first parts are handed out before any is folded: at the
+    // widest row the query's columns can write, which no row is wider than. The shape is filled
+    // before the scan begins.
+    const uint64_t widest = shape_.columns == all_query_columns() ? kMaxQueryRowBytes
+                                                                    : max_row_bytes(shape_.columns);
+    return ceiling_.bytes / std::max<uint64_t>(1, widest);
+}
+
 void QueryResponseBuilder::add(const QueryResult& r) {
     if (!started_) start(r);
     if (buckets_) {

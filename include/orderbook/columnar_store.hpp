@@ -202,6 +202,11 @@ struct PartsScan {
     /// A part folded into the answer, on the scan's thread and in the candidates' order. False ends
     /// the scan.
     std::function<bool(ScanPart&)> fold;
+    /// The rows the answer may still take beyond those folded, estimated, or UINT64_MAX when there
+    /// is no estimate (#257): a candidate goes to the pool only while the rows handed out and not
+    /// folded yet are fewer, so the parts held formatted ahead of the fold are about what the answer
+    /// has room for - not the pool's threads and one, each a segment, past an answer's ceiling.
+    std::function<uint64_t()> rows_room;
     /// Divide a scan a pool cannot speed up as well - fewer rows in range than
     /// `kScanDivideMinRows`, or most of them in one candidate - which only tests ask for, so that
     /// a small store reads the parts' path.
