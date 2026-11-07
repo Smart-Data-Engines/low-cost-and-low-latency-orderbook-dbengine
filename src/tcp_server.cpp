@@ -1055,6 +1055,24 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
     return std::move(r.answer);
 }
 
+/// FLUSH's work and its answer, on the loop or off it (#261): `OK`, or the failure that stopped the
+/// flush - a WAL or segment sync that failed is the client's to know, as it always was.
+std::string flush_answer(Engine& engine, MetricsRegistry* registry) {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        engine.flush_incremental();
+    } catch (const std::exception& e) {
+        return format_error(e.what());
+    }
+    if (registry) {
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        registry->observe_histogram("ob_flush_latency_seconds", secs);
+        registry->increment_counter("ob_total_flushes");
+    }
+    return format_ok();
+}
+
 /// `STATUS`, from a snapshot taken for this answer rather than from the `ServerStats` every
 /// connection shares. Everything in it but three counters is a vector, strings and plain integers,
 /// which was safe while one thread ran every command and is a data race - on a vector - the moment
@@ -1158,7 +1176,7 @@ std::string execute_command(const Command& cmd,
                             SubscriptionHub* hub,
                             const SecretStore* client_secrets,
                             BackupRunner* backups,
-                            OffLoopReads* off_loop) {
+                            OffLoopWork* off_loop) {
     // ── Authentication gate ───────────────────────────────────────────────────
     //
     // Before the switch, not as a branch inside each case. A per-case check means the next command
@@ -1247,7 +1265,7 @@ std::string execute_command(const Command& cmd,
                                                                    asked);
                                          });
         if (asked != nullptr && answer == kAnsweredOffLoop) {
-            off_loop->take(cmd, session, gate.rows_at_most);
+            off_loop->take_read(cmd, session, gate.rows_at_most);
         }
         return answer;
     }
@@ -1279,18 +1297,14 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        auto t0_flush = std::chrono::steady_clock::now();
-        try {
-            engine.flush_incremental();
-        } catch (const std::exception& e) {
-            return format_error(e.what());
+        // Writing the segments held the loop, and every session on it, for as long as they took:
+        // 112-180 ms of 500 000 rows in 1 000 books on the ARM host. Past its refusals, a FLUSH is
+        // the threads' off the loop (#261), and its session waits for its answer.
+        if (off_loop != nullptr && off_loop->may_take(session)) {
+            off_loop->take_flush(session);
+            return std::string(kAnsweredOffLoop);
         }
-        if (registry) {
-            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_flush).count();
-            registry->observe_histogram("ob_flush_latency_seconds", secs);
-            registry->increment_counter("ob_total_flushes");
-        }
-        return format_ok();
+        return flush_answer(engine, registry);
     }
 
     case CommandType::PING:
@@ -3004,7 +3018,7 @@ struct ReactorShared {
     OffLoopPool*             off_loop_pool;
 };
 
-class Reactor final : public OffLoopReads {
+class Reactor final : public OffLoopWork {
 public:
     /// `listen_fd` is the server's listening socket for the reactor that accepts, and a descriptor
     /// of -1 for any other; `unix_listen_fd` the same for the Unix socket (#52), -1 without one. A
@@ -3057,7 +3071,9 @@ private:
     bool may_take(const Session& session) const override;
     /// A large read handed to the threads off the loop, which the engine gave back before its scan
     /// (#260), and its session paused.
-    void take(const Command& cmd, Session& session, uint64_t rows_at_most) override;
+    void take_read(const Command& cmd, Session& session, uint64_t rows_at_most) override;
+    /// A FLUSH handed to the threads off the loop (#261), and its session paused.
+    void take_flush(Session& session) override;
     /// The answers that came back off the loop, each queued on its session, and the sessions resumed:
     /// an event as if readable and writable appended for each to the `nfds` of this pass, so that the
     /// answer is flushed, the commands held behind it run and the socket is read again. Returns the
@@ -3309,7 +3325,7 @@ bool Reactor::may_take(const Session& session) const {
     return off_loop_pool_ != nullptr && !session.in_rings();
 }
 
-void Reactor::take(const Command& cmd, Session& session, uint64_t rows_at_most) {
+void Reactor::take_read(const Command& cmd, Session& session, uint64_t rows_at_most) {
     const int fd = session.fd();
     const uint64_t conn_id = session.conn_id();
     const AnswerCeiling ceiling{Session::max_queued_bytes(), session.is_compressed()};
@@ -3324,7 +3340,7 @@ void Reactor::take(const Command& cmd, Session& session, uint64_t rows_at_most) 
             "ob_off_loop_read_wait_seconds",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
         // The answer as the loop builds it, in a buffer of the read's own: a session is the loop's.
-        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false};
+        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false, false};
         try {
             QueryShape shape;
             ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::string(),
@@ -3340,22 +3356,54 @@ void Reactor::take(const Command& cmd, Session& session, uint64_t rows_at_most) 
             // past the engine's call - the answer's buffer, its frame - answers as a refusal does.
             OB_LOG_ERROR("tcp_server", "reactor %d: a read off the loop for fd=%d failed past the "
                          "engine's call: %s", index, fd, e.what());
-            out = OffLoopAnswer{fd, conn_id, format_error(e.what()), false, 0, false};
+            out = OffLoopAnswer{fd, conn_id, format_error(e.what()), false, 0, false, false};
         }
         OB_LOG_DEBUG("tcp_server", "reactor %d: an answer off the loop for fd=%d, %zu byte(s)%s", index,
                      fd, out.answer.size(), out.framed ? " in an LZ4 frame" : "");
         mailbox->post(std::move(out));
     });
-    session.set_reading_off_loop(true);
+    session.set_waiting_off_loop(true);
     engine_->registry().increment_counter("ob_off_loop_reads_total");
     engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", 1);
     OB_LOG_DEBUG("tcp_server", "reactor %d: SELECT from fd=%d answered off the loop: the index puts %llu "
                  "row(s) or more in its scan", index_, fd, static_cast<unsigned long long>(rows_at_most));
 }
 
+void Reactor::take_flush(Session& session) {
+    const int fd = session.fd();
+    const uint64_t conn_id = session.conn_id();
+    Engine* engine = engine_;
+    MetricsRegistry* registry = &engine_->registry();
+    std::shared_ptr<OffLoopMailbox> mailbox = mailbox_;
+    const int index = index_;
+    const auto handed = std::chrono::steady_clock::now();
+    off_loop_pool_->submit([fd, conn_id, engine, registry, mailbox, index, handed] {
+        registry->observe_histogram(
+            "ob_off_loop_flush_wait_seconds",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
+        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false, true};
+        try {
+            out.answer = flush_answer(*engine, registry);
+        } catch (const std::exception& e) {
+            // The session is paused until an answer comes, so one comes whatever fails.
+            OB_LOG_ERROR("tcp_server", "reactor %d: a FLUSH off the loop for fd=%d failed past the "
+                         "engine's call: %s", index, fd, e.what());
+            out.answer = format_error(e.what());
+        }
+        OB_LOG_DEBUG("tcp_server", "reactor %d: a FLUSH off the loop for fd=%d answered: %s", index, fd,
+                     sanitise_for_log(out.answer, 160).c_str());
+        mailbox->post(std::move(out));
+    });
+    session.set_waiting_off_loop(true);
+    engine_->registry().increment_counter("ob_off_loop_flushes_total");
+    engine_->registry().increment_gauge("ob_off_loop_flushes_in_flight", 1);
+    OB_LOG_DEBUG("tcp_server", "reactor %d: FLUSH from fd=%d answered off the loop", index_, fd);
+}
+
 int Reactor::take_off_loop_answers(int nfds) {
     for (OffLoopAnswer& a : mailbox_->take()) {
-        engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", -1);
+        engine_->registry().increment_gauge(
+            a.flush ? "ob_off_loop_flushes_in_flight" : "ob_off_loop_reads_in_flight", -1);
         Session* s = sessions_.get_session(a.fd);
         if (s == nullptr || s->conn_id() != a.conn_id) {
             // Closed while its read was answered - and the descriptor maybe another's since.
@@ -3364,7 +3412,7 @@ int Reactor::take_off_loop_answers(int nfds) {
                          static_cast<unsigned long long>(a.conn_id));
             continue;
         }
-        s->set_reading_off_loop(false);
+        s->set_waiting_off_loop(false);
         // Its command was counted when the loop asked the engine: only the query is counted here.
         if (a.counted) {
             s->increment_queries();
@@ -3981,10 +4029,10 @@ void Reactor::run_loop() {
                     while (true) {
                         Session* session = sessions_.get_session(fd);
                         if (!session) break;
-                        // A large read of this session is being answered off the loop (#260):
+                        // A command of this session is being answered off the loop (#260, #261):
                         // nothing more of it is read until its answer is queued. The socket keeps
                         // the rest, and TCP tells the client to wait.
-                        if (session->reading_off_loop()) break;
+                        if (session->waiting_off_loop()) break;
 
                         std::vector<std::string> lines;
                         if (session->has_held_lines()) {

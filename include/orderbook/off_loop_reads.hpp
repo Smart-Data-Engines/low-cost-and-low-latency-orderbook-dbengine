@@ -23,7 +23,7 @@
 
 namespace ob {
 
-/// A large read's answer, on its way back to the loop that took it.
+/// A large read's answer, or a FLUSH's (#261), on its way back to the loop that took it.
 struct OffLoopAnswer {
     int         fd{-1};
     uint64_t    conn_id{0};
@@ -31,6 +31,7 @@ struct OffLoopAnswer {
     bool        framed{false};     ///< an LZ4 frame already (#257)
     uint64_t    text_bytes{0};     ///< the text a frame holds, for the session's counters
     bool        counted{false};    ///< a query that ran, which the session's counters take
+    bool        flush{false};      ///< a FLUSH's answer, not a read's (#261)
 };
 
 /// Where answers come back to one client loop: a list under a mutex and an eventfd of its own in the
