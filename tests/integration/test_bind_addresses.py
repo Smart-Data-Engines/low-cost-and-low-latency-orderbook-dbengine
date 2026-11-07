@@ -30,8 +30,8 @@ from conftest import free_port, has_ipv6_loopback, patience, server_binary_path
 pytestmark = pytest.mark.smoke
 
 
-# Every interface, as a port with no bind flag listens on it: both families on `::`, or `0.0.0.0` on
-# a host without IPv6.
+# Every interface, as a port with `*` in its bind flag listens on it, or one with a secret and no
+# bind flag: both families on `::`, or `0.0.0.0` on a host without IPv6.
 EVERY_INTERFACE = "::" if has_ipv6_loopback() else "0.0.0.0"
 
 
@@ -227,6 +227,27 @@ def test_the_mesh_port_listens_on_the_address_mm_bind_names(tmp_path):
         while listening_address(mesh) is None and time.monotonic() < deadline:
             time.sleep(0.1)
         assert listening_address(mesh) == "127.0.0.1"
+    finally:
+        stop(proc)
+
+
+@pytest.mark.parametrize("with_cluster_secret", [False, True])
+def test_the_mesh_port_listens_on_this_host_only_without_a_cluster_secret(tmp_path, with_cluster_secret):
+    """#256 for the multi-master port, as for the replication port: no cluster secret and no --mm-bind
+    is 127.0.0.1, the secret every interface. Announced at loopback, the default, so not refused."""
+    clients, cluster = secrets(tmp_path)
+    extra = ["--auth-secret-file", str(clients)]
+    if with_cluster_secret:
+        extra += ["--cluster-secret-file", str(cluster)]
+    port, mesh = free_port(), free_port()
+    nobody = f"http://127.0.0.1:{free_port()}"
+    proc = start_node(tmp_path, ["--multi-master", "--mm-node-id", "1", "--mm-replication-port", str(mesh),
+                                 "--coordinator-endpoints", nobody, *extra], port)
+    try:
+        deadline = time.monotonic() + patience(10)
+        while listening_address(mesh) is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert listening_address(mesh) == (EVERY_INTERFACE if with_cluster_secret else "127.0.0.1")
     finally:
         stop(proc)
 
