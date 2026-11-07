@@ -517,7 +517,9 @@ in the workspace, three rounds each):
 | `SELECT ... LIMIT 100`, p50 | 23.5-24.0 us | 22.7-23.6 us | 13.1-13.9 us | 13.1-13.9 us |
 
 A writer this fast meets a few milliseconds now and then with no read beside it too: 3.8-3.9 ms at
-the longest on the ARM test host. `ob_off_loop_reads_total` counts the reads answered off their loop, `ob_off_loop_reads_in_flight` the
+the longest on the ARM test host.
+
+`ob_off_loop_reads_total` counts the reads answered off their loop, `ob_off_loop_reads_in_flight` the
 ones whose answer has not come back, and `ob_off_loop_read_wait_seconds` how long each waited for a
 thread: a wait that grows is every thread busy. `--large-read-threads 0` answers every read on its
 loop, as before.
