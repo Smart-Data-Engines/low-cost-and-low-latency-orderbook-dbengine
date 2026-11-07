@@ -2919,7 +2919,6 @@ struct ReactorShared {
     const ServerConfig&      config;
     Engine&                  engine;
     const LoadedTlsContexts& tls;
-    const LoadedSecrets&     secrets;
     const ClientCredentials& credentials;   ///< the client store in force (#258)
     std::atomic<bool>&       running;
     std::atomic<bool>&       draining;
@@ -3019,7 +3018,6 @@ private:
     std::mutex&              admin_mtx_;
     Engine*                  engine_;
     const LoadedTlsContexts& tls_;
-    const LoadedSecrets&     secrets_;
     const ClientCredentials& credentials_;
     /// This loop's copy of the client store in force, and its generation (#258).
     std::shared_ptr<const SecretStore> clients_;
@@ -3114,7 +3112,6 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , admin_mtx_(shared.admin_mtx)
     , engine_(&shared.engine)
     , tls_(shared.tls)
-    , secrets_(shared.secrets)
     , credentials_(shared.credentials)
     , running_(shared.running)
     , draining_(shared.draining)
@@ -4245,7 +4242,7 @@ void TcpServer::run() {
     // address on this frame's stack that the engine holds; the engine holds it only while the
     // reactors run.
     loop_load_ = std::make_unique<LoopLoad>(config_.io_threads);
-    ReactorShared shared{config_,    *engine_, tls_,  secrets_, credentials_, running_,
+    ReactorShared shared{config_,    *engine_, tls_,  credentials_, running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
                          &dealt_to, admin_mtx, backups.get(), loop_load_.get()};
     const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
