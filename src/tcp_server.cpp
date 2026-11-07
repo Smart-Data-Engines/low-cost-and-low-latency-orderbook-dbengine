@@ -3913,6 +3913,11 @@ void Reactor::run_loop() {
                             const bool wants_write = session->io_want() == IoWant::Write;
                             if (!session->has_pending_output() || !wants_write) {
                                 disarm_epollout(fd);
+                            } else if (session->send_yielded()) {
+                                // The flush spent its slice with the socket maybe still writable
+                                // (#260), and no edge would say so: armed again, which reports it
+                                // on the next pass - after this pass's other sessions.
+                                arm_epollout(fd);
                             }
                             if (!session->has_pending_output() && session->close_requested()) {
                                 close_session(fd, "quit after flush");

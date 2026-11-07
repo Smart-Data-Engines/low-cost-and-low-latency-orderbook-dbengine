@@ -186,9 +186,21 @@ public:
     ///
     /// Since #52's rings there are three transports, and the plaintext socket still pays one
     /// compare: of a byte that names the transport, which TLS and the rings share a branch behind.
+    ///
+    /// One flush sends kSendSlice bytes at most, on the socket and through TLS (#260).
     bool flush_output() {
         return transport_ == Transport::Plain ? flush_output_plain() : flush_output_other();
     }
+
+    /// The most one flush sends on the socket or through TLS (#260). Past it the flush stops with
+    /// bytes left and the socket maybe still taking them, says so in send_yielded() and wants to
+    /// write: the loop arms EPOLLOUT again, which reports the socket writable on the loop's next
+    /// pass, after its other sessions. Without it a reader as fast as the loop had the loop for the
+    /// whole of an answer - every other session waited while 45 MB went out (ARM host, loopback).
+    static constexpr size_t kSendSlice = 1u << 20;
+    /// The last flush stopped at kSendSlice with bytes left, rather than at a socket that took no
+    /// more (#260): no edge will say it is writable, so the loop asks again.
+    bool send_yielded() const { return send_yielded_; }
 
 private:
     bool flush_output_plain();
@@ -350,11 +362,15 @@ private:
     /// other session on the reactor waited for it - a `PING` beside a 45 MB answer read 64 KiB
     /// every 5 ms waited 316-783 us at p99.9 on the x86 test host, and 61-83 with this.
     size_t      send_off_{0};
+    /// See send_yielded() (#260).
+    bool        send_yielded_{false};
 
     /// The bytes still to send.
     size_t pending_bytes() const { return send_buf_.size() - send_off_; }
     /// `n` more bytes taken: past them, and the buffer emptied, its capacity kept, once all are.
     void sent(size_t n);
+    /// A flush that spent kSendSlice with bytes left (#260): send_yielded(), and wanting to write.
+    void yield_send(size_t sent_now);
     /// Before an append: the bytes already sent dropped from the front once they are as many as
     /// those still to send, so the buffer holds at most twice what is pending and a pending byte
     /// is moved at most once for each byte it waited behind.

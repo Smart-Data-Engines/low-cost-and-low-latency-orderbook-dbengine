@@ -30,9 +30,14 @@
 #include <string>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <atomic>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -1117,6 +1122,95 @@ TEST(SessionOutput, AnswersQueuedBehindAPartialSendArriveWholeAndInOrder) {
     drain_into(session, fd_client, got, first.size() + 13);
     EXPECT_EQ(got, first + "second\nthird\n");
     EXPECT_FALSE(session.has_pending_output());
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+namespace {
+
+/// Both ends of a TCP connection on the loopback, the server's not blocking: unlike a socketpair's,
+/// its buffers grow while a reader keeps up, so one send can take megabytes.
+std::pair<int, int> make_loopback_tcp_pair() {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(listener, 1) != 0 ||
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        ADD_FAILURE() << "a loopback listener could not be made";
+        if (listener >= 0) ::close(listener);
+        return {-1, -1};
+    }
+    const int client = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (client < 0 || ::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ADD_FAILURE() << "connect() to the loopback listener failed";
+        ::close(listener);
+        if (client >= 0) ::close(client);
+        return {-1, -1};
+    }
+    const int server = ::accept(listener, nullptr, nullptr);
+    ::close(listener);
+    if (server < 0) {
+        ADD_FAILURE() << "accept() failed";
+        ::close(client);
+        return {-1, -1};
+    }
+    ::fcntl(server, F_SETFL, ::fcntl(server, F_GETFL, 0) | O_NONBLOCK);
+    return {server, client};
+}
+
+} // namespace
+
+// #260: a flush sends no more than a slice - a reader as fast as the loop had the loop for the
+// whole of an answer - says it stopped with bytes left, and wants to write, so the loop arms EPOLLOUT
+// again; the answer still arrives whole and in order. The reader is a thread taking what the kernel
+// hands it as fast as it can, which is what let one flush send megabytes.
+TEST(SessionOutput, AFlushSendsASliceAtMostAndSaysWhenItStoppedThere) {
+    auto [fd_server, fd_client] = make_loopback_tcp_pair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    std::string answer(32 * ob::Session::kSendSlice, '\0');
+    for (size_t i = 0; i < answer.size(); ++i) answer[i] = static_cast<char>('a' + (i * 7) % 26);
+    std::string queued = answer;
+    ASSERT_EQ(session.take_answer(std::move(queued)), ob::Session::Queued::Yes);
+
+    std::string got;
+    std::thread reader([&, fd = fd_client] {
+        std::vector<char> buf(4u << 20);
+        while (got.size() < answer.size()) {
+            const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+            if (n <= 0) return;
+            got.append(buf.data(), static_cast<size_t>(n));
+        }
+    });
+
+    size_t flushes = 0;
+    size_t most = 0;
+    size_t yielded = 0;
+    while (session.has_pending_output() && flushes < 1'000'000) {
+        const size_t before = session.pending_output_bytes();
+        ASSERT_TRUE(session.flush_output());
+        most = std::max(most, before - session.pending_output_bytes());
+        if (session.send_yielded()) {
+            ++yielded;
+            EXPECT_TRUE(session.has_pending_output()) << "a flush that sent everything said it stopped";
+            EXPECT_EQ(session.io_want(), ob::IoWant::Write) << "a flush that stopped does not want to write";
+        }
+        ++flushes;
+    }
+    // Whatever was sent, the reader sees its end: a session that kept bytes leaves it short, not
+    // waiting.
+    ::shutdown(fd_server, SHUT_WR);
+    reader.join();
+    EXPECT_LE(most, ob::Session::kSendSlice) << "one flush sent more than the slice";
+    EXPECT_GT(yielded, 0u) << "no flush stopped at the slice: the premise, a reader that keeps up";
+    EXPECT_FALSE(session.has_pending_output());
+    EXPECT_FALSE(session.send_yielded()) << "the flush that sent the last byte said it stopped";
+    EXPECT_EQ(got, answer);
 
     ::close(fd_client);
     ::close(fd_server);
