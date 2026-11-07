@@ -56,12 +56,14 @@ struct ClientConfig {
     std::string unix_socket;
 
     /// Move the session to rings in shared memory once connected (#52, step 2): needs
-    /// `unix_socket`, not `tls` and not `compress`. A pool and the shard router never set it.
+    /// `unix_socket` and not `tls`. A pool and the shard router never set it.
     RingOptions rings;
 
     double      connect_timeout_sec = 5.0;
     double      read_timeout_sec    = 10.0;
-    bool        compress            = false;  // negotiate LZ4
+    /// Not supported: `true` is refused by connect() (#259). The C++ client sends and reads plain
+    /// text; LZ4 sessions are the Python client's (`compress=True`).
+    bool        compress            = false;
 
     /// Credentials for a server running with `--auth-secret-file` (#30).
     ///
@@ -267,7 +269,7 @@ public:
     /// server applies the writes of one read together. Returns how many were stored; `refusal` is
     /// the first `ERR` answer, empty when there was none - the writes after a refused one were sent
     /// and are answered, and may be stored. An error is a connection that failed or an answer that
-    /// is neither `OK` nor `ERR`. Not on a compressed connection.
+    /// is neither `OK` nor `ERR`.
     Result<size_t> minsert_many(const std::vector<MinsertWrite>& writes, std::string& refusal);
 
     /// What the server says it can do, by name, read once per connection (#105).
@@ -351,7 +353,6 @@ private:
     std::string  send_buf_;   // pre-allocated 64KB
     std::string  recv_buf_;   // pre-allocated 64KB
     std::string  sock_buf_;   // socket read accumulation buffer
-    bool         compressed_ = false;
 
     // TLS, both null when config_.tls is false. The context is per client rather than per process:
     // a client that connects once parses its trust anchor once, and a pool of N parses it N times,
@@ -367,7 +368,6 @@ private:
     Result<std::string_view> recv_response();
     Result<void>             read_banner();
     Result<void>             authenticate();
-    Result<void>             negotiate_compression();
     Result<void>             ensure_tls_context();
     Result<void>             start_tls();
     /// Read into `sock_buf_`. >0 bytes, 0 on close, -1 on error, with `why` naming which.
@@ -382,7 +382,7 @@ struct PoolConfig {
     double connect_timeout_sec       = 5.0;
     double read_timeout_sec          = 10.0;
     double health_check_interval_sec = 2.0;
-    bool   compress                  = false;
+    bool   compress                  = false;   ///< refused, as ClientConfig::compress is (#259)
 
     // Sharding (optional — when set, enables ShardRouter)
     std::vector<std::string> coordinator_endpoints;  // etcd endpoints

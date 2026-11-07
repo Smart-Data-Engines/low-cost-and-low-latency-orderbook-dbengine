@@ -305,6 +305,13 @@ here as `#N`.
   how many rows were within it: `ERR answer is larger than the 67108864 bytes a session may have
   queued, past its first N rows; narrow the query or add LIMIT`, where it said the answer's size.
 
+- **The C++ client's `compress` option is refused by name** (#259). Its LZ4 path could not compress a
+  session in any build: the client waited for an answer to `COMPRESS LZ4` that the server never sends,
+  so the connection failed as `server does not support LZ4 compression`, and nothing it sent or read
+  was framed. `ClientConfig::compress` and `PoolConfig::compress` set to `true` are refused by
+  `connect()` before a socket is opened, naming the Python client's `compress=True` as the way to an
+  LZ4 session; the `OB_CLIENT_LZ4` CMake option, which built the dead path, is gone.
+
 - **A read on a node being demoted or promoted no longer reaches a replication client being built or
   destroyed** (#254). Every `SELECT`, `FLUSH`, write and backup asks whether the node is installing a
   snapshot, on its client loop, and it asked the replication client through a pointer the failover
