@@ -4673,12 +4673,12 @@ Learned the hard way. Check here before debugging.
      and a node announced at `::ffff:127.0.0.1` was refused. Before adding a function, `grep` its name
      in the file it goes into; the old one is removed, not shadowed.
 640. **Where the memory goes is measured, not reasoned out.** #257's first version left a refused
-     answer costing +164 MB, and two changes followed on the reading that the scan pool's parts were
-     the rest - handing them out by the answer's room, stopping a text part at the ceiling - and moved
-     nothing. Asking the query twice, the second against a warm column cache, and reading the scan's
-     parts at DEBUG put most of it in the answer's own last doubling: 32 MiB copied into a string of
-     64, both held. Measure warm and cold apart, and read the layout the code took, before changing
-     anything for memory.
+     answer costing the battery module's node 170 MB, and two changes followed on the reading that
+     the scan pool's parts were the rest - handing them out by the answer's room, stopping a text part
+     at the ceiling - and left it at 173. Asking the query twice, the second against a warm column
+     cache, and reading the scan's parts at DEBUG put most of it in the answer's own last doubling:
+     32 MiB copied into a string of 64, both held. Measure warm and cold apart, and read the layout the
+     code took, before changing anything for memory.
 
 ## Current state and open problems
 

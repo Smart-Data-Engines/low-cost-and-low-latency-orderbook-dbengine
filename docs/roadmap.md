@@ -2951,9 +2951,12 @@ refused once its frame passes the ceiling, after about five million rows of this
 compressing them is the work of an answer of that size, refused or not, and the client loop held for
 it is the isolation of a large answer from the sessions beside it, which is not this item.
 
-Two of the changes were made on a guess before this measurement - that the pool's parts were the
-memory - and moved nothing the first time: the answer's own last doubling was most of it (pitfall
-640).
+Two of the changes were made on the reading that the pool's parts were the memory - handing parts
+out by the answer's room, stopping a text part at the ceiling - and moved nothing: the battery
+module's node, refused cold, went 170.3, 172.7 and 172.6 MB, and a warm refusal in Release was still
++133 MB. The scan's parts at DEBUG were 6.6 MB each, and the answer's own last doubling was most of it
+(pitfall 640). The two stay for what that store does not have - a pool of many threads, a candidate
+of millions of unsealed rows - with tests of their mechanism and no number.
 
 - Effort: M | Impact: one query's memory is bounded by the session's ceiling, not by the range it asks
   for
