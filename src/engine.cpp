@@ -2823,8 +2823,10 @@ bool Engine::holds_no_data() {
 }
 
 bool Engine::is_bootstrapping() const {
-    if (repl_client_) {
-        return repl_client_->is_bootstrapping();
+    // The engine's flag and not `repl_client_->is_bootstrapping()`: this runs on the io threads
+    // without `mtx_`, under which the failover thread builds and destroys the client (#254).
+    if (replica_bootstrapping_.load(std::memory_order_acquire)) {
+        return true;
     }
     // And the multi-master path, which this used to miss entirely. ReplicationClient does not
     // exist in MM mode, so every caller of this — SELECT, FLUSH, and the write commands through
@@ -3138,6 +3140,15 @@ void Engine::mark_symbol_migrated(const std::string& symbol_key) {
     std::unique_lock<std::mutex> lock(mtx_);
     migrated_symbols_.insert(symbol_key);
     OB_LOG_INFO("engine", "Marking symbol as migrated: symbol_key=%s", symbol_key.c_str());
+}
+
+void Engine::set_replica_bootstrapping(bool bootstrapping) {
+    const bool was = replica_bootstrapping_.exchange(bootstrapping, std::memory_order_acq_rel);
+    if (was != bootstrapping) {
+        OB_LOG_INFO("engine", "replica snapshot bootstrap %s: reads, flushes and backups %s",
+                    bootstrapping ? "began" : "ended",
+                    bootstrapping ? "answer bootstrapping until it ends" : "are served again");
+    }
 }
 
 // ── RoleTransitionHandler implementation ──────────────────────────────────────

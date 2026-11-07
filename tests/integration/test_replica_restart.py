@@ -73,7 +73,12 @@ def store_shape(data_dir: str) -> tuple[int, int]:
             if name.endswith(".col") or name == "columns.v3":
                 cols += 1
             elif name.startswith("wal_") and name.endswith(".bin"):
-                wal += os.path.getsize(os.path.join(root, name))
+                # A running node removes a file once a checkpoint covers it, and may do so between
+                # the walk and this read (test_pitr.py's fixture met that, #255).
+                try:
+                    wal += os.path.getsize(os.path.join(root, name))
+                except FileNotFoundError:
+                    pass
     return cols, wal
 
 

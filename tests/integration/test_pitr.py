@@ -52,6 +52,22 @@ def wal_indexes(directory: Path) -> list[int]:
     return sorted(int(p.name[4:10]) for p in directory.glob("wal_[0-9][0-9][0-9][0-9][0-9][0-9].bin"))
 
 
+def wal_sizes(directory: Path) -> dict[int, int]:
+    """Each WAL file's size, of the files still there when it is read.
+
+    A running node removes a file once it is archived and a checkpoint covers it, and it may do so
+    between a listing and a `stat()` of what was listed: on 31 October the fixture below read the
+    size of a file the node had just removed, and every test of this module errored at setup (#255).
+    """
+    sizes: dict[int, int] = {}
+    for i in wal_indexes(directory):
+        try:
+            sizes[i] = (directory / f"wal_{i:06d}.bin").stat().st_size
+        except FileNotFoundError:
+            continue
+    return sizes
+
+
 @dataclass
 class Archived:
     tmp: Path
@@ -86,7 +102,7 @@ def archived(tmp_path_factory) -> Archived:
         # rotation has just opened stays empty, and is never rotated.
         identity = (data / "wal_identity").read_text().strip()
         lineage = tmp / "archive" / identity
-        last = max(i for i in wal_indexes(data) if (data / f"wal_{i:06d}.bin").stat().st_size > 0)
+        last = max(i for i, size in wal_sizes(data).items() if size > 0)
         deadline = time.time() + patience(30)
         while not (lineage / f"wal_{last:06d}.bin.crc32c").exists():
             assert time.time() < deadline, f"the archive never took wal_{last:06d}.bin:\n{node.log_text()}"

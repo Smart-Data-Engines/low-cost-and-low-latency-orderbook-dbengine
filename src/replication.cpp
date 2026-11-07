@@ -3016,13 +3016,18 @@ void ReplicationClient::load_state() {
 
 // ── Snapshot bootstrap (replica side) ─────────────────────────────────────────
 
+void ReplicationClient::set_bootstrapping(bool bootstrapping) {
+    bootstrapping_.store(bootstrapping, std::memory_order_release);
+    engine_.set_replica_bootstrapping(bootstrapping);
+}
+
 void ReplicationClient::request_and_receive_snapshot() {
     // The store is about to be replaced (#215). First, so that a record which cannot be written
     // throws with nothing begun - not even `bootstrapping_`, which nothing below would clear.
     if (primary_reports_caught_up_) {
         engine_.begin_joining(stream_id_.load(std::memory_order_relaxed), "snapshot");
     }
-    bootstrapping_.store(true, std::memory_order_release);
+    set_bootstrapping(true);
     snapshot_bytes_received_.store(0, std::memory_order_relaxed);
     snapshot_bytes_total_.store(0, std::memory_order_relaxed);
 
@@ -3041,7 +3046,7 @@ void ReplicationClient::request_and_receive_snapshot() {
         OB_LOG_WARN("repl_client",
                     "snapshot bootstrap abandoned: could not send SNAPSHOT_REQUEST on fd=%d: %s",
                     fd_.load(std::memory_order_relaxed), std::strerror(errno));
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
@@ -3074,7 +3079,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                 OB_LOG_WARN("repl_client",
                             "snapshot bootstrap abandoned: a WAL line before SNAPSHOT_BEGIN that "
                             "cannot be skipped: '%s'", sanitise_for_log(line_buf, 200).c_str());
-                bootstrapping_.store(false, std::memory_order_release);
+                set_bootstrapping(false);
                 return;
             }
             std::vector<uint8_t> skipped(total_len);
@@ -3082,7 +3087,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                 OB_LOG_WARN("repl_client",
                             "snapshot bootstrap abandoned: the stream ended inside the live record "
                             "at %u:%zu before SNAPSHOT_BEGIN", file, offset);
-                bootstrapping_.store(false, std::memory_order_release);
+                set_bootstrapping(false);
                 return;
             }
             ++skipped_live;
@@ -3102,7 +3107,7 @@ void ReplicationClient::request_and_receive_snapshot() {
         OB_LOG_WARN("repl_client",
                     "snapshot bootstrap abandoned: no SNAPSHOT_BEGIN from the primary "
                     "(read_line returned %zd)", n);
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
@@ -3110,7 +3115,7 @@ void ReplicationClient::request_and_receive_snapshot() {
     if (std::strncmp(line_buf, "ERR ", 4) == 0) {
         OB_LOG_WARN("repl_client", "snapshot bootstrap refused by the primary: %s",
                     sanitise_for_log(line_buf, 200).c_str());
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
@@ -3124,7 +3129,7 @@ void ReplicationClient::request_and_receive_snapshot() {
         OB_LOG_WARN("repl_client",
                     "snapshot bootstrap abandoned: expected SNAPSHOT_BEGIN, got '%s'",
                     sanitise_for_log(line_buf, 200).c_str());
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
@@ -3150,7 +3155,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                         "where a SNAPSHOT_FILE header was expected (read_line returned %zd)",
                         i, file_count, n);
             cleanup_staging(staging_dir);
-            bootstrapping_.store(false, std::memory_order_release);
+            set_bootstrapping(false);
             return;
         }
 
@@ -3169,7 +3174,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                          "SNAPSHOT_FILE header, got '%s'",
                          i, file_count, sanitise_for_log(line_buf, 200).c_str());
             cleanup_staging(staging_dir);
-            bootstrapping_.store(false, std::memory_order_release);
+            set_bootstrapping(false);
             return;
         }
 
@@ -3181,7 +3186,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                          "Rejecting snapshot: unsafe file path from peer: '%s'",
                          rel_path);
             cleanup_staging(staging_dir);
-            bootstrapping_.store(false, std::memory_order_release);
+            set_bootstrapping(false);
             return;
         }
 
@@ -3201,7 +3206,7 @@ void ReplicationClient::request_and_receive_snapshot() {
             std::FILE* out = open_temp_file_private(staging_dir, temp_path);
             if (!out) {
                 cleanup_staging(staging_dir);
-                bootstrapping_.store(false, std::memory_order_release);
+                set_bootstrapping(false);
                 return;
             }
 
@@ -3217,7 +3222,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                     std::error_code rm_ec;
                     fs::remove(temp_path, rm_ec);
                     cleanup_staging(staging_dir);
-                    bootstrapping_.store(false, std::memory_order_release);
+                    set_bootstrapping(false);
                     return;
                 }
 
@@ -3241,7 +3246,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                 std::error_code rm_ec;
                 fs::remove(temp_path, rm_ec);
                 cleanup_staging(staging_dir);
-                bootstrapping_.store(false, std::memory_order_release);
+                set_bootstrapping(false);
                 return;
             }
 
@@ -3258,7 +3263,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                 std::error_code rm_ec;
                 fs::remove(temp_path, rm_ec);
                 cleanup_staging(staging_dir);
-                bootstrapping_.store(false, std::memory_order_release);
+                set_bootstrapping(false);
                 return;
             }
         }
@@ -3278,7 +3283,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                     "SNAPSHOT_END was expected (read_line returned %zd)",
                     manifest.files.size(), n);
         cleanup_staging(staging_dir);
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
@@ -3289,7 +3294,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                     "'%s'",
                     manifest.files.size(), sanitise_for_log(line_buf, 200).c_str());
         cleanup_staging(staging_dir);
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
@@ -3303,14 +3308,14 @@ void ReplicationClient::request_and_receive_snapshot() {
                      "the %zu file(s) received make %u",
                      manifest_crc, manifest.files.size(), computed_manifest_crc);
         cleanup_staging(staging_dir);
-        bootstrapping_.store(false, std::memory_order_release);
+        set_bootstrapping(false);
         return;
     }
 
     // Install the snapshot.
     if (install_snapshot(staging_dir, manifest)) resume_at_once_ = true;
 
-    bootstrapping_.store(false, std::memory_order_release);
+    set_bootstrapping(false);
 }
 
 bool ReplicationClient::install_snapshot(const std::string& staging_dir,
