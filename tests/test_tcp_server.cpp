@@ -1193,7 +1193,11 @@ TEST(SessionOutput, AFlushSendsASliceAtMostAndSaysWhenItStoppedThere) {
     size_t yielded = 0;
     while (session.has_pending_output() && flushes < 1'000'000) {
         const size_t before = session.pending_output_bytes();
-        ASSERT_TRUE(session.flush_output());
+        // Not an ASSERT: the reader thread is joined below, whatever a flush did.
+        if (!session.flush_output()) {
+            ADD_FAILURE() << "a flush failed";
+            break;
+        }
         most = std::max(most, before - session.pending_output_bytes());
         if (session.send_yielded()) {
             ++yielded;

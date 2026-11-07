@@ -305,7 +305,11 @@ TEST(TlsSession, AFlushSendsASliceAtMostToAReaderThatKeepsUp) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     while (session.has_pending_output() && std::chrono::steady_clock::now() < deadline) {
         const size_t before = session.pending_output_bytes();
-        ASSERT_TRUE(session.flush_output()) << ob::tls_last_error();
+        // Not an ASSERT: the client thread is joined below, whatever a flush did.
+        if (!session.flush_output()) {
+            ADD_FAILURE() << "a flush failed: " << ob::tls_last_error();
+            break;
+        }
         most = std::max(most, before - session.pending_output_bytes());
         if (session.send_yielded()) {
             ++yielded;
