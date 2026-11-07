@@ -9,6 +9,7 @@
 // against - and the loop goes on. The answer comes back through the loop's mailbox, which the loop
 // reads once a pass.
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -42,16 +43,20 @@ public:
     OffLoopMailbox(const OffLoopMailbox&) = delete;
     OffLoopMailbox& operator=(const OffLoopMailbox&) = delete;
 
-    /// The eventfd the loop adds to its epoll set.
+    /// The eventfd the loop adds to its epoll set, edge-triggered: each post is an event, and a
+    /// counter take() left unread wakes nobody again.
     int event_fd() const { return event_fd_; }
     /// An answer in, and the loop woken.
     void post(OffLoopAnswer answer);
-    /// Every answer in so far, taken; the eventfd read down.
+    /// Every answer in so far, taken; the eventfd read down. With none posted, nothing: one load,
+    /// and no system call - the loop asks every pass, its spins included.
     std::vector<OffLoopAnswer> take();
 
 private:
     std::mutex                 mtx_;
     std::vector<OffLoopAnswer> answers_;
+    /// The answers in `answers_`, moved under `mtx_` and read without it as take()'s first question.
+    std::atomic<size_t>        posted_{0};
     int                        event_fd_{-1};
 };
 

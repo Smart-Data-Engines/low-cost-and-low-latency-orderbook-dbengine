@@ -3268,7 +3268,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
         // Where the answers of the reads this loop hands off come back (#260).
         mailbox_ = std::make_shared<OffLoopMailbox>();
         struct epoll_event mail_ev{};
-        mail_ev.events  = EPOLLIN;
+        mail_ev.events  = EPOLLIN | EPOLLET;
         mail_ev.data.fd = mailbox_->event_fd();
         if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, mailbox_->event_fd(), &mail_ev) < 0) {
             const std::string why = std::strerror(errno);
@@ -3757,7 +3757,9 @@ void Reactor::run_loop() {
         // Waiting is not serving: a scan deciding whether to divide counts the loops serving, or
         // that served within ScanPool::kLoopRecent (#249).
         loop_load_->stopped(static_cast<size_t>(index_));
-        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, ring_filled ? 0 : wait_ms);
+        // Sessions resumed past the events one pass could take (#260) do not wait for the next event.
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS,
+                                ring_filled || !resume_.empty() ? 0 : wait_ms);
         if (nfds > 0) loop_load_->serving(static_cast<size_t>(index_));
         if (rings_told) {
             for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();

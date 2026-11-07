@@ -174,6 +174,14 @@ TEST(OffLoopReads, TheMailboxGivesBackWhatWasPostedAndWakesItsLoop) {
     EXPECT_EQ(answers[0].conn_id, 70u);
     EXPECT_EQ(answers[1].answer, "ERR x\n");
     EXPECT_TRUE(mailbox.take().empty()) << "an answer was given back twice";
+
+    // With nothing posted, take() asks no system call: a counter it left unread is there after it.
+    const uint64_t five = 5;
+    ASSERT_EQ(::write(mailbox.event_fd(), &five, sizeof(five)), static_cast<ssize_t>(sizeof(five)));
+    EXPECT_TRUE(mailbox.take().empty());
+    count = 0;
+    ASSERT_EQ(::read(mailbox.event_fd(), &count, sizeof(count)), static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 5u) << "take() read the eventfd with nothing posted";
 }
 
 TEST(OffLoopReads, ThePoolRunsReadsInTheOrderTheyCameAndDropsWhatWaitsAtItsEnd) {

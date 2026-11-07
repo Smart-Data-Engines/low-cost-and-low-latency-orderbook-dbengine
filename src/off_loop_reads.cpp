@@ -31,6 +31,7 @@ void OffLoopMailbox::post(OffLoopAnswer answer) {
     {
         std::lock_guard<std::mutex> lock(mtx_);
         answers_.push_back(std::move(answer));
+        posted_.fetch_add(1, std::memory_order_release);
     }
     const uint64_t one = 1;
     const ssize_t written = ::write(event_fd_, &one, sizeof(one));
@@ -38,12 +39,16 @@ void OffLoopMailbox::post(OffLoopAnswer answer) {
 }
 
 std::vector<OffLoopAnswer> OffLoopMailbox::take() {
+    // Asked every pass of the loop: nothing posted is one load. An answer posted after it is taken
+    // on the pass its own write to the eventfd wakes.
+    if (posted_.load(std::memory_order_acquire) == 0) return {};
     uint64_t drained = 0;
     const ssize_t got = ::read(event_fd_, &drained, sizeof(drained));
-    (void)got;   // EAGAIN: nothing posted since the last take
+    (void)got;   // EAGAIN: the post whose write this would read has not written yet
     std::lock_guard<std::mutex> lock(mtx_);
     std::vector<OffLoopAnswer> out;
     out.swap(answers_);
+    posted_.fetch_sub(out.size(), std::memory_order_relaxed);
     return out;
 }
 
