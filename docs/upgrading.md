@@ -73,8 +73,10 @@ and format 3 for a build before v0.1.0).
 
 ## Listeners after v0.1.0
 
-A port with no bind flag listens on IPv6 as well as IPv4 in this version: `::`, both families on one
-socket, where v0.1.0 listened on `0.0.0.0` (#236). A host whose firewall covers IPv4 alone -
+A port on every interface listens on IPv6 as well as IPv4 in this version: `::`, both families on one
+socket, where v0.1.0 listened on `0.0.0.0` (#236). Since #256 a port is on every interface with `*` in
+its bind flag, or with no bind flag and its surface's secret; with neither it is on `127.0.0.1` (the
+next section). A host whose firewall covers IPv4 alone -
 iptables rules and no ip6tables ones, say - exposes such a port on IPv6 once the node is upgraded.
 Either extend the firewall to IPv6 first, or keep the port where it was with `0.0.0.0` in its bind
 flag: `bind`, `replication-bind`, `mm-bind`, `metrics-bind`. Clients, replicas and peers that reach a
