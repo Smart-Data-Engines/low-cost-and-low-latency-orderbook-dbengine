@@ -74,8 +74,6 @@ public:
 
     /// What end() adds to a frame whose content has all been added: the end mark and the checksum.
     static constexpr size_t kEndBytes = 8;
-    /// With a capacity ceiling, the capacity past which the next growth is to the ceiling.
-    static constexpr size_t kJumpBytes = 8u << 20;
 
 private:
     void room_for(size_t n);

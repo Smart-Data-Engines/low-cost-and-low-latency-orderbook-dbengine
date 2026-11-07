@@ -172,17 +172,11 @@ Lz4FrameWriter::~Lz4FrameWriter() {
 }
 
 // Grown by doubling, as a string grows, but not past the ceiling unless `n` itself is: a frame that
-// passes its ceiling is refused, so room beyond it would only ever be written to be thrown away. And
-// once doubling reaches kJumpBytes, to the ceiling at once: each doubling copies the frame into a
-// string twice its size, and the last would hold half a ceiling and a ceiling together, where the
-// capacity nobody writes is never touched (#257).
+// passes its ceiling is refused, so room beyond it would only ever be written to be thrown away.
 void Lz4FrameWriter::room_for(size_t n) {
     if (n <= out_.capacity()) return;
     size_t want = std::max(out_.capacity() * 2, n);
-    if (capacity_ceiling_ != 0) {
-        want = want >= kJumpBytes ? capacity_ceiling_ : std::min(want, capacity_ceiling_);
-        want = std::max(want, n);
-    }
+    if (capacity_ceiling_ != 0) want = std::max(n, std::min(want, capacity_ceiling_));
     out_.reserve(want);
 }
 
