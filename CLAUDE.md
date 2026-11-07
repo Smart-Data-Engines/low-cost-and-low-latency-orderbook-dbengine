@@ -4679,6 +4679,18 @@ Learned the hard way. Check here before debugging.
      cache, and reading the scan's parts at DEBUG put most of it in the answer's own last doubling:
      32 MiB copied into a string of 64, both held. Measure warm and cold apart, and read the layout the
      code took, before changing anything for memory.
+642. **A round trip timed by a thread of the process that reads a large answer measures the
+     interpreter.** `test_large_answer_isolation.py` first sent its `PING`s from a thread beside the
+     reader, which held Python's lock while it took 26 MB in: the thread measured 18.7 ms beside a read
+     off the loop that the node answered beside in 0.05-0.18 ms, from a process of their own (#260). A
+     latency beside a heavy client is measured from another process, and the samples kept are the ones
+     sent while what is measured was happening.
+643. **Edge-triggered `EPOLLOUT` reports a socket that became writable, not one that is.** A flush that
+     stops by its own choice with the socket still taking bytes gets no event: #260's slice has the loop
+     arm `EPOLLOUT` again, an `EPOLL_CTL_MOD` that reports the socket's state on the next pass. The
+     first version of #260's resume had the same hole from the other side - the resumed session's
+     `receive()` said it wanted to read, nothing armed `EPOLLOUT` for what the socket had not taken,
+     and the answer stopped (`e46d108`). Every path that leaves bytes queued arms `EPOLLOUT` itself.
 
 ## Current state and open problems
 

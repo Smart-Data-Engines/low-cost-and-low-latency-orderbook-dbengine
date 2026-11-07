@@ -341,6 +341,15 @@ the pool keeps 95% of its rate or more on both test hosts (#248) - measured in `
 query on several cores". A node taking writes and nothing else can give its CPUs to its loops alone with
 `--scan-threads 0`.
 
+A large read is answered off its client loop (#260; `--large-read-threads N`, default 2, threads named
+`ob-read-0` …): a `SELECT` whose scan the index puts at 100 000 rows or more, so an analyst's query of
+millions of rows no longer holds the feed writing on the same loop. The threads sleep while there is
+no such read, and each builds one answer at a time, within the session's 64 MiB. A read waiting for a
+thread holds its session with it: `ob_off_loop_read_wait_seconds` is how long reads waited, and a wait
+that grows is every thread busy - a reason for more threads, which take CPUs from the loops and the scan
+pool while they read. `ob_off_loop_reads_in_flight` is how many sessions wait for one now. Measured in
+`docs/cli.md`, "A large read off its loop".
+
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,
 `top -H -p $(pidof ob_tcp_server)` shows which loop is busy, and the log line
