@@ -2906,8 +2906,8 @@ ignore checks.
 evidence `evidence/2026-11-07-large-answer-off-the-loop/`). A client loop ran a `SELECT` to its last
 byte - scan, formatting, compression, sending - before it served another session, and the sessions on
 it are every Nth connection of the node, the ones writing a feed among them: a `PING` beside a
-`SELECT` of a million rows (45 MB) on the same loop waited 11-22 ms on the m9g.xlarge and 14-17 ms
-on the m8a.xlarge, and 52-56 ms and 48-52 ms in a session with `COMPRESS LZ4`. For a database
+`SELECT` of a million rows (45 MB) on the same loop waited 14-22 ms on the m9g.xlarge and 15-18 ms
+on the m8a.xlarge, and 52-55 ms and 48-52 ms in a session with `COMPRESS LZ4`. For a database
 whose point is latency, an analyst's query is not allowed to hold a feed's writes for tens of
 milliseconds.
 
@@ -2935,24 +2935,27 @@ milliseconds.
   the loop arms `EPOLLOUT` again - edge-triggered, nothing else would report the socket - which
   answers on the next pass, after the pass's other sessions.
 
-Measured with Release builds, eight million rows of one book and one client loop; `master` before
-against the branch, three rounds each, the `PING`s and writes sent by a process of their own and
-counted while the read was answered:
+Measured with Release builds, eight million rows of one book and one client loop; the branch's parent
+against its final code (`e900fd0`, whose loop computes the same wait as the last commit's), three rounds
+each, the `PING`s and writes sent by a process of their own and counted while the read was answered:
 
 | | m9g.xlarge before | after | m8a.xlarge before | after |
 |---|---|---|---|---|
-| longest `PING`, `SELECT` of 1M rows | 11.2-21.9 ms | 0.15-0.48 ms | 14.0-16.6 ms | 0.03-0.29 ms |
-| longest `PING`, the same in LZ4 | 52.2-56.2 ms | 0.07-0.33 ms | 47.7-51.8 ms | 0.03-0.26 ms |
-| longest `MINSERT` of 20 levels beside it | 12.7-18.1 ms | 0.30-1.46 ms | 14.4-19.8 ms | 0.18-1.95 ms |
-| `SELECT ... LIMIT 100`, p50 | 22.8-23.8 us | 23.2-23.3 us | 13.7-14.0 us | 13.8-14.1 us |
-| `SELECT` of about a millisecond of the book, p50 | 60.9-62.4 us | 61.8-62.3 us | 64.7-65.0 us | 65.0-65.7 us |
+| longest `PING`, `SELECT` of 1M rows | 13.6-22.1 ms | 0.22-0.47 ms | 15.2-17.8 ms | 0.06-0.17 ms |
+| longest `PING`, the same in LZ4 | 52.4-55.4 ms | 0.06-1.05 ms | 47.8-52.2 ms | 0.04-0.14 ms |
+| longest `MINSERT` of 20 levels beside it | 11.6-19.5 ms | 0.29-3.52 ms | 13.2-16.9 ms | 0.19-3.84 ms |
+| `SELECT ... LIMIT 100`, p50 | 23.5-24.0 us | 22.7-23.6 us | 13.1-13.9 us | 13.1-13.9 us |
+| `SELECT` of about a millisecond of the book, p50 | 61.5-62.4 us | 62.2-62.7 us | 64.7-65.1 us | 64.7-65.3 us |
 
-The read itself takes as long: 0.031-0.036 s before and 0.032-0.034 after in text and 0.094-0.099 and
-0.097-0.098 in LZ4 on the m9g.xlarge, 0.038-0.047 and 0.040-0.047, 0.104-0.107 and 0.104-0.108 on the
-m8a.xlarge. A writer beside it takes turns of the loop the read had held - 1.6-2.3 times the batches
-while the read was answered, on the m8a.xlarge - and the read with it took 0.039-0.045 s where 0.035-0.038, and
-0.043-0.056 where 0.038-0.043. A small read's 0.5% on the m8a.xlarge is there with the threads off too
-(65.2-65.5 us), and is not the gate.
+The read itself takes as long: 0.032-0.036 s before and 0.033-0.034 after in text and 0.095-0.099 and
+0.097-0.098 in LZ4 on the m9g.xlarge, 0.039-0.048 and 0.036-0.047, 0.104-0.108 and 0.107-0.109 on the
+m8a.xlarge. A writer beside it takes turns of the loop the read had held - 1.5-2.2 times the batches
+while the read was answered on the m9g.xlarge, 1.4-2.2 on the m8a.xlarge - and the read with it took
+0.038-0.045 s where 0.036-0.041, and 0.044-0.053 where 0.039-0.045. The writer's longest, a few
+milliseconds in one round of three, is its own: with no read beside it the same writer met 3.8-3.9 ms
+at the longest, and a write past 1 ms in 8-13% of its 50 ms windows (m9g.xlarge). Two LZ4 reads of the
+six on the m9g.xlarge had a `PING` past a millisecond beside them; five more rounds of the branch gave
+0.04-0.23 ms.
 
 **Two versions before this one.** The first asked the index before `execute()`: it parsed the query a
 second time and copied every candidate's metadata, and `LIMIT 100` of a range of eight million rows
