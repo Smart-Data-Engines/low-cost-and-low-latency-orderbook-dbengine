@@ -99,10 +99,10 @@ bool taken(const Asked& a) { return a.err == ob::kReadTakenAway; }
 
 TEST(OffLoopReads, TheIndexCountsTheRowsInRangeAndStopsWhereItIsToldEnough) {
     Store s;
-    const uint64_t last = kBase + 19'999 * 1'000'000;
+    const uint64_t last = kBase + 19'999ULL * 1'000'000;
     EXPECT_EQ(s.store.rows_in_range_at_most(0, UINT64_MAX, "OL", "EX"), 20'000u);
     // Half of one segment, by the metadata's even spread: within a row or two of 2500.
-    EXPECT_NEAR(static_cast<double>(s.store.rows_in_range_at_most(kBase, kBase + 2499 * 1'000'000, "OL", "EX")),
+    EXPECT_NEAR(static_cast<double>(s.store.rows_in_range_at_most(kBase, kBase + 2'499ULL * 1'000'000, "OL", "EX")),
                 2500.0, 2.0);
     // Outside every segment, and a book nobody wrote.
     EXPECT_EQ(s.store.rows_in_range_at_most(last + 1, UINT64_MAX, "OL", "EX"), 0u);
