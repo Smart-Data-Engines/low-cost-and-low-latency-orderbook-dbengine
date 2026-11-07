@@ -4691,6 +4691,12 @@ Learned the hard way. Check here before debugging.
      first version of #260's resume had the same hole from the other side - the resumed session's
      `receive()` said it wanted to read, nothing armed `EPOLLOUT` for what the socket had not taken,
      and the answer stopped (`e46d108`). Every path that leaves bytes queued arms `EPOLLOUT` itself.
+644. **A change after the last full run is checked by the full run, not by the tests of what it changed.**
+     #260's last change to the loop put `!resume_.empty()` into `epoll_wait`'s timeout, and the
+     targeted runs after it - the module's battery, `test_off_loop_reads`, the slice tests - passed;
+     the full ctest failed on `IoWait.TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral`, which
+     reads every `epoll_wait`'s arguments up to their first `)` for `wait_ms` and found the condition's
+     parenthesis first. A test that reads the source as text belongs to no feature's targeted set.
 
 ## Current state and open problems
 
