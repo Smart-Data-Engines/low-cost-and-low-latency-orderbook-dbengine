@@ -3758,8 +3758,8 @@ void Reactor::run_loop() {
         // that served within ScanPool::kLoopRecent (#249).
         loop_load_->stopped(static_cast<size_t>(index_));
         // Sessions resumed past the events one pass could take (#260) do not wait for the next event.
-        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS,
-                                ring_filled || !resume_.empty() ? 0 : wait_ms);
+        const int pass_wait_ms = ring_filled || !resume_.empty() ? 0 : wait_ms;
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, pass_wait_ms);
         if (nfds > 0) loop_load_->serving(static_cast<size_t>(index_));
         if (rings_told) {
             for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();
