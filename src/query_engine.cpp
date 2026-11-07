@@ -1631,6 +1631,9 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         }
         count += taken.rows.size();
         if (ends) return {true, taken.rows.size() - 1};
+        // An answer past what its session may be sent stops here (#257): the rows after it would
+        // be read and formatted for a refusal.
+        if (rows != nullptr && rows->full()) return {true, taken.rows.size() - 1};
         return {};
     };
     ColumnarStore::ScanCost cost;
@@ -1649,7 +1652,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
             const uint64_t take = std::min<uint64_t>(part.rows(), lim - count);
             rows->add_part(part, take);
             count += take;
-            return count < lim;
+            return count < lim && !rows->full();
         };
         cost = store_.scan_parts(ts_start, ts_end, ast.symbol, ast.exchange, to_read,
                                  filter_of(ast), how);

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -133,6 +134,17 @@ struct ParsedResponse {
 std::string format_query_response(const std::vector<QueryResult>& rows,
                                   const std::vector<QueryColumn>& columns);
 
+class Lz4FrameWriter;
+
+/// What a session may be sent, which a row answer is measured against while it is built (#257).
+struct AnswerCeiling {
+    /// The most bytes a session may have queued, and so the largest answer it can be sent; 0 is no
+    /// ceiling, as for a caller that sends nothing.
+    size_t bytes = 0;
+    /// The session frames its answers in LZ4, and the frame is what has to fit.
+    bool lz4 = false;
+};
+
 /// A row scan's reply built as the engine hands the rows over, rather than from a vector of them
 /// (#49 step 3). The server collected every row of a `SELECT` before it formatted one - 64 bytes a
 /// row, copied again each time the vector grew - and measured on a server whose heap turned over,
@@ -145,15 +157,19 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
 /// written from it then.
 class QueryResponseBuilder : public RowAnswer {
 public:
-    explicit QueryResponseBuilder(const QueryShape& shape) : shape_(shape) {}
+    explicit QueryResponseBuilder(const QueryShape& shape);
     /// The same, writing the reply in `room` - emptied, its capacity kept: the session's send buffer
     /// from `Session::lend_room()`, which finish()'s string, handed back by `Session::take_answer()`,
     /// returns to it (#253). A session's next large answer is written where its last one was, not
     /// grown again by doubling, each growth a copy of what was written.
-    QueryResponseBuilder(const QueryShape& shape, std::string room)
-        : shape_(shape), out_(std::move(room)) {
-        out_.clear();
-    }
+    QueryResponseBuilder(const QueryShape& shape, std::string room);
+    /// The same, measured against `ceiling` as it is built (#257). A row answer that passes it is
+    /// full(): no more of its rows are taken, the scan stops, and the caller answers a refusal rather
+    /// than finish(). On a session that frames its answers in LZ4, a row answer is an LZ4 frame from
+    /// its first row: written in `room`, from its text a megabyte at a time, so that the frame is what
+    /// is measured - the thing that has to fit - and the text is never held whole beside it.
+    QueryResponseBuilder(const QueryShape& shape, std::string room, AnswerCeiling ceiling);
+    ~QueryResponseBuilder() override;
     QueryResponseBuilder(const QueryResponseBuilder&) = delete;
     QueryResponseBuilder& operator=(const QueryResponseBuilder&) = delete;
 
@@ -170,8 +186,24 @@ public:
     std::unique_ptr<ScanPart> part(uint64_t limit) override;
     void add_part(ScanPart& part, uint64_t n) override;
 
-    /// The reply, header and terminator included; the builder is spent after it.
+    /// The reply, header and terminator included; the builder is spent after it. framed(): an LZ4
+    /// frame, its length in front, as a compressed session sends it.
     std::string finish();
+
+    /// Whether a row answer has passed its ceiling (#257).
+    bool full() const override { return full_; }
+    /// The rows of the answer known to fit within the ceiling: those before the batch or the part
+    /// that passed it - in LZ4, those in the frame the last time it was measured.
+    uint64_t rows_within() const { return rows_within_; }
+    /// The rows taken into the answer so far, and its bytes built so far: text, or the frame.
+    uint64_t rows_taken() const { return rows_taken_; }
+    size_t bytes_built() const;
+    /// Whether finish() hands over an LZ4 frame rather than text, and the text that frame holds.
+    bool framed() const { return frame_ != nullptr; }
+    uint64_t text_bytes() const { return text_bytes_; }
+
+    /// Text written before it is compressed onto an LZ4 answer's frame.
+    static constexpr size_t kSpillBytes = 1u << 20;
 
 private:
     void start(const QueryResult& first);
@@ -180,6 +212,10 @@ private:
     void room_for_a_row();
     /// The reply `n` bytes long, the room past `used_` for rows to be written in (#253).
     void grow_to(size_t n);
+    /// `rows` more rows written, measured against the ceiling (#257).
+    void measure(uint64_t rows);
+    /// The text written so far compressed onto the frame, and the text emptied (#257).
+    void spill();
     void add_narrow(const QueryResult& r);
     void add_bucket(const QueryResult& r);
 
@@ -196,6 +232,15 @@ private:
     bool all_seven_ = false;
     bool rows_      = false;   ///< a row scan's reply, written in place
     bool buckets_   = false;   ///< a GROUP BY answer (#44), told by the shape, not by a row
+    AnswerCeiling ceiling_{};
+    /// The most capacity the text asks for ahead of what it needs: the ceiling and one batch past it
+    /// (#257), or 0 for no such bound.
+    size_t capacity_ceiling_ = 0;
+    std::unique_ptr<Lz4FrameWriter> frame_;   ///< an LZ4 session's row answer (#257)
+    bool full_ = false;
+    uint64_t rows_taken_  = 0;
+    uint64_t rows_within_ = 0;
+    uint64_t text_bytes_  = 0;   ///< text compressed onto the frame so far
 };
 
 /// The header of a `GROUP BY TIME_BUCKET(...)` answer (#44), without its line end:

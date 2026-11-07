@@ -1,6 +1,8 @@
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/capabilities.hpp"
+#include "orderbook/compression.hpp"
 #include "orderbook/decimal_text.hpp"
+#include "orderbook/logger.hpp"
 #include "orderbook/version.hpp"
 
 #include <algorithm>
@@ -229,6 +231,21 @@ std::string format_bucket_header(const QueryShape& shape) {
     return out;
 }
 
+QueryResponseBuilder::QueryResponseBuilder(const QueryShape& shape) : shape_(shape) {}
+
+QueryResponseBuilder::QueryResponseBuilder(const QueryShape& shape, std::string room)
+    : shape_(shape), out_(std::move(room)) {
+    out_.clear();
+}
+
+QueryResponseBuilder::QueryResponseBuilder(const QueryShape& shape, std::string room,
+                                           AnswerCeiling ceiling)
+    : shape_(shape), out_(std::move(room)), ceiling_(ceiling) {
+    out_.clear();
+}
+
+QueryResponseBuilder::~QueryResponseBuilder() = default;
+
 void QueryResponseBuilder::start_buckets() {
     started_ = true;
     buckets_ = true;
@@ -269,6 +286,16 @@ void QueryResponseBuilder::start(const QueryResult& first) {
 
 void QueryResponseBuilder::start_rows() {
     started_ = true;
+    if (ceiling_.lz4) {
+        // The frame is what a compressed session sends and what has to fit (#257), so it is built
+        // from the first row: in the session's room, which it hands back as the send buffer, and the
+        // text in a string of its own that each spill empties. The frame's doubling stops at the
+        // ceiling and a spill past it, which a frame that passes the ceiling is refused at.
+        const size_t frame_ceiling =
+            ceiling_.bytes == 0 ? 0 : ceiling_.bytes + kSpillBytes + kSpillBytes / 16;
+        frame_ = std::make_unique<Lz4FrameWriter>(std::move(out_), frame_ceiling);
+        out_ = std::string();
+    }
     // Not reserved from a count, as format_query_response() is: no count exists until the scan
     // ends. A string that doubles copies what it holds about once over in all, where the vector of
     // rows it replaces copied 64 bytes a row each time it grew and was read once more to format.
@@ -284,6 +311,11 @@ void QueryResponseBuilder::start_rows() {
     rows_      = true;
     used_      = out_.size();
     row_bytes_ = all_seven_ ? kMaxQueryRowBytes : max_row_bytes(columns);
+    if (ceiling_.bytes != 0 && !frame_) {
+        // The text never needs room past the ceiling and the batch that passes it (#257): doubling
+        // stops there, so an answer refused at 64 MiB was not first given 128 to grow into.
+        capacity_ceiling_ = ceiling_.bytes + 1 + kScanBatchRows * row_bytes_ + decimal_text::kWriteRoom;
+    }
     room_for_a_row();
 }
 
@@ -302,8 +334,52 @@ void QueryResponseBuilder::room_for_a_row() {
 // twice what was written. Past the capacity, twice the capacity first, so that what was written is
 // copied a number of times that grows with the logarithm of the reply, not with its batches (#253).
 void QueryResponseBuilder::grow_to(size_t n) {
-    if (n > out_.capacity()) out_.reserve(std::max(out_.capacity() * 2, n));
+    if (n > out_.capacity()) {
+        size_t want = std::max(out_.capacity() * 2, n);
+        if (capacity_ceiling_ != 0) want = std::max(n, std::min(want, capacity_ceiling_));
+        out_.reserve(want);
+    }
     out_.resize(n);
+}
+
+// After each batch or part, never inside one: the rows of a batch were written whole, and a check a
+// row would cost the path #227 and #251 made fast (#257). Text passes the ceiling once it and the
+// terminator are more than the session may be sent; a frame, once it and the end mark and checksum
+// are - and it is measured each time the text has passed a megabyte and been compressed onto it, so
+// the rows within it are the ones compressed by then.
+void QueryResponseBuilder::measure(uint64_t rows) {
+    rows_taken_ += rows;
+    if (frame_) {
+        if (used_ >= kSpillBytes) spill();
+        if (ceiling_.bytes != 0 && frame_->size() + Lz4FrameWriter::kEndBytes > ceiling_.bytes) {
+            full_ = true;
+            OB_LOG_DEBUG("formatter", "row answer passed its ceiling of %zu bytes after %llu row(s): a "
+                         "frame of %zu from %llu byte(s) of text", ceiling_.bytes,
+                         static_cast<unsigned long long>(rows_taken_), frame_->size(),
+                         static_cast<unsigned long long>(text_bytes_));
+            return;
+        }
+        if (used_ == 0) rows_within_ = rows_taken_;
+        return;
+    }
+    if (ceiling_.bytes != 0 && used_ + 1 > ceiling_.bytes) {
+        full_ = true;
+        OB_LOG_DEBUG("formatter", "row answer passed its ceiling of %zu bytes after %llu row(s): %zu "
+                     "byte(s) of text", ceiling_.bytes, static_cast<unsigned long long>(rows_taken_),
+                     used_);
+        return;
+    }
+    rows_within_ = rows_taken_;
+}
+
+void QueryResponseBuilder::spill() {
+    frame_->add(std::string_view(out_.data(), used_));
+    text_bytes_ += used_;
+    used_ = 0;
+}
+
+size_t QueryResponseBuilder::bytes_built() const {
+    return frame_ ? frame_->size() : used_;
 }
 
 void QueryResponseBuilder::add(const QueryResult& r) {
@@ -404,7 +480,7 @@ static char* write_rows(char* p, char* end, const RowBatch& b, size_t n, bool al
 }
 
 void QueryResponseBuilder::add_rows(const RowBatch& b) {
-    if (b.rows.empty()) return;
+    if (b.rows.empty() || full_) return;
     if (!started_) start_rows();
     // Room for the whole batch at once, at the widest row this shape can write, and for the word
     // put_field() stores past a row's last digit (#251), grown to what the batch needs within the
@@ -416,6 +492,7 @@ void QueryResponseBuilder::add_rows(const RowBatch& b) {
     char* const end   = reply + out_.size();
     used_ = static_cast<size_t>(write_rows(reply + used_, end, b, b.rows.size(), all_seven_,
                                            shape_.columns) - reply);
+    measure(b.rows.size());
 }
 
 namespace {
@@ -455,6 +532,26 @@ public:
         return {};
     }
     uint64_t rows() const override { return rows_; }
+
+    /// The bytes its first `n` rows take: what append_to() appends for them (#257).
+    size_t bytes(uint64_t n) const {
+        size_t total = 0;
+        for (const Chunk& c : chunks_) {
+            if (n >= rows_) {
+                total += c.used;
+                continue;
+            }
+            const char* const begin = c.bytes.get();
+            const char* p = begin;
+            const char* const end = begin + c.used;
+            for (; n > 0 && p < end; --n) {
+                p = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p))) + 1;
+            }
+            total += static_cast<size_t>(p - begin);
+            if (n == 0) return total;
+        }
+        return total;
+    }
 
     /// Its first `n` rows appended to `out`: through the end of the `n`-th, every row being one line.
     void append_to(std::string& out, uint64_t n) const {
@@ -502,13 +599,30 @@ std::unique_ptr<ScanPart> QueryResponseBuilder::part(uint64_t limit) {
 
 void QueryResponseBuilder::add_part(ScanPart& p, uint64_t n) {
     auto& part = static_cast<RowTextPart&>(p);
-    if (n == 0) return;
+    if (n == 0 || full_) return;
     if (!started_) start_rows();
+    if (ceiling_.bytes != 0 && !frame_) {
+        // A part knows its bytes before they are copied (#257): one that would take the text past
+        // the ceiling is not copied, and the room for one that fits is asked for within it.
+        const size_t adds = part.bytes(n);
+        if (used_ + adds + 1 > ceiling_.bytes) {
+            full_ = true;
+            OB_LOG_DEBUG("formatter", "row answer passed its ceiling of %zu bytes at a part of %llu "
+                         "row(s) and %zu byte(s), after %llu row(s) and %zu byte(s)", ceiling_.bytes,
+                         static_cast<unsigned long long>(n), adds,
+                         static_cast<unsigned long long>(rows_taken_), used_);
+            return;
+        }
+        if (used_ + adds > out_.capacity()) {
+            out_.reserve(std::max(used_ + adds, std::min(out_.capacity() * 2, capacity_ceiling_)));
+        }
+    }
     // Appended rather than copied into room made ahead, which a resize fills with zeros first: the
     // copy is the one pass over the bytes this reply makes.
     out_.resize(used_);
     part.append_to(out_, n);
     used_ = out_.size();
+    measure(n);
 }
 
 std::string QueryResponseBuilder::finish() {
@@ -518,6 +632,12 @@ std::string QueryResponseBuilder::finish() {
     if (!started_) return format_query_response({}, shape_.columns);
     if (rows_) out_.resize(used_);   // the room ahead of a row nobody wrote
     out_ += '\n';   // empty line terminator
+    if (frame_) {
+        // The rest of the text onto the frame, and the frame closed: what the session sends (#257).
+        frame_->add(out_);
+        text_bytes_ += out_.size();
+        return frame_->end();
+    }
     return std::move(out_);
 }
 
