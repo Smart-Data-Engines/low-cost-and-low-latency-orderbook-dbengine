@@ -102,6 +102,12 @@ The procedure, per host, with three hosts as the example:
 #    mm-replication-port   = 9092            # the same on each host is fine; they differ by address
 #    coordinator-endpoints = http://10.0.0.1:2379,http://10.0.0.2:2379,http://10.0.0.3:2379
 #    multi-master          = true
+#
+#    And the secrets, the same files on every host (Security, below): since #256 a node with no
+#    secret listens on 127.0.0.1, and one announced at 10.0.0.1 that would, does not start.
+#    auth-secret-file      = /etc/orderbook/secrets/clients
+#    cluster-secret-file   = /etc/orderbook/secrets/cluster
+#    Or, on a network you trust instead: bind = * and mm-bind = *.
 
 # 3. Confirm what each node resolved before starting it. This is the step that catches a typo in a
 #    file you edited on three machines by hand.
@@ -147,16 +153,19 @@ with `OB_HOST`, three rounds each way).
 
 ### IPv6
 
-Every port listens on both families unless a flag says otherwise. With no `bind`, `replication-bind`,
-`mm-bind` or `metrics-bind`, a listener is `::` with `IPV6_V6ONLY` off. That takes IPv4 clients too,
-as mapped addresses, which the log and `STATUS` show as the IPv4 address they are. A host without
-IPv6 - compiled out, or `disable_ipv6` - gets IPv4 listeners, and its log says so once a port.
+A port on every interface listens on both families: `::` with `IPV6_V6ONLY` off. That takes IPv4
+clients too, as mapped addresses, which the log and `STATUS` show as the IPv4 address they are. A
+host without IPv6 - compiled out, or `disable_ipv6` - gets IPv4 listeners, and its log says so once a
+port. A port is on every interface when its flag says `*`, or when it has no flag and its surface
+authenticates - `bind` with `auth-secret-file`, `replication-bind` and `mm-bind` with
+`cluster-secret-file`; with neither, it listens on `127.0.0.1` (#256). `metrics-bind` with no value
+is every interface, as it always was.
 
 An address in a bind flag listens on its own family alone, written bare or in brackets (`::1`,
 `[::1]`). So `0.0.0.0` is every IPv4 interface and nothing else, and `::` every IPv6 one - whatever
 the host's `net.ipv6.bindv6only` says.
 
-**A firewall that covers IPv4 alone does not cover a port with no bind flag.** v0.1.0 listened on
+**A firewall that covers IPv4 alone does not cover a port on every interface.** v0.1.0 listened on
 `0.0.0.0` there. Put `0.0.0.0` in the flag to keep a port on IPv4, or extend the rules to IPv6
 ("Listeners after v0.1.0" in `docs/upgrading.md`).
 

@@ -152,9 +152,14 @@ mechanism — and the weaker one is the one that gets used. Bind it to a private
 `--metrics-bind` instead. Note that the exposition discloses symbol counts, row volumes and cluster
 role, which is information about your business.
 
-**Nothing at all, by default.** With neither secret file set, the wire behaves exactly as it did
-before: no authentication anywhere. The server logs a `WARN` for each disabled surface at startup, so
-"default open" is visible in the log rather than only in this document.
+**Nothing at all, by default - on this host only.** With neither secret file set, nothing is
+authenticated, and the server logs a `WARN` for each disabled surface at startup. Since #256 a surface
+with no secret also listens on `127.0.0.1` unless its bind flag names an address: the client port
+without `--auth-secret-file` and `--bind`, the replication and multi-master ports without
+`--cluster-secret-file` and their own bind flags. An unauthenticated port reachable from the network
+is a decision an operator writes down (`bind = *` is every interface), not what a package installs.
+A node announced through a coordinator at another host, with a port it needs on loopback by that
+rule, does not start.
 
 ### Therefore
 

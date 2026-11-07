@@ -80,6 +80,28 @@ Either extend the firewall to IPv6 first, or keep the port where it was with `0.
 flag: `bind`, `replication-bind`, `mm-bind`, `metrics-bind`. Clients, replicas and peers that reach a
 node over IPv4 notice nothing.
 
+## Listeners with no secret, from #256
+
+A port whose surface has no secret listens on `127.0.0.1` unless its bind flag names an address: the
+client port without `auth-secret-file` and `bind`, the replication and multi-master ports without
+`cluster-secret-file` and `replication-bind` / `mm-bind`. Before, such a port listened on every
+interface - which is what the package's configuration, with no secret in it, did. Two kinds of
+deployment notice:
+
+- **A node with no authentication serving clients on other hosts.** Its clients are refused after the
+  upgrade. Give it `auth-secret-file` (recommended), or `bind = *` to listen on every interface as it
+  did, or `bind` with one address.
+- **A cluster across hosts with a coordinator and no secrets.** A node announced through the
+  coordinator at a host other than loopback, whose client port or node link would listen on
+  `127.0.0.1` by this rule, does not start, and says which flag to give: the surface's secret file
+  (recommended), or its bind flag.
+- **A primary with replicas on other hosts, no coordinator and no cluster secret.** The primary
+  starts - nothing tells it where its replicas are - and its log says replicas on other hosts cannot
+  connect; the replicas are refused their connection. Give the primary `cluster-secret-file`
+  (recommended, and the replicas the same file), or `replication-bind`.
+
+`ob_tcp_server --print-config` shows where each listener will listen and why, before anything starts.
+
 ## When a change breaks a row
 
 A change to what a node writes or sends that makes a row fail here is not merged by relaxing the

@@ -675,11 +675,11 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |
 | `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |
 | `--mm-replication-port` | `<PORT>` | Multi-master peer port |
-| `--mm-bind` | `<ADDR>` | IPv4 or IPv6 address the multi-master port listens on (default: every interface, both families), as `--replication-bind` is for the replication port (#203) |
+| `--mm-bind` | `<ADDR>` | IPv4 or IPv6 address the multi-master port listens on, or `*` for every interface of both families; without it, every interface with `--cluster-secret-file` and `127.0.0.1` without (#256) - as `--replication-bind` is for the replication port (#203) |
 | `--multi-master` | — (boolean) | Run as a multi-master node instead of primary/replica |
 | `--node-id` | `<ID>` | This node's name, as it appears to the coordinator |
 | `--port` | `<PORT>` | TCP port to listen on (default: 9090) |
-| `--bind` | `<ADDR>` | IPv4 or IPv6 address the client port listens on (default: every interface, both families: `::` taking IPv4 too). `127.0.0.1` keeps it to the machine without a firewall rule, with or without TLS and authentication on it; an address that does not parse is a refusal to start, not a listener on every interface (#203) |
+| `--bind` | `<ADDR>` | IPv4 or IPv6 address the client port listens on, or `*` for every interface of both families (`::` taking IPv4 too). Without it, every interface with `--auth-secret-file` and `127.0.0.1` without: a node that authenticates nobody serves this host until told otherwise (#256). `127.0.0.1` keeps it to the machine without a firewall rule, with or without TLS and authentication on it; an address that does not parse is a refusal to start, not a listener on every interface (#203) |
 | `--primary-host` | `<HOST>` | Primary to replicate from, when starting as a replica: a name, an IPv4 or an IPv6 address, every address of a name tried in turn |
 | `--primary-port` | `<PORT>` | Primary's replication port |
 | `--print-config` | — (boolean) | Print every setting with its origin and exit; opens no port |
@@ -688,7 +688,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--replication-port` | `<PORT>` | Port replicas connect to on this node |
 | `--rings` | `on\|off` | Whether a session through `--unix-socket` may move to a pair of rings in shared memory with `RINGS` (default: `on`, #52): the same protocol, without a system call a round trip when the node polls. Refused for TCP and TLS sessions, and before `AUTH` where it is required |
 | `--ring-bytes` | `<BYTES>` | The size of each direction of a session's rings: a power of two from 65536 to 67108864 (default: 1048576). A client may ask for less, never more |
-| `--replication-bind` | `<ADDR>` | IPv4 or IPv6 address the replication port listens on (default: every interface, both families) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
+| `--replication-bind` | `<ADDR>` | IPv4 or IPv6 address the replication port listens on, or `*` for every interface of both families; without it, every interface with `--cluster-secret-file` and `127.0.0.1` without (#256) - a cluster's private interface, say, while the client port faces the applications. The address replicas dial is still the one this node publishes (`--advertise-host`), and has to be one they can reach on it (#203) |
 | `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
