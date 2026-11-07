@@ -7,12 +7,17 @@ serving the others; the session that asked waits for its answer, and its later c
 wait with it, so a session's answers still come in the order it asked.
 
 One client loop (`--io-threads 1`), so every session is on it; 600 000 rows of one book. The control is
-the same node with `--large-read-threads 0`, as every node was before #260.
+the same node with `--large-read-threads 0`, as every node was before #260. A session closed while its
+read is answered off the loop - a reload that revokes its identity (#258) - is checked on a node of its
+own, with client authentication.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -30,6 +35,8 @@ from orderbook_engine import OrderbookEngine
 pytestmark = pytest.mark.large_response
 
 ROWS = 600_000
+ALICE = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1-alice"
+BOB = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1-bob"
 WHOLE = "SELECT * FROM 'ISO'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999"
 
 # A PING every half millisecond on a session of its own, until a line comes on stdin; then each PING's
@@ -56,13 +63,19 @@ print(json.dumps(samples), flush=True)
 
 
 class Node:
-    def __init__(self, tmp: Path, *extra: str) -> None:
+    def __init__(self, tmp: Path, *extra: str, clients: str | None = None) -> None:
         self.port = free_port()
         self.metrics_port = free_port()
-        self.log = open(tmp / "node.log", "w", encoding="utf-8")
+        self.clients = tmp / "clients"
+        auth: list[str] = []
+        if clients is not None:
+            self.write_clients(clients)
+            auth = ["--auth-secret-file", str(self.clients)]
+        self.log_path = tmp / "node.log"
+        self.log = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [server_binary_path(), "--port", str(self.port), "--data-dir", str(tmp / "data"),
-             "--metrics-port", str(self.metrics_port), "--io-threads", "1", *extra],
+             "--metrics-port", str(self.metrics_port), "--io-threads", "1", *auth, *extra],
             stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + patience(30)
         while time.monotonic() < deadline:
@@ -75,8 +88,26 @@ class Node:
                 time.sleep(0.1)
         raise AssertionError("the node never accepted a connection")
 
-    def load(self) -> None:
-        client = OrderbookEngine(host="127.0.0.1", port=self.port, timeout=patience(120))
+    def write_clients(self, text: str) -> None:
+        self.clients.write_text(text)
+        self.clients.chmod(0o600)
+
+    def reload(self) -> None:
+        self.proc.send_signal(signal.SIGHUP)
+
+    def logged(self, pattern: str, count: int = 1) -> list[str]:
+        """The groups of `pattern` in the node's log, once it holds `count` lines that match."""
+        deadline = time.monotonic() + patience(10)
+        while True:
+            self.log.flush()
+            found = re.findall(pattern, self.log_path.read_text(errors="replace"))
+            if len(found) >= count:
+                return found
+            assert time.monotonic() < deadline, f"the node never logged {pattern!r} {count} time(s)"
+            time.sleep(0.01)
+
+    def load(self, auth: tuple[str, str] | None = None) -> None:
+        client = OrderbookEngine(host="127.0.0.1", port=self.port, timeout=patience(120), auth=auth)
         for sent in range(0, ROWS, 500):
             count = min(500, ROWS - sent)
             client.insert("ISO", "EX", "bid", [1_000_000 + (sent + i) % 900_000 for i in range(count)],
@@ -109,6 +140,23 @@ def connect(port: int) -> socket.socket:
     buf = b""
     while b"\n\n" not in buf:
         buf += s.recv(65536)
+    return s
+
+
+def response(secret: str, identity: str, nonce: str) -> str:
+    message = b"\x00".join([b"ob-auth-v1", b"client", b"initiator", identity.encode(), nonce.encode()])
+    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+
+
+def authenticated(port: int, identity: str, secret: str) -> socket.socket:
+    s = connect(port)
+    s.sendall(b"AUTH\n")
+    (challenge,) = answers(s, 1)
+    assert challenge.startswith(b"OK CHALLENGE "), challenge
+    nonce = challenge.split()[2].decode()
+    s.sendall(f"AUTH {identity} {response(secret, identity, nonce)}\n".encode())
+    (ok,) = answers(s, 1)
+    assert ok.startswith(b"OK AUTH " + identity.encode()), ok
     return s
 
 
@@ -262,3 +310,64 @@ def test_a_compressed_sessions_large_read_is_the_plain_answer_framed(nodes):
     finally:
         plain.close()
         framed.close()
+
+
+def test_an_answer_whose_session_was_closed_goes_to_no_session_after_it(tmp_path):
+    """A reload that revokes an identity closes its session while the session's read waits off the
+    loop. The answer, when it comes, is dropped: the session the node accepted next has the closed
+    one's descriptor - the kernel gives the lowest free one - and is given its own answers only."""
+    node = Node(tmp_path, "--large-read-threads", "1", clients=f"alice {ALICE}\nbob {BOB}\n")
+    sessions: list[socket.socket] = []
+    try:
+        node.load(auth=("alice", ALICE))
+        # One read first, so that the reads after it find the columns held and open no file, which
+        # would take a descriptor.
+        warm = authenticated(node.port, "alice", ALICE)
+        sessions.append(warm)
+        warm.sendall((WHOLE + "\n").encode())
+        answers(warm, 1)
+        before = node.metric("ob_off_loop_reads_total")
+        # Eight reads ahead of bob's on the one thread off the loop: the window the reload falls in.
+        ahead = [authenticated(node.port, "alice", ALICE) for _ in range(8)]
+        sessions += ahead
+        bob = authenticated(node.port, "bob", BOB)
+        sessions.append(bob)
+        for s in ahead:
+            s.sendall((WHOLE + "\n").encode())
+        bob.sendall((WHOLE + "\n").encode())
+        deadline = time.monotonic() + patience(10)
+        while node.metric("ob_off_loop_reads_total") < before + 9:
+            assert time.monotonic() < deadline, "the reads did not leave the loop"
+            time.sleep(0.001)
+
+        node.write_clients(f"alice {ALICE}\n")
+        node.reload()
+        got = b""
+        while True:
+            try:
+                chunk = bob.recv(1 << 20)
+            except OSError:
+                break
+            if not chunk:
+                break
+            got += chunk
+        assert got == b"", "bob's read was answered before the reload closed its session: no window"
+        (closed,) = node.logged(r"closing fd=(\d+) of identity 'bob'")
+
+        adopted = len(node.logged(r"adopted fd=(\d+) conn_id=\d+"))
+        after = authenticated(node.port, "alice", ALICE)
+        sessions.append(after)
+        given = node.logged(r"adopted fd=(\d+) conn_id=\d+", adopted + 1)[adopted]
+        assert given == closed, f"the next session has fd={given}, not bob's {closed}: it shows nothing"
+
+        deadline = time.monotonic() + patience(60)
+        while node.metric("ob_off_loop_reads_in_flight") != 0:
+            assert time.monotonic() < deadline, "the reads off the loop never came back"
+            time.sleep(0.01)
+        after.sendall(b"PING\n")
+        (first,) = answers(after, 1)
+        assert first == b"PONG\n", f"the session after bob's was given {first[:60]!r}"
+    finally:
+        for s in sessions:
+            s.close()
+        node.stop()
