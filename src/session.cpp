@@ -301,7 +301,44 @@ Session::Queued Session::queue_answer(std::string_view response) {
     return Queued::Yes;
 }
 
+void Session::next_answer_framed(uint64_t text_bytes) {
+    framed_next_       = true;
+    framed_text_bytes_ = text_bytes;
+}
+
+Session::Queued Session::take_framed(std::string&& framed, uint64_t text_bytes) {
+    if (framed.size() > kMaxSendBuffer) {
+        OB_LOG_WARN("session", "Answer too large to ever send: fd=%d frame=%zu cap=%zu (compressed as built)",
+                    fd_, framed.size(), kMaxSendBuffer);
+        return Queued::TooLargeAlone;
+    }
+    if (pending_bytes() + framed.size() > kMaxSendBuffer) {
+        OB_LOG_ERROR("session", "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
+                     fd_, pending_bytes(), framed.size(), kMaxSendBuffer);
+        return Queued::CapExceeded;
+    }
+    compress_bytes_in_  += text_bytes;
+    compress_bytes_out_ += static_cast<uint64_t>(framed.size() - 4);
+    OB_LOG_DEBUG("session", "fd=%d: an answer framed as it was built, %zu byte(s) for %llu of text",
+                 fd_, framed.size(), static_cast<unsigned long long>(text_bytes));
+    if (send_buf_.empty()) {
+        // Taken, as a plain answer is (#252): the frame was written in the room lend_room() gave,
+        // and brings it back.
+        send_buf_.swap(framed);
+        send_off_ = 0;
+        std::string().swap(framed);
+        return Queued::Yes;
+    }
+    drop_sent_before_append();
+    send_buf_.append(framed);
+    return Queued::Yes;
+}
+
 Session::Queued Session::take_answer(std::string&& response) {
+    if (framed_next_) {
+        framed_next_ = false;
+        return take_framed(std::move(response), framed_text_bytes_);
+    }
     // An answer with nothing queued before it, and no frame to put it in, is the bytes to send:
     // taken, not copied (#252). The copy was a `SELECT`'s whole reply, 2.6% of a node's samples
     // answering 100 000 rows at a time. The buffer it replaces holds nothing pending - `sent()`

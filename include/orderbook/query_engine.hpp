@@ -198,6 +198,13 @@ public:
     /// The first `n` rows of a part this made, onto the answer: on the query's thread, in the
     /// candidates' order.
     virtual void add_part(ScanPart& part, uint64_t n) = 0;
+    /// Whether the answer has passed what its session may be sent (#257): the scan stops at the
+    /// batch or the part that passed it, rather than read rows nobody can be sent.
+    virtual bool full() const { return false; }
+    /// The rows the answer may still take before it passes that, estimated from the rows it has
+    /// taken, or UINT64_MAX with no ceiling or no rows yet (#257): a divided scan hands out no more
+    /// parts than that, so it does not format ahead what the answer cannot take.
+    virtual uint64_t rows_room() const { return UINT64_MAX; }
 };
 
 // ── QueryEngine ───────────────────────────────────────────────────────────────
