@@ -2625,7 +2625,8 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
 
     // Handed out ahead of the fold by at most the pool's threads and one - so as many parts are
     // held as can be read at once - and, under a LIMIT, only while what has been folded and what
-    // is out may still fall short of it.
+    // is out may still fall short of it; under the answer's ceiling (#257), only while what is out
+    // may still fit in it.
     const size_t n = slots.size();
     const size_t window = static_cast<size_t>(pool->threads()) + 1;
     size_t handed = 0;
@@ -2633,7 +2634,8 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
     uint64_t out_rows = 0;
     const auto hand_out = [&](size_t folding) {
         while (handed < n && handed < folding + window &&
-               (how.limit_rows == UINT64_MAX || folded_rows + out_rows < how.limit_rows)) {
+               (how.limit_rows == UINT64_MAX || folded_rows + out_rows < how.limit_rows) &&
+               (!how.rows_room || out_rows < how.rows_room())) {
             Slot& s = slots[handed];
             out_rows += s.rows_at_most;
             s.task = pool->submit([&read_slot, &s] { read_slot(s); });

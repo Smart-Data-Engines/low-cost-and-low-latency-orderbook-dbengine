@@ -8,6 +8,7 @@
 #include <sstream>
 #include <iterator>
 #include "orderbook/command_parser.hpp"
+#include "orderbook/compression.hpp"
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/session.hpp"
 #include "orderbook/tcp_server.hpp"
@@ -1163,7 +1164,7 @@ TEST(SessionOutput, ALargeAnswerWithNothingPendingIsTakenAndTheOthersAreCopied) 
     std::string too_large(ob::Session::max_queued_bytes() + 1, 'x');
     EXPECT_EQ(session.take_answer(std::move(too_large)), ob::Session::Queued::TooLargeAlone);
     EXPECT_EQ(too_large.size(), ob::Session::max_queued_bytes() + 1)
-        << "a refused answer was not left as it was, so the refusal cannot say its size";
+        << "a refused answer was not left as it was";
     EXPECT_FALSE(session.has_pending_output());
 
     session.set_compressed(true);
@@ -2040,6 +2041,49 @@ TEST(AdminSerialisation, TheClassifierHasNoDefaultAndTheLoopConsultsIt) {
         << "the reactor runs every command without asking whether it must run alone";
     EXPECT_EQ(before.find('\n', before.find('\n', consult) + 1), std::string::npos)
         << "the lock is taken more than a line before the command it guards";
+}
+
+// #257: a row answer a compressed session's read framed as it built it is queued as it is - not
+// framed a second time - measured by its own size against the cap, and counted as compressed. The
+// mark is spent on the answer it was set for: the next is text, framed by the session as before.
+TEST(SessionOutput, AnAnswerFramedAsItWasBuiltIsQueuedAsItIs) {
+    int sv[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    {
+        ob::Session s(sv[0], 1);
+        s.set_compressed(true);
+        const std::string text = "OK\nprice\n1\n2\n\n";
+        ob::Lz4FrameWriter writer{std::string()};
+        writer.add(text);
+        const std::string framed = writer.end();
+        s.next_answer_framed(text.size());
+        std::string taken = framed;
+        ASSERT_EQ(s.take_answer(std::move(taken)), ob::Session::Queued::Yes);
+        EXPECT_EQ(s.pending_output_bytes(), framed.size()) << "the frame was framed again";
+        EXPECT_EQ(s.compress_bytes_in(), text.size());
+        EXPECT_EQ(s.compress_bytes_out(), framed.size() - 4);
+
+        ASSERT_EQ(s.take_answer(std::string("OK\n\n")), ob::Session::Queued::Yes);
+        const size_t both = s.pending_output_bytes();
+        std::string got;
+        drain_into(s, sv[1], got, both);
+        ASSERT_EQ(got.size(), both);
+        EXPECT_EQ(got.substr(0, framed.size()), framed);
+        // The second answer, framed by the session: its own length and frame, the text it was.
+        const std::string second = got.substr(framed.size());
+        ASSERT_GT(second.size(), 4u);
+        const auto text_back = ob::lz4_decompress(second.data() + 4, second.size() - 4);
+        EXPECT_EQ(std::string(text_back.begin(), text_back.end()), "OK\n\n")
+            << "the mark was not spent on the answer it was set for";
+
+        // A frame larger than the cap alone is refused as an answer is, and nothing is queued.
+        s.next_answer_framed(1);
+        std::string too_large(ob::Session::max_queued_bytes() + 1, 'f');
+        EXPECT_EQ(s.take_answer(std::move(too_large)), ob::Session::Queued::TooLargeAlone);
+        EXPECT_EQ(s.pending_output_bytes(), 0u);
+    }
+    ::close(sv[0]);
+    ::close(sv[1]);
 }
 
 // ── An answer too large to ever send (#152) ────────────────────────────────────

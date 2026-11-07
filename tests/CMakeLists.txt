@@ -379,6 +379,13 @@ ob_add_query_test(test_scan_parts
 )
 target_link_libraries(test_scan_parts PRIVATE orderbook_tcp_server_lib)
 
+# #257: a row answer measured against what its session may be sent while it is built, and the scan
+# stopped where it passed - on one thread and on the pool, in text and as an LZ4 frame.
+ob_add_query_test(test_answer_ceiling
+    test_answer_ceiling.cpp
+)
+target_link_libraries(test_answer_ceiling PRIVATE orderbook_tcp_server_lib)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

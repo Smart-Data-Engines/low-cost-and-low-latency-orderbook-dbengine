@@ -122,9 +122,16 @@ public:
     /// pending and nothing to frame it becomes the send buffer and is not copied, and `response` is
     /// left empty - as does any answer with more room than the buffer has, such as one written in
     /// the room lend_room() gave (#253). Otherwise it is queued as `queue_answer()` queues it, and `response` is left as it
-    /// was - so a refusal can still say how large it was. A name of its own rather than an overload,
-    /// which would make every call with a string literal ambiguous.
+    /// was. A name of its own rather than an overload, which would make every call with a string
+    /// literal ambiguous.
     Queued take_answer(std::string&& response);
+
+    /// The next answer take_answer() is given is an LZ4 frame already, its length in front (#257):
+    /// a row answer built as its text was written, so that the frame could be measured as it grew.
+    /// It is queued as it is - taken, with nothing pending - against the cap on its own size, and
+    /// `text_bytes`, the text it holds, goes to the compression counters. Set by the read that built
+    /// the frame and used by the take of its answer, on the session's own thread.
+    void next_answer_framed(uint64_t text_bytes);
 
     /// The send buffer's room for an answer to be written in, and handed back by take_answer()
     /// (#253): the buffer itself when nothing is pending - emptied, its capacity what the session's
@@ -352,6 +359,10 @@ private:
     uint64_t    command_count_{0};
     uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
     uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
+    bool        framed_next_{false};     // the next answer taken is a frame already (#257)
+    uint64_t    framed_text_bytes_{0};
+    /// take_answer() for an answer that is a frame already (#257).
+    Queued take_framed(std::string&& framed, uint64_t text_bytes);
 
     // TLS (#30 part three). Null means plaintext, and then every branch below is the one that
     // existed before - one pointer test on a path that already does a syscall.

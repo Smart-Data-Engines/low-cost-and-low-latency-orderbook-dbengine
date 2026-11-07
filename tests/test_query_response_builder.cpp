@@ -10,6 +10,7 @@
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/command_parser.hpp"
+#include "orderbook/compression.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/query_columns.hpp"
 #include "orderbook/query_engine.hpp"
@@ -521,6 +522,18 @@ TEST(QueryResponseOnTheServer, SelectAndBookAnswerWhatTheirCollectedRowsDid) {
         ASSERT_FALSE(book.empty());
         EXPECT_EQ(ob::execute_command(ob::parse_command("BOOK RBS EX"), engine, session, stats, false),
                   ob::format_query_response(book, ob::all_query_columns()));
+
+        // #257: on a session that compresses, the answer is the LZ4 frame of that text, its length
+        // in front, built as the rows came - and the session queues it as it is.
+        ob::Session lz4(-1);
+        lz4.set_compressed(true);
+        const std::string framed = ob::execute_command(ob::parse_command(sql), engine, lz4, stats, false);
+        ASSERT_GT(framed.size(), 4u);
+        const auto text = ob::lz4_decompress(framed.data() + 4, framed.size() - 4);
+        EXPECT_EQ(std::string(text.begin(), text.end()), ob::format_query_response(rows, shape.columns));
+        std::string taken = framed;
+        ASSERT_EQ(lz4.take_answer(std::move(taken)), ob::Session::Queued::Yes);
+        EXPECT_EQ(lz4.pending_output_bytes(), framed.size()) << "the frame was framed again";
         engine.close();
     }
     std::error_code ec;

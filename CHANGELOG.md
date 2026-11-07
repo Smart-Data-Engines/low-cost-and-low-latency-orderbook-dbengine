@@ -294,6 +294,17 @@ here as `#N`.
 
 ### Fixed
 
+- **An answer past what a session may be sent is refused where it passes it, not after its last row**
+  (#257). Since #152 such an answer was refused and the session kept - but built in full first: on
+  the m9g.xlarge a `SELECT *` of eight million rows formatted 367 MB, took the node's resident memory
+  up by 912 MB and held its client loop for 225 ms, to be told no. A row answer is measured against
+  the session's 64 MiB as it is built now, and the scan stops at the batch or the part that passes
+  it; a divided scan hands its pool no more parts than the answer has room for, and a part of a text
+  answer stops at the ceiling. On a session with `COMPRESS LZ4` the frame is what is measured, built
+  as the rows come, so text past the ceiling in a frame under it is still an answer. The refusal says
+  how many rows were within it: `ERR answer is larger than the 67108864 bytes a session may have
+  queued, past its first N rows; narrow the query or add LIMIT`, where it said the answer's size.
+
 - **A read on a node being demoted or promoted no longer reaches a replication client being built or
   destroyed** (#254). Every `SELECT`, `FLUSH`, write and backup asks whether the node is installing a
   snapshot, on its client loop, and it asked the replication client through a pointer the failover

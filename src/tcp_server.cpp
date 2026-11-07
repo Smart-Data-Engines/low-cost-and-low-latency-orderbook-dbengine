@@ -844,6 +844,16 @@ void execute_writes(std::span<const Command> cmds,
 
 namespace {
 
+/// The refusal of an answer larger than a session may have queued (#152, #257). Its size is not
+/// said: since #257 the answer is not built past the ceiling, so nobody knows it. The rows within
+/// it are, where they were counted - a `LIMIT` of that many fits.
+std::string answer_too_large(uint64_t rows_within) {
+    std::string why = "answer is larger than the " + std::to_string(Session::max_queued_bytes()) +
+                      " bytes a session may have queued";
+    if (rows_within > 0) why += ", past its first " + std::to_string(rows_within) + " rows";
+    return why + "; narrow the query or add LIMIT";
+}
+
 /// A read's answer - `SELECT` and `BOOK` - with what both do around the engine's call: the refusal
 /// during a snapshot bootstrap, the rows formatted as the engine hands them over, and the latency
 /// and counters every read shares. `read` makes the call with the row callback it is given and
@@ -860,8 +870,11 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
     if (engine.is_bootstrapping()) return format_error("bootstrapping");
     const auto started = std::chrono::steady_clock::now();
     // Written in the session's send buffer's room, which take_answer() gives back with the reply
-    // (#253): a session's large answers are written where the last one was.
-    QueryResponseBuilder reply(shape, session.lend_room());
+    // (#253): a session's large answers are written where the last one was. Measured against what
+    // the session may be sent as it is built (#257) - its frame, where the session compresses - so
+    // that an answer past it stops being read and formatted there, rather than at its last row.
+    QueryResponseBuilder reply(shape, session.lend_room(),
+                               AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()});
     try {
         // The builder twice: as a row callback for whatever arrives one result at a time, and as
         // the place a row answer's batches go (OB-12).
@@ -877,7 +890,19 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
                      sanitise_for_log(e.what(), 256).c_str());
         return format_error(e.what());
     }
+    if (reply.full()) {
+        // No client could be sent this however fast it reads: refused as #152 refuses it, with the
+        // session left open - but now where it passed the ceiling, not after its last row (#257).
+        OB_LOG_INFO("tcp_server", "%s from fd=%d passed its answer's ceiling of %zu bytes after %llu "
+                    "row(s), %zu byte(s) built (%s): refused, the first %llu row(s) within it", what,
+                    session.fd(), Session::max_queued_bytes(),
+                    static_cast<unsigned long long>(reply.rows_taken()), reply.bytes_built(),
+                    reply.framed() ? "an LZ4 frame" : "text",
+                    static_cast<unsigned long long>(reply.rows_within()));
+        return format_error(answer_too_large(reply.rows_within()));
+    }
     std::string answer = reply.finish();
+    if (reply.framed()) session.next_answer_framed(reply.text_bytes());
     if (registry) {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -3665,11 +3690,7 @@ void Reactor::run_loop() {
                                     // No client could be sent this, however fast it reads, so the
                                     // session is not the thing that failed: it gets an error in
                                     // the answer's place and stays open (#152).
-                                    const std::string refusal = format_error(
-                                        "answer of " + std::to_string(response.size()) +
-                                        " bytes is larger than the " +
-                                        std::to_string(Session::max_queued_bytes()) +
-                                        " a session may have queued; narrow the query or add LIMIT");
+                                    const std::string refusal = format_error(answer_too_large(0));
                                     return session->queue_response(refusal);
                                 }
                                 // The send buffer cap: a client that has stopped reading. EPIPE
