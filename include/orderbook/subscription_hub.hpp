@@ -131,6 +131,9 @@ private:
     const size_t max_queue_bytes_;
     const int    max_per_session_;
 
+    /// The most a drain gives a queue back as room for the next writes (#263).
+    static constexpr size_t kPendingRoom = 64 * 1024;
+
     mutable std::mutex mtx_;
     /// By subscription id (#263): a write reaches a queue in one lookup, however many the hub holds.
     std::unordered_map<uint64_t, SubscriberQueue> queues_;
