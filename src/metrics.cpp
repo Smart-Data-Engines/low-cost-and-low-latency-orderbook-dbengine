@@ -171,7 +171,7 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_tls_handshakes_total",
                                      "Client-port TLS handshakes completed off the client loops (#265)"));
     counters_.push_back(make_counter("ob_tls_handshake_failures_total",
-                                     "Client-port TLS handshakes that failed, each connection closed (#265)"));
+                                     "Client-port TLS handshakes that failed on the handshake threads, each connection closed (#265)"));
     counters_.push_back(make_counter("ob_tls_handshake_timeouts_total",
                                      "Client-port TLS handshakes past --tls-handshake-timeout-ms, each connection closed (#265)"));
     // Large reads answered off the client loops (#260).
@@ -403,7 +403,7 @@ MetricsRegistry::MetricsRegistry() {
     // A large read's wait for a thread off the client loops (#260): its session waits with it, so a
     // queue that grows is reads every thread is busy with, and a reason for --large-read-threads.
     histograms_.push_back(make_histogram("ob_tls_handshake_seconds",
-                                         "Seconds from a connection's hand to a TLS handshake thread to its handshake done (#265)"));
+                                         "Seconds from a handshake thread taking a connection to its TLS handshake done (#265)"));
     histograms_.push_back(make_histogram("ob_off_loop_read_wait_seconds",
                                          "Seconds a large read waited for a thread off the client loops (#260)"));
     histograms_.push_back(make_histogram("ob_off_loop_flush_wait_seconds",

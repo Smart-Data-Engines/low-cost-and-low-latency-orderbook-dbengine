@@ -1614,6 +1614,116 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "TLS handshakes off the client loops",
+      "id": 49,
+      "description": "Handshakes a second the client port's handshake threads completed (#265), and those they closed: failed, or not done within --tls-handshake-timeout-ms. A node with --tls-handshake-threads 0 drives them on its loops and counts none here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 96
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(ob_tls_handshakes_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "done {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instance) (rate(ob_tls_handshake_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "failed {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (instance) (rate(ob_tls_handshake_timeouts_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "timed out {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "A TLS handshake's time, p99, and handshakes under way",
+      "id": 50,
+      "description": "How long a handshake took on its thread, from the moment the thread took the connection to the session given to its loop (#265), and how many are under way now. Handshakes under way that keep growing are more than the threads sign: more --tls-handshake-threads, or clients reconnecting in a loop.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 96
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(ob_tls_handshake_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99 {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (instance) (ob_tls_handshakes_in_flight{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "under way {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Large reads and FLUSHes off the client loops",
       "id": 45,
