@@ -534,9 +534,9 @@ answer, and a read sent after it sees what it wrote. Measured as above, the back
 
 | | ARM before | after | x86 before | after |
 |---|---|---|---|---|
-| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 152-198 ms | 0.023-0.036 ms | 114-155 ms | 0.029-0.103 ms |
-| the same of 100 000 rows in 100 books | 26.6-29.7 ms | 0.017-0.068 ms | 26.1-30.4 ms | 0.021-0.039 ms |
-| a FLUSH with nothing waiting, p50 | 14.2-15.3 us | 18.3-19.7 us | 7.1-8.9 us | 10.1-11.1 us |
+| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 141.5-148.7 ms | 0.024-0.031 ms | 146.9-182.3 ms | 0.030-0.147 ms |
+| the same of 100 000 rows in 100 books | 25.8-27.7 ms | 0.013-0.047 ms | 32.1-35.4 ms | 0.013-0.026 ms |
+| a FLUSH with nothing waiting, p50 | 14.1-15.8 us | 19.5-19.6 us | 7.0-8.9 us | 10.1-10.9 us |
 
 A FLUSH takes as long as it did - it is the same work - and one with nothing waiting pays for the hand
 to the thread and back. `ob_off_loop_flushes_total`, `ob_off_loop_flushes_in_flight` and
