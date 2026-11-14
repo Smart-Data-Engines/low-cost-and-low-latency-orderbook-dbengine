@@ -273,6 +273,24 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
             const std::string dir = s.segment(rows);
             RC_ASSERT(!dir.empty());
             if (what != 1) {
+                // Sometimes with a block published and not sealed before the summary, as the drain
+                // publishes them: its rows are after the segment's, or - an event time a client gave -
+                // inside the span the summary is composed over.
+                if (*rc::gen::inRange(0, 3) == 0) {
+                    std::vector<ob::SnapshotRow> more;
+                    const int m = *rc::gen::inRange(1, 4);
+                    for (int k = 0; k < m; ++k) {
+                        const bool inside = *rc::gen::inRange(0, 2) == 0;
+                        const uint64_t ts = inside ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40))
+                                                   : latest + 1 + static_cast<uint64_t>(*rc::gen::inRange(0, 4));
+                        if (!inside) latest = std::max(latest, ts);
+                        more.push_back(row(ts, *rc::gen::inRange(0, 2) == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
+                                           90 + *rc::gen::inRange<int64_t>(0, 15),
+                                           static_cast<uint64_t>(*rc::gen::inRange(0, 50)),
+                                           static_cast<uint64_t>(500 + i * 10 + k)));
+                    }
+                    s.block(more);
+                }
                 const std::string why = s.summarise_and_compare(dir);
                 RC_ASSERT(why.empty());
             }
