@@ -15,9 +15,11 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -33,23 +35,46 @@ using namespace std::chrono_literals;
 
 namespace {
 
+/// A certificate and its key in a directory of their own, removed with it; both empty when the openssl
+/// tool could not make them.
 struct KeyPair {
+    fs::path    dir;
     std::string cert, key;
+
+    explicit KeyPair(const std::string& tag)
+        : dir(fs::temp_directory_path() / ("ob_tlshp_" + tag + "_" + std::to_string(::getpid()))) {
+        fs::create_directories(dir);
+        const std::string c = (dir / "cert.pem").string();
+        const std::string k = (dir / "key.pem").string();
+        const std::string cmd = "openssl req -x509 -newkey rsa:2048 -keyout '" + k + "' -out '" + c +
+                                "' -days 1 -nodes -subj '/CN=localhost' >/dev/null 2>&1";
+        if (std::system(cmd.c_str()) != 0) return;
+        ::chmod(k.c_str(), 0600);
+        cert = c;
+        key  = k;
+    }
+    ~KeyPair() {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    KeyPair(const KeyPair&)            = delete;
+    KeyPair& operator=(const KeyPair&) = delete;
 };
 
-KeyPair generate(const std::string& tag) {
-    const auto dir = fs::temp_directory_path() / ("ob_tlshp_" + tag + std::to_string(std::rand()));
-    fs::create_directories(dir);
-    const std::string cert = (dir / "cert.pem").string();
-    const std::string key  = (dir / "key.pem").string();
-    const std::string cmd = "openssl req -x509 -newkey rsa:2048 -keyout '" + key + "' -out '" + cert +
-                            "' -days 1 -nodes -subj '/CN=localhost' >/dev/null 2>&1";
-    if (std::system(cmd.c_str()) != 0) return {"", ""};
-    ::chmod(key.c_str(), 0600);
-    return {cert, key};
-}
-
 void set_nonblocking(int fd) { ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
+
+/// Whether the client's end reads the server's end closed: the end of the stream, or a reset where the
+/// pool closed with bytes the client sent still unread, which a Unix socket pair reports as ECONNRESET.
+/// Within ten seconds, so that a server's end left open fails the test rather than hanging it.
+bool closed_by_server(int fd) {
+    timeval tv{};
+    tv.tv_sec = 10;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[256];
+    ssize_t n = 0;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) {}
+    return n == 0 || (n < 0 && errno == ECONNRESET);
+}
 
 /// What the pool gave back, gathered under a lock for the test's thread to wait on.
 struct Outcome {
@@ -100,7 +125,7 @@ std::shared_ptr<ob::TlsSurface> surface_of(const KeyPair& kp) {
 }  // namespace
 
 TEST(TlsHandshakePool, AHandshakeIsDoneOffTheLoopAndTheSessionGivenToTheLoopItWasDealtTo) {
-    const KeyPair kp = generate("done");
+    const KeyPair kp("done");
     ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
     ob::MetricsRegistry registry;
     Outcome out;
@@ -141,7 +166,7 @@ TEST(TlsHandshakePool, AHandshakeIsDoneOffTheLoopAndTheSessionGivenToTheLoopItWa
 }
 
 TEST(TlsHandshakePool, AHandshakeThatFailsIsClosedAndItsPlaceGivenBack) {
-    const KeyPair kp = generate("fail");
+    const KeyPair kp("fail");
     ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
     ob::MetricsRegistry registry;
     Outcome out;
@@ -162,15 +187,12 @@ TEST(TlsHandshakePool, AHandshakeThatFailsIsClosedAndItsPlaceGivenBack) {
     EXPECT_EQ(out.given_back, 1);
     EXPECT_EQ(registry.counter_value("ob_tls_handshake_failures_total"), 1u);
     EXPECT_EQ(registry.gauge_value("ob_tls_handshakes_in_flight"), 0);
-    // Closed by the pool: the client reads its end of the stream (an alert, maybe, then nothing).
-    char buf[256];
-    ssize_t n = 0;
-    while ((n = ::recv(sv[1], buf, sizeof(buf), 0)) > 0) {}
-    EXPECT_EQ(n, 0) << "the server's end was not closed";
+    // Closed by the pool, with the rest of the request unread: an alert, maybe, then the reset.
+    EXPECT_TRUE(closed_by_server(sv[1])) << "the server's end was not closed";
 }
 
 TEST(TlsHandshakePool, AHandshakeThatNeverStartsIsClosedAtItsDeadline) {
-    const KeyPair kp = generate("late");
+    const KeyPair kp("late");
     ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
     ob::MetricsRegistry registry;
     Outcome out;
@@ -192,12 +214,11 @@ TEST(TlsHandshakePool, AHandshakeThatNeverStartsIsClosedAtItsDeadline) {
     EXPECT_EQ(registry.counter_value("ob_tls_handshake_timeouts_total"), 1u);
     EXPECT_EQ(registry.counter_value("ob_tls_handshake_failures_total"), 0u);
     EXPECT_EQ(registry.gauge_value("ob_tls_handshakes_in_flight"), 0);
-    char buf[16];
-    EXPECT_EQ(::recv(sv[1], buf, sizeof(buf), 0), 0) << "the server's end was not closed";
+    EXPECT_TRUE(closed_by_server(sv[1])) << "the server's end was not closed";
 }
 
 TEST(TlsHandshakePool, AHandshakeUnderWayWhenThePoolStopsIsClosedAndItsPlaceGivenBack) {
-    const KeyPair kp = generate("stop");
+    const KeyPair kp("stop");
     ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
     ob::MetricsRegistry registry;
     Outcome out;
@@ -220,12 +241,11 @@ TEST(TlsHandshakePool, AHandshakeUnderWayWhenThePoolStopsIsClosedAndItsPlaceGive
     EXPECT_TRUE(out.done.empty());
     EXPECT_EQ(out.given_back, 1) << "the pool stopped and the connection's place was not given back";
     EXPECT_EQ(registry.gauge_value("ob_tls_handshakes_in_flight"), 0);
-    char buf[16];
-    EXPECT_EQ(::recv(sv[1], buf, sizeof(buf), 0), 0) << "the server's end was not closed";
+    EXPECT_TRUE(closed_by_server(sv[1])) << "the server's end was not closed";
 }
 
 TEST(TlsHandshakePool, ConnectionsOnSeveralThreadsEachReachTheLoopTheyWereDealtTo) {
-    const KeyPair kp = generate("many");
+    const KeyPair kp("many");
     ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
     ob::MetricsRegistry registry;
     Outcome out;
