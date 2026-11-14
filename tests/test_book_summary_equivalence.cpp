@@ -178,12 +178,19 @@ struct Store {
         pending.clear();
         for (const auto& rows : again) block(rows);
     }
+    size_t compared = 0;   ///< summaries written and compared
+    std::string last_why_not;
+
     /// A summary, and whether its two files are the oracle's: "" when they are, or what differs.
     std::string summarise_and_compare(const std::string& seg_dir) {
         // The summary it will start from: the newest one the index holds, before the one written.
         const std::vector<uint64_t> before = store->book_summaries("SUM", "EX");
         const ob::ColumnarStore::SummaryWrite w = store->write_book_summary("SUM", "EX", seg_dir);
-        if (!w.written) return {};
+        if (!w.written) {
+            last_why_not = w.why_not;
+            return {};
+        }
+        ++compared;
         std::optional<uint64_t> from;
         for (uint64_t t : before) {
             if (t < w.as_of_ts && (!from || t > *from)) from = t;
@@ -262,4 +269,17 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
         }
         if (*rc::gen::inRange(0, 8) == 0) s.reopen();   // the blocks go with the process, as on a crash
     }
+    // And one after all of it, so that every case compares: rows after the latest, a segment, a summary.
+    std::vector<ob::SnapshotRow> last;
+    for (int k = 0; k < 3; ++k) {
+        last.push_back(row(latest + 1 + static_cast<uint64_t>(k), k % 2 == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
+                           90 + k, static_cast<uint64_t>(k + 1), 1000 + static_cast<uint64_t>(k)));
+    }
+    const std::string dir = s.segment(last);
+    RC_ASSERT(!dir.empty());
+    const std::string why = s.summarise_and_compare(dir);
+    RC_ASSERT(why.empty());
+    RC_CLASSIFY(s.compared == 1, "one summary compared");
+    RC_CLASSIFY(s.compared > 1, "more than one compared");
+    RC_ASSERT(s.compared > 0u);
 }
