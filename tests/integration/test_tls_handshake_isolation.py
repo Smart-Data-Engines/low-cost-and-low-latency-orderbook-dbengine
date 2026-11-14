@@ -141,6 +141,14 @@ class Node:
         self.log.close()
 
 
+def no_sessions(node: Node, why: str = "a session stayed open") -> None:
+    """Until the node counts no open session."""
+    deadline = time.monotonic() + patience(10)
+    while node.metric("ob_active_sessions") != 0:
+        assert time.monotonic() < deadline, why
+        time.sleep(0.05)
+
+
 def tls_session(port: int) -> ssl.SSLSocket:
     s = tls_client().wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=patience(30)))
     return s
@@ -226,7 +234,8 @@ def test_a_connection_that_never_starts_its_handshake_is_closed_at_its_deadline(
         pytest.skip("the openssl tool makes the certificates")
     node = Node(tmp_path, "--tls-handshake-timeout-ms", "500")
     try:
-        sessions = node.metric("ob_active_sessions")
+        # The start's probe connection may not have been closed yet: none open is what to come back to.
+        no_sessions(node)
         raw = socket.create_connection(("127.0.0.1", node.port), timeout=patience(10))
         started = time.monotonic()
         try:
@@ -236,10 +245,7 @@ def test_a_connection_that_never_starts_its_handshake_is_closed_at_its_deadline(
         waited = time.monotonic() - started
         assert got == b"", f"a connection that sent nothing was sent {got!r}"
         assert waited >= 0.45, f"closed after {waited:.2f} s, before its 0.5 s"
-        deadline = time.monotonic() + patience(10)
-        while node.metric("ob_active_sessions") != sessions:
-            assert time.monotonic() < deadline, "its place in --max-sessions was not given back"
-            time.sleep(0.05)
+        no_sessions(node, "its place in --max-sessions was not given back")
         assert node.metric("ob_tls_handshake_timeouts_total") == 1
     finally:
         node.stop()
