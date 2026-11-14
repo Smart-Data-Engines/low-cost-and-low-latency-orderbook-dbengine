@@ -2924,10 +2924,12 @@ resume as a step of its own), for an OpenSSL that holds what came behind the cli
 buffer - which without read-ahead, off in every context here, it does not. With
 `--tls-handshake-threads 0` the loops drive the handshakes, as before.
 
-Measured on the test hosts with Release builds, `master` (`113de4b`) against this change (`5b0b334`), one
-client loop, three rounds of each certificate with the builds taking turns: a process `PING`s every half
-millisecond through the Unix socket, plain and served by the same loop, while two processes open TLS
-connections back to back for 5 s, each a full TLS 1.3 handshake and the banner.
+Measured on the test hosts with Release builds, `master` (`113de4b`) against this change on it
+(`5b0b334`, before it was moved onto #263 and #264; the evidence maps each commit to the one it became),
+one client loop, three rounds of each certificate with the builds taking turns: a process `PING`s every
+half millisecond through the Unix socket, plain and served by the same loop, while two processes - or
+one, in the rows that say so - open TLS connections back to back for 5 s, each a full TLS 1.3 handshake
+and the banner.
 
 | | m9g.xlarge before | after | m8a.xlarge before | after |
 |---|---|---|---|---|
