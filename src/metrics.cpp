@@ -170,6 +170,8 @@ MetricsRegistry::MetricsRegistry() {
     // Large reads answered off the client loops (#260).
     counters_.push_back(make_counter("ob_off_loop_reads_total",
                                      "SELECTs answered off their client loop: the index put their scan past the threshold (#260)"));
+    counters_.push_back(make_counter("ob_off_loop_flushes_total",
+                                     "FLUSHes answered off their client loop (#261)"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.
@@ -292,6 +294,8 @@ MetricsRegistry::MetricsRegistry() {
                                  "Number of active client sessions, over TCP and the Unix socket"));
     gauges_.push_back(make_gauge("ob_off_loop_reads_in_flight",
                                  "SELECTs handed to the threads off the client loops whose answer has not come back (#260)"));
+    gauges_.push_back(make_gauge("ob_off_loop_flushes_in_flight",
+                                 "FLUSHes handed to the threads off the client loops whose answer has not come back (#261)"));
     gauges_.push_back(make_gauge("ob_ring_bytes",
                                  "Shared memory the sessions in rings hold, in bytes"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
@@ -391,6 +395,8 @@ MetricsRegistry::MetricsRegistry() {
     // queue that grows is reads every thread is busy with, and a reason for --large-read-threads.
     histograms_.push_back(make_histogram("ob_off_loop_read_wait_seconds",
                                          "Seconds a large read waited for a thread off the client loops (#260)"));
+    histograms_.push_back(make_histogram("ob_off_loop_flush_wait_seconds",
+                                         "Seconds a FLUSH waited for a thread off the client loops (#261)"));
 
     // Multi-master metrics
     gauges_.push_back(make_gauge("ob_mm_peers_connected",          "Number of connected multi-master peers"));

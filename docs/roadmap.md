@@ -2918,6 +2918,46 @@ is the load it checks it under - at least as many updates as before. 30 runs of 
 
 - Effort: S | Impact: the suite passes on ARM as it does on x86
 
+### 261. A FLUSH held its client loop, and every session on it, for as long as it wrote ✅ **P1**
+
+**Found after #260, asking what else one session's command costs the sessions on its loop** (spec
+`smart-data-engine-workspace/specs/flush-off-the-loop/`, evidence
+`evidence/2026-11-07-flush-off-the-loop/`). `FLUSH` called `Engine::flush_incremental()` on its client
+loop. The flush's phases already kept other loops' writers out of it - the engine's lock only to take
+the rows waiting, the segments written without it - but its own loop waited for all of it: a `PING`
+beside a `FLUSH` of 500 000 rows in 1 000 books waited 112-180 ms on the m9g.xlarge, with the
+background flush at its default 100 ms too, and the Python client's `flush()` is a FLUSH.
+
+**Past its refusals, a FLUSH is answered on the threads of #260.** A read-only node, a replica and a
+bootstrap still refuse it on the loop; otherwise `take_flush()` hands it to `--large-read-threads`, its
+session waits for its answer - what came behind it in the session, what comes later in the socket - and
+a read sent after it sees what it wrote. Its answer is the one it had, `OK` or the failed sync's `ERR`,
+built in one place for both (`flush_answer()`). A session in rings, and a node with
+`--large-read-threads 0`, flush on the loop. `OffLoopReads` is `OffLoopWork` (`take_read()`,
+`take_flush()`), and a session's flag `waiting_off_loop()`.
+
+Measured with Release builds, one client loop and no flush in the background
+(`--flush-interval-ms 600000`), #260's final code against this one, three rounds each, the `PING`s sent
+by a process of their own and counted while the FLUSH was answered:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 152-198 ms | 23-36 us | 114-155 ms | 29-103 us |
+| the same of 100 000 rows in 100 books | 26.6-29.7 ms | 17-68 us | 26.1-30.4 ms | 21-39 us |
+| the FLUSH of 500 000 rows itself | 152-198 ms | 155-163 ms | 115-155 ms | 119-133 ms |
+
+A FLUSH with nothing waiting pays for the hand to the thread and back: 18.3-19.7 us at p50 where it
+took 14.2-15.3 on the m9g.xlarge, and 10.1-11.1 where 7.1-8.9 on the m8a.xlarge. One that has a row to
+write is the WAL's sync, 3.9 ms and 7.5 ms at p50 after one `INSERT`, as it was.
+
+Tests: `tests/integration/test_flush_isolation.py` (a `PING` beside a FLUSH of 300 000 rows in 1 000
+books under a tenth of the one on the loop, with the metrics; a session's answers in order around a
+FLUSH, a read and a `PING` sent while it is written seeing what it wrote; a read-only node refusing on
+its loop). Mutation table (`mutations/` in the evidence, ARM): 8 mutants, 7 killed - each by the test of what
+it breaks - and the control survives.
+
+- Effort: S | Impact: a client's FLUSH no longer holds the sessions of its loop
+
 ### 260. A large read held its client loop, and every session on it, for as long as it was answered ✅ **P1**
 
 **Found measuring #257** (spec `smart-data-engine-workspace/specs/large-answer-off-the-loop/`,
