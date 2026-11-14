@@ -180,6 +180,69 @@ jobs:
             echo "This runner's CPU has no avx512f: the AVX-512 build compiled and was not run."
           fi
 
+  # The C++ suite on aarch64 (#264), as build-and-test runs it on x86. The release ships an ARM64
+  # package, built and accepted here on every pull request (package-arm64), and until this job nothing
+  # ran the tests on ARM: a test whose control raced the scheduler failed 16 runs of 20 on the ARM test
+  # host and passed every run CI made (#262). The integration battery stays on x86 - its timings are
+  # the ones the battery's patience was calibrated on, and what differs by architecture is in the C++
+  # suite: the codec, the SoA buffer's ordering, the rings' fences.
+  build-and-test-arm64:
+    name: build-and-test-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libzstd-dev libcurl4-openssl-dev
+
+      - name: Install etcd
+        env:
+          ETCD_VER: v3.5.17
+        run: |
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-arm64.tar.gz" | tar xz
+          sudo install -m755 "etcd-${ETCD_VER}-linux-arm64/etcd" "etcd-${ETCD_VER}-linux-arm64/etcdctl" /usr/local/bin/
+          etcd --version
+
+      - name: Start etcd
+        run: |
+          etcd --name ci-etcd --data-dir /tmp/ci-etcd \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            --listen-client-urls http://127.0.0.1:2379 \
+            > /tmp/ci-etcd.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2379/version && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:2379/version
+
+      # Keyed by the architecture too: build/_deps holds the dependencies' builds, not only their
+      # sources, and an x86 cache restored here would be objects of the wrong machine.
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      # -j1, as on x86: the network tests bind fixed ports.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j1
+
+      - name: Test against etcd
+        run: OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+
 
   # The whole pytest suite against a plain build, on every pull request.
   #

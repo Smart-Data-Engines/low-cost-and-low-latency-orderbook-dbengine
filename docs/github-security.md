@@ -21,8 +21,9 @@ The required checks and the remaining branch protections are described below.
 
 ### Required checks and how to update them ✅
 
-**Fourteen checks are required** since #42 added `package-arm64`, the release's packages built and
-accepted on aarch64 on every pull request; #147 removed the io_uring transport and with it
+**Fifteen checks are required** since #264 added `build-and-test-arm64`, the C++ suite on aarch64 on
+every pull request, and #42 `package-arm64`, the release's packages built and accepted there; #147
+removed the io_uring transport and with it
 `io-uring-build`, which #108 had added, and #38 added `fuzz` before that. The complete list lives in
 [`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
 protections. That sentence is no longer maintained by hand: the drift checker derives the count from
