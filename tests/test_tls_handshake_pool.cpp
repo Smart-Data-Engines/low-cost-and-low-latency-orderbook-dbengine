@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -60,6 +61,13 @@ struct KeyPair {
     KeyPair(const KeyPair&)            = delete;
     KeyPair& operator=(const KeyPair&) = delete;
 };
+
+/// A client writing to a connection the pool has closed raises SIGPIPE, whose default action would end
+/// this binary before an assertion could say which test failed.
+[[maybe_unused]] const bool kSigpipeIgnored = [] {
+    std::signal(SIGPIPE, SIG_IGN);
+    return true;
+}();
 
 void set_nonblocking(int fd) { ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
 
