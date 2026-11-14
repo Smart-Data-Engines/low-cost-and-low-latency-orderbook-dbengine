@@ -334,22 +334,28 @@ TEST(QueryBookStatic, TheLabelComesFromTheSnapshotAndASubscriptionIsInForceWhenI
            "returns, so it can pair one update's number with another's time";
 
     // **A subscription is in force for every write after `subscribe()` returns**: the engine takes
-    // the write lock once, after registering.
+    // the write lock once, after registering - in subscribe() and in the server's subscribe_batch()
+    // (#263) alike.
     const std::string engine = read("src/engine.cpp");
-    const std::size_t at = engine.find("uint64_t Engine::subscribe(");
-    ASSERT_NE(at, std::string::npos) << "Engine::subscribe() is not in src/engine.cpp - this "
-                                        "test's anchor has moved, so it is asserting about nothing";
-    const std::size_t end = engine.find("\n}\n", at);
-    const std::string body = engine.substr(at, end == std::string::npos ? std::string::npos
-                                                                        : end - at);
-    const std::size_t registered = body.find("query_engine_->subscribe(");
-    const std::size_t locked = body.find("std::lock_guard<std::mutex> in_force(mtx_);");
-    ASSERT_NE(registered, std::string::npos) << "Engine::subscribe() no longer registers through "
-                                                "the query engine - this test's anchor has moved";
-    EXPECT_NE(locked, std::string::npos)
-        << "Engine::subscribe() does not take the write lock: a write may then read the subscriber "
-           "flag before the registration is visible, and its update is neither pushed nor in a book "
-           "taken after subscribing";
-    EXPECT_GT(locked, registered) << "Engine::subscribe() takes the write lock before registering, "
-                                     "which orders nothing after the registration";
+    for (const auto& [function, registers] :
+         {std::pair<std::string, std::string>{"uint64_t Engine::subscribe(", "query_engine_->subscribe("},
+          std::pair<std::string, std::string>{"uint64_t Engine::subscribe_batch(",
+                                              "query_engine_->subscribe_batch("}}) {
+        const std::size_t at = engine.find(function);
+        ASSERT_NE(at, std::string::npos) << function << " is not in src/engine.cpp - this test's "
+                                            "anchor has moved, so it is asserting about nothing";
+        const std::size_t end = engine.find("\n}\n", at);
+        const std::string body = engine.substr(at, end == std::string::npos ? std::string::npos
+                                                                            : end - at);
+        const std::size_t registered = body.find(registers);
+        const std::size_t locked = body.find("std::lock_guard<std::mutex> in_force(mtx_);");
+        ASSERT_NE(registered, std::string::npos) << function << " no longer registers through the "
+                                                    "query engine - this test's anchor has moved";
+        EXPECT_NE(locked, std::string::npos)
+            << function << " does not take the write lock: a write may then read the subscriber "
+               "flag before the registration is visible, and its update is neither pushed nor in a "
+               "book taken after subscribing";
+        EXPECT_GT(locked, registered) << function << " takes the write lock before registering, "
+                                                     "which orders nothing after the registration";
+    }
 }

@@ -932,10 +932,6 @@ public:
     bool is_multi_master() const { return mm_config_.enabled; }
 
 private:
-    /// A subscription's registration made to hold for every write after it (#239): subscribe() and
-    /// subscribe_batch() return through this.
-    uint64_t in_force(uint64_t id);
-
     std::string base_dir_;
     /// Where the WAL lives (#186). Before `wal_`, which opens its first file as it is built, because
     /// the refusals that keep a moved WAL from being a lost one run as this is resolved.
