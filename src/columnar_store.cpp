@@ -2811,61 +2811,123 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
         gather_locked(0, at, symbol, exchange, at, g);
     }
     uint64_t from = 0;
+    BookSummary summary;
+    bool from_summary = false;
     if (g.summary.has_value()) {
-        BookSummary summary;
         if (read_book_summary(g.summary->second, summary).empty()) {
+            from_summary = true;
+            from = summary.header.as_of_ts;
+        } else {
+            // read_book_summary() said why. The rows themselves are the answer, from the first.
+            g = Gathered{};
+            std::shared_lock<std::shared_mutex> lock(index_mtx_);
+            gather_locked(0, at, symbol, exchange, std::nullopt, g);
+        }
+    }
+    // The best of each side where the composition starts, and after each instant at which it
+    // changed: the rows of one instant are applied together, and the best after all of them is the
+    // one in force, as a series takes it (#243).
+    const auto top_now = [&]() {
+        BookTop t;
+        if (!bids.empty()) {
+            t.has_bid = true;
+            t.bid = bids.best();
+        }
+        if (!asks.empty()) {
+            t.has_ask = true;
+            t.ask = asks.best();
+        }
+        return t;
+    };
+    uint64_t instant = 0;
+    bool pending = false;
+    // The book the composition starts from - the summary's, or none - and the track's first entry.
+    // Again, from nothing, when the read below gives up on the order it hoped for.
+    const auto start = [&]() {
+        bids.clear();
+        asks.clear();
+        out.as_of.reset();
+        out.from_summary.reset();
+        if (from_summary) {
             for (const SnapshotRow& r : summary.rows) apply(r);
             SnapshotRow label{};
             label.timestamp_ns    = summary.header.as_of_ts;
             label.sequence_number = summary.header.as_of_seq;
             out.as_of = label;
             out.from_summary = summary.header.as_of_ts;
-            from = summary.header.as_of_ts;
+        }
+        instant = 0;
+        pending = false;
+        if (track != nullptr) {
+            track->header.from_ts = from;
+            track->header.from_first_row = !out.from_summary.has_value();
+            track->entries.assign(1, BestTrackEntry{from, top_now()});
+        }
+    };
+    const auto close_instant = [&]() {
+        if (const BookTop t = top_now(); !(t == track->entries.back().top)) {
+            track->entries.push_back(BestTrackEntry{instant, t});
+        }
+    };
+    const auto each = [&](const SnapshotRow& r) {
+        if (track != nullptr) {
+            if (pending && r.timestamp_ns != instant) close_instant();
+            instant = r.timestamp_ns;
+            pending = true;
+        }
+        return apply(r);
+    };
+    start();
+
+    // A summary's span is mostly the one segment sealed since the summary it starts from, its rows in
+    // time order, and no block with a row in it. Then its rows are applied as the decoder gives them,
+    // a batch at a time, rather than copied into a run, sorted if they need it and merged (#266). A row
+    // before the one ahead of it - an event time a client gave - sends the composition back to the
+    // merge, from the start: the merge orders such a span by time, and this would not.
+    const auto reaches = [&](const std::shared_ptr<const RowBlock>& b) {
+        return !(b->max_ts_ns < from || b->min_ts_ns > at);
+    };
+    const bool one_segment = g.found && g.segments.size() == 1 && g.segments[0].time_range_is_rows &&
+                             std::none_of(g.blocks.begin(), g.blocks.end(), reaches);
+    bool direct = false;
+    if (one_segment) {
+        bool in_order = true;
+        uint64_t last = 0;
+        uint64_t kept = 0;
+        uint64_t filtered = 0;
+        const BatchReader as_read = [&](const RowBatch& b) -> BatchVerdict {
+            for (size_t k = 0; k < b.rows.size(); ++k) {
+                const SnapshotRow r = row_of(b, b.rows[k]);
+                if (r.timestamp_ns < last) {
+                    in_order = false;
+                    return {true, k};
+                }
+                last = r.timestamp_ns;
+                ++kept;
+                each(r);
+            }
+            return {};
+        };
+        read_segment_rows(g.segments[0], columns, from, at, RowFilter{}, as_read, ReadMode::kQuery,
+                          &filtered);
+        if (in_order) {
+            direct = true;
+            out.cost.candidates    = 1;
+            out.cost.blocks        = g.blocks.size();
+            out.cost.kept          = kept;
+            out.cost.delivered     = kept;
+            out.cost.rows_filtered = filtered;
         } else {
-            // read_book_summary() said why. The rows themselves are the answer, from the first.
-            bids.clear();
-            asks.clear();
-            out.as_of.reset();
-            g = Gathered{};
-            std::shared_lock<std::shared_mutex> lock(index_mtx_);
-            gather_locked(0, at, symbol, exchange, std::nullopt, g);
+            OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: its segment's rows are not in "
+                                     "time order; composed again through the merge",
+                         static_cast<int>(symbol.size()), symbol.data(),
+                         static_cast<int>(exchange.size()), exchange.data(),
+                         static_cast<unsigned long long>(at));
+            start();
         }
     }
-    if (track == nullptr) {
-        out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{}, apply);
-    } else {
-        // The best of each side where the composition starts, and after each instant at which it
-        // changed: the rows of one instant are applied together, and the best after all of them is
-        // the one in force, as a series takes it (#243).
-        const auto top_now = [&]() {
-            BookTop t;
-            if (!bids.empty()) {
-                t.has_bid = true;
-                t.bid = bids.best();
-            }
-            if (!asks.empty()) {
-                t.has_ask = true;
-                t.ask = asks.best();
-            }
-            return t;
-        };
-        track->header.from_ts = from;
-        track->header.from_first_row = !out.from_summary.has_value();
-        track->entries.assign(1, BestTrackEntry{from, top_now()});
-        uint64_t instant = 0;
-        bool pending = false;
-        const auto close_instant = [&]() {
-            if (const BookTop t = top_now(); !(t == track->entries.back().top)) {
-                track->entries.push_back(BestTrackEntry{instant, t});
-            }
-        };
-        out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{},
-                                 [&](const SnapshotRow& r) {
-                                     if (pending && r.timestamp_ns != instant) close_instant();
-                                     instant = r.timestamp_ns;
-                                     pending = true;
-                                     return apply(r);
-                                 });
+    if (!direct) out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{}, each);
+    if (track != nullptr) {
         if (pending) close_instant();
         track->header.entries = static_cast<uint32_t>(track->entries.size());
     }
