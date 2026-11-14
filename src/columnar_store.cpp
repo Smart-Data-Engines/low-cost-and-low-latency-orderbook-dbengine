@@ -2879,18 +2879,24 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
     };
     start();
 
-    // A summary's span is mostly the one segment sealed since the summary it starts from, its rows in
-    // time order, and no block with a row in it. Then its rows are applied as the decoder gives them,
-    // a batch at a time, rather than copied into a run, sorted if they need it and merged (#266). A row
-    // before the one ahead of it - an event time a client gave - sends the composition back to the
-    // merge, from the start: the merge orders such a span by time, and this would not.
+    // A summary's span is mostly the segment sealed since the summary it starts from, and the row at
+    // the summary's time that ends the segment before it: segments whose rows come in time order one
+    // after another, and no block with a row in the span. Then the rows are applied as the decoder
+    // gives them, a batch at a time and the segments in the order the merge ranks them, rather than
+    // copied into runs, sorted if they need it and merged (#266). The merge hands over the earliest
+    // time first and, at one time, the lower rank: the same rows in the same order, as long as no row
+    // comes before the one ahead of it. One that does - an event time a client gave - sends the
+    // composition back to the merge, from the start.
     const auto reaches = [&](const std::shared_ptr<const RowBlock>& b) {
         return !(b->max_ts_ns < from || b->min_ts_ns > at);
     };
-    const bool one_segment = g.found && g.segments.size() == 1 && g.segments[0].time_range_is_rows &&
-                             std::none_of(g.blocks.begin(), g.blocks.end(), reaches);
+    const bool in_sequence =
+        g.found && !g.segments.empty() &&
+        std::all_of(g.segments.begin(), g.segments.end(),
+                    [](const SegmentMeta& m) { return m.time_range_is_rows; }) &&
+        std::none_of(g.blocks.begin(), g.blocks.end(), reaches);
     bool direct = false;
-    if (one_segment) {
+    if (in_sequence) {
         bool in_order = true;
         uint64_t last = 0;
         uint64_t kept = 0;
@@ -2908,17 +2914,19 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
             }
             return {};
         };
-        read_segment_rows(g.segments[0], columns, from, at, RowFilter{}, as_read, ReadMode::kQuery,
-                          &filtered);
+        for (const SegmentMeta& m : g.segments) {
+            read_segment_rows(m, columns, from, at, RowFilter{}, as_read, ReadMode::kQuery, &filtered);
+            if (!in_order) break;
+        }
         if (in_order) {
             direct = true;
-            out.cost.candidates    = 1;
+            out.cost.candidates    = g.segments.size();
             out.cost.blocks        = g.blocks.size();
             out.cost.kept          = kept;
             out.cost.delivered     = kept;
             out.cost.rows_filtered = filtered;
         } else {
-            OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: its segment's rows are not in "
+            OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: its segments' rows are not in "
                                      "time order; composed again through the merge",
                          static_cast<int>(symbol.size()), symbol.data(),
                          static_cast<int>(exchange.size()), exchange.data(),
