@@ -153,13 +153,16 @@ void SubscriptionHub::enqueue_batch(uint64_t subscription_id, const Subscription
         if (scratch.offset[i] != NotifyScratch::kNone) continue;
         char row[kPushRowRoom];
         const char* end = format_push_row(row, std::end(row), batch.rows[i]);
+        // Bounded by the buffer as well as by the formatter: GCC 14 at -O3 cannot see the bound
+        // through a pointer another unit returns, and warns of an unbounded copy (-Wrestrict).
+        const size_t length = std::min(static_cast<size_t>(end - row), sizeof(row));
         scratch.offset[i] = static_cast<uint32_t>(scratch.bytes.size());
-        scratch.length[i] = static_cast<uint32_t>(end - row);
-        scratch.bytes.append(row, scratch.length[i]);
+        scratch.length[i] = static_cast<uint32_t>(length);
+        scratch.bytes.append(row, length);
     }
     char head[kPushHeadRoom];
-    const size_t head_len =
-        static_cast<size_t>(format_push_head(head, std::end(head), subscription_id) - head);
+    const size_t head_len = std::min(
+        static_cast<size_t>(format_push_head(head, std::end(head), subscription_id) - head), sizeof(head));
 
     bool should_wake = false;
     {

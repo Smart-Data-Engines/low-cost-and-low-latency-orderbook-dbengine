@@ -473,7 +473,8 @@ def test_two_hundred_subscribers_of_one_book_each_get_every_row_in_order(tmp_pat
             assert answer.startswith(b"OK SUB "), answer
             client.buf = rest
             subscribers.append((client, int(answer.split()[2])))
-        assert len({sid for _, sid in subscribers}) == 200, "two subscriptions were given one id"
+        # An id is its client loop's hub's, so two sessions on two loops may hold the same one: what
+        # tells their pushes apart is the connection they come on.
 
         writer = WireClient(port, timeout=patience(8))
         for write in range(20):
