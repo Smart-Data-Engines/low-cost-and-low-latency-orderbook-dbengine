@@ -2926,11 +2926,11 @@ of the node's CPU.
   reallocation at a time, on the writer's thread. A queue counts its lines as they are added, and the
   drain no longer counts them in the bytes.
 
-Measured on the m9g.xlarge with Release builds: #261 (`d921e65`) against this change on it, three rounds
-each, a writer sending `MINSERT`s of 20 levels of one book as fast as their answers come for 10 s while
-S sessions subscribed to the book are read to their end by a process of their own
-(`fanout_probe.py`); the writer's cost a push is its p50 less the p50 with no subscriber, over the
-pushes a write makes:
+Measured on the test hosts of 14 November with Release builds: #261 (`d921e65`) against this change on
+it (`c2f1d18`), three rounds each, a writer sending `MINSERT`s of 20 levels of one book as fast as their
+answers come for 10 s while S sessions subscribed to the book are read to their end by a process of
+their own (`fanout_probe.py`); the writer's cost a push is its p50 less the p50 with no subscriber, over
+the pushes a write makes:
 
 | `MINSERT` of 20 levels, p50 | one loop before | after | four loops before | after |
 |---|---|---|---|---|
@@ -2941,13 +2941,23 @@ pushes a write makes:
 | 1 000 | 5.04-5.08 ms | 2.05-2.09 ms | 4.59-4.70 ms | 0.91-0.94 ms |
 | the writer's cost a push at 1 000 | 252-254 ns | 102-104 ns | 229-234 ns | 45-46 ns |
 
-{X86}
+On the m8a.xlarge, the same:
 
-With four loops the writer pays for a push a fifth of what it did, and its book's subscribers take as
-many more pushes: 8 140-8 566 writes of a 1 000-subscriber book in 10 s where 2 078-2 140. With one
-loop the writer's loop also sends every push - a thousand sockets written a write - and what is left
-is mostly that, the kernel's: in the profile at 1 000 subscribers the hub's work fell from 31% of the
-node's CPU (`enqueue`) to 7% (`enqueue_batch`). The pushes are the bytes they were.
+| `MINSERT` of 20 levels, p50 | one loop before | after | four loops before | after |
+|---|---|---|---|---|
+| no subscriber | 7.2 us | 7.2 us | 7.2 us | 7.2 us |
+| 10 subscribers of its book | 30.0-31.5 us | 21.4-22.0 us | | |
+| 100 | 266-273 us | 168-169 us | 283-288 us | 46-63 us |
+| 300 | 903-960 us | 488-497 us | | |
+| 1 000 | 4.98-5.07 ms | 1.62-1.72 ms | 3.66-3.82 ms | 0.62-0.69 ms |
+| the writer's cost a push at 1 000 | 249-253 ns | 80-86 ns | 183-190 ns | 31-34 ns |
+
+With four loops the writer pays for a push a fifth of what it did on the m9g.xlarge and a sixth on the
+m8a.xlarge, and its book's subscribers take as many more pushes: 8 140-8 566 writes of a
+1 000-subscriber book in 10 s where 2 078-2 140, and 12 779-15 458 where 2 521-2 618. With one loop the
+writer's loop also sends every push - a thousand sockets written a write - and what is left is mostly
+that, the kernel's: in the profile at 1 000 subscribers the hub's work fell from 31% and 34% of the
+node's CPU (`enqueue`) to 7% and 3% (`enqueue_batch`). The pushes are the bytes they were.
 
 **And the documentation's `SUBSCRIBE`.** The README, `docs/query-language.md`'s wire example and #45's
 entry here showed `SUBSCRIBE 'SYM'.'EXCH'`, which no version accepts - v0.1.0 answers it
