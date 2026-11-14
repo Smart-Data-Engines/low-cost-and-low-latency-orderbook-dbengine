@@ -297,6 +297,10 @@ public:
     /// its sequence number, miss nothing between the two (#239).
     uint64_t subscribe(std::string_view sql, RowCallback cb);
 
+    /// The same, with a callback that takes each write's allowed rows at once (#263): the server's
+    /// subscriptions, so that what it does once a call it does once a write rather than once a row.
+    uint64_t subscribe_batch(std::string_view sql, BatchCallback cb);
+
     /// Unregister a streaming subscription.
     void unsubscribe(uint64_t id);
 

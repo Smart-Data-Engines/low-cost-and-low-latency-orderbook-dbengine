@@ -216,7 +216,7 @@ in the harness installs anything, and a containerised competitor would measure t
   than of a level, so every row carries the same `timestamp_ns` and `sequence_number`. Every update
   up to that number is in the book, which makes it the number to resume a `SUBSCRIBE` from:
   subscribe first, then take the book. Also in the Python client (`book()`) and in `ob_cli`
-- **Streaming subscriptions, pushed** — `SUBSCRIBE 'SYM'.'EXCH'` over the wire and the server sends
+- **Streaming subscriptions, pushed** — `SUBSCRIBE * FROM 'SYM'.'EXCH'` over the wire and the server sends
   rows as they are written, prefixed `PUSH <id>` with all seven columns, whatever select list the
   subscription named: a `PUSH` line has no header, so a narrowed push would change what a field
   means with nothing for a client to check against. A

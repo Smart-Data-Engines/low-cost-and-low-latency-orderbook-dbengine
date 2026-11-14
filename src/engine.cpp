@@ -2145,6 +2145,15 @@ uint64_t Engine::subscribe(std::string_view sql, RowCallback cb) {
     return id;
 }
 
+uint64_t Engine::subscribe_batch(std::string_view sql, BatchCallback cb) {
+    const uint64_t id = query_engine_->subscribe_batch(sql, std::move(cb));
+    // In force for every write after this returns, as subscribe()'s is (#239).
+    { std::lock_guard<std::mutex> in_force(mtx_); }
+    OB_LOG_DEBUG("engine", "Subscription %llu in force for every write from here, a write at a time",
+                 static_cast<unsigned long long>(id));
+    return id;
+}
+
 void Engine::unsubscribe(uint64_t id) {
     query_engine_->unsubscribe(id);
 }

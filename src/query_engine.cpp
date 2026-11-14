@@ -2779,6 +2779,15 @@ void QueryEngine::compact_locked() {
 }
 
 uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
+    return register_subscription(sql, std::move(cb), BatchCallback{});
+}
+
+uint64_t QueryEngine::subscribe_batch(std::string_view sql, BatchCallback cb) {
+    return register_subscription(sql, RowCallback{}, std::move(cb));
+}
+
+uint64_t QueryEngine::register_subscription(std::string_view sql, RowCallback cb,
+                                            BatchCallback batch_cb) {
     QueryAST ast;
     std::string err = parse(sql, ast);
     if (!err.empty()) {
@@ -2789,10 +2798,12 @@ uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
     std::unique_lock<std::shared_mutex> lock(subs_mtx_);
     compact_locked();
 
-    auto sub  = std::make_unique<Subscription>();
-    sub->id   = next_sub_id_++;
-    sub->ast  = std::move(ast);
-    sub->cb   = std::move(cb);
+    auto sub      = std::make_unique<Subscription>();
+    sub->id       = next_sub_id_++;
+    sub->ast      = std::move(ast);
+    sub->cb       = std::move(cb);
+    sub->batch_cb = std::move(batch_cb);
+    const bool a_write_at_a_time = static_cast<bool>(sub->batch_cb);
     const uint64_t id     = sub->id;
     const std::string sym = sub->ast.symbol;
     const std::string exc = sub->ast.exchange;
@@ -2801,9 +2812,10 @@ uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
     // what is actually there across a compaction.
     live_.store(count_live_locked(), std::memory_order_relaxed);
 
-    OB_LOG_INFO("query", "Subscription %llu registered for %s.%s (%zu live)",
+    OB_LOG_INFO("query", "Subscription %llu registered for %s.%s (%zu live)%s",
                 static_cast<unsigned long long>(id), sym.c_str(), exc.c_str(),
-                static_cast<size_t>(live_.load(std::memory_order_relaxed)));
+                static_cast<size_t>(live_.load(std::memory_order_relaxed)),
+                a_write_at_a_time ? ", a write at a time" : "");
     return id;
 }
 
@@ -2860,6 +2872,10 @@ void QueryEngine::notify_subscribers(const std::string& symbol,
     static constexpr size_t kBatch = 32;
     const Subscription* matched[kBatch];
     size_t index = 0;
+    // For the subscriptions that take a write at a time (#263): the rows each one's conditions allow,
+    // and a scratch every one of them shares - the server formats a row there once for all of them.
+    NotifyScratch         scratch;
+    std::vector<uint32_t> allowed;
 
     while (true) {
         size_t found = 0;
@@ -2881,6 +2897,14 @@ void QueryEngine::notify_subscribers(const std::string& symbol,
         for (size_t i = 0; i < found; ++i) {
             const Subscription& sub = *matched[i];
             const QueryAST& ast     = sub.ast;
+            if (sub.batch_cb) {
+                allowed.clear();
+                for (size_t r = 0; r < rows.size(); ++r) {
+                    if (row_allowed(ast, rows[r])) allowed.push_back(static_cast<uint32_t>(r));
+                }
+                if (!allowed.empty()) sub.batch_cb(SubscriptionBatch{rows, allowed, scratch});
+                continue;
+            }
             for (const SnapshotRow& row : rows) {
                 if (!row_allowed(ast, row)) continue;
                 // Build QueryResult and invoke callback
