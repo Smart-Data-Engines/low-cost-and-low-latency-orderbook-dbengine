@@ -763,6 +763,14 @@ public:
     /// use the scan is `scan_batches()` through `how.direct`. The blocks no seal has written yet are
     /// the last part, read here. Every part handed out is finished or dropped before this returns,
     /// when a part throws as well, and the throw then leaves through here.
+    /// The rows a scan of this range may read, at most: each candidate's rows in range read from its
+    /// metadata as scan_parts() reads them - as if spread evenly over its time - and every unsealed
+    /// block's rows. The index alone, under its shared lock and with nothing copied, and the count
+    /// stops once it reaches `enough` (#260): what a client loop's ReadGate asks before a query
+    /// reads a row.
+    uint64_t rows_in_range_at_most(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                                   std::string_view exchange, uint64_t enough = UINT64_MAX) const;
+
     ScanCost scan_parts(uint64_t start_ns, uint64_t end_ns,
                         std::string_view symbol, std::string_view exchange,
                         ColumnSet columns, const RowFilter& filter,

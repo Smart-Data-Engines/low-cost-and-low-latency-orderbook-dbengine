@@ -365,6 +365,14 @@ std::string Session::lend_room() {
     return room;
 }
 
+void Session::yield_send(size_t sent_now) {
+    send_yielded_ = true;
+    io_want_ = IoWant::Write;
+    OB_LOG_DEBUG("session", "fd=%d conn_id=%llu: %zu bytes sent in this flush, the slice; %zu still "
+                 "pending, for the loop's next pass", fd_, static_cast<unsigned long long>(conn_id_),
+                 sent_now, pending_bytes());
+}
+
 void Session::sent(size_t n) {
     send_off_ += n;
     if (send_off_ == send_buf_.size()) {
@@ -399,12 +407,21 @@ bool Session::flush_output_tls() {
         // handshake has one owner, and the loop flushes the banner the moment it completes.
         return true;
     }
+    send_yielded_ = false;
+    size_t this_flush = 0;
     while (send_off_ < send_buf_.size()) {
+        if (this_flush >= kSendSlice) {
+            yield_send(this_flush);
+            break;
+        }
         ERR_clear_error();
-        const int n = SSL_write(ssl_.get(), send_buf_.data() + send_off_,
-                                static_cast<int>(send_buf_.size() - send_off_));
+        // No more than the slice left (#260). A retry after WANT_WRITE asks for at least what the
+        // write it repeats asked for - a new flush's slice is whole - which partial writes accept.
+        const size_t want = std::min(send_buf_.size() - send_off_, kSendSlice - this_flush);
+        const int n = SSL_write(ssl_.get(), send_buf_.data() + send_off_, static_cast<int>(want));
         if (n > 0) {
             sent(static_cast<size_t>(n));
+            this_flush += static_cast<size_t>(n);
             io_want_ = IoWant::Read;
             continue;
         }
@@ -437,15 +454,23 @@ bool Session::flush_output_tls() {
 }
 
 bool Session::flush_output_plain() {
+    send_yielded_ = false;
+    size_t this_flush = 0;
     while (send_off_ < send_buf_.size()) {
+        if (this_flush >= kSendSlice) {
+            yield_send(this_flush);
+            break;
+        }
         // send() with MSG_NOSIGNAL, not write(): a client that disconnects while we
         // are writing raises SIGPIPE, whose default action kills the whole server
         // process — every other session with it. Every other socket writer in this
-        // repository already does this; this one did not.
-        ssize_t written = ::send(fd_, send_buf_.data() + send_off_,
-                                 send_buf_.size() - send_off_, MSG_NOSIGNAL);
+        // repository already does this; this one did not. No more than the slice left (#260):
+        // a socket whose reader keeps up takes megabytes in one call.
+        const size_t want = std::min(send_buf_.size() - send_off_, kSendSlice - this_flush);
+        ssize_t written = ::send(fd_, send_buf_.data() + send_off_, want, MSG_NOSIGNAL);
         if (written > 0) {
             sent(static_cast<size_t>(written));
+            this_flush += static_cast<size_t>(written);
             continue;
         }
 

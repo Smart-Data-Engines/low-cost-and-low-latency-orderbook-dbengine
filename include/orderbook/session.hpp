@@ -126,6 +126,21 @@ public:
     /// literal ambiguous.
     Queued take_answer(std::string&& response);
 
+    /// A large read of this session is being answered off the client loop (#260): set when the loop
+    /// hands one out, cleared when its answer is queued. While it is set the loop reads nothing more
+    /// of this session - the socket keeps the rest, and TCP tells the client to wait.
+    bool reading_off_loop() const { return reading_off_loop_; }
+    void set_reading_off_loop(bool reading) { reading_off_loop_ = reading; }
+    /// The commands of a read that came after a large read handed off (#260), in order: run once its
+    /// answer is queued, before anything more is read from the socket.
+    void hold_lines(std::vector<std::string> lines) { held_lines_ = std::move(lines); }
+    bool has_held_lines() const { return !held_lines_.empty(); }
+    std::vector<std::string> take_held_lines() {
+        std::vector<std::string> out;
+        out.swap(held_lines_);
+        return out;
+    }
+
     /// The next answer take_answer() is given is an LZ4 frame already, its length in front (#257):
     /// a row answer built as its text was written, so that the frame could be measured as it grew.
     /// It is queued as it is - taken, with nothing pending - against the cap on its own size, and
@@ -171,9 +186,21 @@ public:
     ///
     /// Since #52's rings there are three transports, and the plaintext socket still pays one
     /// compare: of a byte that names the transport, which TLS and the rings share a branch behind.
+    ///
+    /// One flush sends kSendSlice bytes at most, on the socket and through TLS (#260).
     bool flush_output() {
         return transport_ == Transport::Plain ? flush_output_plain() : flush_output_other();
     }
+
+    /// The most one flush sends on the socket or through TLS (#260). Past it the flush stops with
+    /// bytes left and the socket maybe still taking them, says so in send_yielded() and wants to
+    /// write: the loop arms EPOLLOUT again, which reports the socket writable on the loop's next
+    /// pass, after its other sessions. Without it a reader as fast as the loop had the loop for the
+    /// whole of an answer - every other session waited while 45 MB went out (ARM host, loopback).
+    static constexpr size_t kSendSlice = 1u << 20;
+    /// The last flush stopped at kSendSlice with bytes left, rather than at a socket that took no
+    /// more (#260): no edge will say it is writable, so the loop asks again.
+    bool send_yielded() const { return send_yielded_; }
 
 private:
     bool flush_output_plain();
@@ -335,11 +362,15 @@ private:
     /// other session on the reactor waited for it - a `PING` beside a 45 MB answer read 64 KiB
     /// every 5 ms waited 316-783 us at p99.9 on the x86 test host, and 61-83 with this.
     size_t      send_off_{0};
+    /// See send_yielded() (#260).
+    bool        send_yielded_{false};
 
     /// The bytes still to send.
     size_t pending_bytes() const { return send_buf_.size() - send_off_; }
     /// `n` more bytes taken: past them, and the buffer emptied, its capacity kept, once all are.
     void sent(size_t n);
+    /// A flush that spent kSendSlice with bytes left (#260): send_yielded(), and wanting to write.
+    void yield_send(size_t sent_now);
     /// Before an append: the bytes already sent dropped from the front once they are as many as
     /// those still to send, so the buffer holds at most twice what is pending and a pending byte
     /// is moved at most once for each byte it waited behind.
@@ -360,6 +391,8 @@ private:
     uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
     uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
     bool        framed_next_{false};     // the next answer taken is a frame already (#257)
+    bool        reading_off_loop_{false};          // a large read answered off the loop (#260)
+    std::vector<std::string> held_lines_;          // the commands waiting behind it
     uint64_t    framed_text_bytes_{0};
     /// take_answer() for an answer that is a frame already (#257).
     Queued take_framed(std::string&& framed, uint64_t text_bytes);

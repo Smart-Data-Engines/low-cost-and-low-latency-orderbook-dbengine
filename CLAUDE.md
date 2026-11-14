@@ -4685,6 +4685,24 @@ Learned the hard way. Check here before debugging.
      and went red in CI's `clang-build` and `CodeQL` - a strict `master` and a round of CI lost (PR
      #309). The check compiles: `clang++-18 -std=c++20 -Wall -Wextra -Werror -c -o /dev/null
      -Iinclude '-DOB_VERSION="0"' <file>`.
+642. **A round trip timed by a thread of the process that reads a large answer measures the
+     interpreter.** `test_large_answer_isolation.py` first sent its `PING`s from a thread beside the
+     reader, which held Python's lock while it took 26 MB in: the thread measured 18.7 ms beside a read
+     off the loop that the node answered beside in 0.05-0.18 ms, from a process of their own (#260). A
+     latency beside a heavy client is measured from another process, and the samples kept are the ones
+     sent while what is measured was happening.
+643. **Edge-triggered `EPOLLOUT` reports a socket that became writable, not one that is.** A flush that
+     stops by its own choice with the socket still taking bytes gets no event: #260's slice has the loop
+     arm `EPOLLOUT` again, an `EPOLL_CTL_MOD` that reports the socket's state on the next pass. The
+     first version of #260's resume had the same hole from the other side - the resumed session's
+     `receive()` said it wanted to read, nothing armed `EPOLLOUT` for what the socket had not taken,
+     and the answer stopped (`e46d108`). Every path that leaves bytes queued arms `EPOLLOUT` itself.
+644. **A change after the last full run is checked by the full run, not by the tests of what it changed.**
+     #260's last change to the loop put `!resume_.empty()` into `epoll_wait`'s timeout, and the
+     targeted runs after it - the module's battery, `test_off_loop_reads`, the slice tests - passed;
+     the full ctest failed on `IoWait.TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral`, which
+     reads every `epoll_wait`'s arguments up to their first `)` for `wait_ms` and found the condition's
+     parenthesis first. A test that reads the source as text belongs to no feature's targeted set.
 
 ## Current state and open problems
 

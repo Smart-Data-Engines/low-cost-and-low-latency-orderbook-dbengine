@@ -190,6 +190,10 @@ struct ServerConfig {
     /// client loops (#249). `boost` sets one thread per usable CPU; 0, `eco`'s and the struct's,
     /// reads every segment on the query's loop, which is what this server always did.
     uint32_t    scan_threads{0};
+    /// --large-read-threads: the threads a large `SELECT` is answered on, off the client loops
+    /// (#260), so that a loop goes on serving its other sessions while one reads millions of rows.
+    /// 0 answers every read on its loop, as this server always did.
+    uint32_t    large_read_threads{2};
     /// The CPUs this process may use, as `detect_machine()` found them (#156): what a scan on the
     /// pool divides against. 0 until the command line is read, and then the client loops' count.
     uint32_t    usable_cpus{0};
@@ -592,6 +596,26 @@ private:
 ///
 /// When backups is non-null, BACKUP starts one and BACKUP STATUS reports it (#34); when it is null,
 /// BACKUP is refused and BACKUP STATUS answers `state: idle`.
+/// Where a large read is answered instead of the loop that runs execute_command() (#260). A `SELECT`
+/// past the authentication gate and the permissions - so nothing reaches the threads off the loop that
+/// the loop would have refused - of a session that may_take() is executed with a ReadGate at
+/// kOffLoopReadRows, and one the engine hands back before reading a row is given to take(): its
+/// answer comes back to the loop, and execute_command() answers kAnsweredOffLoop, which the loop
+/// never queues.
+class OffLoopReads {
+public:
+    virtual ~OffLoopReads() = default;
+    /// Whether this session's large reads may be answered off its loop.
+    virtual bool may_take(const Session& session) const = 0;
+    /// The read handed off, and its session paused until the answer is queued.
+    virtual void take(const Command& cmd, Session& session, uint64_t rows_at_most) = 0;
+};
+
+/// execute_command()'s answer to a read an OffLoopReads took: not an answer of the protocol - none
+/// begins with a NUL - and the loop's alone to see.
+inline constexpr std::string_view kAnsweredOffLoop{"\0answered off the loop",
+                                                 sizeof("\0answered off the loop") - 1};
+
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -601,7 +625,8 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord = nullptr,
                             SubscriptionHub* hub = nullptr,
                             const SecretStore* client_secrets = nullptr,
-                            BackupRunner* backups = nullptr);
+                            BackupRunner* backups = nullptr,
+                            OffLoopReads* off_loop = nullptr);
 
 /// Execute `INSERT` and `MINSERT` commands as one batch - the writes a client sent in one read.
 ///

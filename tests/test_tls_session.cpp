@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -231,6 +232,99 @@ TEST(TlsSession, ALargeResponseSurvivesPartialWritesAndTheEraseThatFollowsThem) 
 
     ASSERT_EQ(received.size(), payload.size())
         << "the client received " << received.size() << " of " << payload.size() << " bytes";
+    EXPECT_EQ(received, payload) << "the bytes that arrived are not the bytes that were queued";
+    fs::remove_all(fs::path(kp.cert).parent_path());
+}
+
+// ── #260: a flush sends a slice at most ──────────────────────────────────────
+
+TEST(TlsSession, AFlushSendsASliceAtMostToAReaderThatKeepsUp) {
+    // A reader as fast as the loop took the loop for the whole of an answer: SSL_write with partial
+    // writes returns a record at a time, and the flush wrote records until the socket took no more,
+    // which a reader that keeps up never let happen. One flush now encrypts and sends kSendSlice
+    // bytes at most and says it stopped there; the answer still arrives whole. Default buffers,
+    // which autotune into megabytes, and a reader taking whatever SSL_read has.
+    const auto kp = generate("slice");
+    ASSERT_FALSE(kp.cert.empty()) << "openssl tool not available";
+
+    const int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listen_fd, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    ASSERT_EQ(::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    socklen_t len = sizeof(addr);
+    ASSERT_EQ(::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+    ASSERT_EQ(::listen(listen_fd, 1), 0);
+
+    std::string payload(8 * ob::Session::kSendSlice, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>('a' + (i * 11) % 26);
+
+    std::string received;
+    received.reserve(payload.size());
+    std::thread client([&] {
+        auto ctx = ob::TlsContext::client("", /*verify=*/false);
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        auto ssl = ctx.wrap(fd, /*server_side=*/false);
+        while (SSL_connect(ssl.get()) != 1) {
+            const int e = SSL_get_error(ssl.get(), -1);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                ADD_FAILURE() << "client handshake failed: " << ob::tls_last_error();
+                ::close(fd);
+                return;
+            }
+        }
+        std::vector<char> buf(1 << 20);
+        while (received.size() < payload.size()) {
+            const int n = SSL_read(ssl.get(), buf.data(), static_cast<int>(buf.size()));
+            if (n <= 0) break;
+            received.append(buf.data(), static_cast<size_t>(n));
+        }
+        ::close(fd);
+    });
+
+    const int fd = ::accept(listen_fd, nullptr, nullptr);
+    ASSERT_GE(fd, 0);
+    set_nonblocking(fd);
+    auto server_ctx = ob::TlsContext::server(kp.cert, kp.key);
+    ob::Session session(fd, /*conn_id=*/1);
+    session.enable_tls(server_ctx.wrap(fd, /*server_side=*/true));
+    const auto hs_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (session.tls_handshaking() && std::chrono::steady_clock::now() < hs_deadline) {
+        ASSERT_TRUE(session.continue_tls_handshake()) << ob::tls_last_error();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_FALSE(session.tls_handshaking()) << "server handshake did not complete";
+
+    std::string queued = payload;
+    ASSERT_EQ(session.take_answer(std::move(queued)), ob::Session::Queued::Yes);
+    size_t most = 0;
+    size_t yielded = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (session.has_pending_output() && std::chrono::steady_clock::now() < deadline) {
+        const size_t before = session.pending_output_bytes();
+        // Not an ASSERT: the client thread is joined below, whatever a flush did.
+        if (!session.flush_output()) {
+            ADD_FAILURE() << "a flush failed: " << ob::tls_last_error();
+            break;
+        }
+        most = std::max(most, before - session.pending_output_bytes());
+        if (session.send_yielded()) {
+            ++yielded;
+            EXPECT_EQ(session.io_want(), ob::IoWant::Write) << "a flush that stopped does not want to write";
+        }
+    }
+    // Whatever was sent, the reader sees its end.
+    ::shutdown(fd, SHUT_WR);
+    client.join();
+    ::close(fd);
+    ::close(listen_fd);
+
+    EXPECT_LE(most, ob::Session::kSendSlice) << "one flush sent more than the slice";
+    EXPECT_GT(yielded, 0u) << "no flush stopped at the slice: the premise, a reader that keeps up";
+    EXPECT_FALSE(session.has_pending_output());
     EXPECT_EQ(received, payload) << "the bytes that arrived are not the bytes that were queued";
     fs::remove_all(fs::path(kp.cert).parent_path());
 }
