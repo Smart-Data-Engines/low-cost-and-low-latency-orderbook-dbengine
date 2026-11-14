@@ -297,6 +297,10 @@ public:
     /// its sequence number, miss nothing between the two (#239).
     uint64_t subscribe(std::string_view sql, RowCallback cb);
 
+    /// The same, with a callback that takes each write's allowed rows at once (#263): the server's
+    /// subscriptions, so that what it does once a call it does once a write rather than once a row.
+    uint64_t subscribe_batch(std::string_view sql, BatchCallback cb);
+
     /// Unregister a streaming subscription.
     void unsubscribe(uint64_t id);
 
@@ -928,6 +932,10 @@ public:
     bool is_multi_master() const { return mm_config_.enabled; }
 
 private:
+    /// A subscription's registration made to hold for every write after it (#239): subscribe() and
+    /// subscribe_batch() return through this.
+    uint64_t in_force(uint64_t id);
+
     std::string base_dir_;
     /// Where the WAL lives (#186). Before `wal_`, which opens its first file as it is built, because
     /// the refusals that keep a moved WAL from being a lost one run as this is resolved.

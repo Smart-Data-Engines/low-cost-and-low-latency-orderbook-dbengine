@@ -152,6 +152,32 @@ inline constexpr std::string_view kReadTakenAway{"\0taken away", sizeof("\0taken
 
 using RowCallback = std::function<void(const QueryResult&)>;
 
+// ── Batch subscriptions (#263) ────────────────────────────────────────────────
+
+/// Shared by the batch callbacks of one notification (#263): a piece of bytes per row of the batch,
+/// made by the first callback that needs it and read by the next - the server keeps a pushed row's
+/// text here, so a row reaching a thousand subscriptions is formatted once. The engine makes it empty
+/// for each notification and reads nothing in it.
+struct NotifyScratch {
+    static constexpr uint32_t kNone = UINT32_MAX;
+    std::string           bytes;
+    std::vector<uint32_t> offset;   // per row of the batch: where its piece starts, kNone until made
+    std::vector<uint32_t> length;
+};
+
+/// One write's rows as one subscription receives them (#263): the delta's rows, the indexes of those
+/// its conditions allow - in order, never empty - and the notification's scratch. Valid during the
+/// call only.
+struct SubscriptionBatch {
+    std::span<const SnapshotRow> rows;
+    std::span<const uint32_t>    allowed;
+    NotifyScratch&               scratch;
+};
+
+/// Called once per write for a subscription registered with subscribe_batch(), rather than once per
+/// row: what it does once per call - a lock, a lookup - it does once per write.
+using BatchCallback = std::function<void(const SubscriptionBatch&)>;
+
 /// Resolve the live SoA buffer for a `"symbol.exchange"` key, or nullptr if there is none.
 ///
 /// **A callable rather than a reference to Engine's map**, and the difference is a data race. The
@@ -303,6 +329,9 @@ public:
     /// Register streaming subscription; returns subscription id, or 0 if the SQL does not parse.
     uint64_t subscribe(std::string_view sql, RowCallback cb);
 
+    /// The same, with a callback that takes each write's allowed rows at once (#263).
+    uint64_t subscribe_batch(std::string_view sql, BatchCallback cb);
+
     /// Unregister a streaming subscription.
     ///
     /// Marks it dead and returns; the entry is removed later, under the exclusive lock, when no
@@ -372,9 +401,14 @@ private:
     struct Subscription {
         uint64_t          id;
         QueryAST          ast;
-        RowCallback       cb;
+        RowCallback       cb;         // one row a call - the C API's
+        BatchCallback     batch_cb;   // one write a call (#263); exactly one of the two is set
         std::atomic<bool> dead{false};
     };
+
+    /// subscribe() and subscribe_batch(): the query parsed and the entry registered with the callback
+    /// given. 0 if the query does not parse.
+    uint64_t register_subscription(std::string_view sql, RowCallback cb, BatchCallback batch_cb);
 
     /// Held shared while notifying, exclusive while registering or compacting.
     ///
