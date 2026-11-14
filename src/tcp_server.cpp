@@ -3562,9 +3562,10 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local, std::shared_ptr<ssl_st
     Session* s = sessions_.get_session(fd);
     if (s) s->set_local(local, config_.rings ? config_.ring_bytes : 0);
     if (s && done) {
-        // The handshake a thread of the pool did (#265). What the client sent behind its Finished may
-        // be in the SSL's buffer already, where this loop's epoll does not see it: the session is
-        // resumed below, which flushes the banner and reads whatever is there.
+        // The handshake a thread of the pool did (#265). What the client sent behind its Finished is in
+        // the socket, and the registration above reported it: without read-ahead, which no context
+        // here turns on, OpenSSL reads a record at a time. With it, those bytes would be in the SSL's
+        // buffer, where this loop's epoll does not see them, so the session is resumed below anyway.
         s->enable_tls_done(std::move(done));
     } else if (s && tls_.client_port && !local) {
         // Wrap before anything is written: the banner is application data and must not precede
