@@ -2947,7 +2947,11 @@ composes from a plain scan and encodes with the files' own encoders, and the row
 a walk of a book summarised twenty times, and any sequence of publishes, seals, late rows, summaries and
 restarts, each case comparing at least once).
 
-<!-- #266 mutation table -->
+Mutation table (`mutations/` in the evidence, ARM): 9 mutants, every one killed by the test of what it
+breaks, and the control - every price hashed to the table's first slot, correct and slower - survives. One
+of them, a block reaching the span left to the direct read, passed the bytes property and was killed by the
+summary store's tests: every summary the property wrote came after a seal of every block. It now leaves a
+block pending before some, and kills that mutant itself.
 
 - Effort: M | Impact: a summary at a seal costs less than half of what it did
 
