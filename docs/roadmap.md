@@ -2936,19 +2936,21 @@ built in one place for both (`flush_answer()`). A session in rings, and a node w
 `--large-read-threads 0`, flush on the loop. `OffLoopReads` is `OffLoopWork` (`take_read()`,
 `take_flush()`), and a session's flag `waiting_off_loop()`.
 
-Measured with Release builds, one client loop and no flush in the background
-(`--flush-interval-ms 600000`), #260's final code against this one, three rounds each, the `PING`s sent
-by a process of their own and counted while the FLUSH was answered:
+Measured on the test hosts of 14 November with Release builds, one client loop and no flush in the
+background (`--flush-interval-ms 600000`): #260 on `master` (`4c04172`) against this change on it
+(`d921e65`), three rounds each, the `PING`s sent by a process of their own and counted while the FLUSH
+was answered (`evidence/2026-11-14-off-the-loop-on-master/`; first measured on its first branch with the
+same result, `evidence/2026-11-07-flush-off-the-loop/`):
 
 | | m9g.xlarge before | after | m8a.xlarge before | after |
 |---|---|---|---|---|
-| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 152-198 ms | 23-36 us | 114-155 ms | 29-103 us |
-| the same of 100 000 rows in 100 books | 26.6-29.7 ms | 17-68 us | 26.1-30.4 ms | 21-39 us |
-| the FLUSH of 500 000 rows itself | 152-198 ms | 155-163 ms | 115-155 ms | 119-133 ms |
+| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 141.5-148.7 ms | 24-31 us | 146.9-182.3 ms | 30-147 us |
+| the same of 100 000 rows in 100 books | 25.8-27.7 ms | 13-47 us | 32.1-35.4 ms | 13-26 us |
+| the FLUSH of 500 000 rows itself | 141.7-148.9 ms | 141.9-149.6 ms | 147.0-182.8 ms | 167.1-178.0 ms |
 
-A FLUSH with nothing waiting pays for the hand to the thread and back: 18.3-19.7 us at p50 where it
-took 14.2-15.3 on the m9g.xlarge, and 10.1-11.1 where 7.1-8.9 on the m8a.xlarge. One that has a row to
-write is the WAL's sync, 3.9 ms and 7.5 ms at p50 after one `INSERT`, as it was.
+A FLUSH with nothing waiting pays for the hand to the thread and back: 19.5-19.6 us at p50 where it
+took 14.1-15.8 on the m9g.xlarge, and 10.1-10.9 where 7.0-8.9 on the m8a.xlarge. One that has a row to
+write is the WAL's sync, 3.8 ms and 7.5 ms at p50 after one `INSERT`, as it was.
 
 Tests: `tests/integration/test_flush_isolation.py` (a `PING` beside a FLUSH of 300 000 rows in 1 000
 books under a tenth of the one on the loop, with the metrics; a session's answers in order around a
