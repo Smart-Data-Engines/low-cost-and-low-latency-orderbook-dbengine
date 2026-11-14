@@ -2900,6 +2900,77 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 263. A write paid for every subscriber of its book, on the writer's thread, and more for each one ✅ **P1**
+
+**Found asking what a feed's writer pays for the clients subscribed to its book** (spec
+`smart-data-engine-workspace/specs/subscription-fanout/`, evidence
+`evidence/2026-11-14-subscription-fanout/`). A write's notification called each subscription's
+callback once a row, and the server's took the hub's mutex, searched every queue of the hub for its
+own, formatted the whole row into a new string and appended it - on the writer's thread, a client
+loop's for a `MINSERT`, so every session of that loop waited as well. With S sessions subscribed to one
+book, a `MINSERT` of 20 levels cost its writer 10 us at S = 0, 41 us at 10, 350 us at 100 and 5.1 ms at
+1 000 on the m9g.xlarge with one client loop, and as much with four, where most subscribers were on
+other loops. A push cost 152 ns at S = 10 and 252 ns at 1 000, and at 1 000 the search alone was 32%
+of the node's CPU.
+
+**A write reaches each subscription once.**
+- **One call a subscription and write** (`Engine::subscribe_batch()`, `SubscriptionBatch`): the
+  server's subscriptions take the rows of a write their conditions allow at once - one lock and one
+  lookup each. The C API's row callback is unchanged.
+- **The hub keeps its queues by id**, not in a vector searched in turn.
+- **A row's text is made once a write**, in the notification's scratch (`NotifyScratch`), and shared
+  by every subscription the row reaches under its own `PUSH <id>\t`, made once a call:
+  `format_push_head()` and `format_push_row()` write `format_push()`'s bytes, which a test pins.
+- **A drain gives a queue back room** for as many bytes as it took, up to 64 KiB, on the subscriber's
+  loop: the writes before the next drain append into it rather than grow a string from nothing, a
+  reallocation at a time, on the writer's thread. A queue counts its lines as they are added, and the
+  drain no longer counts them in the bytes.
+
+Measured on the m9g.xlarge with Release builds: #261 (`d921e65`) against this change on it, three rounds
+each, a writer sending `MINSERT`s of 20 levels of one book as fast as their answers come for 10 s while
+S sessions subscribed to the book are read to their end by a process of their own
+(`fanout_probe.py`); the writer's cost a push is its p50 less the p50 with no subscriber, over the
+pushes a write makes:
+
+| `MINSERT` of 20 levels, p50 | one loop before | after | four loops before | after |
+|---|---|---|---|---|
+| no subscriber | 10.3-10.4 us | 10.3-10.4 us | 10.3-10.4 us | 10.3-10.4 us |
+| 10 subscribers of its book | 40.8-41.0 us | 27.9-28.1 us | | |
+| 100 | 346-355 us | 200-202 us | 372-386 us | 83-86 us |
+| 300 | 1 149-1 167 us | 621-632 us | | |
+| 1 000 | 5.04-5.08 ms | 2.05-2.09 ms | 4.59-4.70 ms | 0.91-0.94 ms |
+| the writer's cost a push at 1 000 | 252-254 ns | 102-104 ns | 229-234 ns | 45-46 ns |
+
+{X86}
+
+With four loops the writer pays for a push a fifth of what it did, and its book's subscribers take as
+many more pushes: 8 140-8 566 writes of a 1 000-subscriber book in 10 s where 2 078-2 140. With one
+loop the writer's loop also sends every push - a thousand sockets written a write - and what is left
+is mostly that, the kernel's: in the profile at 1 000 subscribers the hub's work fell from 31% of the
+node's CPU (`enqueue`) to 7% (`enqueue_batch`). The pushes are the bytes they were.
+
+**And the documentation's `SUBSCRIBE`.** The README, `docs/query-language.md`'s wire example and #45's
+entry here showed `SUBSCRIBE 'SYM'.'EXCH'`, which no version accepts - v0.1.0 answers it
+`ERR query does not parse as a subscription`, as `master` does. The form is
+`SUBSCRIBE * FROM 'SYM'.'EXCH'`, the one the clients and the tests send. Pitfall 645: the ARM host's
+GCC 14 failed the first version's Release build on `-Wrestrict` where clang and GCC 12 and 15 saw
+nothing.
+
+Tests: `tests/test_subscription_hub.cpp` (300 subscriptions of one book, each given its own lines and
+the rows a row callback is given, in order; two subscriptions of different conditions given the text
+of the rows each allows under its own id; a write past the ceiling marking the queue where it passes
+and adding nothing after; each drain counting the rows it moved and no more), the pieces of a push
+pinned to `format_push()` for 4 000 rows (`tests/test_response_formatter.cpp`), `QueryBookStatic`
+reading `subscribe_batch()` for the write lock as it reads `subscribe()`, and
+`tests/integration/test_subscriptions.py`'s two hundred sessions on two loops each given a hundred
+rows in order. Mutation table (`arm/m263-mutations*.log` in the evidence): 11 mutants, 8 killed - each
+by the test of what it breaks - and three surviving as expected: a row formatted again for each
+subscription and a drain's room not capped, which change what the work costs and not what is
+pushed, and the control.
+
+- Effort: M | Impact: a feed's writer pays about a fifth of what it did for each subscriber of its
+  book, and its subscribers are sent four times as much
+
 ### 262. A test's control raced the scheduler, and failed four runs in five on the ARM host ✅ **P2**
 
 **Found running the whole suite on the m9g.xlarge, for a change to the client loop.** `SoABuffer.TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt`

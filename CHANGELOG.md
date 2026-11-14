@@ -326,6 +326,18 @@ here as `#N`.
 
 ### Fixed
 
+- **A write paid for every subscriber of its book, on its own thread, and more for each one** (#263).
+  Its notification reached each subscription once a row, and the server took the hub's lock, searched
+  every queue of the hub for the subscription's, and formatted the row anew for each - on the writer's
+  client loop. With 1 000 sessions subscribed to one book a `MINSERT` of 20 levels cost its writer
+  4.6-4.7 ms on the m9g.xlarge with four client loops, a push 229-234 ns. Now a write reaches each
+  subscription once, its queue by id, and a row is formatted once a write and shared: 0.91-0.94 ms and
+  45-46 ns, and the subscribers are sent four times the writes in the same time. With no subscriber a
+  write costs what it did; the pushes are the bytes they were.
+- **The documentation showed a `SUBSCRIBE` no version accepts** (#263): `SUBSCRIBE 'SYM'.'EXCH'`, in the
+  README, the query language's wire example and the roadmap. The form is `SUBSCRIBE * FROM
+  'SYM'.'EXCH'` - or a select list, which a push ignores.
+
 - **An answer past what a session may be sent is refused where it passes it, not after its last row**
   (#257). Since #152 such an answer was refused and the session kept - but built in full first: on
   the m9g.xlarge a `SELECT *` of eight million rows formatted 367 MB, took the node's resident memory
