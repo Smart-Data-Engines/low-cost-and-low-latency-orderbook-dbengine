@@ -71,6 +71,9 @@ public:
     /// be a command from an unauthenticated transport, and the gate from part one checks the
     /// *application* identity and knows nothing about TLS.
     void enable_tls(std::shared_ptr<ssl_st> ssl);
+    /// TLS on, its handshake done already, off the loop (#265): the session reads and writes through
+    /// `ssl` from the first event, and the loop drives no handshake for it.
+    void enable_tls_done(std::shared_ptr<ssl_st> ssl);
 
     bool tls_enabled() const;
     bool tls_handshaking() const;

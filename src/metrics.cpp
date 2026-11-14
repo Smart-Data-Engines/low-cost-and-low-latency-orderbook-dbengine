@@ -167,6 +167,13 @@ MetricsRegistry::MetricsRegistry() {
                                      "TLS reloads that put new contexts in force (#238)"));
     counters_.push_back(make_counter("ob_tls_reload_failures_total",
                                      "TLS reloads refused, each leaving the certificate in force (#238)"));
+    // The client port's TLS handshakes on their own threads, off the client loops (#265).
+    counters_.push_back(make_counter("ob_tls_handshakes_total",
+                                     "Client-port TLS handshakes completed off the client loops (#265)"));
+    counters_.push_back(make_counter("ob_tls_handshake_failures_total",
+                                     "Client-port TLS handshakes that failed, each connection closed (#265)"));
+    counters_.push_back(make_counter("ob_tls_handshake_timeouts_total",
+                                     "Client-port TLS handshakes past --tls-handshake-timeout-ms, each connection closed (#265)"));
     // Large reads answered off the client loops (#260).
     counters_.push_back(make_counter("ob_off_loop_reads_total",
                                      "SELECTs answered off their client loop: the index put their scan past the threshold (#260)"));
@@ -292,6 +299,8 @@ MetricsRegistry::MetricsRegistry() {
                                  "Milliseconds the last backup held merges and retention back"));
     gauges_.push_back(make_gauge("ob_active_sessions",
                                  "Number of active client sessions, over TCP and the Unix socket"));
+    gauges_.push_back(make_gauge("ob_tls_handshakes_in_flight",
+                                 "Client-port TLS handshakes under way on their threads (#265)"));
     gauges_.push_back(make_gauge("ob_off_loop_reads_in_flight",
                                  "SELECTs handed to the threads off the client loops whose answer has not come back (#260)"));
     gauges_.push_back(make_gauge("ob_off_loop_flushes_in_flight",
@@ -393,6 +402,8 @@ MetricsRegistry::MetricsRegistry() {
     histograms_.push_back(make_histogram("ob_query_latency_seconds",  "Query operation latency in seconds"));
     // A large read's wait for a thread off the client loops (#260): its session waits with it, so a
     // queue that grows is reads every thread is busy with, and a reason for --large-read-threads.
+    histograms_.push_back(make_histogram("ob_tls_handshake_seconds",
+                                         "Seconds from a connection's hand to a TLS handshake thread to its handshake done (#265)"));
     histograms_.push_back(make_histogram("ob_off_loop_read_wait_seconds",
                                          "Seconds a large read waited for a thread off the client loops (#260)"));
     histograms_.push_back(make_histogram("ob_off_loop_flush_wait_seconds",

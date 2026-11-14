@@ -273,6 +273,10 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
          "same problem as the others from the other side (#131)"},
         {"OrderbookPool::health_check_loop",
          "a client pool stops noticing dead connections; the only one outside the server (#131)"},
+        {"TlsHandshakeWorker::run_loop",
+         "the connections dealt to this thread wait for a handshake nobody drives, each holding its "
+         "place in --max-sessions until its client gives up; guarded per event, one connection closed "
+         "for what fails on it (#265)"},
         {"ScanPool::worker_loop",
          "the pool has one thread fewer to read a query's segments on; the queries still run every "
          "part no thread took, on their own loops, so they slow down and do not stop (#246)"},

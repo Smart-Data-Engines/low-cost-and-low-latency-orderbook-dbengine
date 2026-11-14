@@ -165,6 +165,7 @@ tests/integration/
 ├── test_access_control.py            # permissions per identity (#31)
 ├── test_tls.py                       # TLS on the client port, chain and name (#30)
 ├── test_tls_cluster.py               # TLS on the replication link and the mesh (#30)
+├── test_tls_handshake_isolation.py   # TLS handshakes off the client loop, their deadline (#265)
 ├── test_tls_reload.py                # SIGHUP reads the certificate again, on every surface (#238)
 │
 │   # Observability

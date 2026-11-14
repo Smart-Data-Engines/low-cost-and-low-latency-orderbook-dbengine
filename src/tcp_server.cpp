@@ -1,5 +1,6 @@
 #include "orderbook/tcp_server.hpp"
 #include "orderbook/off_loop_reads.hpp"
+#include "orderbook/tls_handshake_pool.hpp"
 #include "orderbook/net.hpp"
 
 #include "orderbook/backup.hpp"
@@ -1493,6 +1494,8 @@ const std::vector<std::string>& known_flags() {
         "io-threads",
         "scan-threads",
         "large-read-threads",
+        "tls-handshake-threads",
+        "tls-handshake-timeout-ms",
         "handover-grace-seconds",
         "log-level",
         "max-query-buckets",
@@ -1597,6 +1600,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
         {"scan-threads", {"<N>", "Threads a query's segments are read on, 0 to 64 (default: 0 under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, about twice as fast alone on four cores; beside writes it costs them, so 0 reads every segment on the query's loop"}},
         {"large-read-threads", {"<N>", "Threads a large SELECT is answered on, off the client loops, 0 to 64 (default: 2; 0 answers every read on its loop): a read whose scan the index puts at 100000 rows or more, while the loop serves its other sessions (#260)"}},
+        {"tls-handshake-threads", {"<N>", "Threads the client port's TLS handshakes are driven on, off the client loops, 0 to 64 (default: 1; 0 drives each handshake on the loop its connection is dealt to): a loop's sessions do not wait while it signs for new connections (#265)"}},
+        {"tls-handshake-timeout-ms", {"<MS>", "How long a TLS handshake on those threads may take before the connection is closed and its place in --max-sessions given back, 100 to 600000 (default: 10000) (#265)"}},
         {"profile", {"<name>", "boost (default: one client event loop per usable CPU, and a 10 us spin where it cannot starve anything) or eco (one loop, blocking between events). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
@@ -2174,6 +2179,10 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.scan_threads = cursor.value_as<uint32_t>();
         } else if (arg == "--large-read-threads") {
             config.large_read_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--tls-handshake-threads") {
+            config.tls_handshake_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--tls-handshake-timeout-ms") {
+            config.tls_handshake_timeout_ms = cursor.value_as<uint32_t>();
         } else if (arg == "--profile") {
             config.profile = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
@@ -2249,6 +2258,22 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                      "threads a large SELECT is answered on, off the client loops; 0 answers every "
                      "read on its loop.\n",
                      config.large_read_threads, kMaxScanThreads);
+        std::exit(1);
+    }
+    // The TLS handshake threads (#265): 0 drives each handshake on its loop; past the cap is a typo.
+    if (config.tls_handshake_threads > kMaxScanThreads) {
+        std::fprintf(stderr,
+                     "Error: --tls-handshake-threads (%u) must be between 0 and %u. It is the number "
+                     "of threads the client port's TLS handshakes are driven on, off the client loops; "
+                     "0 drives each on its loop.\n",
+                     config.tls_handshake_threads, kMaxScanThreads);
+        std::exit(1);
+    }
+    if (config.tls_handshake_timeout_ms < 100 || config.tls_handshake_timeout_ms > 600'000) {
+        std::fprintf(stderr,
+                     "Error: --tls-handshake-timeout-ms (%u) must be between 100 and 600000: how long "
+                     "a TLS handshake on its threads may take before the connection is closed.\n",
+                     config.tls_handshake_timeout_ms);
         std::exit(1);
     }
 
@@ -2529,6 +2554,8 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("io-threads", std::to_string(c.io_threads));
     line("scan-threads", std::to_string(c.scan_threads));
     line("large-read-threads", std::to_string(c.large_read_threads));
+    line("tls-handshake-threads", std::to_string(c.tls_handshake_threads));
+    line("tls-handshake-timeout-ms", std::to_string(c.tls_handshake_timeout_ms));
     line("profile", c.profile);
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
@@ -2911,6 +2938,10 @@ struct ReactorShared {
 
     /// The threads large reads are answered on, off the loops (#260); null with --large-read-threads 0.
     OffLoopPool*             off_loop_pool;
+
+    /// The threads the client port's TLS handshakes are driven on (#265); null without TLS on the
+    /// client port, or with --tls-handshake-threads 0.
+    TlsHandshakePool*        tls_handshakes;
 };
 
 class Reactor final : public OffLoopWork {
@@ -2934,14 +2965,18 @@ public:
     /// `Session` belongs to the thread that serves it from its first byte.
     /// `local`: the connection came through the Unix socket (#52), which has no TLS.
     void hand_off(int fd, uint64_t conn_id, bool local);
+    /// Give this reactor a TLS connection whose handshake a thread of the pool did (#265): adopted as
+    /// hand_off()'s are, its session reading and writing through `ssl` from the first event.
+    void hand_off_established(int fd, uint64_t conn_id, std::shared_ptr<ssl_st> ssl);
 
     int index() const { return index_; }
 
 private:
     /// Take ownership of an accepted connection: session, epoll registration, TLS, banner. The
     /// session count was taken at accept, so every failure here gives it back. A `local` connection,
-    /// from the Unix socket, is plaintext whatever the client port's TLS says (#52).
-    void adopt(int fd, uint64_t conn_id, bool local);
+    /// from the Unix socket, is plaintext whatever the client port's TLS says (#52). `done`: the SSL of a
+    /// handshake the pool did (#265); without it the loop starts the handshake, as it always did.
+    void adopt(int fd, uint64_t conn_id, bool local, std::shared_ptr<ssl_st> done = nullptr);
 
     /// Every connection waiting on a listening socket: refused while draining, otherwise counted
     /// against --max-sessions and dealt to a reactor. `local` for the Unix socket (#52).
@@ -2969,11 +3004,15 @@ private:
     void take_read(const Command& cmd, Session& session, uint64_t rows_at_most) override;
     /// A FLUSH handed to the threads off the loop (#261), and its session paused.
     void take_flush(Session& session) override;
-    /// The answers that came back off the loop, each queued on its session, and the sessions resumed:
-    /// an event as if readable and writable appended for each to the `nfds` of this pass, so that the
-    /// answer is flushed, the commands held behind it run and the socket is read again. Returns the
-    /// events now in the pass; a session that does not fit is resumed on the next.
-    int take_off_loop_answers(int nfds);
+    /// The answers that came back off the loop, each queued on its session, and the session put in
+    /// `resume_`.
+    void take_off_loop_answers();
+    /// The sessions in `resume_` - an answer of theirs came back off the loop (#260), or they were
+    /// adopted with their TLS handshake done off it (#265) - each an event as if readable and writable
+    /// appended to the `nfds` of this pass, so that what is queued is flushed, the commands held behind
+    /// it run and the socket is read again. Returns the events now in the pass; a session that does not
+    /// fit is resumed on the next.
+    int append_resumed(int nfds);
 
     /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
     ///
@@ -3001,6 +3040,8 @@ private:
     /// with every read handed out, so that one finishing after this loop has gone writes to a mailbox
     /// nobody reads - and the sessions resumed past the events one pass could take.
     OffLoopPool*             off_loop_pool_;
+    /// The client port's TLS handshake threads (#265); null when the loops drive the handshakes.
+    TlsHandshakePool*        tls_handshakes_;
     std::shared_ptr<OffLoopMailbox> mailbox_;
     std::vector<int>         resume_;
     std::atomic<bool>&       running_;
@@ -3018,9 +3059,10 @@ private:
     int                      wake_fd_{-1};
     std::mutex               handoff_mtx_;
     struct HandedOff {
-        int      fd;
-        uint64_t conn_id;
-        bool     local;
+        int                     fd;
+        uint64_t                conn_id;
+        bool                    local;
+        std::shared_ptr<ssl_st> ssl;   ///< the handshake done off the loop (#265), or null
     };
     std::vector<HandedOff>   handoff_;   ///< under handoff_mtx_
 
@@ -3095,6 +3137,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , tls_(shared.tls)
     , secrets_(shared.secrets)
     , off_loop_pool_(shared.off_loop_pool)
+    , tls_handshakes_(shared.tls_handshakes)
     , running_(shared.running)
     , draining_(shared.draining)
     , stats_(shared.stats)
@@ -3280,7 +3323,7 @@ void Reactor::take_flush(Session& session) {
     OB_LOG_DEBUG("tcp_server", "reactor %d: FLUSH from fd=%d answered off the loop", index_, fd);
 }
 
-int Reactor::take_off_loop_answers(int nfds) {
+void Reactor::take_off_loop_answers() {
     for (OffLoopAnswer& a : mailbox_->take()) {
         engine_->registry().increment_gauge(
             a.flush ? "ob_off_loop_flushes_in_flight" : "ob_off_loop_reads_in_flight", -1);
@@ -3316,6 +3359,9 @@ int Reactor::take_off_loop_answers(int nfds) {
         if (s->has_pending_output()) arm_epollout(a.fd);
         resume_.push_back(a.fd);
     }
+}
+
+int Reactor::append_resumed(int nfds) {
     // As if readable and writable: the answer flushed, the commands held behind it run, and the socket
     // read to EAGAIN - which, edge-triggered, it would not report again for what came while it waited.
     size_t taken = 0;
@@ -3435,7 +3481,7 @@ void Reactor::serve_ring_output(Session& s) {
 void Reactor::hand_off(int fd, uint64_t conn_id, bool local) {
     {
         std::lock_guard<std::mutex> lock(handoff_mtx_);
-        handoff_.push_back(HandedOff{fd, conn_id, local});
+        handoff_.push_back(HandedOff{fd, conn_id, local, nullptr});
     }
     const uint64_t one = 1;
     const ssize_t wr = ::write(wake_fd_, &one, sizeof(one));
@@ -3449,6 +3495,21 @@ void Reactor::hand_off(int fd, uint64_t conn_id, bool local) {
                  static_cast<unsigned long long>(conn_id), index_);
 }
 
+void Reactor::hand_off_established(int fd, uint64_t conn_id, std::shared_ptr<ssl_st> ssl) {
+    {
+        std::lock_guard<std::mutex> lock(handoff_mtx_);
+        handoff_.push_back(HandedOff{fd, conn_id, /*local=*/false, std::move(ssl)});
+    }
+    const uint64_t one = 1;
+    const ssize_t wr = ::write(wake_fd_, &one, sizeof(one));
+    if (wr != static_cast<ssize_t>(sizeof(one))) {
+        OB_LOG_WARN("tcp_server", "Reactor %d: wake write for fd=%d returned %zd: %s", index_, fd,
+                    wr, std::strerror(errno));
+    }
+    OB_LOG_DEBUG("tcp_server", "Handed fd=%d (conn_id=%llu), its TLS handshake done, to reactor %d", fd,
+                 static_cast<unsigned long long>(conn_id), index_);
+}
+
 void Reactor::adopt_handed_off() {
     uint64_t counter = 0;
     const ssize_t rd = ::read(wake_fd_, &counter, sizeof(counter));
@@ -3458,12 +3519,12 @@ void Reactor::adopt_handed_off() {
         std::lock_guard<std::mutex> lock(handoff_mtx_);
         taken.swap(handoff_);
     }
-    for (const HandedOff& h : taken) {
-        adopt(h.fd, h.conn_id, h.local);
+    for (HandedOff& h : taken) {
+        adopt(h.fd, h.conn_id, h.local, std::move(h.ssl));
     }
 }
 
-void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
+void Reactor::adopt(int fd, uint64_t conn_id, bool local, std::shared_ptr<ssl_st> done) {
     // Every failure below gives back the place in the session count the accepting reactor took.
     const auto give_back = [&] {
         stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
@@ -3472,9 +3533,15 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
 
     if (!sessions_.add_session(fd, conn_id)) {
         // Not the global limit, which the accepting reactor applied: this reactor's own table.
+        // Not to a session whose TLS handshake is done (#265): it reads records, not this in the
+        // clear, and is told by the close.
         const char* msg = "ERR server full\n";
-        auto wr = ::send(fd, msg, std::strlen(msg), MSG_NOSIGNAL);
-        (void)wr;
+        if (!done) {
+            auto wr = ::send(fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+            (void)wr;
+        }
+        OB_LOG_WARN("tcp_server", "Reactor %d: no room for fd=%d (conn_id=%llu) in its session table; "
+                    "closed", index_, fd, static_cast<unsigned long long>(conn_id));
         ::close(fd);
         give_back();
         return;
@@ -3494,7 +3561,12 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
 
     Session* s = sessions_.get_session(fd);
     if (s) s->set_local(local, config_.rings ? config_.ring_bytes : 0);
-    if (s && tls_.client_port && !local) {
+    if (s && done) {
+        // The handshake a thread of the pool did (#265). What the client sent behind its Finished may
+        // be in the SSL's buffer already, where this loop's epoll does not see it: the session is
+        // resumed below, which flushes the banner and reads whatever is there.
+        s->enable_tls_done(std::move(done));
+    } else if (s && tls_.client_port && !local) {
         // Wrap before anything is written: the banner is application data and must not precede
         // the handshake. It is queued here and goes out with the first flush after the handshake
         // completes, which is what send_response() on a handshaking session does - the bytes sit in
@@ -3524,7 +3596,9 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
     if (s) {
         static const std::string banner =
             "OK ob_tcp_server v" + std::string(version()) + "\n\n";
+        const bool handshake_done = s->tls_enabled() && !s->tls_handshaking();
         s->send_response(banner);
+        if (handshake_done) resume_.push_back(fd);
     }
 }
 
@@ -3589,7 +3663,13 @@ void Reactor::accept_from(int listen_fd, bool local) {
         // Dealt in turn, so four connections on four reactors are one each, and a
         // connection stays where it is dealt for its whole life.
         const uint64_t conn_id = next_conn_id_++;
-        Reactor* target = (*reactors_)[next_reactor_++ % reactors_->size()];
+        const size_t   dealt   = next_reactor_++ % reactors_->size();
+        Reactor* target = (*reactors_)[dealt];
+        if (tls_handshakes_ != nullptr && tls_.client_port && !local) {
+            // Its handshake on a thread of the pool, and then to the loop it is dealt to (#265).
+            tls_handshakes_->submit(client_fd, conn_id, dealt);
+            continue;
+        }
         if (target == this) {
             adopt(client_fd, conn_id, local);
         } else {
@@ -3673,7 +3753,12 @@ void Reactor::run_loop() {
             }
         }
         // The answers of the reads handed off, and their sessions resumed (#260).
-        if (nfds >= 0 && mailbox_) nfds = take_off_loop_answers(nfds);
+        // The answers of the reads handed off (#260), and the sessions resumed - by an answer that came
+        // back, or adopted with their TLS handshake done off the loop (#265).
+        if (nfds >= 0) {
+            if (mailbox_) take_off_loop_answers();
+            nfds = append_resumed(nfds);
+        }
         if (nfds > 0) last_event_at_ = std::chrono::steady_clock::now();
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -4376,10 +4461,27 @@ void TcpServer::run() {
     if (config_.large_read_threads > 0) {
         off_loop_pool = std::make_unique<OffLoopPool>(config_.large_read_threads);
     }
+    // The client port's TLS handshakes, off the loops (#265). Made before the loops, because the one
+    // that accepts submits to it, and stopped once they have stopped and before they are gone: a
+    // handshake completed after that would be handed to a loop that no longer exists. `dealt_to` is
+    // filled as the loops are made, before any of them runs.
+    std::unique_ptr<TlsHandshakePool> tls_handshakes;
+    if (tls_.client_port && config_.tls_handshake_threads > 0) {
+        tls_handshakes = std::make_unique<TlsHandshakePool>(
+            config_.tls_handshake_threads, std::chrono::milliseconds(config_.tls_handshake_timeout_ms),
+            tls_.client_port, &engine_->registry(),
+            [&dealt_to](size_t loop, TlsHandshakePool::Done done) {
+                dealt_to[loop]->hand_off_established(done.fd, done.conn_id, std::move(done.ssl));
+            },
+            [this, &stats] {
+                stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                engine_->registry().increment_gauge("ob_active_sessions", -1);
+            });
+    }
         ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
                          &dealt_to, admin_mtx, backups.get(), loop_load_.get(),
-                         off_loop_pool.get()};
+                         off_loop_pool.get(), tls_handshakes.get()};
     const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
     engine_->set_loop_load(loop_load_.get(), cpus);
     struct Unload {
@@ -4397,6 +4499,12 @@ void TcpServer::run() {
     // and never changes while it is read.
     int no_listener = -1;
     std::vector<std::unique_ptr<Reactor>> reactors;
+    // Whichever way this function is left, the handshake threads stop before the loops they hand
+    // sessions to are gone (#265): declared after `reactors`, this is destroyed before them.
+    struct StopHandshakesFirst {
+        std::unique_ptr<TlsHandshakePool>& pool;
+        ~StopHandshakesFirst() { pool.reset(); }
+    } stop_handshakes_first{tls_handshakes};
     reactors.reserve(config_.io_threads);
     for (uint32_t i = 0; i < config_.io_threads; ++i) {
         reactors.push_back(std::make_unique<Reactor>(static_cast<int>(i), shared,
@@ -4461,6 +4569,10 @@ void TcpServer::run() {
         // Reactor 0 returned, so the server is stopping: a finished drain, a deadline, a fatal
         // error, or another reactor's failure. The block's end stops and joins the others.
     }
+    // The handshake threads before the loops they hand sessions to (#265): what they still hold is
+    // closed with its place given back, and what they handed on is in the loops' queues, which the
+    // next line closes.
+    tls_handshakes.reset();
     reactors.clear();   // closes every reactor's descriptors, and anything still handed off
 
     // listen_fd_ may already be closed by the reactor during drain, and unix_listen_fd_ with it.
