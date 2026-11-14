@@ -2900,6 +2900,71 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 265. A client loop signed for every new TLS session, and every session on it waited ✅ **P2**
+
+**Found asking what else holds a client loop after #260 and #261** (spec
+`smart-data-engine-workspace/specs/tls-handshake-off-the-loop/`, evidence
+`evidence/2026-11-14-tls-handshake-probe/` and `evidence/2026-11-14-tls-handshake-off-the-loop/`). A
+loop drove each of its TLS sessions' handshakes itself (`Session::continue_tls_handshake()`,
+`SSL_accept()`), between the events of every other session it serves: with an RSA-2048 certificate about
+1 300 handshakes a second on the m9g.xlarge and 2 200 on the m8a.xlarge. Two processes opening
+connections back to back - clients reconnecting after a failover, or one reconnecting in a loop - raised
+the median `PING` of a session on the same loop 31-36 times with an RSA-2048 certificate, on both test
+hosts, and a feed's writes on that loop waited behind the handshakes the same way.
+
+**The client port's handshakes run on threads of their own** (`TlsHandshakePool`,
+`--tls-handshake-threads N`, default 1, threads `ob-tls-0` …). The accepting loop hands a TLS connection
+to one, which drives `SSL_accept()` on the connection's events in an epoll of its own and gives the loop
+the connection was dealt to a session whose handshake is done (`Reactor::hand_off_established()`,
+`Session::enable_tls_done()`). A handshake that fails is closed on its thread, and so is one not done
+within `--tls-handshake-timeout-ms` (default 10 000): a client that connected and never began its
+handshake held its place in `--max-sessions` for as long as it stayed connected, and gives it back now.
+A session adopted with its handshake done is resumed in its loop's next pass (`append_resumed()`, #260's
+resume as a step of its own), for an OpenSSL that holds what came behind the client's `Finished` in its
+buffer - which without read-ahead, off in every context here, it does not. With
+`--tls-handshake-threads 0` the loops drive the handshakes, as before.
+
+Measured on the test hosts with Release builds, `master` (`113de4b`) against this change (`5b0b334`), one
+client loop, three rounds of each certificate with the builds taking turns: a process `PING`s every half
+millisecond through the Unix socket, plain and served by the same loop, while two processes open TLS
+connections back to back for 5 s, each a full TLS 1.3 handshake and the banner.
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| `PING` p50 beside RSA-2048 handshakes, two processes opening them | 233-248 us | 10.4-10.5 us | 333-336 us | 10.5-10.6 us |
+| its p99 | 483-497 us | 25-30 us | 524-532 us | 30-39 us |
+| the same with one process: p50 | 348-349 us | 7.5 us | 110-114 us | 8.0 us |
+| its p99 | 591-592 us | 16-17 us | 303-307 us | 15-16 us |
+| `PING` p50 beside ECDSA P-256 handshakes, two processes | 112.6-113.2 us | 14.2-14.3 us | 11.4-15.5 us | 8.6-8.8 us |
+| its p99 | 151-152 us | 119-178 us | 192-197 us | 87-219 us |
+| the same with one process: p50 | 33.5-34.6 us | 7.5 us | 10.6-10.8 us | 5.8-6.9 us |
+| its p99 | 100-109 us | 18-19 us | 165-166 us | 16 us |
+| `PING` p50 with no handshake | 7.3-7.5 us | 7.3-7.5 us | 9.2-9.3 us | 9.1-9.2 us |
+| RSA-2048 handshakes a second, two processes | 1 281-1 290 | 1 295-1 298 | 2 204-2 214 | 2 272-2 276 |
+| ECDSA P-256 handshakes a second, two processes | 4 075 | 3 975-3 993 | 3 598-3 672 | 3 609-3 646 |
+| one connection to its banner on an idle node, RSA-2048, p50 | 894-895 us | 892-894 us | 655-661 us | 657-660 us |
+
+With two processes opening connections the host's four CPUs carry five busy threads - theirs, the
+pinger's, the loop's and the handshake thread's - and with ECDSA, whose handshakes cost a loop less, the
+p99 is about what it was on both hosts; with one process it is a fifth and a tenth of it. One thread
+takes about as many handshakes a second as the loop did, 2.5% fewer to 3.3% more, and a connection waits
+for its banner as long as it did.
+
+Tests: `tests/test_tls_handshake_pool.cpp` (a handshake done and handed to the loop it was dealt to,
+with an SSL its session writes through; one that fails, one that never starts and one under way when the
+pool stops, each closed with its place given back; six connections on two threads each reaching its
+loop), the flags' defaults and both ends of their ranges in `tests/test_cli_args.cpp`, and
+`tests/integration/test_tls_handshake_isolation.py` (a `PING` beside a handshake storm under a quarter of
+the one with the handshakes on the loop, with the metrics; a command sent right behind the handshake
+answered; a connection that never sends its ClientHello closed at its deadline, its place given back; a
+certificate replaced on `SIGHUP` presented by the next handshake on the threads).
+
+Mutation table (`arm/mutations/` in the evidence): 10 mutants, 9 killed - each by the test of what it
+breaks - and one surviving as expected with the control: a session adopted with its handshake done and
+not resumed, which only a context with read-ahead would need.
+
+- Effort: M | Impact: a burst of TLS connections no longer holds the sessions already served
+
 ### 264. Nothing ran the test suite on ARM, which the release ships ✅ **P2**
 
 **Found by #262.** The release's ARM64 packages are built and accepted on every pull request

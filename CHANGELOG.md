@@ -11,6 +11,19 @@ here as `#N`.
 
 ### Added
 
+- **The client port's TLS handshakes are driven off the client loops** (#265), on
+  `--tls-handshake-threads N` threads (default 1, `ob-tls-N`; 0 keeps them on the loops). A loop drove
+  each new TLS session's handshake between the events of all its others, so two processes opening
+  connections back to back raised the median `PING` of a session on the same loop 31-36 times with an
+  RSA-2048 certificate. A loop is now given a session whose handshake is done: that `PING` takes
+  10.4-10.6 us at the median beside them where it took 233-336 us, and 25-39 us at p99 where 483-532
+  (m9g.xlarge and m8a.xlarge), and one thread takes about as many handshakes a second as a loop did.
+  A handshake that fails, or is not done within `--tls-handshake-timeout-ms` (default 10 000), is closed
+  on its thread and its place in `--max-sessions` given back: a client that connects and never begins
+  its handshake no longer holds one for as long as it stays.
+  `ob_tls_handshakes_total`, `ob_tls_handshake_failures_total`, `ob_tls_handshake_timeouts_total`,
+  `ob_tls_handshakes_in_flight` and `ob_tls_handshake_seconds`.
+
 - **A large `SELECT` is answered off its client loop** (#260), on `--large-read-threads N` threads
   (default 2, `ob-read-N`). A client loop ran a read to its last byte before it served another
   session, so every session on it - its `PING`, its writes - waited for as long as the read took: a
