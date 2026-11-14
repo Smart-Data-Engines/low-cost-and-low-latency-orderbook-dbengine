@@ -2900,6 +2900,24 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 264. Nothing ran the test suite on ARM, which the release ships ✅ **P2**
+
+**Found by #262.** The release's ARM64 packages are built and accepted on every pull request
+(`package-arm64`, #42), but the C++ suite ran on x86 alone: #262's test failed 16 runs of 20 on the
+m9g.xlarge's Debug build, with nothing wrong in the book, and passed every run CI had made. Anyone
+running the suite on ARM was told the book was broken, and a defect that only ARM's ordering or
+codec paths show would have reached a release the same way.
+
+**`build-and-test-arm64`** builds the tree in Debug on GitHub's ARM runner (`ubuntu-24.04-arm`) and
+runs what `build-and-test` runs on x86: the whole ctest, `-j1`, and the failover manager's tests
+against a real etcd. Its FetchContent cache is keyed by the architecture as well - `build/_deps`
+holds the dependencies' builds. `.github/rulesets/master.json` requires it, fifteen contexts now, and
+`check_contexts.py` holds the file, the workflows and the two documents that state the count to one
+another; the live ruleset takes the file once this is merged, as its README orders. The integration
+battery stays on x86, where its patience was calibrated.
+
+- Effort: S | Impact: a failure on ARM fails the pull request, not a user's node
+
 ### 263. A write paid for every subscriber of its book, on the writer's thread, and more for each one ✅ **P1**
 
 **Found asking what a feed's writer pays for the clients subscribed to its book** (spec
