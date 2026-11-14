@@ -169,6 +169,35 @@ TEST(CliArgsDeath, IoThreadsAboveTheCeilingIsRefused) {
                 ::testing::ExitedWithCode(1), "must be between 1 and 64");
 }
 
+TEST(CliArgs, TlsHandshakesHaveAThreadAndTenSecondsUnlessTold) {
+    // #265: one thread drives the client port's handshakes off the loops, and a handshake not done in
+    // ten seconds is closed; 0 threads drives each on its loop, as every node did before. Both ends of
+    // each range, which `docs/cli.md` prints.
+    const ob::ServerConfig defaults = parse({});
+    EXPECT_EQ(defaults.tls_handshake_threads, 1u);
+    EXPECT_EQ(defaults.tls_handshake_timeout_ms, 10'000u);
+    EXPECT_EQ(parse({"--profile", "eco"}).tls_handshake_threads, 1u);
+    EXPECT_EQ(parse({"--tls-handshake-threads", "0"}).tls_handshake_threads, 0u);
+    EXPECT_EQ(parse({"--tls-handshake-threads", "64"}).tls_handshake_threads, 64u);
+    EXPECT_EQ(parse({"--tls-handshake-timeout-ms", "100"}).tls_handshake_timeout_ms, 100u);
+    EXPECT_EQ(parse({"--tls-handshake-timeout-ms", "600000"}).tls_handshake_timeout_ms, 600'000u);
+}
+
+TEST(CliArgsDeath, TlsHandshakeThreadsAboveTheCeilingAreRefused) {
+    EXPECT_EXIT(parse({"--tls-handshake-threads", "65"}), ::testing::ExitedWithCode(1),
+                "--tls-handshake-threads \\(65\\) must be between 0 and 64");
+}
+
+TEST(CliArgsDeath, ATlsHandshakeTimeoutPastEitherEndIsRefused) {
+    // One past each end, so each comparison is pinned rather than the order of magnitude. A timeout of
+    // 0 would close every connection before its ClientHello; one of hours would hold a place in
+    // --max-sessions for a client that never sends one.
+    EXPECT_EXIT(parse({"--tls-handshake-timeout-ms", "99"}), ::testing::ExitedWithCode(1),
+                "--tls-handshake-timeout-ms \\(99\\) must be between 100 and 600000");
+    EXPECT_EXIT(parse({"--tls-handshake-timeout-ms", "600001"}), ::testing::ExitedWithCode(1),
+                "--tls-handshake-timeout-ms \\(600001\\) must be between 100 and 600000");
+}
+
 TEST(CliArgsDeath, AValueOutOfRangeForItsTypeIsRefused) {
     // 99999 does not fit a uint16 port. static_cast would have wrapped it to 34463.
     EXPECT_EXIT(parse({"--port", "99999"}), ::testing::ExitedWithCode(1),

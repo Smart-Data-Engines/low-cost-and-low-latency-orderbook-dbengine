@@ -585,6 +585,7 @@ endif()
 add_library(orderbook_tcp_server_lib STATIC
     src/tcp_server.cpp
     src/off_loop_reads.cpp
+    src/tls_handshake_pool.cpp
     src/command_parser.cpp
     src/response_formatter.cpp
     src/session.cpp

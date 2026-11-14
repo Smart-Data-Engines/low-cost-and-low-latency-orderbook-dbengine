@@ -1284,6 +1284,12 @@ ob_add_tcp_test(test_tls_session
     test_tls_session.cpp
 )
 
+# The client port's TLS handshakes on their own threads, off the client loops (#265): a handshake done
+# and handed to its loop, one that fails, one past its deadline, one under way when the pool stops.
+ob_add_tcp_test(test_tls_handshake_pool
+    test_tls_handshake_pool.cpp
+)
+
 # TLS on the node links: mutual verification, the peer-name allowlist, and the two static tests
 # that make the disconnect and socket-I/O shapes impossible rather than fixed once (series D).
 ob_add_tls_test(test_tls_node_link

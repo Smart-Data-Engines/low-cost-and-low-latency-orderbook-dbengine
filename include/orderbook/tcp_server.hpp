@@ -194,6 +194,13 @@ struct ServerConfig {
     /// (#260), so that a loop goes on serving its other sessions while one reads millions of rows.
     /// 0 answers every read on its loop, as this server always did.
     uint32_t    large_read_threads{2};
+    /// --tls-handshake-threads: the threads the client port's TLS handshakes are driven on, off the
+    /// client loops (#265), so that a loop's sessions do not wait while it signs for new connections.
+    /// 0 drives each handshake on the loop its connection is dealt to, as this server always did.
+    uint32_t    tls_handshake_threads{1};
+    /// --tls-handshake-timeout-ms: how long a handshake on those threads may take before its connection
+    /// is closed and its place in --max-sessions given back (#265). A handshake on a loop has none.
+    uint32_t    tls_handshake_timeout_ms{10'000};
     /// The CPUs this process may use, as `detect_machine()` found them (#156): what a scan on the
     /// pool divides against. 0 until the command line is read, and then the client loops' count.
     uint32_t    usable_cpus{0};

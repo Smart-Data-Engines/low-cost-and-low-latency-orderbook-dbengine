@@ -163,6 +163,15 @@ void Session::enable_tls(std::shared_ptr<ssl_st> ssl) {
     transport_       = Transport::Tls;
 }
 
+void Session::enable_tls_done(std::shared_ptr<ssl_st> ssl) {
+    ssl_             = std::move(ssl);
+    tls_handshaking_ = false;
+    io_want_         = IoWant::Read;
+    transport_       = Transport::Tls;
+    OB_LOG_DEBUG("tls", "fd=%d conn_id=%llu adopted with its handshake done off the loop", fd_,
+                 static_cast<unsigned long long>(conn_id_));
+}
+
 bool Session::tls_enabled() const { return ssl_ != nullptr; }
 
 bool Session::tls_handshaking() const { return tls_handshaking_; }
