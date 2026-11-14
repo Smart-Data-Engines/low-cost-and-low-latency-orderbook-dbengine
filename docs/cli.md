@@ -503,21 +503,21 @@ The session that asked waits for its answer: what it wrote behind the read waits
 it writes later waits in its socket, and its answers come in the order it asked - a write sent after
 the read is not in it. The answer is the same bytes, in a frame on a session with `COMPRESS LZ4` and
 within the session's 64 MiB, and each thread builds one at a time. A session closed while its read
-is answered - by its client, or by a reload that revoked its identity - has the answer dropped.
+is answered - its client gone with answers still queued for it - has the answer dropped.
 
 Measured with Release builds, eight million rows of one book, one client loop, the `PING`s and writes
-sent by a process of their own while the read was answered (`evidence/2026-11-07-large-answer-off-the-loop/`
+sent by a process of their own while the read was answered (`evidence/2026-11-14-off-the-loop-on-master/`
 in the workspace, three rounds each):
 
 | | ARM before | after | x86 before | after |
 |---|---|---|---|---|
-| longest `PING` beside a `SELECT` of 1M rows | 13.6-22.1 ms | 0.22-0.47 ms | 15.2-17.8 ms | 0.06-0.17 ms |
-| the same in LZ4 | 52.4-55.4 ms | 0.06-1.05 ms | 47.8-52.2 ms | 0.04-0.14 ms |
-| longest `MINSERT` of 20 levels beside it | 11.6-19.5 ms | 0.29-3.52 ms | 13.2-16.9 ms | 0.19-3.84 ms |
-| `SELECT ... LIMIT 100`, p50 | 23.5-24.0 us | 22.7-23.6 us | 13.1-13.9 us | 13.1-13.9 us |
+| longest `PING` beside a `SELECT` of 1M rows | 11.9-24.6 ms | 0.13-0.41 ms | 14.0-18.3 ms | 0.08-0.26 ms |
+| the same in LZ4 | 55.0-59.3 ms | 0.15-0.47 ms | 41.3-50.1 ms | 0.03-0.07 ms |
+| longest `MINSERT` of 20 levels beside it | 12.5-20.5 ms | 0.46-0.64 ms | 13.3-16.4 ms | 0.19-2.05 ms |
+| `SELECT ... LIMIT 100`, p50 | 22.3-23.3 us | 22.6-23.0 us | 13.2-14.0 us | 13.0-14.0 us |
 
-A writer this fast meets a few milliseconds now and then with no read beside it too: 3.8-3.9 ms at
-the longest on the ARM test host.
+A writer this fast meets a few milliseconds now and then with no read beside it too: 3.7-3.9 ms at
+the longest on the ARM test host and 4.0-4.1 ms on the x86 one.
 
 `ob_off_loop_reads_total` counts the reads answered off their loop, `ob_off_loop_reads_in_flight` the
 ones whose answer has not come back, and `ob_off_loop_read_wait_seconds` how long each waited for a
