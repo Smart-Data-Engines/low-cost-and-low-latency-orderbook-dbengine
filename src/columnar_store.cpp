@@ -4,6 +4,7 @@
 #include "orderbook/codec.hpp"
 #include "orderbook/column_codec.hpp"
 #include "orderbook/crc32c.hpp"
+#include "orderbook/price_side.hpp"
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
@@ -2772,23 +2773,23 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
                                                          std::string_view exchange, size_t depth,
                                                          BestTrack* track) const {
     PricedBook out;
-    // The row holding each price, by side. Ordered maps, so the best come first without a sort,
-    // and a removal is one erase.
-    std::map<int64_t, SnapshotRow, std::greater<>> bids;
-    std::map<int64_t, SnapshotRow> asks;
+    // The row holding each price, by side: a table from price to row and the best price at hand,
+    // sorted once at the end (#266). A std::map here was half of what composing a summary cost.
+    PriceSide<true>  bids;
+    PriceSide<false> asks;
     const auto apply = [&](const SnapshotRow& r) {
         out.as_of = r;
         if (r.side == SIDE_BID) {
             if (r.quantity == 0) {
-                bids.erase(r.price);
+                bids.remove(r.price);
             } else {
-                bids.insert_or_assign(r.price, r);
+                bids.put(r);
             }
         } else if (r.side == SIDE_ASK) {
             if (r.quantity == 0) {
-                asks.erase(r.price);
+                asks.remove(r.price);
             } else {
-                asks.insert_or_assign(r.price, r);
+                asks.put(r);
             }
         }
         return true;
@@ -2840,11 +2841,11 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
             BookTop t;
             if (!bids.empty()) {
                 t.has_bid = true;
-                t.bid = bids.begin()->first;
+                t.bid = bids.best();
             }
             if (!asks.empty()) {
                 t.has_ask = true;
-                t.ask = asks.begin()->first;
+                t.ask = asks.best();
             }
             return t;
         };
@@ -2872,7 +2873,7 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
     out.ask_prices = asks.size();
     const auto take = [&](const auto& side) {
         size_t level = 0;
-        for (const auto& [price, row] : side) {
+        for (const SnapshotRow& row : side.best_first()) {
             if (level >= depth) break;
             SnapshotRow r = row;
             // A position past what the field holds only in a read of more than 65535 prices a

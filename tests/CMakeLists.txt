@@ -494,6 +494,13 @@ ob_add_engine_test(test_book_summary_equivalence
 )
 target_link_libraries(test_book_summary_equivalence PRIVATE rapidcheck rapidcheck_gtest)
 
+# One side of a book composed by price (#266): a table from price to row and a heap of the best,
+# against the std::map it replaces.
+ob_add_engine_test(test_price_side
+    test_price_side.cpp
+)
+target_link_libraries(test_price_side PRIVATE rapidcheck rapidcheck_gtest)
+
 # The WAL archive of point-in-time recovery (#34): closed files copied and checked, a file with other
 # contents refused and never overwritten, and the retention floor never above a file the archive
 # does not hold.
