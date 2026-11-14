@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import free_port, patience, server_binary_path
+from conftest import free_port, instrumented_run, patience, server_binary_path
 
 pytestmark = pytest.mark.smoke
 
@@ -189,9 +189,14 @@ def test_a_handshake_storm_does_not_hold_the_sessions_beside_it(nodes):
     before = off.metric("ob_tls_handshakes_total")
     beside, made_off = ping_median_beside_a_storm(off)
     assert made_on > 0 and made_off > 0, "the storm made no handshake"
-    # On the loop a PING waits behind the handshakes; off it, for a fraction of that.
-    assert beside < held / 4, (f"the median PING beside the handshakes was {beside * 1e6:.0f} us, "
-                               f"{held * 1e6:.0f} us with them on the loop")
+    # On the loop a PING waits behind the handshakes; off it, for a fraction of that: under a twentieth
+    # in #265's measurement (Release builds, RSA-2048), and a quarter is asked. Under a sanitizer the
+    # server's own code, a PING's path with it, runs several times slower while the system's OpenSSL,
+    # which is not instrumented, signs as fast, so half is asked there - the scaling patience() does
+    # for the waits, applied to a ratio.
+    fraction = 2 if instrumented_run() else 4
+    assert beside < held / fraction, (f"the median PING beside the handshakes was {beside * 1e6:.0f} us, "
+                                      f"{held * 1e6:.0f} us with them on the loop")
     assert off.metric("ob_tls_handshakes_total") >= before + made_off
     assert off.metric("ob_tls_handshakes_in_flight") == 0
     assert on.metric("ob_tls_handshakes_total") == 0, "a handshake left a loop with no threads"
