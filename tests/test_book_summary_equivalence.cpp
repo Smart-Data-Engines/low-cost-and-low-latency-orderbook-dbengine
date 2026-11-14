@@ -203,6 +203,16 @@ struct Store {
             why << "the summary as of " << w.as_of_ts << " is " << summary.size() << " bytes, the oracle's "
                 << want.summary.size() << (summary.size() == want.summary.size() ? ", and they differ" : "");
         }
+        // And the rows it says it read: every row from the summary's time to its own, both included,
+        // which the engine's log line reports.
+        uint64_t span = 0;
+        for (const ob::SnapshotRow& r : rows_to(*store, w.as_of_ts)) {
+            if (r.timestamp_ns >= from.value_or(0)) ++span;
+        }
+        if (w.rows_read != span) {
+            why << (why.tellp() > 0 ? "; " : "") << "it says it read " << w.rows_read << " rows, the span holds "
+                << span;
+        }
         if (track != want.track) {
             why << (why.tellp() > 0 ? "; " : "") << "its track is " << track.size() << " bytes, the oracle's "
                 << want.track.size() << (track.size() == want.track.size() ? ", and they differ" : "");

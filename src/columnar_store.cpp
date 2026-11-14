@@ -2956,14 +2956,15 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
     take(bids);
     take(asks);
     OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: %zu bid and %zu ask price(s), %zu "
-                             "answered; from %s, then %llu row(s) read from %zu candidate(s)",
+                             "answered; from %s, then %llu row(s) read from %zu candidate(s), %s",
                  static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
                  static_cast<unsigned long long>(at), out.bid_prices, out.ask_prices,
                  out.rows.size(),
                  out.from_summary ? ("the summary as of " + std::to_string(*out.from_summary)).c_str()
                                   : "the first row",
-                 static_cast<unsigned long long>(out.cost.kept), out.cost.candidates);
+                 static_cast<unsigned long long>(out.cost.kept), out.cost.candidates,
+                 direct ? "in sequence as decoded" : "merged by time");
     return out;
 }
 
