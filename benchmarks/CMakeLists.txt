@@ -92,6 +92,13 @@ target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)
 add_executable(segment_read_cost segment_read_cost.cpp)
 target_link_libraries(segment_read_cost PRIVATE orderbook_columnar)
 
+# ── What composing a book summary costs at a seal (#266) ─────────────────────
+#
+# Compiled, deliberately not run: it writes a store into the directory it is given and prints one
+# JSON object, the time a summary took and that time over the rows it read.
+add_executable(book_summary_cost book_summary_cost.cpp)
+target_link_libraries(book_summary_cost PRIVATE orderbook_columnar)
+
 # ── What each column of a store's segments takes, under each candidate encoding (segment format v3) ──
 #
 # Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
