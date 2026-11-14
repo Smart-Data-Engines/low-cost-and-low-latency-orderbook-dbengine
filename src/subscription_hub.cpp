@@ -233,9 +233,15 @@ std::vector<int> SubscriptionHub::drain(SessionManager& sessions,
                 continue;
             }
             if (q.pending.empty()) continue;
-            const uint64_t rows = q.pending_rows;
+            const uint64_t rows  = q.pending_rows;
+            const size_t   taken = q.pending.size();
             ready.push_back(Ready{q.fd, std::move(q.pending), rows, false});
             q.pending.clear();
+            // The bytes moved out took their room with them: room for as much again, made here on the
+            // subscriber's loop, so the writes before the next drain append into it rather than grow
+            // a string from nothing, a reallocation at a time, on the writer's thread (#263). Up to
+            // kPendingRoom, so that one burst does not leave every subscription holding its size.
+            q.pending.reserve(std::min(taken, kPendingRoom));
             q.pending_rows = 0;
             q.pushed += rows;
         }
