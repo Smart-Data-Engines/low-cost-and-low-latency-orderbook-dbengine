@@ -556,3 +556,28 @@ TEST(SubscriptionHubUnit, AWritePastTheCeilingMarksTheQueueWhereItPassesAndAddsN
     EXPECT_EQ(to_close[0], 7);
     EXPECT_EQ(hub.overflow_disconnects(), 1u);
 }
+
+TEST(SubscriptionHubUnit, EachDrainCountsTheRowsItMovedAndNoMore) {
+    // A queue counts its lines as they are added (#263) rather than the drain counting them in the
+    // bytes: a count a drain does not set back would add the rows of every drain before it again.
+    EngineFixture fix;
+    ob::SubscriptionHub hub(1 << 20, 4);
+    ob::SessionManager sessions(8);
+    int pair[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair), 0);
+    ASSERT_TRUE(sessions.add_session(pair[0]));
+    std::string error;
+    ASSERT_NE(hub.add(fix.engine, pair[0], 1, kSub, &error), 0u) << error;
+
+    fix.write("AAPL", "NYSE", 3, 1);
+    hub.drain(sessions, [](int) {});
+    EXPECT_EQ(hub.rows_pushed(), 3u);
+    fix.write("AAPL", "NYSE", 2, 2);
+    hub.drain(sessions, [](int) {});
+    EXPECT_EQ(hub.rows_pushed(), 5u) << "the second drain counted the first one's rows again";
+    const std::string got = read_available(pair[1]);
+    EXPECT_EQ(std::count(got.begin(), got.end(), '\n'), 5) << "the two writes' five rows reach the socket";
+
+    ::close(pair[1]);
+    sessions.remove_session(pair[0]);
+}
