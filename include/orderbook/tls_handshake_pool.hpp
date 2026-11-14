@@ -1,12 +1,13 @@
 #pragma once
 // TLS handshakes of the client port, off the client loops (#265).
 //
-// A client loop drove each of its TLS sessions' handshakes itself, between the events of every other
-// session it serves: an RSA-2048 handshake is about 0.45 ms of signing on an m8a.xlarge and 0.75 ms on
-// an m9g.xlarge, and two processes opening connections back to back raised the median PING of a session
-// on the same loop 31-36 times. Here the accepting loop hands a TLS connection to a thread of this pool
-// instead, which drives SSL_accept() on the connection's events and gives the loop it was dealt to a
-// session whose handshake is done - or closes it, when the handshake fails or runs out of time.
+// A client loop drove each of its TLS sessions' handshakes itself, between the events of every
+// other session it serves: two processes opening connections back to back had about 2 200 RSA-2048
+// handshakes a second out of a loop on an m8a.xlarge and 1 300 on an m9g.xlarge, and raised the
+// median PING of a session on the same loop 31-36 times. Here the accepting loop hands a TLS
+// connection to a thread of this pool instead, which drives SSL_accept() on the connection's events
+// and gives the loop it was dealt to a session whose handshake is done - or closes it, when the
+// handshake fails or runs out of time.
 
 #include <atomic>
 #include <chrono>
