@@ -1,4 +1,5 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/off_loop_reads.hpp"
 #include "orderbook/net.hpp"
 
 #include "orderbook/backup.hpp"
@@ -855,54 +856,68 @@ std::string answer_too_large(uint64_t rows_within) {
 }
 
 /// A read's answer - `SELECT` and `BOOK` - with what both do around the engine's call: the refusal
-/// during a snapshot bootstrap, the rows formatted as the engine hands them over, and the latency
-/// and counters every read shares. `read` makes the call with the row callback it is given and
-/// returns the engine's refusal, empty when there is none.
+/// during a snapshot bootstrap, the rows formatted as the engine hands them over, measured against what
+/// the session may be sent (#257), and the latency and the registry's count every read shares. `read`
+/// makes the call with the row callback it is given and returns the engine's refusal, empty when there
+/// is none. No session in it (#260): a thread off the client loop builds a large read's answer here as
+/// the loop builds the others, and the caller does the session's part.
 ///
 /// Refused during a bootstrap because a replica installing a snapshot is replacing the store under
 /// itself (#142), and an answer composed across that is an answer about two trees. Each row is
 /// formatted as it arrives (#49 step 3), not collected first: the vector of rows that was replaced
 /// was three quarters of a turned-over heap's page faults, so the latency includes formatting.
+struct ReadAnswer {
+    std::string answer;
+    bool        framed{false};      ///< an LZ4 frame already (#257)
+    uint64_t    text_bytes{0};      ///< the text a frame holds
+    bool        counted{false};     ///< a query that ran, which the session and the server count
+    bool        taken_away{false};  ///< no answer: the engine's ReadGate handed it back (#260)
+};
+
 template <typename Read>
-std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
-                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
-    session.increment_commands();
-    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+ReadAnswer build_read_answer(const char* what, int fd, Engine& engine, MetricsRegistry* registry,
+                             QueryShape& shape, std::string room, AnswerCeiling ceiling, Read&& read) {
+    ReadAnswer out;
+    if (engine.is_bootstrapping()) {
+        out.answer = format_error("bootstrapping");
+        return out;
+    }
     const auto started = std::chrono::steady_clock::now();
-    // Written in the session's send buffer's room, which take_answer() gives back with the reply
-    // (#253): a session's large answers are written where the last one was. Measured against what
-    // the session may be sent as it is built (#257) - its frame, where the session compresses - so
-    // that an answer past it stops being read and formatted there, rather than at its last row.
-    QueryResponseBuilder reply(shape, session.lend_room(),
-                               AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()});
+    QueryResponseBuilder reply(shape, std::move(room), ceiling);
     try {
         // The builder twice: as a row callback for whatever arrives one result at a time, and as
         // the place a row answer's batches go (OB-12).
         const std::string err = read([&](const QueryResult& r) { reply.add(r); },
                                      static_cast<RowAnswer&>(reply));
+        if (err == kReadTakenAway) {
+            out.taken_away = true;
+            return out;
+        }
         if (!err.empty()) {
-            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, session.fd(),
+            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, fd,
                          sanitise_for_log(err, 256).c_str());
-            return format_error(err);
+            out.answer = format_error(err);
+            return out;
         }
     } catch (const std::exception& e) {
-        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, session.fd(),
-                     sanitise_for_log(e.what(), 256).c_str());
-        return format_error(e.what());
+        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, fd, sanitise_for_log(e.what(), 256).c_str());
+        out.answer = format_error(e.what());
+        return out;
     }
     if (reply.full()) {
         // No client could be sent this however fast it reads: refused as #152 refuses it, with the
         // session left open - but now where it passed the ceiling, not after its last row (#257).
         OB_LOG_INFO("tcp_server", "%s from fd=%d passed its answer's ceiling of %zu bytes after %llu "
                     "row(s), %zu byte(s) built (%s): refused, the first %llu row(s) within it", what,
-                    session.fd(), Session::max_queued_bytes(),
-                    static_cast<unsigned long long>(reply.rows_taken()), reply.bytes_built(),
-                    reply.framed() ? "an LZ4 frame" : "text",
+                    fd, ceiling.bytes, static_cast<unsigned long long>(reply.rows_taken()),
+                    reply.bytes_built(), reply.framed() ? "an LZ4 frame" : "text",
                     static_cast<unsigned long long>(reply.rows_within()));
-        return format_error(answer_too_large(reply.rows_within()));
+        out.answer = format_error(answer_too_large(reply.rows_within()));
+        return out;
     }
-    std::string answer = reply.finish();
-    if (reply.framed()) session.next_answer_framed(reply.text_bytes());
+    out.answer     = reply.finish();
+    out.framed     = reply.framed();
+    out.text_bytes = reply.text_bytes();
     if (registry) {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -912,9 +927,28 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
         registry->observe_histogram("ob_query_latency_seconds", secs);
         registry->increment_counter("ob_total_queries");
     }
-    session.increment_queries();
-    stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-    return answer;
+    out.counted = true;
+    return out;
+}
+
+/// build_read_answer() on the loop, with the session's part: its command and query counted, the
+/// answer written in its send buffer's room (#253), and a frame marked for take_answer() (#257).
+template <typename Read>
+std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
+                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
+    session.increment_commands();
+    // Before the room is lent, so that a refused read leaves the session the room it had.
+    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+    ReadAnswer r = build_read_answer(what, session.fd(), engine, registry, shape, session.lend_room(),
+                                     AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()},
+                                     std::forward<Read>(read));
+    if (r.taken_away) return std::string(kAnsweredOffLoop);
+    if (r.framed) session.next_answer_framed(r.text_bytes);
+    if (r.counted) {
+        session.increment_queries();
+        stats.total_queries.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::move(r.answer);
 }
 
 /// `STATUS`, from a snapshot taken for this answer rather than from the `ServerStats` every
@@ -1019,7 +1053,8 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord,
                             SubscriptionHub* hub,
                             const SecretStore* client_secrets,
-                            BackupRunner* backups) {
+                            BackupRunner* backups,
+                            OffLoopReads* off_loop) {
     // ── Authentication gate ───────────────────────────────────────────────────
     //
     // Before the switch, not as a branch inside each case. A per-case check means the next command
@@ -1097,10 +1132,20 @@ std::string execute_command(const Command& cmd,
         // client while the engine computed them correctly. The engine fills `shape` in as it
         // parses the query.
         QueryShape shape;
-        return answer_read("SELECT", engine, session, stats, registry, shape,
-                           [&](auto row, RowAnswer& rows) {
-                               return engine.execute(cmd.raw_sql, row, shape, &rows);
-                           });
+        // A read the index puts at kOffLoopReadRows or more goes to the threads off the loop, and
+        // the loop goes on with its other sessions (#260). The engine hands it back once it has
+        // parsed the query and before it reads a row, so a small read pays for the question alone.
+        ReadGate gate{kOffLoopReadRows, 0};
+        ReadGate* const asked = off_loop != nullptr && off_loop->may_take(session) ? &gate : nullptr;
+        std::string answer = answer_read("SELECT", engine, session, stats, registry, shape,
+                                         [&](auto row, RowAnswer& rows) {
+                                             return engine.execute(cmd.raw_sql, row, shape, &rows,
+                                                                   asked);
+                                         });
+        if (asked != nullptr && answer == kAnsweredOffLoop) {
+            off_loop->take(cmd, session, gate.rows_at_most);
+        }
+        return answer;
     }
 
     case CommandType::BOOK: {
@@ -1433,6 +1478,7 @@ const std::vector<std::string>& known_flags() {
         "io-spin-us",
         "io-threads",
         "scan-threads",
+        "large-read-threads",
         "handover-grace-seconds",
         "log-level",
         "max-query-buckets",
@@ -1536,6 +1582,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
         {"scan-threads", {"<N>", "Threads a query's segments are read on, 0 to 64 (default: 0 under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, about twice as fast alone on four cores; beside writes it costs them, so 0 reads every segment on the query's loop"}},
+        {"large-read-threads", {"<N>", "Threads a large SELECT is answered on, off the client loops, 0 to 64 (default: 2; 0 answers every read on its loop): a read whose scan the index puts at 100000 rows or more, while the loop serves its other sessions (#260)"}},
         {"profile", {"<name>", "boost (default: one client event loop per usable CPU, and a 10 us spin where it cannot starve anything) or eco (one loop, blocking between events). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
@@ -2111,6 +2158,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.io_threads = cursor.value_as<uint32_t>();
         } else if (arg == "--scan-threads") {
             config.scan_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--large-read-threads") {
+            config.large_read_threads = cursor.value_as<uint32_t>();
         } else if (arg == "--profile") {
             config.profile = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
@@ -2177,6 +2226,15 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                      "Error: --scan-threads (%u) must be between 0 and %u. It is the number of "
                      "threads a query's segments are read on; 0 reads them on the query's loop.\n",
                      config.scan_threads, kMaxScanThreads);
+        std::exit(1);
+    }
+    // The threads off the loops (#260): 0 answers every read on its loop; past the cap is a typo.
+    if (config.large_read_threads > kMaxScanThreads) {
+        std::fprintf(stderr,
+                     "Error: --large-read-threads (%u) must be between 0 and %u. It is the number of "
+                     "threads a large SELECT is answered on, off the client loops; 0 answers every "
+                     "read on its loop.\n",
+                     config.large_read_threads, kMaxScanThreads);
         std::exit(1);
     }
 
@@ -2456,6 +2514,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("io-spin-us", std::to_string(c.io_spin_us));
     line("io-threads", std::to_string(c.io_threads));
     line("scan-threads", std::to_string(c.scan_threads));
+    line("large-read-threads", std::to_string(c.large_read_threads));
     line("profile", c.profile);
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
@@ -2835,9 +2894,12 @@ struct ReactorShared {
 
     /// Which reactors are serving events, now or a moment ago, for a scan that could divide (#249).
     LoopLoad*                loop_load;
+
+    /// The threads large reads are answered on, off the loops (#260); null with --large-read-threads 0.
+    OffLoopPool*             off_loop_pool;
 };
 
-class Reactor {
+class Reactor final : public OffLoopReads {
 public:
     /// `listen_fd` is the server's listening socket for the reactor that accepts, and a descriptor
     /// of -1 for any other; `unix_listen_fd` the same for the Unix socket (#52), -1 without one. A
@@ -2885,6 +2947,18 @@ private:
     /// which is why a session dying in the middle of a large response left no trace.
     void close_session(int fd, const char* reason);
 
+    /// A session whose large reads may go off the loop (#260): one the loop can pause - not one in
+    /// rings, whose events the loop makes itself - on a node with threads to answer them.
+    bool may_take(const Session& session) const override;
+    /// A large read handed to the threads off the loop, which the engine gave back before its scan
+    /// (#260), and its session paused.
+    void take(const Command& cmd, Session& session, uint64_t rows_at_most) override;
+    /// The answers that came back off the loop, each queued on its session, and the sessions resumed:
+    /// an event as if readable and writable appended for each to the `nfds` of this pass, so that the
+    /// answer is flushed, the commands held behind it run and the socket is read again. Returns the
+    /// events now in the pass; a session that does not fit is resumed on the next.
+    int take_off_loop_answers(int nfds);
+
     /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
     ///
     /// Armed only after a partial write. Leaving EPOLLOUT armed permanently on an
@@ -2907,6 +2981,12 @@ private:
     Engine*                  engine_;
     const LoadedTlsContexts& tls_;
     const LoadedSecrets&     secrets_;
+    /// The threads large reads are answered on (#260), the mailbox their answers come back to - shared
+    /// with every read handed out, so that one finishing after this loop has gone writes to a mailbox
+    /// nobody reads - and the sessions resumed past the events one pass could take.
+    OffLoopPool*             off_loop_pool_;
+    std::shared_ptr<OffLoopMailbox> mailbox_;
+    std::vector<int>         resume_;
     std::atomic<bool>&       running_;
     std::atomic<bool>&       draining_;
     ServerStats&             stats_;
@@ -2998,6 +3078,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , engine_(&shared.engine)
     , tls_(shared.tls)
     , secrets_(shared.secrets)
+    , off_loop_pool_(shared.off_loop_pool)
     , running_(shared.running)
     , draining_(shared.draining)
     , stats_(shared.stats)
@@ -3063,6 +3144,21 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
         throw std::runtime_error("epoll_ctl() failed for reactor " + std::to_string(index_) +
                                  "'s wake descriptor: " + why);
     }
+    if (off_loop_pool_ != nullptr) {
+        // Where the answers of the reads this loop hands off come back (#260).
+        mailbox_ = std::make_shared<OffLoopMailbox>();
+        struct epoll_event mail_ev{};
+        mail_ev.events  = EPOLLIN | EPOLLET;
+        mail_ev.data.fd = mailbox_->event_fd();
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, mailbox_->event_fd(), &mail_ev) < 0) {
+            const std::string why = std::strerror(errno);
+            ::close(wake_fd_);
+            ::close(epoll_fd_);
+            wake_fd_ = epoll_fd_ = -1;
+            throw std::runtime_error("epoll_ctl() failed for reactor " + std::to_string(index_) +
+                                     "'s off-loop mailbox: " + why);
+        }
+    }
     OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, wake fd=%d, accepts=%s%s", index_,
                  epoll_fd_, wake_fd_, listen_fd_ >= 0 ? "yes" : "no",
                  unix_listen_fd_ >= 0 ? ", and on the unix socket" : "");
@@ -3087,6 +3183,102 @@ Reactor::~Reactor() {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }
+}
+
+bool Reactor::may_take(const Session& session) const {
+    return off_loop_pool_ != nullptr && !session.in_rings();
+}
+
+void Reactor::take(const Command& cmd, Session& session, uint64_t rows_at_most) {
+    const int fd = session.fd();
+    const uint64_t conn_id = session.conn_id();
+    const AnswerCeiling ceiling{Session::max_queued_bytes(), session.is_compressed()};
+    Engine* engine = engine_;
+    MetricsRegistry* registry = &engine_->registry();
+    std::shared_ptr<OffLoopMailbox> mailbox = mailbox_;
+    const int index = index_;
+    const auto handed = std::chrono::steady_clock::now();
+    off_loop_pool_->submit([fd, conn_id, ceiling, engine, registry, mailbox, index, handed,
+                            sql = cmd.raw_sql] {
+        registry->observe_histogram(
+            "ob_off_loop_read_wait_seconds",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
+        // The answer as the loop builds it, in a buffer of the read's own: a session is the loop's.
+        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false};
+        try {
+            QueryShape shape;
+            ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::string(),
+                                             ceiling, [&](auto row, RowAnswer& rows) {
+                                                 return engine->execute(sql, row, shape, &rows);
+                                             });
+            out.answer     = std::move(r.answer);
+            out.framed     = r.framed;
+            out.text_bytes = r.text_bytes;
+            out.counted    = r.counted;
+        } catch (const std::exception& e) {
+            // The session is paused until an answer comes, so one comes whatever fails: a failure
+            // past the engine's call - the answer's buffer, its frame - answers as a refusal does.
+            OB_LOG_ERROR("tcp_server", "reactor %d: a read off the loop for fd=%d failed past the "
+                         "engine's call: %s", index, fd, e.what());
+            out = OffLoopAnswer{fd, conn_id, format_error(e.what()), false, 0, false};
+        }
+        OB_LOG_DEBUG("tcp_server", "reactor %d: an answer off the loop for fd=%d, %zu byte(s)%s", index,
+                     fd, out.answer.size(), out.framed ? " in an LZ4 frame" : "");
+        mailbox->post(std::move(out));
+    });
+    session.set_reading_off_loop(true);
+    engine_->registry().increment_counter("ob_off_loop_reads_total");
+    engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", 1);
+    OB_LOG_DEBUG("tcp_server", "reactor %d: SELECT from fd=%d answered off the loop: the index puts %llu "
+                 "row(s) or more in its scan", index_, fd, static_cast<unsigned long long>(rows_at_most));
+}
+
+int Reactor::take_off_loop_answers(int nfds) {
+    for (OffLoopAnswer& a : mailbox_->take()) {
+        engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", -1);
+        Session* s = sessions_.get_session(a.fd);
+        if (s == nullptr || s->conn_id() != a.conn_id) {
+            // Closed while its read was answered - and the descriptor maybe another's since.
+            OB_LOG_DEBUG("tcp_server", "reactor %d: an answer off the loop for fd=%d conn_id=%llu, whose "
+                         "session has gone: dropped", index_, a.fd,
+                         static_cast<unsigned long long>(a.conn_id));
+            continue;
+        }
+        s->set_reading_off_loop(false);
+        // Its command was counted when the loop asked the engine: only the query is counted here.
+        if (a.counted) {
+            s->increment_queries();
+            stats_.total_queries.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (a.framed) s->next_answer_framed(a.text_bytes);
+        const Session::Queued queued = s->take_answer(std::move(a.answer));
+        if (queued == Session::Queued::TooLargeAlone) {
+            const std::string refusal = format_error(answer_too_large(0));
+            if (!s->queue_response(refusal)) {
+                close_session(a.fd, "send failed");
+                continue;
+            }
+        } else if (queued == Session::Queued::CapExceeded) {
+            close_session(a.fd, "send failed");
+            continue;
+        }
+        // Armed here, as the end of a read's batch arms it: an answer larger than the socket takes in
+        // one send is finished by EPOLLOUT, and the read the resumed session makes next would leave
+        // nothing armed to finish it - its receive() says it wants to read.
+        if (s->has_pending_output()) arm_epollout(a.fd);
+        resume_.push_back(a.fd);
+    }
+    // As if readable and writable: the answer flushed, the commands held behind it run, and the socket
+    // read to EAGAIN - which, edge-triggered, it would not report again for what came while it waited.
+    size_t taken = 0;
+    while (taken < resume_.size() && nfds < MAX_EVENTS) {
+        events_[nfds].events  = EPOLLIN | EPOLLOUT;
+        events_[nfds].data.fd = resume_[taken];
+        ++nfds;
+        ++taken;
+    }
+    resume_.erase(resume_.begin(), resume_.begin() + static_cast<std::ptrdiff_t>(taken));
+    return nfds;
 }
 
 void Reactor::close_session(int fd, const char* reason) {
@@ -3415,7 +3607,9 @@ void Reactor::run_loop() {
         // Waiting is not serving: a scan deciding whether to divide counts the loops serving, or
         // that served within ScanPool::kLoopRecent (#249).
         loop_load_->stopped(static_cast<size_t>(index_));
-        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, ring_filled ? 0 : wait_ms);
+        // Sessions resumed past the events one pass could take (#260) do not wait for the next event.
+        const int pass_wait_ms = ring_filled || !resume_.empty() ? 0 : wait_ms;
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, pass_wait_ms);
         if (nfds > 0) loop_load_->serving(static_cast<size_t>(index_));
         if (rings_told) {
             for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();
@@ -3430,6 +3624,8 @@ void Reactor::run_loop() {
                 }
             }
         }
+        // The answers of the reads handed off, and their sessions resumed (#260).
+        if (nfds >= 0 && mailbox_) nfds = take_off_loop_answers(nfds);
         if (nfds > 0) last_event_at_ = std::chrono::steady_clock::now();
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -3499,6 +3695,8 @@ void Reactor::run_loop() {
                     adopt_handed_off();
                     continue;
                 }
+                // Read at the start of the pass, with the answers it carried (#260).
+                if (mailbox_ && fd == mailbox_->event_fd()) continue;
 
                 // Sessions in rings (#52, step 2): a bell, or a ring the loop polled, stands for the
                 // session's socket being readable and writable at once. The socket itself carries
@@ -3563,6 +3761,11 @@ void Reactor::run_loop() {
                             const bool wants_write = session->io_want() == IoWant::Write;
                             if (!session->has_pending_output() || !wants_write) {
                                 disarm_epollout(fd);
+                            } else if (session->send_yielded()) {
+                                // The flush spent its slice with the socket maybe still writable
+                                // (#260), and no edge would say so: armed again, which reports it
+                                // on the next pass - after this pass's other sessions.
+                                arm_epollout(fd);
                             }
                             if (!session->has_pending_output() && session->close_requested()) {
                                 close_session(fd, "quit after flush");
@@ -3624,36 +3827,48 @@ void Reactor::run_loop() {
                     while (true) {
                         Session* session = sessions_.get_session(fd);
                         if (!session) break;
+                        // A large read of this session is being answered off the loop (#260):
+                        // nothing more of it is read until its answer is queued. The socket keeps
+                        // the rest, and TCP tells the client to wait.
+                        if (session->reading_off_loop()) break;
 
-                        size_t got = 0;
-                        const Session::IoResult r = session->receive(buf, sizeof(buf), got);
-                        if (r == Session::IoResult::Closed) {
-                            close_session(fd, "peer closed");
-                            break;
-                        }
-                        if (r == Session::IoResult::Error) {
-                            close_session(fd, "read error");
-                            break;
-                        }
-                        if (r == Session::IoResult::Again) {
-                            // Nothing more now. With TLS this can mean OpenSSL wants to *write*, so
-                            // arm what it asked for rather than assuming readability.
-                            if (session->io_want() == IoWant::Write) arm_epollout(fd);
-                            break;
-                        }
+                        std::vector<std::string> lines;
+                        if (session->has_held_lines()) {
+                            // The commands that came behind a large read, now that its answer is
+                            // queued (#260): run before anything more is read from the socket.
+                            lines = session->take_held_lines();
+                        } else {
+                            size_t got = 0;
+                            const Session::IoResult r = session->receive(buf, sizeof(buf), got);
+                            if (r == Session::IoResult::Closed) {
+                                close_session(fd, "peer closed");
+                                break;
+                            }
+                            if (r == Session::IoResult::Error) {
+                                close_session(fd, "read error");
+                                break;
+                            }
+                            if (r == Session::IoResult::Again) {
+                                // Nothing more now. With TLS this can mean OpenSSL wants to *write*,
+                                // so arm what it asked for rather than assuming readability.
+                                if (session->io_want() == IoWant::Write) arm_epollout(fd);
+                                break;
+                            }
 
-                        auto lines = session->feed(buf, got);
+                            lines = session->feed(buf, got);
 
-                        // Outside the loop below, and that is the whole point: a client that never
-                        // sends a newline produces **no lines**, so every check written per line —
-                        // including `max_line_length` directly under here — never runs for it, and
-                        // the session accumulates for ever. Measured before this: 227 MiB on one
-                        // unauthenticated connection took the server to 257 MiB resident (#143).
-                        if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
-                            engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
-                            session->send_response(format_error("unparsed input too long"));
-                            close_session(fd, "unparsed input too long");
-                            goto next_event;
+                            // Outside the loop below, and that is the whole point: a client that
+                            // never sends a newline produces **no lines**, so every check written per
+                            // line — including `max_line_length` directly under here — never runs for
+                            // it, and the session accumulates for ever. Measured before this: 227 MiB
+                            // on one unauthenticated connection took the server to 257 MiB resident
+                            // (#143).
+                            if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
+                                engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
+                                session->send_response(format_error("unparsed input too long"));
+                                close_session(fd, "unparsed input too long");
+                                goto next_event;
+                            }
                         }
 
                         {
@@ -3673,6 +3888,8 @@ void Reactor::run_loop() {
                             const char* close_after_flush = nullptr;
                             bool        quit              = false;
                             bool        queue_refused     = false;
+                            // A large read handed off (#260): the rest of the batch waits for it.
+                            bool        off_loop_paused   = false;
                             // RINGS as the read's last command (#52, step 2): its size and its
                             // answer, for after the flush.
                             uint64_t    rings_bytes       = 0;
@@ -3751,8 +3968,19 @@ void Reactor::run_loop() {
                                 // caller at a time, and released before the answer is queued.
                                 std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
                                 if (serialised_across_reactors(cmd.type)) alone.lock();
-                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store(), backups_);
+                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store(), backups_, off_loop_pool_ != nullptr ? this : nullptr);
                                 if (alone.owns_lock()) alone.unlock();
+
+                                if (response == kAnsweredOffLoop) {
+                                    // Answered off the loop (#260): what came after it in this read
+                                    // runs once its answer is queued, and the socket waits with it.
+                                    const auto next = static_cast<size_t>(&line - lines.data()) + 1;
+                                    session->hold_lines(std::vector<std::string>(
+                                        std::make_move_iterator(lines.begin() + static_cast<std::ptrdiff_t>(next)),
+                                        std::make_move_iterator(lines.end())));
+                                    off_loop_paused = true;
+                                    break;
+                                }
 
                                 if (response.empty()) {
                                     quit = true;
@@ -3859,6 +4087,12 @@ void Reactor::run_loop() {
                                 if (!session->has_pending_output()) {
                                     close_session(fd, "close requested after flush");
                                 }
+                                goto next_event;
+                            }
+
+                            if (off_loop_paused) {
+                                // Its answer resumes it (#260): the commands held and the socket are
+                                // read then, through this path.
                                 goto next_event;
                             }
                         }
@@ -4088,9 +4322,16 @@ void TcpServer::run() {
     // address on this frame's stack that the engine holds; the engine holds it only while the
     // reactors run.
     loop_load_ = std::make_unique<LoopLoad>(config_.io_threads);
-    ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
+    // The threads large reads are answered on, off the loops (#260). Made before the loops and
+    // gone before the engine: a read finishing after its loop posts to a mailbox it shares.
+    std::unique_ptr<OffLoopPool> off_loop_pool;
+    if (config_.large_read_threads > 0) {
+        off_loop_pool = std::make_unique<OffLoopPool>(config_.large_read_threads);
+    }
+        ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
-                         &dealt_to, admin_mtx, backups.get(), loop_load_.get()};
+                         &dealt_to, admin_mtx, backups.get(), loop_load_.get(),
+                         off_loop_pool.get()};
     const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
     engine_->set_loop_load(loop_load_.get(), cpus);
     struct Unload {

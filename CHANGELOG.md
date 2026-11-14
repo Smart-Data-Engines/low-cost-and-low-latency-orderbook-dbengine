@@ -11,6 +11,22 @@ here as `#N`.
 
 ### Added
 
+- **A large `SELECT` is answered off its client loop** (#260), on `--large-read-threads N` threads
+  (default 2, `ob-read-N`). A client loop ran a read to its last byte before it served another
+  session, so every session on it - its `PING`, its writes - waited for as long as the read took: a
+  `SELECT` of a million rows held a loop for 12-25 ms, and 55-59 ms in an LZ4 session (m9g.xlarge).
+  The engine hands a read back once it is parsed and before a row is read when the index puts its scan
+  at 100 000 rows or more - a row query with no price, side or level condition by its `LIMIT`, others
+  and time buckets by the rows in their range - and its loop goes on serving its other sessions. The
+  session waits for its answer, its later commands and its socket with it, so its answers come in the
+  order it asked; a session in rings is answered on its loop. A read below the threshold pays a
+  comparison with its `LIMIT`, or a walk of the index under its shared lock. The longest `PING` on the
+  same loop while a million rows were read and sent: 0.13-0.41 ms on the m9g.xlarge and 0.08-0.26 ms on
+  the m8a.xlarge, where 11.9-24.6 and 14.0-18.3 ms; a `MINSERT` beside it 0.46-0.64 and 0.19-2.05 ms at
+  the longest - no longer than the same writer meets with no read beside it - where 12.5-20.5 and
+  13.3-16.4 ms.
+  `ob_off_loop_reads_total`, `ob_off_loop_reads_in_flight` and `ob_off_loop_read_wait_seconds`.
+
 - Segment format 4, written where `segment-format = 4` (`--segment-format 4`) asks (#250): format 3's
   file with one more encoding a column may be in, runs of equal values each written as its step from
   the run before. A book's timestamps and sequence numbers are such runs, and as a seal writes them a
@@ -167,6 +183,12 @@ here as `#N`.
   interface of both families - the way back - and a node announced through a coordinator at another
   host, with a port it needs on loopback by this rule, does not start. `--print-config` and the
   startup log say where each listener listens and why. `docs/upgrading.md` has what to change.
+
+- **One flush sends a megabyte at most** (#260), on the socket and through TLS, and the loop serves its
+  other sessions before the next: a client reading a large answer as fast as the loop sent it never
+  filled its socket, and the loop sent the whole answer in one pass - every other session on the loop
+  waited 4.7-10.3 ms while 45 MB went out (m9g.xlarge). The answer's bytes are the same, and a
+  million rows take as long to read.
 
 - **A session's large answers are written where its last one was** (#253): a row answer is written in
   the session's send buffer's room, lent to it when nothing is pending and taken back with the answer,

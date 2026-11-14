@@ -103,6 +103,53 @@ static int run_large_select(const std::string& host, uint16_t port) {
     return 0;
 }
 
+// ── Test: large_read ─────────────────────────────────────────────────────────
+
+/// A read the index puts at the threshold of #260 - 101 000 rows of one symbol, LIMIT 100 000 - read
+/// back whole. Through the socket it is answered off the client loop, through rings on it: the
+/// loop makes a ring session's events itself, and none would resume it.
+static int run_large_read(const std::string& host, uint16_t port) {
+    ob::ClientConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+    apply_auth_from_env(cfg);
+    ob::OrderbookClient client(cfg);
+    if (auto conn = client.connect(); !conn) {
+        print_result("large_read", "fail", "connect failed: " + conn.error_message());
+        return 1;
+    }
+    constexpr size_t N = 1000;
+    ob::Level levels[N];
+    for (int round = 0; round < 101; ++round) {
+        for (size_t i = 0; i < N; ++i) {
+            levels[i].price = static_cast<int64_t>(70000 + i);
+            levels[i].qty   = static_cast<uint64_t>(round + 1);
+            levels[i].count = 1;
+        }
+        if (auto mi = client.minsert("CPP-LARGE", "TEST-EX", ob::Side::BID, levels, N); !mi) {
+            print_result("large_read", "fail", "minsert failed: " + mi.error_message());
+            return 1;
+        }
+    }
+    if (auto fl = client.flush(); !fl) {
+        print_result("large_read", "fail", "flush failed: " + fl.error_message());
+        return 1;
+    }
+    auto qr = client.query("SELECT * FROM 'CPP-LARGE'.'TEST-EX' WHERE timestamp BETWEEN 0 AND "
+                           "9999999999999999999 LIMIT 100000");
+    if (!qr) {
+        print_result("large_read", "fail", "query failed: " + qr.error_message());
+        return 1;
+    }
+    if (qr.value().rows.size() != 100000) {
+        print_result("large_read", "fail",
+                     "expected 100000 rows, got " + std::to_string(qr.value().rows.size()));
+        return 1;
+    }
+    print_result("large_read", "pass", "100000 rows");
+    return 0;
+}
+
 // ── Test: ping ───────────────────────────────────────────────────────────────
 
 static int run_ping(const std::string& host, uint16_t port) {
@@ -648,6 +695,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "query_buckets") return run_query_buckets(host, port);
     if (test_name == "query_named")  return run_query_named(host, port);
     if (test_name == "large_select") return run_large_select(host, port);
+    if (test_name == "large_read")   return run_large_read(host, port);
     if (test_name == "shard_pool")   return run_shard_pool(coordinator, symbols);
     if (test_name == "shard_writer") return run_shard_writer(coordinator, symbols, until, out);
 

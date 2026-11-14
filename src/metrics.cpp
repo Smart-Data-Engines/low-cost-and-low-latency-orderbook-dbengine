@@ -167,6 +167,9 @@ MetricsRegistry::MetricsRegistry() {
                                      "TLS reloads that put new contexts in force (#238)"));
     counters_.push_back(make_counter("ob_tls_reload_failures_total",
                                      "TLS reloads refused, each leaving the certificate in force (#238)"));
+    // Large reads answered off the client loops (#260).
+    counters_.push_back(make_counter("ob_off_loop_reads_total",
+                                     "SELECTs answered off their client loop: the index put their scan past the threshold (#260)"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.
@@ -287,6 +290,8 @@ MetricsRegistry::MetricsRegistry() {
                                  "Milliseconds the last backup held merges and retention back"));
     gauges_.push_back(make_gauge("ob_active_sessions",
                                  "Number of active client sessions, over TCP and the Unix socket"));
+    gauges_.push_back(make_gauge("ob_off_loop_reads_in_flight",
+                                 "SELECTs handed to the threads off the client loops whose answer has not come back (#260)"));
     gauges_.push_back(make_gauge("ob_ring_bytes",
                                  "Shared memory the sessions in rings hold, in bytes"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
@@ -382,6 +387,10 @@ MetricsRegistry::MetricsRegistry() {
     histograms_.push_back(make_histogram("ob_insert_latency_seconds", "Insert operation latency in seconds"));
     histograms_.push_back(make_histogram("ob_flush_latency_seconds",  "Flush operation latency in seconds"));
     histograms_.push_back(make_histogram("ob_query_latency_seconds",  "Query operation latency in seconds"));
+    // A large read's wait for a thread off the client loops (#260): its session waits with it, so a
+    // queue that grows is reads every thread is busy with, and a reason for --large-read-threads.
+    histograms_.push_back(make_histogram("ob_off_loop_read_wait_seconds",
+                                         "Seconds a large read waited for a thread off the client loops (#260)"));
 
     // Multi-master metrics
     gauges_.push_back(make_gauge("ob_mm_peers_connected",          "Number of connected multi-master peers"));

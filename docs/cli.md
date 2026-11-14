@@ -323,6 +323,11 @@ consequences worth knowing:
   not the size of the range. On a session with `COMPRESS LZ4` the cap is on the frame, and a row
   answer is compressed as its rows come - text past the cap in a frame under it is still an answer.
 
+- **One flush sends a megabyte at most** (#260), on the socket and through TLS, and the loop serves
+  its other sessions before the next. A client reading a large answer as fast as the loop sent it
+  never filled its socket, and the loop sent the whole answer in one pass: every other session on the
+  loop waited while 45 MB went out, 4.7-10.3 ms on the ARM test host.
+
 `ob_session_pending_bytes` in `/metrics` reports the bytes queued across all sessions. It is the
 signal that a client is not keeping up, and it should sit at zero in a healthy system.
 
@@ -482,6 +487,43 @@ node's CPUs for its client loops alone - a node taking writes and nothing else -
 and on the queries' loops, `ob_scan_undivided_total` the scans kept on their loop because every CPU
 had a loop serving, and `ob_scan_threads` is N.
 
+## A large read off its loop: `--large-read-threads`
+
+A client loop runs a read to its last byte before it serves another session, so a `SELECT` of a
+million rows held every session of its loop - their `PING`s, their writes - for as long as it was
+answered. With `--large-read-threads N` above 0 (default 2; threads `ob-read-0` …), a read whose
+scan the index puts at 100 000 rows or more is answered on those threads instead, and its loop goes
+on serving its other sessions (#260). The engine decides once it has parsed the query and before it
+reads a row: a row query with no price, side or level condition by its `LIMIT`, a query with a
+condition and time buckets by the rows in their range, which the index counts under its shared lock.
+The live book's functions read the book and stay on the loop, as does every read of a session in
+rings.
+
+The session that asked waits for its answer: what it wrote behind the read waits in the session, what
+it writes later waits in its socket, and its answers come in the order it asked - a write sent after
+the read is not in it. The answer is the same bytes, in a frame on a session with `COMPRESS LZ4` and
+within the session's 64 MiB, and each thread builds one at a time. A session closed while its read
+is answered - its client gone with answers still queued for it - has the answer dropped.
+
+Measured with Release builds, eight million rows of one book, one client loop, the `PING`s and writes
+sent by a process of their own while the read was answered (`evidence/2026-11-14-off-the-loop-on-master/`
+in the workspace, three rounds each):
+
+| | ARM before | after | x86 before | after |
+|---|---|---|---|---|
+| longest `PING` beside a `SELECT` of 1M rows | 11.9-24.6 ms | 0.13-0.41 ms | 14.0-18.3 ms | 0.08-0.26 ms |
+| the same in LZ4 | 55.0-59.3 ms | 0.15-0.47 ms | 41.3-50.1 ms | 0.03-0.07 ms |
+| longest `MINSERT` of 20 levels beside it | 12.5-20.5 ms | 0.46-0.64 ms | 13.3-16.4 ms | 0.19-2.05 ms |
+| `SELECT ... LIMIT 100`, p50 | 22.3-23.3 us | 22.6-23.0 us | 13.2-14.0 us | 13.0-14.0 us |
+
+A writer this fast meets a few milliseconds now and then with no read beside it too: 3.7-3.9 ms at
+the longest on the ARM test host and 4.0-4.1 ms on the x86 one.
+
+`ob_off_loop_reads_total` counts the reads answered off their loop, `ob_off_loop_reads_in_flight` the
+ones whose answer has not come back, and `ob_off_loop_read_wait_seconds` how long each waited for a
+thread: a wait that grows is every thread busy. `--large-read-threads 0` answers every read on its
+loop, as before.
+
 ## Client event loops: `--io-threads`
 
 `--io-threads N` gives the server N client event loops. The one that holds the listening socket
@@ -506,7 +548,7 @@ for #155, which is what changed them):
 - **A query no longer stalls the writes of another connection** — if that connection is on another
   loop. At one loop a writer beside a connection looping a 134 ms scan waited behind every scan;
   on another loop it did not notice. Connections are dealt in turn, so two can share a loop, and a
-  heavy query holds its own loop for as long as it runs.
+  heavy query held its own loop for as long as it ran - a large read does not since #260 (above).
 - **Pipelined writes scale to about two loops.** The writes of one read are applied under one
   acquisition of the engine's write lock and reach the WAL with one `write()` (#155), so two loops
   write 1.65× what one does, and four add 5% more: what is left is the work done holding that lock
@@ -664,6 +706,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: the profile's — 10 under `boost` where the process has a CPU to spare, 0 under `eco`). Costs up to one core per loop while traffic flows and takes ~18% off the loopback round trip |
 | `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: the profile's — one per usable CPU under `boost`, 1 under `eco`). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
 | `--scan-threads` | `<N>` | Threads a query's segments are read on, 0 to 64 (default: 0, under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, and its loop folds what each made in the segments' order, so the answer is the same bytes; 0 reads every segment on the query's loop. Beside writes it costs them, which is why it is off ("A query on several cores: `--scan-threads`" below) |
+| `--large-read-threads` | `<N>` | Threads a large `SELECT` is answered on, off the client loops, 0 to 64 (default: 2; 0 answers every read on its loop, as before). A read whose scan the index puts at 100 000 rows or more is handed to them once it is parsed and before a row is read: a row query with no price, side or level condition by its `LIMIT`, one with a condition and time buckets by the rows in their range. Its loop goes on serving its other sessions; the session's later commands, and its socket, wait for its answer, so a session's answers come in the order it asked. A session in rings is answered on its loop (#260) |
 | `--profile` | `<NAME>` | `boost` (default: one client event loop per usable CPU, and a 10 µs spin where it cannot starve anything) or `eco` (one loop, blocking between events). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |

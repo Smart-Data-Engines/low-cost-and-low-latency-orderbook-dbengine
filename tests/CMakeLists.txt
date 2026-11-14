@@ -379,6 +379,13 @@ ob_add_query_test(test_scan_parts
 )
 target_link_libraries(test_scan_parts PRIVATE orderbook_tcp_server_lib)
 
+# #260: a large read answered off the client loop - the index's estimate of a scan, the threads and
+# the mailbox its answer comes back through.
+ob_add_query_test(test_off_loop_reads
+    test_off_loop_reads.cpp
+)
+target_link_libraries(test_off_loop_reads PRIVATE orderbook_tcp_server_lib)
+
 # #257: a row answer measured against what its session may be sent while it is built, and the scan
 # stopped where it passed - on one thread and on the pool, in text and as an LZ4 frame.
 ob_add_query_test(test_answer_ceiling
