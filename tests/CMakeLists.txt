@@ -487,6 +487,13 @@ ob_add_engine_test(test_best_track
 )
 target_link_libraries(test_best_track PRIVATE rapidcheck rapidcheck_gtest)
 
+# The bytes of a book summary and its best track, whatever composes them (#266): a store's files after
+# any sequence of publishes, seals, late rows, summaries and restarts, against an oracle's.
+ob_add_engine_test(test_book_summary_equivalence
+    test_book_summary_equivalence.cpp
+)
+target_link_libraries(test_book_summary_equivalence PRIVATE rapidcheck rapidcheck_gtest)
+
 # The WAL archive of point-in-time recovery (#34): closed files copied and checked, a file with other
 # contents refused and never overwritten, and the retention floor never above a file the archive
 # does not hold.
