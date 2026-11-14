@@ -347,8 +347,9 @@ millions of rows no longer holds the feed writing on the same loop. The threads 
 no such read, and each builds one answer at a time, within the session's 64 MiB. A read waiting for a
 thread holds its session with it: `ob_off_loop_read_wait_seconds` is how long reads waited, and a wait
 that grows is every thread busy - a reason for more threads, which take CPUs from the loops and the scan
-pool while they read. `ob_off_loop_reads_in_flight` is how many sessions wait for one now. Measured in
-`docs/cli.md`, "A large read off its loop".
+pool while they read. `ob_off_loop_reads_in_flight` is how many sessions wait for one now. A FLUSH is
+answered on the same threads (#261), with `ob_off_loop_flushes_in_flight` and
+`ob_off_loop_flush_wait_seconds` of its own. Measured in `docs/cli.md`, "A large read off its loop".
 
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,

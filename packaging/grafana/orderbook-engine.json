@@ -1615,7 +1615,7 @@
     },
     {
       "type": "row",
-      "title": "Large reads off the client loops",
+      "title": "Large reads and FLUSHes off the client loops",
       "id": 45,
       "collapsed": false,
       "gridPos": {
@@ -1628,9 +1628,9 @@
     },
     {
       "type": "timeseries",
-      "title": "Large reads answered off their loop",
+      "title": "Large reads and FLUSHes answered off their loop",
       "id": 46,
-      "description": "SELECTs whose scan the index put at 100 000 rows or more, answered on the --large-read-threads threads while their client loop served its other sessions (#260).",
+      "description": "SELECTs whose scan the index put at 100 000 rows or more (#260), and FLUSHes (#261), answered on the --large-read-threads threads while their client loop served its other sessions.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1651,7 +1651,16 @@
         {
           "refId": "A",
           "expr": "sum by (instance) (rate(ob_off_loop_reads_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{instance}}",
+          "legendFormat": "{{instance}} reads",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instance) (rate(ob_off_loop_flushes_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{instance}} FLUSHes",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1661,9 +1670,9 @@
     },
     {
       "type": "timeseries",
-      "title": "Sessions waiting for a large read",
+      "title": "Sessions waiting for a large read or a FLUSH",
       "id": 47,
-      "description": "Sessions whose large read has not come back from the threads off the loops: each waits for its answer, its later commands with it (#260).",
+      "description": "Sessions whose large read (#260) or FLUSH (#261) has not come back from the threads off the loops: each waits for its answer, its later commands with it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1684,7 +1693,16 @@
         {
           "refId": "A",
           "expr": "max by (instance) (ob_off_loop_reads_in_flight{job=~\"$job\", instance=~\"$instance\"})",
-          "legendFormat": "{{instance}}",
+          "legendFormat": "{{instance}} reads",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (instance) (ob_off_loop_flushes_in_flight{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} FLUSHes",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1694,9 +1712,9 @@
     },
     {
       "type": "timeseries",
-      "title": "A large read's wait for a thread, p99",
+      "title": "A large read's or a FLUSH's wait for a thread, p99",
       "id": 48,
-      "description": "How long a large read waited for one of the --large-read-threads threads. A wait that grows is every thread busy, and its session waits with it (#260).",
+      "description": "How long a large read (#260) or a FLUSH (#261) waited for one of the --large-read-threads threads. A wait that grows is every thread busy, and its session waits with it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1717,7 +1735,16 @@
         {
           "refId": "A",
           "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(ob_off_loop_read_wait_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[5m])))",
-          "legendFormat": "{{instance}}",
+          "legendFormat": "{{instance}} reads",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(ob_off_loop_flush_wait_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{instance}} FLUSHes",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

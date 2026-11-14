@@ -90,6 +90,8 @@ ob> generate BTC-USD BINANCE 10000
 ### flush
 
 Force-flush all pending data from the in-memory buffer to the columnar store. Required before data is visible to queries.
+The node writes it on the threads of `--large-read-threads`, not on the session's client loop, so the
+sessions beside it are served meanwhile (#261); this session waits for it.
 
 ```
 ob> flush
@@ -524,6 +526,23 @@ ones whose answer has not come back, and `ob_off_loop_read_wait_seconds` how lon
 thread: a wait that grows is every thread busy. `--large-read-threads 0` answers every read on its
 loop, as before.
 
+**A FLUSH is answered on the same threads** (#261). It wrote the rows waiting into segments on its
+client loop, and every session of the loop waited for as long as that took; past its refusals - a
+read-only node, a replica, a bootstrap, which still answer on the loop - its session waits for its
+answer, and a read sent after it sees what it wrote. Measured as above, the background flush off
+(`--flush-interval-ms 600000`) so that the FLUSH writes every row:
+
+| | ARM before | after | x86 before | after |
+|---|---|---|---|---|
+| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 141.5-148.7 ms | 0.024-0.031 ms | 146.9-182.3 ms | 0.030-0.147 ms |
+| the same of 100 000 rows in 100 books | 25.8-27.7 ms | 0.013-0.047 ms | 32.1-35.4 ms | 0.013-0.026 ms |
+| a FLUSH with nothing waiting, p50 | 14.1-15.8 us | 19.5-19.6 us | 7.0-8.9 us | 10.1-10.9 us |
+
+A FLUSH takes as long as it did - it is the same work - and one with nothing waiting pays for the hand
+to the thread and back. `ob_off_loop_flushes_total`, `ob_off_loop_flushes_in_flight` and
+`ob_off_loop_flush_wait_seconds` are the FLUSH's three. A session in rings, and a node with
+`--large-read-threads 0`, flush on the loop.
+
 ## Client event loops: `--io-threads`
 
 `--io-threads N` gives the server N client event loops. The one that holds the listening socket
@@ -706,7 +725,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: the profile's — 10 under `boost` where the process has a CPU to spare, 0 under `eco`). Costs up to one core per loop while traffic flows and takes ~18% off the loopback round trip |
 | `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: the profile's — one per usable CPU under `boost`, 1 under `eco`). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
 | `--scan-threads` | `<N>` | Threads a query's segments are read on, 0 to 64 (default: 0, under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, and its loop folds what each made in the segments' order, so the answer is the same bytes; 0 reads every segment on the query's loop. Beside writes it costs them, which is why it is off ("A query on several cores: `--scan-threads`" below) |
-| `--large-read-threads` | `<N>` | Threads a large `SELECT` is answered on, off the client loops, 0 to 64 (default: 2; 0 answers every read on its loop, as before). A read whose scan the index puts at 100 000 rows or more is handed to them once it is parsed and before a row is read: a row query with no price, side or level condition by its `LIMIT`, one with a condition and time buckets by the rows in their range. Its loop goes on serving its other sessions; the session's later commands, and its socket, wait for its answer, so a session's answers come in the order it asked. A session in rings is answered on its loop (#260) |
+| `--large-read-threads` | `<N>` | Threads a large `SELECT` is answered on, off the client loops, 0 to 64 (default: 2; 0 answers every read on its loop, as before). A read whose scan the index puts at 100 000 rows or more is handed to them once it is parsed and before a row is read: a row query with no price, side or level condition by its `LIMIT`, one with a condition and time buckets by the rows in their range. Its loop goes on serving its other sessions; the session's later commands, and its socket, wait for its answer, so a session's answers come in the order it asked. A FLUSH past its refusals is answered on them too (#261). A session in rings is answered on its loop (#260) |
 | `--profile` | `<NAME>` | `boost` (default: one client event loop per usable CPU, and a 10 µs spin where it cannot starve anything) or `eco` (one loop, blocking between events). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |

@@ -162,8 +162,8 @@ TEST(OffLoopReads, BucketsAreTakenByTheirRangeAndTheLiveBooksFunctionsNever) {
 TEST(OffLoopReads, TheMailboxGivesBackWhatWasPostedAndWakesItsLoop) {
     ob::OffLoopMailbox mailbox;
     EXPECT_TRUE(mailbox.take().empty());
-    mailbox.post(ob::OffLoopAnswer{7, 70, "OK\n\n", false, 0, true});
-    mailbox.post(ob::OffLoopAnswer{8, 80, "ERR x\n", false, 0, false});
+    mailbox.post(ob::OffLoopAnswer{7, 70, "OK\n\n", false, 0, true, false});
+    mailbox.post(ob::OffLoopAnswer{8, 80, "ERR x\n", false, 0, false, true});
     // The eventfd is readable: the loop's epoll would report it.
     uint64_t count = 0;
     ASSERT_EQ(::read(mailbox.event_fd(), &count, sizeof(count)), static_cast<ssize_t>(sizeof(count)));

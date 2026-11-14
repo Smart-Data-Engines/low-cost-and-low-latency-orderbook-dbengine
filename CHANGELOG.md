@@ -27,6 +27,16 @@ here as `#N`.
   13.3-16.4 ms.
   `ob_off_loop_reads_total`, `ob_off_loop_reads_in_flight` and `ob_off_loop_read_wait_seconds`.
 
+- **A FLUSH is answered off its client loop** (#261), on the threads of `--large-read-threads`. It
+  wrote the rows waiting into segments on its loop, and every session of the loop waited for as long
+  as that took: a `PING` beside a FLUSH of 500 000 rows in 1 000 books waited 141-149 ms on the
+  m9g.xlarge and 147-182 ms on the m8a.xlarge, and 24-31 us and 30-147 us now. Past its refusals - a
+  read-only node, a replica, a bootstrap, which answer on the loop as they did - its session waits for
+  its answer, and a read sent after it sees what it wrote. A FLUSH with nothing waiting pays for the
+  hand to the thread and back, 19.5-19.6 us at p50 where it took 14.1-15.8 (m9g.xlarge), and 10.1-10.9
+  where 7.0-8.9 (m8a.xlarge).
+  `ob_off_loop_flushes_total`, `ob_off_loop_flushes_in_flight` and `ob_off_loop_flush_wait_seconds`.
+
 - Segment format 4, written where `segment-format = 4` (`--segment-format 4`) asks (#250): format 3's
   file with one more encoding a column may be in, runs of equal values each written as its step from
   the run before. A book's timestamps and sequence numbers are such runs, and as a seal writes them a
