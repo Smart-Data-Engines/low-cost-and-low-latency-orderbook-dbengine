@@ -2900,6 +2900,57 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 266. A book summary at a seal decoded again what the seal had encoded, and applied it through a map ✅ **P2**
+
+**Found in the node's CPU profile under #190's ingest** (`evidence/2026-11-14-ingest-profile/`; spec
+`smart-data-engine-workspace/specs/book-summary-cost/`, evidence `evidence/2026-11-14-book-summary-cost/`).
+The thread that flushes and seals - the one every writer's rows go through - spent a quarter to a third of
+its time composing book summaries (#233, #243, #247): after a seal of a busy symbol, `write_book_summary()`
+composes the book as of the segment's end from the summary before it and every row since, through
+`compose_by_price()`, which answers every book read by price too. `benchmarks/book_summary_cost` (new) put
+a summary of 65 536 rows at 64-73 ns a row on the m8a.xlarge and 74-78 on the m9g.xlarge, and its profile
+half of that in applying each row to a `std::map` a side - a node a price, a copy of the row in it, a
+pointer chased a level - a quarter in reading the span's segments into runs, and a fifth in merging them.
+
+**A composition keeps its prices in a table** (`PriceSide`, `price_side.hpp`): open addressing from a price
+to the row that set it, the best price at the top of a heap whose removed prices it takes out when it
+reaches them - and known without a look until the best is removed - and the rows sorted by price once, at
+the end. **And a span whose segments come in time order one after another, with no block reaching it, is
+applied as it is decoded**: the segments in the order the merge ranks them, each batch's rows applied
+rather than copied into runs and merged. A row before the one ahead of it - an event time a client gave -
+sends the composition back to the merge, from the start. A summary's span holds the segment sealed since
+it and the row at the summary's time that ends the one before, so a condition of one segment never held.
+A third measure - the reader called without `std::function`, one run handed over without the heap - moved
+nothing and is not in it. The summary's and the track's bytes are an oracle's after any sequence of
+publishes, seals, late rows, summaries and restarts.
+
+Measured with Release builds on the test hosts, `master` (`d50edb2`) against this change (`2e8efdb`, its
+last commit since changing tests and a DEBUG line): the benchmark three runs each; under #190's ingest
+three rounds each, the two builds one after the other on each host.
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| composing a summary of 65 536 rows, 500 prices a side, a row (p50) | 74.2-77.9 ns | 33.0-33.3 ns | 63.6-72.9 ns | 29.7-29.9 ns |
+| the summary (p50) | 4.86-5.11 ms | 2.17-2.19 ms | 4.17-4.78 ms | 1.95-1.96 ms |
+| under the ingest, the summary's share of the node's samples | 10.7-10.9% | 5.3-5.5% | 9.1-9.3% | 5.1-5.5% |
+| the node's CPU for the ingest | 9.10-9.27 s | 8.55-8.72 s | 6.50-6.58 s | 6.36-6.55 s |
+
+The ingest's rate and the writer's waits are what they were. The spec asked the summary's share of the
+flush thread to fall by half on both hosts; it fell from 32% to 18-19% on ARM and from 26-27% to 15-17% on
+x86. What is left is decoding the segment the seal has just encoded, and applying its rows: a book kept as
+the rows are sealed would leave neither, and is a larger change of its own.
+
+Tests: `tests/test_price_side.cpp` (a side against the std::map it replaces after every put and removal,
+prices a tick or a hundred apart; a removed best giving way to the next), and
+`tests/test_book_summary_equivalence.cpp` (the summary's and the track's bytes against an oracle that
+composes from a plain scan and encodes with the files' own encoders, and the rows a summary says it read;
+a walk of a book summarised twenty times, and any sequence of publishes, seals, late rows, summaries and
+restarts, each case comparing at least once).
+
+<!-- #266 mutation table -->
+
+- Effort: M | Impact: a summary at a seal costs less than half of what it did
+
 ### 265. A client loop signed for every new TLS session, and every session on it waited ✅ **P2**
 
 **Found asking what else holds a client loop after #260 and #261** (spec

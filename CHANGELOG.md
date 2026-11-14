@@ -197,6 +197,16 @@ here as `#N`.
 
 ### Changed
 
+- **A book summary at a seal costs half of what it did** (#266). After a seal of a busy symbol the
+  flush thread - the one every writer's rows go through - composes the book as of the segment's end
+  (#233), and in the node's profile under a pipelined ingest that was a quarter to a third of the
+  thread's time. A composition keeps its prices in a table rather than a `std::map`, and reads a span
+  whose segments come in time order one after another as it decodes them, rather than through runs and a
+  merge. Composing a summary of 65 536 rows takes 29.7-29.9 ns a row where 63.6-72.9 (m8a.xlarge) and
+  33.0-33.3 where 74.2-77.9 (m9g.xlarge); under the ingest the summary's share of the node's samples fell
+  from 9.1-9.3% to 5.1-5.5% and from 10.7-10.9% to 5.3-5.5%. The files are the bytes they were, and every
+  book read by price composes through the same code.
+
 - **Breaking: a listener with no secret listens on 127.0.0.1 unless told where** (#256). The client
   port without `--auth-secret-file` and `--bind`, and the replication and multi-master ports without
   `--cluster-secret-file` and their own bind flags, listened on every interface - which is what the
