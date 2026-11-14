@@ -4703,6 +4703,14 @@ Learned the hard way. Check here before debugging.
      the full ctest failed on `IoWait.TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral`, which
      reads every `epoll_wait`'s arguments up to their first `)` for `wait_ms` and found the condition's
      parenthesis first. A test that reads the source as text belongs to no feature's targeted set.
+645. **GCC 14 at `-O3` warns of an unbounded copy where clang and GCC 12 and 15 see none.** #263's
+     hub appends a pushed row's text with a length taken from the pointer `format_push_row()`, in
+     another unit, returns: the ARM host's Release build (`gcc14-g++`, `-O3 -Werror`) failed on
+     `-Wrestrict` in `std::string::append` - "accessing 9223372036854775808 or more bytes" - while the
+     laptop's clang 18, GCC 15 and GCC 12 compiled it clean, Debug and `-O3` alike. A length that
+     comes back through a call the optimiser cannot see into is bounded by its buffer as well
+     (`std::min(end - buf, sizeof(buf))`), and the ARM Release build is the check that reaches
+     GCC 14 - the packages are built with GCC 12, CI with the runner's.
 
 ## Current state and open problems
 

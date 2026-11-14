@@ -1407,7 +1407,7 @@ and getting data into their existing Python stack without a copy.
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
 
 ### 45. Streaming subscriptions ✅
-- `SUBSCRIBE 'SYM'.'EXCH'` pushing updates to the client
+- `SUBSCRIBE * FROM 'SYM'.'EXCH'` pushing updates to the client
 - Backpressure policy per subscriber, slow-consumer disconnect
 - **The claim has been corrected in the meantime, because it was the half that was free.** The
   README listed "streaming subscriptions" among the features, and a reader takes a feature list on a
@@ -1418,7 +1418,7 @@ and getting data into their existing Python stack without a copy.
   `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
   client polls. The README now says exactly that.
 - **Done.** Spec: `smart-data-engine-workspace/specs/streaming-subscriptions/`.
-  `SUBSCRIBE 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
+  `SUBSCRIBE * FROM 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
   as `PUSH <id>` with the same seven columns as a query row. Bounded queue per subscriber
   (`--max-subscriber-queue-bytes`, 8 MB ≈ 140 000 rows), overflow closes the session, per-session
   limit on subscriptions, five metrics, and `subscribe()` / `poll()` in the Python client.
