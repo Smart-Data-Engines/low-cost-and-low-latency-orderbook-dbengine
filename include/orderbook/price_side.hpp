@@ -56,6 +56,8 @@ public:
         }
         table_[reuse] = Slot{r.price, row, kFull};
         ++live_;
+        // The best known stays known: a new price better than it is the best now.
+        if (best_known_ && Worse{}(best_, r.price)) best_ = r.price;
         heap_.push_back(r.price);
         std::push_heap(heap_.begin(), heap_.end(), Worse{});
         // A heap of prices most of which are gone is rebuilt from the ones held.
@@ -72,6 +74,7 @@ public:
                 s.state = kRemoved;
                 free_.push_back(s.row);
                 --live_;
+                if (best_known_ && price == best_) best_known_ = false;
                 return;
             }
         }
@@ -80,13 +83,17 @@ public:
     bool empty() const { return live_ == 0; }
     size_t size() const { return live_; }
 
-    /// The best price held. The side is not empty.
+    /// The best price held. The side is not empty. Known without a look at the table until the best is
+    /// removed: a composition asks after every instant, and most instants change a price below it.
     int64_t best() {
+        if (best_known_) return best_;
         while (find(heap_.front()) == nullptr) {
             std::pop_heap(heap_.begin(), heap_.end(), Worse{});
             heap_.pop_back();
         }
-        return heap_.front();
+        best_ = heap_.front();
+        best_known_ = true;
+        return best_;
     }
 
     /// Every row held, best price first.
@@ -110,6 +117,7 @@ public:
         live_ = used_ = 0;
         mask_ = 0;
         shift_ = 64;
+        best_known_ = false;
     }
 
 private:
@@ -175,6 +183,8 @@ private:
     size_t                   used_{0};   ///< table slots not empty: held and removed
     size_t                   mask_{0};
     unsigned                 shift_{64};
+    int64_t                  best_{0};
+    bool                     best_known_{false};   ///< `best_` is the best held
 };
 
 }  // namespace ob
