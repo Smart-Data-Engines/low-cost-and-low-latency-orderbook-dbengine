@@ -9,6 +9,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ob {
@@ -52,6 +53,8 @@ struct SubscriberQueue {
 
     /// Formatted, complete lines awaiting the epoll loop. Never a partial row.
     std::string pending;
+    /// The lines in `pending`, counted as they are added (#263), so the drain does not count them.
+    uint64_t    pending_rows{0};
 
     /// Rows delivered to the session, for the counter.
     uint64_t    pushed{0};
@@ -110,8 +113,11 @@ public:
     uint64_t refused() const { return refused_.load(std::memory_order_relaxed); }
 
 private:
-    /// Called from whichever thread the write path owns. Never touches a Session.
-    void enqueue(uint64_t subscription_id, const QueryResult& row);
+    /// One write's rows for one subscription, called from whichever thread the write path owns: under
+    /// one lock, the queue found by its id, and a line a row added - "PUSH <id>\t" made once, and the
+    /// row's text taken from the notification's scratch, or made there for the subscriptions after
+    /// this one (#263). Never touches a Session.
+    void enqueue_batch(uint64_t subscription_id, const SubscriptionBatch& batch);
 
     /// Wake the epoll loop, at most once per pending batch.
     ///
@@ -126,7 +132,8 @@ private:
     const int    max_per_session_;
 
     mutable std::mutex mtx_;
-    std::vector<SubscriberQueue> queues_;
+    /// By subscription id (#263): a write reaches a queue in one lookup, however many the hub holds.
+    std::unordered_map<uint64_t, SubscriberQueue> queues_;
 
     uint64_t next_id_{1};
 

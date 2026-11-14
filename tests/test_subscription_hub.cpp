@@ -59,7 +59,68 @@ struct EngineFixture {
         }
         ASSERT_EQ(engine.apply_delta(delta, rows.data()), ob::OB_OK);
     }
+
+    /// One delta of the levels given, for a test that needs rows of chosen lengths.
+    void write_levels(const char* symbol, const char* exchange, std::vector<ob::Level> rows,
+                      uint64_t seq) {
+        ob::DeltaUpdate delta{};
+        std::strncpy(delta.symbol, symbol, sizeof(delta.symbol) - 1);
+        std::strncpy(delta.exchange, exchange, sizeof(delta.exchange) - 1);
+        delta.sequence_number = seq;
+        delta.timestamp_ns    = 1'000'000'000ULL + seq;
+        delta.side            = ob::SIDE_BID;
+        delta.n_levels        = static_cast<uint16_t>(rows.size());
+        ASSERT_EQ(engine.apply_delta(delta, rows.data()), ob::OB_OK);
+    }
 };
+
+/// Everything the socket holds, read until it would block.
+std::string read_available(int fd) {
+    std::string out;
+    char buf[65536];
+    while (true) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        out.append(buf, static_cast<size_t>(n));
+    }
+    return out;
+}
+
+/// The rows of `pushed` - lines of "PUSH <id>\t<row>" - with their heads cut, checking that every
+/// line is whole and under `id`.
+std::string rows_of(const std::string& pushed, uint64_t id, int* lines) {
+    const std::string head = "PUSH " + std::to_string(id) + "\t";
+    std::string rows;
+    *lines = 0;
+    size_t at = 0;
+    while (at < pushed.size()) {
+        const size_t end = pushed.find('\n', at);
+        if (end == std::string::npos) {
+            ADD_FAILURE() << "a partial line: " << pushed.substr(at);
+            break;
+        }
+        const std::string line = pushed.substr(at, end + 1 - at);
+        if (line.rfind(head, 0) != 0) {
+            ADD_FAILURE() << "subscription " << id << " was given " << line;
+            break;
+        }
+        rows += line.substr(head.size());
+        at = end + 1;
+        ++*lines;
+    }
+    return rows;
+}
+
+/// What a subscription is pushed for these rows, after its "PUSH <id>\t": format_push()'s bytes, the
+/// path a row callback has always taken.
+std::string rows_text(const std::vector<ob::QueryResult>& rows) {
+    std::string out;
+    for (const auto& r : rows) {
+        const std::string line = ob::format_push(0, r);
+        out += line.substr(line.find('\t') + 1);
+    }
+    return out;
+}
 
 /// How many times the hub wrote to its eventfd since the last read.
 ///
@@ -339,8 +400,8 @@ TEST(SubscriptionHubUnit, NothingIsDeliveredOnceEverySubscriptionIsCancelled) {
     //
     // Established by mutation, and the limit is worth recording. This catches the hub failing to
     // erase a cancelled queue — as does the simpler `AddAndRemove`, so that part is redundant. What
-    // it does **not** catch is `QueryEngine` continuing to notify a dead entry: `enqueue()` finds no
-    // queue and returns, so the hub's removal masks the engine's dead-flag check. The direction of
+    // it does **not** catch is `QueryEngine` continuing to notify a dead entry: `enqueue_batch()` finds
+    // no queue and returns, so the hub's removal masks the engine's dead-flag check. The direction of
     // the count is therefore guaranteed by construction (recounted from the vector under the lock,
     // never incremented) rather than by this test, and its unique value is the user-visible
     // contract: a write after the last cancellation reaches nobody.
@@ -367,4 +428,131 @@ TEST(SubscriptionHubUnit, NothingIsDeliveredOnceEverySubscriptionIsCancelled) {
     EXPECT_EQ(hub.queued_bytes(), 0u)
         << "a write was delivered after every subscription had been cancelled";
     EXPECT_EQ(hub.active(), 0u);
+}
+
+// ── Many subscriptions of one book (#263) ─────────────────────────────────────
+
+TEST(SubscriptionHubUnit, ManySubscriptionsOfOneBookEachGetTheirOwnLinesWithEveryRowInOrder) {
+    // A write reaches each subscription's queue by its id (#263). With the queues searched in turn
+    // that was a scan per row per subscription; a queue found wrong would push one subscriber's rows
+    // to another. 300 subscriptions, each on a socket of its own, and a write of five levels: every
+    // socket holds five lines under its own id, and the rows as a row callback is given them - the
+    // path the C API takes - in the order written.
+    EngineFixture fix;
+    ob::SubscriptionHub hub(1 << 20, 4);
+    constexpr int kSubscribers = 300;
+    ob::SessionManager sessions(kSubscribers + 8);
+
+    struct Subscriber {
+        int      pair[2];
+        uint64_t id;
+    };
+    std::vector<Subscriber> subs(kSubscribers);
+    std::string error;
+    for (auto& s : subs) {
+        ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, s.pair), 0);
+        ASSERT_TRUE(sessions.add_session(s.pair[0]));
+        s.id = hub.add(fix.engine, s.pair[0], 1, kSub, &error);
+        ASSERT_NE(s.id, 0u) << error;
+    }
+    std::vector<ob::QueryResult> seen;
+    ASSERT_NE(fix.engine.subscribe(kSub, [&](const ob::QueryResult& r) { seen.push_back(r); }), 0u);
+
+    fix.write("AAPL", "NYSE", 5);
+    ASSERT_EQ(seen.size(), 5u);
+    const std::string expected = rows_text(seen);
+
+    const auto to_close = hub.drain(sessions, [](int) {});
+    EXPECT_TRUE(to_close.empty());
+    EXPECT_EQ(hub.rows_pushed(), 5u * kSubscribers);
+    for (const auto& s : subs) {
+        int lines = 0;
+        const std::string rows = rows_of(read_available(s.pair[1]), s.id, &lines);
+        EXPECT_EQ(lines, 5) << "subscription " << s.id;
+        EXPECT_EQ(rows, expected) << "subscription " << s.id << " was given other rows, or in another order";
+    }
+    for (auto& s : subs) {
+        ::close(s.pair[1]);
+        sessions.remove_session(s.pair[0]);
+    }
+}
+
+TEST(SubscriptionHubUnit, TwoSubscriptionsGetTheTextOfTheRowsTheirConditionsAllowUnderTheirOwnIds) {
+    // A row's text is made once a write and shared by every subscription the row reaches (#263), kept
+    // by the row's place in the write. A subscription whose conditions allow two rows of five has to
+    // be given those two - not the first two the write's scratch holds.
+    EngineFixture fix;
+    ob::SubscriptionHub hub(1 << 20, 4);
+    ob::SessionManager sessions(8);
+    constexpr const char* kSome = "SUBSCRIBE * FROM 'AAPL'.'NYSE' WHERE price BETWEEN 10002 AND 10003";
+
+    int all[2];
+    int some[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, all), 0);
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, some), 0);
+    ASSERT_TRUE(sessions.add_session(all[0]));
+    ASSERT_TRUE(sessions.add_session(some[0]));
+    std::string error;
+    // The narrower one first, so that it makes the text of its two rows and the other reads them.
+    const uint64_t some_id = hub.add(fix.engine, some[0], 1, kSome, &error);
+    ASSERT_NE(some_id, 0u) << error;
+    const uint64_t all_id = hub.add(fix.engine, all[0], 1, kSub, &error);
+    ASSERT_NE(all_id, 0u) << error;
+    std::vector<ob::QueryResult> seen_all;
+    std::vector<ob::QueryResult> seen_some;
+    ASSERT_NE(fix.engine.subscribe(kSub, [&](const ob::QueryResult& r) { seen_all.push_back(r); }), 0u);
+    ASSERT_NE(fix.engine.subscribe(kSome, [&](const ob::QueryResult& r) { seen_some.push_back(r); }), 0u);
+
+    fix.write("AAPL", "NYSE", 5);
+    ASSERT_EQ(seen_all.size(), 5u);
+    ASSERT_EQ(seen_some.size(), 2u) << "the condition does not allow two rows of five: the test proves nothing";
+
+    hub.drain(sessions, [](int) {});
+    int lines = 0;
+    EXPECT_EQ(rows_of(read_available(some[1]), some_id, &lines), rows_text(seen_some));
+    EXPECT_EQ(lines, 2);
+    EXPECT_EQ(rows_of(read_available(all[1]), all_id, &lines), rows_text(seen_all));
+    EXPECT_EQ(lines, 5);
+
+    ::close(all[1]);
+    ::close(some[1]);
+    sessions.remove_session(all[0]);
+    sessions.remove_session(some[0]);
+}
+
+TEST(SubscriptionHubUnit, AWritePastTheCeilingMarksTheQueueWhereItPassesAndAddsNothingAfter) {
+    // A write's rows go into a queue under one lock (#263); the one that would pass the ceiling marks
+    // the queue condemned, what came before it stays (#69), and nothing after it is added - not even a
+    // row short enough to fit, which a queue taking rows one at a time never added either.
+    EngineFixture fix;
+    const std::vector<ob::Level> levels{{1, 100, 1, 0}, {2, 100, 1, 0}, {1'000'000'000'000'000, 100, 1, 0},
+                                        {3, 100, 1, 0}, {4, 100, 1, 0}};
+    constexpr uint64_t kSeq = 7;
+    // The rows as the write makes them (Engine::apply_delta), and the line each is pushed as.
+    std::vector<size_t> line;
+    for (uint16_t i = 0; i < levels.size(); ++i) {
+        ob::QueryResult r{};
+        r.timestamp_ns    = 1'000'000'000ULL + kSeq;
+        r.sequence_number = kSeq;
+        r.price           = levels[i].price;
+        r.quantity        = levels[i].qty;
+        r.order_count     = levels[i].cnt;
+        r.side            = ob::SIDE_BID;
+        r.level           = i;
+        line.push_back(ob::format_push(1, r).size());
+    }
+    ASSERT_GT(line[2], line[3] + 10) << "the third row is not the long one: the test proves nothing";
+    // Room for the first two and less than the third; the fourth would fit after the first two.
+    ob::SubscriptionHub hub(line[0] + line[1] + line[3], 4);
+    std::string error;
+    ASSERT_EQ(hub.add(fix.engine, 7, 1, kSub, &error), 1u) << error;
+
+    fix.write_levels("AAPL", "NYSE", levels, kSeq);
+    EXPECT_EQ(hub.queued_bytes(), line[0] + line[1])
+        << "the queue holds what came before the row that passed the ceiling, and nothing after it";
+    ob::SessionManager sessions(4);
+    const auto to_close = hub.drain(sessions, [](int) {});
+    ASSERT_EQ(to_close.size(), 1u);
+    EXPECT_EQ(to_close[0], 7);
+    EXPECT_EQ(hub.overflow_disconnects(), 1u);
 }

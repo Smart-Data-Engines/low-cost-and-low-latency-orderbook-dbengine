@@ -2133,13 +2133,20 @@ std::string Engine::format(const QueryAST& ast) {
 }
 
 uint64_t Engine::subscribe(std::string_view sql, RowCallback cb) {
-    const uint64_t id = query_engine_->subscribe(sql, std::move(cb));
+    return in_force(query_engine_->subscribe(sql, std::move(cb)));
+}
+
+uint64_t Engine::subscribe_batch(std::string_view sql, BatchCallback cb) {
+    return in_force(query_engine_->subscribe_batch(sql, std::move(cb)));
+}
+
+uint64_t Engine::in_force(uint64_t id) {
     // A write applies and notifies under `mtx_`, and asks whether anyone is subscribed with a
-    // relaxed load, which nothing orders after the registration above. Taking `mtx_` once, after
-    // it, puts every write on one side of this call (#239): a write that takes the lock after this
-    // sees the subscription, and one that released it before is held by any read made after this
-    // returns. A client that subscribes and then takes the book misses nothing in between.
-    { std::lock_guard<std::mutex> in_force(mtx_); }
+    // relaxed load, which nothing orders after the registration that returned `id`. Taking `mtx_`
+    // once, after it, puts every write on one side of this call (#239): a write that takes the lock
+    // after this sees the subscription, and one that released it before is held by any read made
+    // after this returns. A client that subscribes and then takes the book misses nothing in between.
+    { std::lock_guard<std::mutex> barrier(mtx_); }
     OB_LOG_DEBUG("engine", "Subscription %llu in force for every write from here",
                  static_cast<unsigned long long>(id));
     return id;
