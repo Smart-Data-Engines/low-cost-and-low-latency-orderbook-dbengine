@@ -990,11 +990,21 @@ bool get_varint(std::span<const char> in, size_t& at, uint64_t& v) {
 
 size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int zstd_level,
                  std::string& out) {
-    Stream s;
+    // This thread's stream rather than a fresh one: a fresh one's values were allocated and zeroed
+    // for every column of every seal, and then written over (#267).
+    thread_local Stream s;
+    struct KeepSmall {
+        Stream& s;
+        ~KeepSmall() { keep_small(s.values); }
+    } keep{s};
     switch (encoding.transform) {
     case Transform::kNone:
+        // Every field, the anchor and the scale too: the stream is the last column's until here, and
+        // a scale left over is written into the header (the equivalence test found it).
         s.transform = Transform::kNone;
         s.count = values.size();
+        s.anchor = 0;
+        s.scale = 1;
         s.values.assign(values.begin(), values.end());
         break;
     case Transform::kFor:   transform_for(values, s); break;
