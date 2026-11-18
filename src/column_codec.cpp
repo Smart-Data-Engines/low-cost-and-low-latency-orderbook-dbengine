@@ -109,22 +109,6 @@ struct Divisor {
     }
 };
 
-/// The greatest common divisor of `v`: 0 when all are zero.
-uint64_t common_divisor(const std::vector<uint64_t>& v) {
-    size_t i = 0;
-    uint64_t g = 0;
-    while (i < v.size() && g == 0) g = v[i++];
-    if (g <= 1) return g;
-    Divisor d(g);
-    for (; i < v.size(); ++i) {
-        if (d.divides(v[i])) continue;
-        g = std::gcd(g, v[i]);
-        if (g == 1) return 1;
-        d = Divisor(g);
-    }
-    return g;
-}
-
 /// A transform's output: the values to pack, the anchor and the divisor.
 struct Stream {
     Transform transform{Transform::kFor};
@@ -141,9 +125,9 @@ bool negative_of(uint64_t z) { return (z & 1) != 0; }
 
 /// A transform's values divided by their greatest common divisor as the divisor is found, in the pass
 /// that makes them (#267): `magnitude(i)` gives the i-th value's magnitude and sign, and `out[i]` gets
-/// its quotient - zigzagged when `Signed`. Returns the divisor, 1 when there is none, which is what
-/// common_divisor() over the magnitudes gives; every quotient is the one dividing by it afterwards
-/// gives.
+/// its quotient - zigzagged when `Signed`. Returns the divisor: the greatest common divisor of the
+/// magnitudes, and 1 when it is 1 or every magnitude is zero - what the transforms before this found in
+/// a pass of their own after the magnitudes, and every quotient the one dividing by it afterwards gave.
 ///
 /// The divisor is the first magnitude that is not zero and then the greatest common divisor of it and
 /// each that follows. A value it does not divide makes it smaller, and the quotients written so far
@@ -265,7 +249,7 @@ void transform_delta(std::span<const uint64_t> v, Stream& s) {
 
 /// The runs payload: how many, the words of their values, those words, then the words of their
 /// lengths less one - each in Simple8b, packed into this thread's buffers (#267).
-void put_runs(const std::vector<uint64_t>& values, const std::vector<uint64_t>& lengths, std::string& out) {
+void put_runs(std::span<const uint64_t> values, std::span<const uint64_t> lengths, std::string& out) {
     thread_local std::vector<uint64_t> value_words, length_words;
     encode_simple8b_into(values, value_words);
     encode_simple8b_into(lengths, length_words);
@@ -277,20 +261,51 @@ void put_runs(const std::vector<uint64_t>& values, const std::vector<uint64_t>& 
     keep_small(length_words);
 }
 
+/// The runs of equal values in `v`: each run's value into `values` and its length less one into
+/// `lengths`, their first `runs` slots, which it returns. Both vectors only ever grow here, so a
+/// thread's are not zeroed again for every column.
+///
+/// Without a branch a value (#267): the loop it replaces asked of every value whether it ended a run,
+/// and where runs are a value or two long that answer cannot be predicted. Here each value writes the
+/// run that would start at it and the run count moves by whether one does; and eight values none of
+/// which starts a run - the inside of a long run - are passed over by one test.
+size_t find_runs(std::span<const uint64_t> v, std::vector<uint64_t>& values, std::vector<uint64_t>& lengths) {
+    const size_t n = v.size();
+    if (n == 0) return 0;
+    if (values.size() < n) values.resize(n);
+    if (lengths.size() < n) lengths.resize(n);
+    const uint64_t* in = v.data();
+    uint64_t* value = values.data();
+    uint64_t* start = lengths.data();   // each run's first position, made its length at the end
+    size_t r = 0;
+    value[0] = in[0];
+    start[0] = 0;
+    // A run that would start at `i` is written one past the last, and counted if it does start there:
+    // until then the next value writes over it. r + 1 <= i < n, so it stays inside the vectors.
+    const auto step = [&](size_t i) {
+        value[r + 1] = in[i];
+        start[r + 1] = i;
+        r += static_cast<size_t>(in[i] != in[i - 1]);
+    };
+    size_t i = 1;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t differs = 0;
+        for (size_t k = 0; k < 8; ++k) differs |= in[i + k] ^ in[i + k - 1];
+        if (differs == 0) continue;
+        for (size_t k = 0; k < 8; ++k) step(i + k);
+    }
+    for (; i < n; ++i) step(i);
+    const size_t runs = r + 1;
+    for (size_t k = 0; k + 1 < runs; ++k) start[k] = start[k + 1] - start[k] - 1;
+    start[runs - 1] = n - start[runs - 1] - 1;
+    return runs;
+}
+
 /// Returns how many runs it packed.
 size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
     thread_local std::vector<uint64_t> values, lengths;
-    values.clear();
-    lengths.clear();
-    for (size_t i = 0; i < v.size();) {
-        size_t j = i + 1;
-        while (j < v.size() && v[j] == v[i]) ++j;
-        values.push_back(v[i]);
-        lengths.push_back(j - i - 1);
-        i = j;
-    }
-    put_runs(values, lengths, out);
-    const size_t runs = values.size();
+    const size_t runs = find_runs(v, values, lengths);
+    put_runs(std::span<const uint64_t>(values.data(), runs), std::span<const uint64_t>(lengths.data(), runs), out);
     keep_small(values);
     keep_small(lengths);
     return runs;
@@ -303,35 +318,26 @@ size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
 /// book's sequence numbers, would be one run of that output, and decode as one step. Fills `s`'s
 /// header fields and its values, one a run; returns how many runs it packed.
 size_t pack_steps(std::span<const uint64_t> v, Stream& s, std::string& out) {
-    thread_local std::vector<uint64_t> raw, lengths;
-    raw.clear();
-    lengths.clear();
+    thread_local std::vector<uint64_t> values, lengths;
     s.transform = Transform::kSteps;
     s.count = v.size();
     s.anchor = v.empty() ? 0 : v[0];
-    uint64_t before = s.anchor;
-    for (size_t i = 0; i < v.size();) {
-        size_t j = i + 1;
-        while (j < v.size() && v[j] == v[i]) ++j;
-        raw.push_back(v[i] - before);
-        lengths.push_back(j - i - 1);
-        before = v[i];
-        i = j;
-    }
-    // Magnitudes first, the signs taken again below, as transform_delta() takes them: the divisor is
-    // of the magnitudes.
-    s.values.resize(raw.size());
-    for (size_t r = 0; r < raw.size(); ++r) s.values[r] = static_cast<int64_t>(raw[r]) < 0 ? 0 - raw[r] : raw[r];
-    const uint64_t g = common_divisor(s.values);
-    s.scale = g > 1 ? g : 1;
-    const Divisor div(s.scale);
-    for (size_t r = 0; r < raw.size(); ++r) {
-        const uint64_t m = s.scale > 1 ? div.quotient(s.values[r]) : s.values[r];
-        s.values[r] = zigzag(static_cast<int64_t>(raw[r]) < 0, m);
-    }
-    put_runs(s.values, lengths, out);
-    const size_t runs = raw.size();
-    keep_small(raw);
+    const size_t runs = find_runs(v, values, lengths);
+    // Each run's step from the one before, the first's from the anchor - zero - divided as their
+    // divisor is found, as transform_delta() divides its differences (#267).
+    s.values.resize(runs);
+    const uint64_t* value = values.data();
+    const uint64_t anchor = s.anchor;
+    s.scale = divide_as_found<true>(
+        runs,
+        [value, anchor](size_t r) {
+            const uint64_t d = value[r] - (r == 0 ? anchor : value[r - 1]);
+            const bool negative = static_cast<int64_t>(d) < 0;
+            return std::pair<uint64_t, bool>{negative ? 0 - d : d, negative};
+        },
+        s.values.data());
+    put_runs(s.values, std::span<const uint64_t>(lengths.data(), runs), out);
+    keep_small(values);
     keep_small(lengths);
     return runs;
 }
