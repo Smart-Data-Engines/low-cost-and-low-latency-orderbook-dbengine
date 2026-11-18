@@ -102,6 +102,11 @@ struct Divisor {
         return (x >> k) * inverse <= limit;
     }
     uint64_t quotient(uint64_t x) const { return (x >> k) * inverse; }   // x a multiple
+    /// divides() and quotient() from one product: the quotient into `q` when `x` is a multiple.
+    bool divide(uint64_t x, uint64_t& q) const {
+        q = (x >> k) * inverse;
+        return (k == 0 || (x & ((uint64_t{1} << k) - 1)) == 0) && q <= limit;
+    }
 };
 
 /// The greatest common divisor of `v`: 0 when all are zero.
@@ -129,18 +134,113 @@ struct Stream {
     std::vector<uint64_t> values;
 };
 
+/// A zigzagged value's magnitude and sign, as zigzag() made it from them: 2m for a value of m, 2m - 1 for
+/// one of -m - where 2^63's is UINT64_MAX, so (z + 1) / 2 would wrap and this does not.
+uint64_t magnitude_of(uint64_t z) { return (z >> 1) + (z & 1); }
+bool negative_of(uint64_t z) { return (z & 1) != 0; }
+
+/// A transform's values divided by their greatest common divisor as the divisor is found, in the pass
+/// that makes them (#267): `magnitude(i)` gives the i-th value's magnitude and sign, and `out[i]` gets
+/// its quotient - zigzagged when `Signed`. Returns the divisor, 1 when there is none, which is what
+/// common_divisor() over the magnitudes gives; every quotient is the one dividing by it afterwards
+/// gives.
+///
+/// The divisor is the first magnitude that is not zero and then the greatest common divisor of it and
+/// each that follows. A value it does not divide makes it smaller, and the quotients written so far
+/// are taken to the new one by multiplying by the old over the new: m/g' = (m/g)(g/g'), never past m.
+/// Each such correction at least halves the divisor, and a column of a client's values could make
+/// them late and many - up to 63 passes over what came before. So corrections may rewrite as many
+/// values as the column holds, once, and past that the rest is written undivided while its common
+/// divisor is found, and one last pass takes every value to the divisor of the whole: three passes at
+/// worst, as many as the transforms before this took every time.
+template <bool Signed, typename Magnitude>
+uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* out) {
+    const auto put = [](bool negative, uint64_t m) { return Signed ? zigzag(negative, m) : m; };
+    // Corrections rewrite the quotients written so far.
+    const auto rescale = [&](size_t upto, uint64_t factor) {
+        for (size_t j = 0; j < upto; ++j) {
+            out[j] = Signed ? zigzag(negative_of(out[j]), magnitude_of(out[j]) * factor) : out[j] * factor;
+        }
+    };
+    size_t i = 0;
+    // Zeros until the first magnitude that is not: a quotient of zero whatever the divisor.
+    for (; i < n; ++i) {
+        const auto [m, negative] = magnitude(i);
+        if (m != 0) break;
+        out[i] = put(negative, 0);
+    }
+    if (i == n) return 1;
+    uint64_t g = magnitude(i).first;
+    out[i] = put(magnitude(i).second, 1);
+    ++i;
+    size_t budget = n;   // the values corrections may still rewrite
+    if (g > 1) {
+        Divisor d(g);
+        for (; i < n; ++i) {
+            const auto [m, negative] = magnitude(i);
+            uint64_t q;
+            if (d.divide(m, q)) {
+                out[i] = put(negative, q);
+                continue;
+            }
+            const uint64_t h = std::gcd(g, m);
+            if (i > budget) {
+                // Past the budget: the rest undivided, their divisor found with the one so far, and
+                // one pass to the divisor of the whole.
+                uint64_t whole = h;
+                Divisor dw(whole > 1 ? whole : 1);
+                for (size_t j = i; j < n; ++j) {
+                    const auto [mj, nj] = magnitude(j);
+                    out[j] = put(nj, mj);
+                    if (whole > 1 && !dw.divides(mj)) {
+                        whole = std::gcd(whole, mj);
+                        if (whole > 1) dw = Divisor(whole);
+                    }
+                }
+                const uint64_t factor = g / whole;
+                const Divisor dd(whole > 1 ? whole : 1);
+                for (size_t j = 0; j < n; ++j) {
+                    const uint64_t mj = Signed ? magnitude_of(out[j]) : out[j];
+                    const uint64_t to = j < i ? mj * factor : (whole > 1 ? dd.quotient(mj) : mj);
+                    out[j] = Signed ? zigzag(negative_of(out[j]), to) : to;
+                }
+                return whole > 1 ? whole : 1;
+            }
+            budget -= i;
+            rescale(i, g / h);
+            g = h;
+            if (g == 1) {
+                out[i] = put(negative, m);
+                ++i;
+                break;
+            }
+            d = Divisor(g);
+            out[i] = put(negative, d.quotient(m));
+        }
+        if (g > 1) return g;
+    }
+    // No divisor: the rest as they are.
+    for (; i < n; ++i) {
+        const auto [m, negative] = magnitude(i);
+        out[i] = put(negative, m);
+    }
+    return 1;
+}
+
 void transform_for(std::span<const uint64_t> v, Stream& s) {
     s.transform = Transform::kFor;
     s.count = v.size();
-    s.anchor = v.empty() ? 0 : *std::min_element(v.begin(), v.end());
+    // The minimum on its own, a pass the compiler makes wide; then one pass of differences, divided as
+    // their divisor is found (#267). It was four: the minimum, the differences, their divisor, the
+    // quotients.
+    uint64_t lowest = v.empty() ? 0 : v[0];
+    for (const uint64_t x : v) lowest = std::min(lowest, x);
+    s.anchor = lowest;
     s.values.resize(v.size());
-    for (size_t i = 0; i < v.size(); ++i) s.values[i] = v[i] - s.anchor;
-    const uint64_t g = common_divisor(s.values);
-    s.scale = g > 1 ? g : 1;
-    if (s.scale > 1) {
-        const Divisor d(s.scale);
-        for (uint64_t& x : s.values) x = d.quotient(x);
-    }
+    const uint64_t* in = v.data();
+    s.scale = divide_as_found<false>(
+        v.size(), [in, lowest](size_t i) { return std::pair<uint64_t, bool>{in[i] - lowest, false}; },
+        s.values.data());
 }
 
 void transform_delta(std::span<const uint64_t> v, Stream& s) {
@@ -148,21 +248,19 @@ void transform_delta(std::span<const uint64_t> v, Stream& s) {
     s.count = v.size();
     s.anchor = v.empty() ? 0 : v[0];
     const size_t n = v.empty() ? 0 : v.size() - 1;
-    // Magnitudes first, the signs taken again below: the divisor is of the magnitudes, and the
-    // differences are taken in wrapping arithmetic, as encode_prices() takes them.
+    // One pass: each difference, in wrapping arithmetic as encode_prices() takes it, its sign and its
+    // magnitude - the divisor is of the magnitudes - divided as the divisor is found and zigzagged
+    // (#267). It was three: the magnitudes, their divisor, then the signs again and the quotients.
     s.values.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-        const uint64_t d = v[i + 1] - v[i];
-        s.values[i] = static_cast<int64_t>(d) < 0 ? 0 - d : d;
-    }
-    const uint64_t g = common_divisor(s.values);
-    s.scale = g > 1 ? g : 1;
-    const Divisor div(s.scale);
-    for (size_t i = 0; i < n; ++i) {
-        const bool negative = static_cast<int64_t>(v[i + 1] - v[i]) < 0;
-        const uint64_t m = s.scale > 1 ? div.quotient(s.values[i]) : s.values[i];
-        s.values[i] = zigzag(negative, m);
-    }
+    const uint64_t* in = v.data();
+    s.scale = divide_as_found<true>(
+        n,
+        [in](size_t i) {
+            const uint64_t d = in[i + 1] - in[i];
+            const bool negative = static_cast<int64_t>(d) < 0;
+            return std::pair<uint64_t, bool>{negative ? 0 - d : d, negative};
+        },
+        s.values.data());
 }
 
 /// The runs payload: how many, the words of their values, those words, then the words of their
