@@ -213,10 +213,9 @@ uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* __restrict o
 void transform_for(std::span<const uint64_t> v, Stream& s) {
     s.transform = Transform::kFor;
     s.count = v.size();
-    // The minimum on its own, a pass the compiler makes wide; then one pass of differences, divided as
-    // their divisor is found (#267). It was four: the minimum, the differences, their divisor, the
-    // quotients.
-    // Four minima side by side: one was a chain of a compare and a move a value.
+    // The minimum first, in four chains side by side - one chain was a compare and a move a value, each
+    // waiting on the one before - and then one pass of differences, divided as their divisor is found
+    // (#267). It was four passes: the minimum, the differences, their divisor, the quotients.
     uint64_t lowest = v.empty() ? 0 : v[0];
     {
         uint64_t m[4] = {lowest, lowest, lowest, lowest};
