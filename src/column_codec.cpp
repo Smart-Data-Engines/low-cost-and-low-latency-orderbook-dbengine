@@ -86,26 +86,26 @@ void put_u64_words(std::string& out, const std::vector<uint64_t>& words) {
 /// than everything else a column's transform does.
 struct Divisor {
     unsigned k{0};
+    uint64_t low{0};   ///< the k low bits: a multiple has none of them set
     uint64_t inverse{1};
     uint64_t limit{std::numeric_limits<uint64_t>::max()};
 
     explicit Divisor(uint64_t g) {
         k = static_cast<unsigned>(__builtin_ctzll(g));
+        low = (uint64_t{1} << k) - 1;
         const uint64_t o = g >> k;
         uint64_t inv = o;   // right in 3 bits for any odd o; each step doubles them
         for (int i = 0; i < 5; ++i) inv *= 2 - o * inv;
         inverse = inv;
         limit = std::numeric_limits<uint64_t>::max() / o;
     }
-    bool divides(uint64_t x) const {
-        if (k != 0 && (x & ((uint64_t{1} << k) - 1)) != 0) return false;
-        return (x >> k) * inverse <= limit;
-    }
+    bool divides(uint64_t x) const { return ((x & low) == 0) & ((x >> k) * inverse <= limit); }
     uint64_t quotient(uint64_t x) const { return (x >> k) * inverse; }   // x a multiple
-    /// divides() and quotient() from one product: the quotient into `q` when `x` is a multiple.
+    /// divides() and quotient() from one product: the quotient into `q`, which is `x / g` when this
+    /// says `x` is a multiple. One test, so that a column of multiples takes one branch a value.
     bool divide(uint64_t x, uint64_t& q) const {
         q = (x >> k) * inverse;
-        return (k == 0 || (x & ((uint64_t{1} << k) - 1)) == 0) && q <= limit;
+        return ((x & low) == 0) & (q <= limit);
     }
 };
 
@@ -138,7 +138,7 @@ bool negative_of(uint64_t z) { return (z & 1) != 0; }
 /// divisor is found, and one last pass takes every value to the divisor of the whole: three passes at
 /// worst, as many as the transforms before this took every time.
 template <bool Signed, typename Magnitude>
-uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* out) {
+uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* __restrict out) {
     const auto put = [](bool negative, uint64_t m) { return Signed ? zigzag(negative, m) : m; };
     // Corrections rewrite the quotients written so far.
     const auto rescale = [&](size_t upto, uint64_t factor) {
@@ -163,10 +163,9 @@ uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* out) {
         for (; i < n; ++i) {
             const auto [m, negative] = magnitude(i);
             uint64_t q;
-            if (d.divide(m, q)) {
-                out[i] = put(negative, q);
-                continue;
-            }
+            const bool multiple = d.divide(m, q);
+            out[i] = put(negative, q);   // written again below when it is not a multiple
+            if (multiple) [[likely]] continue;
             const uint64_t h = std::gcd(g, m);
             if (i > budget) {
                 // Past the budget: the rest undivided, their divisor found with the one so far, and
@@ -217,8 +216,17 @@ void transform_for(std::span<const uint64_t> v, Stream& s) {
     // The minimum on its own, a pass the compiler makes wide; then one pass of differences, divided as
     // their divisor is found (#267). It was four: the minimum, the differences, their divisor, the
     // quotients.
+    // Four minima side by side: one was a chain of a compare and a move a value.
     uint64_t lowest = v.empty() ? 0 : v[0];
-    for (const uint64_t x : v) lowest = std::min(lowest, x);
+    {
+        uint64_t m[4] = {lowest, lowest, lowest, lowest};
+        size_t i = 0;
+        for (; i + 4 <= v.size(); i += 4) {
+            for (size_t k = 0; k < 4; ++k) m[k] = std::min(m[k], v[i + k]);
+        }
+        for (; i < v.size(); ++i) m[0] = std::min(m[0], v[i]);
+        lowest = std::min(std::min(m[0], m[1]), std::min(m[2], m[3]));
+    }
     s.anchor = lowest;
     s.values.resize(v.size());
     const uint64_t* in = v.data();
