@@ -166,14 +166,17 @@ void transform_delta(std::span<const uint64_t> v, Stream& s) {
 }
 
 /// The runs payload: how many, the words of their values, those words, then the words of their
-/// lengths less one - each in Simple8b.
+/// lengths less one - each in Simple8b, packed into this thread's buffers (#267).
 void put_runs(const std::vector<uint64_t>& values, const std::vector<uint64_t>& lengths, std::string& out) {
-    const auto value_words = encode_simple8b(values).words;
-    const auto length_words = encode_simple8b(lengths).words;
+    thread_local std::vector<uint64_t> value_words, length_words;
+    encode_simple8b_into(values, value_words);
+    encode_simple8b_into(lengths, length_words);
     put_varint(out, values.size());
     put_varint(out, value_words.size());
     put_u64_words(out, value_words);
     put_u64_words(out, length_words);
+    keep_small(value_words);
+    keep_small(length_words);
 }
 
 /// Returns how many runs it packed.
@@ -374,9 +377,17 @@ bool compress(Compressor c, const std::string& in, int zstd_level, std::string& 
     return c == Compressor::kZstd ? zstd_compress(in, zstd_level, out) : lz4_compress(in, out);
 }
 
+/// The Simple8b words of `values` appended to `out`, packed in this thread's buffer.
+void put_simple8b(const std::vector<uint64_t>& values, std::string& out) {
+    thread_local std::vector<uint64_t> words;
+    encode_simple8b_into(values, words);
+    put_u64_words(out, words);
+    keep_small(words);
+}
+
 void pack(const Stream& s, Packing p, unsigned width, std::string& out) {
     switch (p) {
-    case Packing::kSimple8b: put_u64_words(out, encode_simple8b(s.values).words); return;
+    case Packing::kSimple8b: put_simple8b(s.values, out); return;
     case Packing::kRuns:     pack_runs(s.values, out); return;
     case Packing::kBlocks:   pack_blocks(s.values, out); return;
     case Packing::kNarrow:   pack_narrow(s.values, width, out); return;
@@ -1054,7 +1065,7 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     for (int t = 0; t < 2; ++t) {
         const Stream& s = streams[t];
         s8b[t].clear();
-        put_u64_words(s8b[t], encode_simple8b(s.values).words);
+        put_simple8b(s.values, s8b[t]);
         runs[t].clear();
         run_count[t] = pack_runs(s.values, runs[t]);
         const size_t b_s8b = header_bytes(s, Packing::kSimple8b, Compressor::kNone, 0) + s8b[t].size();
