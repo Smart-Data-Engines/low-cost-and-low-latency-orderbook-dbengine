@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -108,32 +110,40 @@ static constexpr std::array<uint8_t, 61> kFirstSelector = [] {
     return first;
 }();
 
-static inline unsigned width_of(uint64_t v) { return v == 0 ? 0 : 64 - static_cast<unsigned>(__builtin_clzll(v)); }
-
 // The first selector, in the table's order, whose values all fit - a value fits when it is no
-// wider than the selector's bits, and a selector of 0 bits takes only zeros. The widths' running
-// maximum is extended only as far as a selector needs, and no further once it is wider than that
-// selector takes, since a longer prefix is no narrower. The version before this scanned the values
-// again for every selector it tried, up to 240 of them for the first: on a column of wide values
-// that scan was most of what encoding cost (segment format v3 encodes each column several ways).
-// The search starts at the first selector the first value fits (#267): before it, a column of values
-// 40 bits wide tried fourteen selectors a word for a word of one value. It picks what the versions
-// before it picked, which `test_codec` holds it to. `begin[0]` is below the fallback marker.
-static int best_selector(const uint64_t* begin, size_t available) {
-    uint8_t widest[241];   // widest[k]: the widest of the first k values, as far as computed
-    widest[0] = 0;
-    const unsigned first = width_of(begin[0]);
-    widest[1] = static_cast<uint8_t>(first);
-    size_t known = 1;
-    for (int sel = kFirstSelector[first]; sel <= 15; ++sel) {
+// wider than the selector's bits, and a selector of 0 bits takes only zeros. The search starts at the
+// first selector the first value fits (#267): before it, a column of values 40 bits wide tried
+// fourteen selectors a word for a word of one value. And each selector's window is judged from the
+// values' widths, eight at a time (#267): the widths were a running maximum extended one value at a
+// time, a chain of a count, a compare and a store a value, and that chain was most of what encoding a
+// column of narrow values cost. It picks what the versions before it picked, which `test_codec` holds
+// it to.
+//
+// Whether the first `use` of `widths` are all `bits` or fewer. A byte past `bits` gets its top bit from
+// adding 0x80 - (bits + 1), and no byte of 64 or less carries into the next, so eight widths are judged
+// by one addition; a window stops at the first eight that hold one too wide. `widths` is readable eight
+// bytes past `use`.
+static inline bool widths_at_most(const uint8_t* widths, size_t use, unsigned bits) {
+    const uint64_t add = (uint64_t{0x80} - (bits + 1)) * 0x0101010101010101ULL;
+    size_t k = 0;
+    for (; k + 8 <= use; k += 8) {
+        uint64_t eight;
+        std::memcpy(&eight, widths + k, sizeof eight);
+        if (((eight + add) & 0x8080808080808080ULL) != 0) return false;
+    }
+    if (k == use) return true;
+    uint64_t rest;
+    std::memcpy(&rest, widths + k, sizeof rest);
+    rest &= (uint64_t{1} << (8 * (use - k))) - 1;   // the bytes past the window as zeros
+    return ((rest + add) & 0x8080808080808080ULL) == 0;
+}
+
+// `widths` holds a byte a value, its width in bits, and is readable eight bytes past the values;
+// `widths[0]` is under 61, the first value being below the fallback marker.
+static int best_selector(const uint8_t* widths, size_t available) {
+    for (int sel = kFirstSelector[widths[0]]; sel <= 15; ++sel) {
         const size_t use = std::min<size_t>(kSelectors[sel].count, available);
-        const unsigned bits = kSelectors[sel].bits;
-        while (known < use && widest[known] <= bits) {
-            widest[known + 1] = std::max(widest[known], static_cast<uint8_t>(width_of(begin[known])));
-            ++known;
-        }
-        // Stopped short of `use`: the values so far are already wider than this selector takes.
-        if (known >= use && widest[use] <= bits) return sel;
+        if (widths_at_most(widths, use, kSelectors[sel].bits)) return sel;
     }
     return -1; // unreachable for valid inputs
 }
@@ -197,6 +207,19 @@ bool encode_simple8b_into(std::span<const uint64_t> values, std::vector<uint64_t
     words.clear();
     // A word a value at most, and two for a value that takes the fallback.
     words.reserve(values.size());
+    // Every value's width in bits, a byte each and eight more bytes to read past the last, for
+    // best_selector(); kept by the thread, unless a column made it larger than the column codec keeps
+    // its own buffers (1 MiB).
+    thread_local std::vector<uint8_t> width_buffer;
+    if (width_buffer.size() < values.size() + 8) width_buffer.resize(values.size() + 8);
+    uint8_t* widths = width_buffer.data();
+    for (size_t k = 0; k < values.size(); ++k) widths[k] = static_cast<uint8_t>(64 - std::countl_zero(values[k]));
+    struct KeepSmall {
+        std::vector<uint8_t>& b;
+        ~KeepSmall() {
+            if (b.capacity() > (size_t{1} << 20)) std::vector<uint8_t>().swap(b);
+        }
+    } keep{width_buffer};
     bool has_fallback = false;
     size_t i = 0;
     while (i < values.size()) {
@@ -216,7 +239,7 @@ bool encode_simple8b_into(std::span<const uint64_t> values, std::vector<uint64_t
         }
 
         // Find best selector for values starting at i
-        const int sel = best_selector(values.data() + i, values.size() - i);
+        const int sel = best_selector(widths + i, values.size() - i);
         if (sel < 0) {
             // Should not happen; treat as fallback
             words.push_back((static_cast<uint64_t>(15) << 60) | kFallbackMarker);
