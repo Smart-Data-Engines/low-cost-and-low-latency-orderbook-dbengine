@@ -110,15 +110,6 @@ static constexpr std::array<uint8_t, 61> kFirstSelector = [] {
     return first;
 }();
 
-// The first selector, in the table's order, whose values all fit - a value fits when it is no
-// wider than the selector's bits, and a selector of 0 bits takes only zeros. The search starts at the
-// first selector the first value fits (#267): before it, a column of values 40 bits wide tried
-// fourteen selectors a word for a word of one value. And each selector's window is judged from the
-// values' widths, eight at a time (#267): the widths were a running maximum extended one value at a
-// time, a chain of a count, a compare and a store a value, and that chain was most of what encoding a
-// column of narrow values cost. It picks what the versions before it picked, which `test_codec` holds
-// it to.
-//
 // Whether the first `use` of `widths` are all `bits` or fewer. A byte past `bits` gets its top bit from
 // adding 0x80 - (bits + 1), and no byte of 64 or less carries into the next, so eight widths are judged
 // by one addition; a window stops at the first eight that hold one too wide. `widths` is readable eight
@@ -138,6 +129,15 @@ static inline bool widths_at_most(const uint8_t* widths, size_t use, unsigned bi
     return ((rest + add) & 0x8080808080808080ULL) == 0;
 }
 
+// The first selector, in the table's order, whose values all fit - a value fits when it is no
+// wider than the selector's bits, and a selector of 0 bits takes only zeros. The search starts at the
+// first selector the first value fits (#267): before it, a column of values 40 bits wide tried
+// fourteen selectors a word for a word of one value. And each selector's window is judged from the
+// values' widths, eight at a time (#267): the widths were a running maximum extended one value at a
+// time, a chain of a count, a compare and a store a value, and that chain was most of what encoding a
+// column of narrow values cost. It picks what the versions before it picked, which `test_codec` holds
+// it to.
+//
 // `widths` holds a byte a value, its width in bits, and is readable eight bytes past the values;
 // `widths[0]` is under 61, the first value being below the fallback marker.
 static int best_selector(const uint8_t* widths, size_t available) {
