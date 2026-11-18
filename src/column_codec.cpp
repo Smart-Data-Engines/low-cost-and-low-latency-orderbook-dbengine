@@ -358,25 +358,35 @@ size_t blocks_bytes(const std::vector<uint64_t>& v) {
 }
 
 void pack_blocks(const std::vector<uint64_t>& v, std::string& out) {
-    // Each value ORed into the eight bytes at its first bit, and the ninth when it reaches past
-    // them, in a buffer padded for that ninth byte.
-    thread_local std::vector<unsigned char> buf;
+    // Each block's values gathered in a 64-bit accumulator, the lowest bit first, and written a whole
+    // word at a time (#267). Each value was ORed into the eight bytes at its first bit, which the
+    // value before had just written - a load waiting on a store that overlaps it, for every value -
+    // in a buffer zeroed first, and then copied.
     for (size_t i = 0; i < v.size(); i += kBlockValues) {
         const size_t n = std::min(kBlockValues, v.size() - i);
         const unsigned w = block_width(v.data() + i, n);
         out.push_back(static_cast<char>(w));
         if (w == 0) continue;
         const size_t need = (n * w + 7) / 8;
-        buf.assign(need + 9, 0);
+        const size_t at = out.size();
+        out.resize(at + need + 8);   // room for the last word's eight bytes, cut back below
+        unsigned char* o = reinterpret_cast<unsigned char*>(out.data() + at);
+        uint64_t acc = 0;
+        unsigned filled = 0;   // the accumulator's bits taken, under 64 between values
+        const uint64_t* x = v.data() + i;
         for (size_t k = 0; k < n; ++k) {
-            const size_t bit = k * w;
-            const unsigned shift = static_cast<unsigned>(bit & 7);
-            unsigned char* p = buf.data() + (bit >> 3);
-            const uint64_t x = v[i + k];
-            store64(p, load64(p) | (x << shift));
-            if (shift + w > 64) p[8] = static_cast<unsigned char>(p[8] | (x >> (64 - shift)));
+            acc |= x[k] << filled;
+            filled += w;
+            if (filled >= 64) {
+                store64(o, acc);
+                o += 8;
+                filled -= 64;
+                // The bits of this value past the word, if any: shifting by w itself would be by 64.
+                acc = filled == 0 ? 0 : x[k] >> (w - filled);
+            }
         }
-        out.append(reinterpret_cast<const char*>(buf.data()), need);
+        if (filled > 0) store64(o, acc);
+        out.resize(at + need);
     }
 }
 
