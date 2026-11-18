@@ -2974,6 +2974,12 @@ The equivalence test found a bug of the change on its first run: a reused stream
 scale into a block of `none`. `prop_simple8b_encode_matches_the_previous_encoder` holds the selector to the
 encoder before #49.
 
+Mutation table (`mutations/` in the evidence, ARM): 13 mutants, every one killed by the test of what it
+breaks. Both controls survive, each correct and slower: corrections to the divisor past any budget, and a
+selector's window read to its end after a width too wide. One of the killed mutants takes the value where
+the corrections' budget ran out for one before it. Both properties kill it, so the end of the budget is
+reached in the cases they draw.
+
 - Effort: M | Impact: a seal's encoding costs 26-41% less on both hosts' recordings, writing the same bytes
 
 ### 266. A book summary at a seal decoded again what the seal had encoded, and applied it through a map ✅ **P2**
