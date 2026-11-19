@@ -318,7 +318,13 @@ def test_an_answer_whose_session_was_closed_goes_to_no_session_after_it(tmp_path
     connection without reading: the loop's next flush of the answers queued fails, and closes the
     session while the large read is answered off the loop. That answer, when it comes, finds the
     session the node accepted next on bob's descriptor - the kernel gives the lowest free one - and is
-    dropped by the connection's id."""
+    dropped by the connection's id.
+
+    The lowest free descriptor is bob's only if none below it came free since bob's was taken. A tick's
+    WAL sync holds a descriptor of its own for the sync's length - a duplicate of the WAL's, `sync
+    ticket: ... descriptor N` in the node's log - and one taken while the sessions before bob's connected
+    is free again by now: the next session took it, in 2 of 10 runs of this file on the m8a.xlarge. So
+    sessions are opened until one is given bob's, the ones before it holding what came free."""
     node = Node(tmp_path, "--large-read-threads", "1", "--log-level", "DEBUG")
     sessions: list[socket.socket] = []
     try:
@@ -361,10 +367,15 @@ def test_an_answer_whose_session_was_closed_goes_to_no_session_after_it(tmp_path
             f"bob's session closed as {reason!r} with {pending} byte(s) queued: not by a failed flush"
 
         adopted = len(node.logged(r"adopted fd=(\d+) conn_id=\d+"))
-        after = connect(node.port)
-        sessions.append(after)
-        given, given_conn = node.logged(r"adopted fd=(\d+) conn_id=(\d+)", adopted + 1)[adopted]
-        assert given == fd, f"the next session has fd={given}, not bob's {fd}: it shows nothing"
+        given = given_conn = None
+        for _ in range(4):
+            after = connect(node.port)
+            sessions.append(after)
+            given, given_conn = node.logged(r"adopted fd=(\d+) conn_id=(\d+)", adopted + 1)[adopted]
+            adopted += 1
+            if given == fd:
+                break
+        assert given == fd, f"no session of four after bob's was given bob's fd={fd}: it shows nothing"
 
         dropped = rf"an answer off the loop for fd={fd} conn_id={conn}, whose session has gone: dropped"
         node.logged(dropped)
