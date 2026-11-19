@@ -241,6 +241,24 @@ ob_add_columnar_test(test_column_codec
     test_column_codec.cpp
 )
 
+# ── #267: the encoder against the one it replaced, byte for byte ─────────────
+# column_codec_reference.hpp calls LZ4 and ZSTD itself, as the encoder it copies does.
+ob_add_columnar_test(test_column_codec_equivalence
+    test_column_codec_equivalence.cpp
+)
+if(TARGET PkgConfig::LZ4)
+    target_link_libraries(test_column_codec_equivalence PRIVATE PkgConfig::LZ4)
+else()
+    target_link_libraries(test_column_codec_equivalence PRIVATE ${LZ4_LIBRARY})
+    target_include_directories(test_column_codec_equivalence PRIVATE ${LZ4_INCLUDE_DIR})
+endif()
+if(TARGET PkgConfig::ZSTD)
+    target_link_libraries(test_column_codec_equivalence PRIVATE PkgConfig::ZSTD)
+else()
+    target_link_libraries(test_column_codec_equivalence PRIVATE ${ZSTD_LIBRARY})
+    target_include_directories(test_column_codec_equivalence PRIVATE ${ZSTD_INCLUDE_DIR})
+endif()
+
 # ── #139: column identities, spellings and read sets ─────────────────────────
 ob_add_columnar_test(test_query_columns
     test_query_columns.cpp

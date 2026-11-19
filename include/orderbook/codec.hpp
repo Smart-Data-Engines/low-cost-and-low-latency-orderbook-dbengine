@@ -62,6 +62,11 @@ struct Simple8bResult {
 /// Encode uint64 quantities using Simple8b.
 Simple8bResult encode_simple8b(std::span<const uint64_t> values);
 
+/// encode_simple8b()'s words into `words`, which it clears first and whose capacity it keeps - the
+/// segment encoder packs several columns' worth of words a seal (#267), and a vector made for each was
+/// an allocation and a copy each time. Returns whether a value took the fallback.
+bool encode_simple8b_into(std::span<const uint64_t> values, std::vector<uint64_t>& words);
+
 /// Decode Simple8b-encoded words back to uint64 values.
 /// count: expected number of output values.
 std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t count);

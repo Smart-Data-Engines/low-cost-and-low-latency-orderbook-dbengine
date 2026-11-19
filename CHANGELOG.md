@@ -197,6 +197,17 @@ here as `#N`.
 
 ### Changed
 
+- **A seal encodes its columns into the same bytes for 26-41% less** (#267). After #266, encoding
+  a segment's columns was the largest item of the flush thread - the one every writer's rows go through -
+  in the node's profile under a pipelined ingest. The transforms divide as they find their divisor, in
+  one pass where they took three or four. Simple8b starts at the first selector the word's first value
+  fits, and judges a selector's window eight widths at a time. Runs are found without a branch a value,
+  and blocks are packed through a 64-bit accumulator. A seal's encoding of the Binance recordings takes
+  20.5-20.8 ns a row where it took 33.7-34.5 and 11.8-12.6 where 16.6-17.6 (m8a.xlarge), and 23.5-23.8
+  where 37.8-38.0 and 14.3-14.7 where 23.6-24.4 (m9g.xlarge). Under the ingest, encoding's share of the
+  node's samples fell from 8.4-8.7% to 6.2-6.4% and from 9.0-9.1% to 5.5-5.7%. Every block and every choice
+  is the one the encoder before it made, held by a test against a copy of that encoder.
+
 - **A book summary at a seal costs half of what it did** (#266). After a seal of a busy symbol the
   flush thread - the one every writer's rows go through - composes the book as of the segment's end
   (#233), and in the node's profile under a pipelined ingest that was a quarter to a third of the

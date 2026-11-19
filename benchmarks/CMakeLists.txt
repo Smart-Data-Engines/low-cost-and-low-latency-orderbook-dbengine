@@ -118,6 +118,13 @@ endif()
 add_executable(column_codec_cost column_codec_cost.cpp)
 target_link_libraries(column_codec_cost PRIVATE orderbook_column_codec)
 
+# ── What a seal's encoding of its columns costs, as a store pays it (#267) ────
+#
+# Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object,
+# the time a row of every seal, of the searched ones and of the others, and a hash of what they wrote.
+add_executable(seal_encode_cost seal_encode_cost.cpp)
+target_link_libraries(seal_encode_cost PRIVATE orderbook_columnar)
+
 # ── What a reply's numbers cost to write (#251) ───────────────────────────────
 #
 # Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object,
