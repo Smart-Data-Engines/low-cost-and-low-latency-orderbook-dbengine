@@ -16,11 +16,13 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <compare>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -817,6 +819,50 @@ void ColumnarStore::append_row(const SnapshotRow& row, uint64_t own_seq) {
     active_own_max_ = std::max(active_own_max_, own_seq);
 }
 
+namespace {
+
+/// One field of each row of a block, as an iterator `vector::insert()` takes (#284): a column grows by its
+/// values, each constructed where it stays. resize() zeroed a tile before it was written, and on the m9g.xlarge
+/// glibc zeroes with its generic memset - 1.1-1.5% of the node's samples under #190's ingest after #281.
+template <typename T, auto Field>
+class FieldOfRows {
+public:
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type        = T;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = void;
+    using reference         = T;
+
+    FieldOfRows() = default;
+    explicit FieldOfRows(const SnapshotRow* row) : row_(row) {}
+
+    T operator*() const { return static_cast<T>(row_->*Field); }
+    T operator[](difference_type n) const { return static_cast<T>(row_[n].*Field); }
+    FieldOfRows& operator++() { ++row_; return *this; }
+    FieldOfRows operator++(int) { FieldOfRows was = *this; ++row_; return was; }
+    FieldOfRows& operator--() { --row_; return *this; }
+    FieldOfRows operator--(int) { FieldOfRows was = *this; --row_; return was; }
+    FieldOfRows& operator+=(difference_type n) { row_ += n; return *this; }
+    FieldOfRows& operator-=(difference_type n) { row_ -= n; return *this; }
+    friend FieldOfRows operator+(FieldOfRows i, difference_type n) { return i += n; }
+    friend FieldOfRows operator+(difference_type n, FieldOfRows i) { return i += n; }
+    friend FieldOfRows operator-(FieldOfRows i, difference_type n) { return i -= n; }
+    friend difference_type operator-(const FieldOfRows& a, const FieldOfRows& b) { return a.row_ - b.row_; }
+    friend bool operator==(const FieldOfRows& a, const FieldOfRows& b) { return a.row_ == b.row_; }
+    friend auto operator<=>(const FieldOfRows& a, const FieldOfRows& b) { return a.row_ <=> b.row_; }
+
+private:
+    const SnapshotRow* row_{nullptr};
+};
+
+/// The `n` rows from `from` appended to `column`, by the one field of theirs it holds.
+template <auto Field, typename T>
+void append_field(std::vector<T>& column, const SnapshotRow* from, size_t n) {
+    column.insert(column.end(), FieldOfRows<T, Field>(from), FieldOfRows<T, Field>(from + n));
+}
+
+}  // namespace
+
 void ColumnarStore::append_block(const RowBlock& block) {
     const std::vector<SnapshotRow>& rows = block.rows;
     if (rows.empty()) return;
@@ -851,40 +897,23 @@ void ColumnarStore::append_block(const RowBlock& block) {
     // it writes. Found by the mutation table: dropping the test here was the one row it could not
     // kill.
     //
-    // The columns grow a tile of rows at a time and the rows are written through pointers into it (#281).
-    // Seven push_back()s a row loaded each column's end from the store, compared it with the capacity
-    // and stored it back - for every row, the char column's store keeping the compiler from holding any
-    // of them in a register - and that was most of append_block()'s samples under #190's ingest. A
-    // tile's resize() zeroes it, in the cache it is then written in; a seal reserved the rows already.
+    // The columns grow a tile of rows at a time (#281): seven push_back()s a row loaded each column's end
+    // from the store, compared it with the capacity and stored it back - for every row, the char column's
+    // store keeping the compiler from holding any of them in a register - and that was most of
+    // append_block()'s samples under #190's ingest. Each column takes the tile's values by one insert(),
+    // constructed where they stay (#284) - a tile's resize() zeroed it first - and the seven passes over a
+    // tile read it from the cache; a seal reserved the rows already.
     constexpr size_t kTile = 1024;
     const SnapshotRow* src = rows.data() + 1;
     for (size_t left = rows.size() - 1; left > 0;) {
-        const size_t n  = std::min(left, kTile);
-        const size_t at = price_buf_.size();
-        price_buf_.resize(at + n);
-        qty_buf_.resize(at + n);
-        ts_buf_.resize(at + n);
-        cnt_buf_.resize(at + n);
-        side_buf_.resize(at + n);
-        level_buf_.resize(at + n);
-        seq_buf_.resize(at + n);
-        int64_t*  const price = price_buf_.data() + at;
-        uint64_t* const qty   = qty_buf_.data() + at;
-        uint64_t* const ts    = ts_buf_.data() + at;
-        uint32_t* const cnt   = cnt_buf_.data() + at;
-        uint8_t*  const side  = side_buf_.data() + at;
-        uint16_t* const level = level_buf_.data() + at;
-        int64_t*  const seq   = seq_buf_.data() + at;
-        for (size_t i = 0; i < n; ++i) {
-            const SnapshotRow& row = src[i];
-            price[i] = row.price;
-            qty[i]   = row.quantity;
-            ts[i]    = row.timestamp_ns;
-            cnt[i]   = row.order_count;
-            side[i]  = row.side;
-            level[i] = row.level_index;
-            seq[i]   = static_cast<int64_t>(row.sequence_number);
-        }
+        const size_t n = std::min(left, kTile);
+        append_field<&SnapshotRow::price>(price_buf_, src, n);
+        append_field<&SnapshotRow::quantity>(qty_buf_, src, n);
+        append_field<&SnapshotRow::timestamp_ns>(ts_buf_, src, n);
+        append_field<&SnapshotRow::order_count>(cnt_buf_, src, n);
+        append_field<&SnapshotRow::side>(side_buf_, src, n);
+        append_field<&SnapshotRow::level_index>(level_buf_, src, n);
+        append_field<&SnapshotRow::sequence_number>(seq_buf_, src, n);
         src  += n;
         left -= n;
     }
