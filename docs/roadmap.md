@@ -2952,6 +2952,16 @@ the branch first, the same extra time went to the base: it belongs to the second
 What is left on binance-diff is shifting the arrays for a price added or removed near the top of a deep
 side. A side kept best price last would remove it, and would change every reader of a side.
 
+**The change made one integration test lose its premise, six runs of six on the x86 test host.**
+`test_a_primary_lost_while_its_replica_joins_loses_no_write` (#215) stops the primary when the replica
+decides to discard its store. It watched for that decision only after `restart_node()` returned, which
+waits for a PING answer and tries every half a second. That was enough while the replica took seconds to
+apply the catch-up: every level a new best price on a side of a thousand, the search from the front's
+worst case. With the search by halves the catch-up was over 0.28 s after the decision, before the watch
+began. A thread started before the restart now stops the primary within milliseconds of the line, before
+the replica has asked for any catch-up. Six runs of six pass on this change and on its base. With a joining
+replica standing for election again, #215's defect, the test fails twice of two.
+
 Mutation table (`mutations/` in the evidence, i3-7100U): 7 mutants, every one killed by the test of what
 it breaks. Two of them are killed by a crash: a shift whose length wraps when a full side takes a price
 worse than every level, or a price taken as held past the side. The control survives: the search's steps
