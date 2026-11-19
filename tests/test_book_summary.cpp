@@ -387,6 +387,24 @@ TEST(BookSummaryStore, ASealThatPutsTheRowsOfAnInstantInAnotherOrderFalsifiesThe
     }
 }
 
+TEST(BookSummaryStore, ASealThatReachesTheFirstInstantOfASegmentAfterItFalsifiesToo) {
+    // The edge of the one above: the segment indexed already starts at the very instant the sealed one
+    // ends, so that instant alone has rows in both, and its tie changes places all the same (#278).
+    Store s;
+    const std::string dir = s.segment({row(kBase + 22, ob::SIDE_BID, 90, 0, 41),
+                                       row(kBase + 30, ob::SIDE_ASK, 95, 1, 42)});
+    s.block({row(kBase + 0, ob::SIDE_BID, 91, 2, 570), row(kBase + 22, ob::SIDE_BID, 90, 1, 571)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 30}));
+    ASSERT_EQ(composed(*s.store, kBase + 30).size(), 3u) << "the row at 22 that adds price 90 lost the tie";
+    s.seal();   // [0, 22]: before [22, 30], sharing its first instant
+    ASSERT_EQ(composed(*s.store, kBase + 30).size(), 2u) << "the tie at 22 did not change places";
+    EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty()) << "a summary of the order before the seal stayed";
+    for (uint64_t t : {kBase + 22, kBase + 30}) {
+        EXPECT_EQ(levels_of(s.at(t).rows), composed(*s.store, t)) << "at " << t - kBase;
+    }
+}
+
 TEST(BookSummaryStore, ASealBeforeASegmentItSharesNoInstantWithFalsifiesNothing) {
     // The control of the one above: a late row's segment starts before one already indexed and ends
     // before that one begins. No instant has rows in both, so no tie changes place, and the summary -
