@@ -250,7 +250,20 @@ TEST(BookSummaryBytes, AWalkOfABookSummarisedTwentyTimesIsTheOraclesEveryTime) {
     }
 }
 
-RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesTheOraclesBytes, ()) {
+namespace {
+
+/// How a sequence of the property below is drawn: the prices a row takes, how often a row is late (one in
+/// `late_one_in`) and how far back, and how far apart the rows in time order come.
+struct Shape {
+    int64_t prices;        ///< a row's price is 90 and up to this many above
+    int late_one_in;
+    int late_within;       ///< a late row's time is kBase and up to this many nanoseconds after
+    int step;              ///< a row in time order comes up to this many nanoseconds after the latest
+};
+
+/// Any sequence of publishes, seals, late rows, restarts and summaries in `shape`, each summary's files
+/// compared with the oracle's.
+void any_sequence(const Shape& shape) {
     Store s;
     uint64_t latest = kBase;
     const int steps = *rc::gen::inRange(1, 16);
@@ -259,13 +272,13 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
         const int n = *rc::gen::inRange(1, 12);
         for (int k = 0; k < n; ++k) {
             // Mostly after what came before, sometimes before it: a client's event time (#105).
-            const bool late = *rc::gen::inRange(0, 6) == 0;
-            const uint64_t ts = late ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40))
-                                     : latest + static_cast<uint64_t>(*rc::gen::inRange(0, 4));
+            const bool late = *rc::gen::inRange(0, shape.late_one_in) == 0;
+            const uint64_t ts = late ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, shape.late_within))
+                                     : latest + static_cast<uint64_t>(*rc::gen::inRange(0, shape.step));
             latest = std::max(latest, ts);
             const uint64_t qty = *rc::gen::inRange(0, 4) == 0 ? 0 : static_cast<uint64_t>(*rc::gen::inRange(1, 50));
             rows.push_back(row(ts, *rc::gen::inRange(0, 2) == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
-                               90 + *rc::gen::inRange<int64_t>(0, 15), qty, static_cast<uint64_t>(i * 20 + k)));
+                               90 + *rc::gen::inRange<int64_t>(0, shape.prices), qty, static_cast<uint64_t>(i * 20 + k)));
         }
         const int what = *rc::gen::inRange(0, 4);
         if (what == 0) {
@@ -282,11 +295,11 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
                     const int m = *rc::gen::inRange(1, 4);
                     for (int k = 0; k < m; ++k) {
                         const bool inside = *rc::gen::inRange(0, 2) == 0;
-                        const uint64_t ts = inside ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40))
-                                                   : latest + 1 + static_cast<uint64_t>(*rc::gen::inRange(0, 4));
+                        const uint64_t ts = inside ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, shape.late_within))
+                                                   : latest + 1 + static_cast<uint64_t>(*rc::gen::inRange(0, shape.step));
                         if (!inside) latest = std::max(latest, ts);
                         more.push_back(row(ts, *rc::gen::inRange(0, 2) == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
-                                           90 + *rc::gen::inRange<int64_t>(0, 15),
+                                           90 + *rc::gen::inRange<int64_t>(0, shape.prices),
                                            static_cast<uint64_t>(*rc::gen::inRange(0, 50)),
                                            static_cast<uint64_t>(500 + i * 10 + k)));
                     }
@@ -311,4 +324,17 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
     RC_CLASSIFY(s.compared == 1, "one summary compared");
     RC_CLASSIFY(s.compared > 1, "more than one compared");
     RC_ASSERT(s.compared > 0u);
+}
+
+}  // namespace
+
+RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesTheOraclesBytes, ()) {
+    any_sequence(Shape{15, 6, 40, 4});
+}
+
+RC_GTEST_PROP(BookSummaryBytes, AnySequenceWithItsRowsTiedOnTheirTimesWritesTheOraclesBytes, ()) {
+    // Few prices, late rows often and close: rows of one price at one instant in different segments, which
+    // a seal can put in another order (#278). The shape above found that once in CI, on its fifteenth
+    // case of seed 14180367816294839680; 2 000 of its cases on four other seeds did not.
+    any_sequence(Shape{3, 3, 12, 2});
 }
