@@ -4754,6 +4754,16 @@ Learned the hard way. Check here before debugging.
      on the very thread that held the lock. Both hung rather than failed under the mutant that made the tick
      wait. Declare what waits for the other thread before the hold, run what may block on a thread of its
      own, and bound the wait.
+653. **A property that compares a cache with its oracle only when it writes an entry finds a stale one by luck.**
+     #278's defect - a book summary a later seal had made stale - hid in a property that compared a summary with
+     the oracle when the store wrote one: it was found only if a later summary composed from the stale one, once
+     in CI on the fifteenth case of a seed, and in none of 2 000 cases on four other seeds. Assert the invariant
+     itself after every step (every summary the store holds is the book a composition gives at its time), and
+     draw the shape the defect needs - here few prices, late rows often, a block published before every summary.
+654. **A RapidCheck seed reproduces with the case count it ran with, not alone.** CI runs most properties at
+     `max_success=25` (`tests/CMakeLists.txt`). Seed `14180367816294839680` fails #278's property at 25 cases,
+     "after 15 tests and 143 shrinks" as in CI, and passes at 500: the cases a seed gives depend on the count as
+     well. Rerun a CI failure with both, or with the `reproduce=` string RapidCheck prints.
 
 ## Current state and open problems
 

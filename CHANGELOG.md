@@ -197,6 +197,15 @@ here as `#N`.
 
 ### Changed
 
+- **A book summary stays true when a seal puts an instant's rows in another order** (#278). A tie on a timestamp
+  goes to the row a scan delivers last, and a seal of a block with a late row (a client's event time, #105) can
+  give a segment that starts before one indexed already: at an instant the two share, the rows change places. A
+  book summary and its best track composed before the seal kept the old order, so a read from them answered
+  differently than a composition of the rows, and the next summary composed from them wrote another track. Such a
+  seal now removes the summaries and tracks from its segment's first row, as a late row's publication does. The
+  embedded engine's flush (C API) indexed rows no block had published and removed no summary at all; it removes
+  those at or after a new segment's first row now. Which row wins such a tie is open item #279.
+
 - **The WAL files retention lets go are removed off the flush thread** (#277). The flush tick unlinked them
   itself, and a 512 MB file took it 34-37 ms on ext4 and 16-17 ms on XFS, twice in a round of a pipelined
   ingest, while the writers filled half the pending queue in 32-36 ms: most of the writes that still waited at

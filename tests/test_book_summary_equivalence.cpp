@@ -181,6 +181,35 @@ struct Store {
     size_t compared = 0;   ///< summaries written and compared
     std::string last_why_not;
 
+    /// Whether every summary the store holds is the book a composition from every row gives at its time
+    /// now - what book_summary.hpp says the store keeps true, after any change of the index (#278): ""
+    /// when it is, or which is not.
+    std::string summaries_hold() const {
+        for (uint64_t t : store->book_summaries("SUM", "EX")) {
+            const ob::ColumnarStore::PricedBook book = store->book_at_by_price(t, "SUM", "EX");
+            if (!book.from_summary.has_value() || *book.from_summary != t) continue;
+            std::map<int64_t, ob::SnapshotRow, std::greater<>> bids;
+            std::map<int64_t, ob::SnapshotRow> asks;
+            for (const ob::SnapshotRow& r : rows_to(*store, t)) {
+                if (r.side == ob::SIDE_BID) {
+                    if (r.quantity == 0) bids.erase(r.price); else bids[r.price] = r;
+                } else {
+                    if (r.quantity == 0) asks.erase(r.price); else asks[r.price] = r;
+                }
+            }
+            std::vector<std::pair<int64_t, uint64_t>> want;
+            for (const auto& [p, r] : bids) want.emplace_back(p, r.quantity);
+            for (const auto& [p, r] : asks) want.emplace_back(p, r.quantity);
+            std::vector<std::pair<int64_t, uint64_t>> got;
+            for (const ob::SnapshotRow& r : book.rows) got.emplace_back(r.price, r.quantity);
+            if (got != want) {
+                return "the summary as of " + std::to_string(t - kBase) + " gives " + std::to_string(got.size()) +
+                       " prices, a composition " + std::to_string(want.size());
+            }
+        }
+        return {};
+    }
+
     /// A summary, and whether its two files are the oracle's: "" when they are, or what differs.
     std::string summarise_and_compare(const std::string& seg_dir) {
         // The summary it will start from: the newest one the index holds, before the one written.
@@ -250,7 +279,21 @@ TEST(BookSummaryBytes, AWalkOfABookSummarisedTwentyTimesIsTheOraclesEveryTime) {
     }
 }
 
-RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesTheOraclesBytes, ()) {
+namespace {
+
+/// How a sequence of the property below is drawn: the prices a row takes, how often a row is late (one in
+/// `late_one_in`) and how far back, and how far apart the rows in time order come.
+struct Shape {
+    int64_t prices;        ///< a row's price is 90 and up to this many above
+    int late_one_in;
+    int late_within;       ///< a late row's time is kBase and up to this many nanoseconds after
+    int step;              ///< a row in time order comes up to this many nanoseconds after the latest
+    int unsealed_one_in;   ///< a summary has a block published and not sealed before it, one in this many
+};
+
+/// Any sequence of publishes, seals, late rows, restarts and summaries in `shape`, each summary's files
+/// compared with the oracle's.
+void any_sequence(const Shape& shape) {
     Store s;
     uint64_t latest = kBase;
     const int steps = *rc::gen::inRange(1, 16);
@@ -259,13 +302,13 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
         const int n = *rc::gen::inRange(1, 12);
         for (int k = 0; k < n; ++k) {
             // Mostly after what came before, sometimes before it: a client's event time (#105).
-            const bool late = *rc::gen::inRange(0, 6) == 0;
-            const uint64_t ts = late ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40))
-                                     : latest + static_cast<uint64_t>(*rc::gen::inRange(0, 4));
+            const bool late = *rc::gen::inRange(0, shape.late_one_in) == 0;
+            const uint64_t ts = late ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, shape.late_within))
+                                     : latest + static_cast<uint64_t>(*rc::gen::inRange(0, shape.step));
             latest = std::max(latest, ts);
             const uint64_t qty = *rc::gen::inRange(0, 4) == 0 ? 0 : static_cast<uint64_t>(*rc::gen::inRange(1, 50));
             rows.push_back(row(ts, *rc::gen::inRange(0, 2) == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
-                               90 + *rc::gen::inRange<int64_t>(0, 15), qty, static_cast<uint64_t>(i * 20 + k)));
+                               90 + *rc::gen::inRange<int64_t>(0, shape.prices), qty, static_cast<uint64_t>(i * 20 + k)));
         }
         const int what = *rc::gen::inRange(0, 4);
         if (what == 0) {
@@ -277,16 +320,16 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
                 // Sometimes with a block published and not sealed before the summary, as the drain
                 // publishes them: its rows are after the segment's, or - an event time a client gave -
                 // inside the span the summary is composed over.
-                if (*rc::gen::inRange(0, 3) == 0) {
+                if (*rc::gen::inRange(0, shape.unsealed_one_in) == 0) {
                     std::vector<ob::SnapshotRow> more;
                     const int m = *rc::gen::inRange(1, 4);
                     for (int k = 0; k < m; ++k) {
                         const bool inside = *rc::gen::inRange(0, 2) == 0;
-                        const uint64_t ts = inside ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, 40))
-                                                   : latest + 1 + static_cast<uint64_t>(*rc::gen::inRange(0, 4));
+                        const uint64_t ts = inside ? kBase + static_cast<uint64_t>(*rc::gen::inRange(0, shape.late_within))
+                                                   : latest + 1 + static_cast<uint64_t>(*rc::gen::inRange(0, shape.step));
                         if (!inside) latest = std::max(latest, ts);
                         more.push_back(row(ts, *rc::gen::inRange(0, 2) == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
-                                           90 + *rc::gen::inRange<int64_t>(0, 15),
+                                           90 + *rc::gen::inRange<int64_t>(0, shape.prices),
                                            static_cast<uint64_t>(*rc::gen::inRange(0, 50)),
                                            static_cast<uint64_t>(500 + i * 10 + k)));
                     }
@@ -297,6 +340,8 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
             }
         }
         if (*rc::gen::inRange(0, 8) == 0) s.reopen();   // the blocks go with the process, as on a crash
+        const std::string held = s.summaries_hold();
+        RC_ASSERT(held.empty());
     }
     // And one after all of it, so that every case compares: rows after the latest, a segment, a summary.
     std::vector<ob::SnapshotRow> last;
@@ -306,9 +351,24 @@ RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesThe
     }
     const std::string dir = s.segment(last);
     RC_ASSERT(!dir.empty());
+    const std::string held = s.summaries_hold();
+    RC_ASSERT(held.empty());
     const std::string why = s.summarise_and_compare(dir);
     RC_ASSERT(why.empty());
     RC_CLASSIFY(s.compared == 1, "one summary compared");
     RC_CLASSIFY(s.compared > 1, "more than one compared");
     RC_ASSERT(s.compared > 0u);
+}
+
+}  // namespace
+
+RC_GTEST_PROP(BookSummaryBytes, AnySequenceOfPublishesSealsAndSummariesWritesTheOraclesBytes, ()) {
+    any_sequence(Shape{15, 6, 40, 4, 3});
+}
+
+RC_GTEST_PROP(BookSummaryBytes, AnySequenceWithItsRowsTiedOnTheirTimesWritesTheOraclesBytes, ()) {
+    // Few prices, late rows often and close: rows of one price at one instant in different segments, which
+    // a seal can put in another order (#278). The shape above found that once in CI, on its fifteenth
+    // case of seed 14180367816294839680; 2 000 of its cases on four other seeds did not.
+    any_sequence(Shape{3, 3, 12, 2, 1});
 }

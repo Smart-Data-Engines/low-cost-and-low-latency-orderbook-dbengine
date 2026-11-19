@@ -6,6 +6,7 @@
 // row answers - the oracle below, from a plain scan - through what can make a summary false: a row at
 // or before its time arriving after it, a restart that reads it back, a file that does not read back.
 
+#include "orderbook/best_track.hpp"
 #include "orderbook/book_summary.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
@@ -133,6 +134,17 @@ struct Store {
     std::string segment(const std::vector<ob::SnapshotRow>& rows) {
         block(rows);
         return seal();
+    }
+    /// A segment of `rows` written beside the index and not published - what the embedded engine's
+    /// flush hands merge_segments() (C API).
+    ob::SegmentMeta written(const std::vector<ob::SnapshotRow>& rows) {
+        ob::ColumnarStore writer(dir.path.string(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                                 ob::ColumnarStore::OwnIndex::kNo);
+        writer.set_symbol_exchange("SUM", "EX");
+        for (const auto& r : rows) writer.append(r);
+        auto meta = writer.flush_segment();
+        EXPECT_TRUE(meta.has_value());
+        return meta.value_or(ob::SegmentMeta{});
     }
     ob::ColumnarStore::PricedBook at(uint64_t t) const { return store->book_at_by_price(t, "SUM", "EX"); }
     /// What a restart does: the index read from the disk, and the rows no seal took published again,
@@ -341,6 +353,96 @@ TEST(BookSummaryStore, ARowAtExactlyItsTimeFalsifiesIt) {
     s.block({row(kBase + 10, ob::SIDE_BID, 100, 0)});
     EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty());
     EXPECT_TRUE(s.at(kBase + 10).rows.empty());
+}
+
+TEST(BookSummaryStore, ASealThatPutsTheRowsOfAnInstantInAnotherOrderFalsifiesTheSummariesFromIt) {
+    // A tie on a timestamp goes to the row a scan delivers last: segments by start, then blocks
+    // (incremental-books/design.md). A block with a late row sealed into a segment that starts before
+    // one already indexed puts the rows of an instant they share in another order, and a summary of the
+    // order before the seal is a book a composition no longer gives (#278). Found by the property test in
+    // test_book_summary_equivalence.cpp, on CI's seed 14180367816294839680.
+    Store s;
+    const std::string dir = s.segment({row(kBase + 16, ob::SIDE_BID, 90, 1, 43),
+                                       row(kBase + 22, ob::SIDE_BID, 90, 0, 41)});
+    // Published and not sealed: delivered after the segment, so its row at 22 wins the tie.
+    s.block({row(kBase + 0, ob::SIDE_BID, 91, 2, 570), row(kBase + 22, ob::SIDE_BID, 90, 1, 571)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 22}));
+    ASSERT_EQ(s.store->best_tracks("SUM", "EX"), (std::vector<uint64_t>{kBase + 22}));
+    ASSERT_EQ(levels_of(s.at(kBase + 22).rows), composed(*s.store, kBase + 22));
+    ASSERT_EQ(composed(*s.store, kBase + 22).size(), 2u) << "the row at 22 that adds price 90 lost the tie";
+
+    // Sealed: its segment starts at 0, before the one at 16, and its row at 22 comes first now.
+    s.seal();
+    ASSERT_EQ(composed(*s.store, kBase + 22).size(), 1u) << "the tie at 22 did not change places";
+    EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty()) << "a summary of the order before the seal stayed";
+    EXPECT_TRUE(s.store->best_tracks("SUM", "EX").empty()) << "a track of the order before the seal stayed";
+    EXPECT_FALSE(fs::exists(fs::path(dir) / ob::book_summary_file(kBase + 22)))
+        << "its file stayed, for the next start to believe";
+    EXPECT_FALSE(fs::exists(fs::path(dir) / ob::best_track_file(kBase + 22)));
+    for (uint64_t t : {kBase + 16, kBase + 22}) {
+        const auto book = s.at(t);
+        EXPECT_FALSE(book.from_summary.has_value()) << "at " << t - kBase;
+        EXPECT_EQ(levels_of(book.rows), composed(*s.store, t)) << "at " << t - kBase;
+    }
+}
+
+TEST(BookSummaryStore, ASealThatReachesTheFirstInstantOfASegmentAfterItFalsifiesToo) {
+    // The edge of the one above: the segment indexed already starts at the very instant the sealed one
+    // ends, so that instant alone has rows in both, and its tie changes places all the same (#278).
+    Store s;
+    const std::string dir = s.segment({row(kBase + 22, ob::SIDE_BID, 90, 0, 41),
+                                       row(kBase + 30, ob::SIDE_ASK, 95, 1, 42)});
+    s.block({row(kBase + 0, ob::SIDE_BID, 91, 2, 570), row(kBase + 22, ob::SIDE_BID, 90, 1, 571)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 30}));
+    ASSERT_EQ(composed(*s.store, kBase + 30).size(), 3u) << "the row at 22 that adds price 90 lost the tie";
+    s.seal();   // [0, 22]: before [22, 30], sharing its first instant
+    ASSERT_EQ(composed(*s.store, kBase + 30).size(), 2u) << "the tie at 22 did not change places";
+    EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty()) << "a summary of the order before the seal stayed";
+    for (uint64_t t : {kBase + 22, kBase + 30}) {
+        EXPECT_EQ(levels_of(s.at(t).rows), composed(*s.store, t)) << "at " << t - kBase;
+    }
+}
+
+TEST(BookSummaryStore, ASealBeforeASegmentItSharesNoInstantWithFalsifiesNothing) {
+    // The control of the one above: a late row's segment starts before one already indexed and ends
+    // before that one begins. No instant has rows in both, so no tie changes place, and the summary -
+    // written after the row was published - holds the row already (#278).
+    Store s;
+    s.segment({row(kBase + 1, ob::SIDE_BID, 90, 1, 1)});
+    const std::string dir = s.segment({row(kBase + 30, ob::SIDE_BID, 91, 2, 2),
+                                       row(kBase + 40, ob::SIDE_ASK, 95, 3, 3)});
+    s.block({row(kBase + 5, ob::SIDE_BID, 92, 4, 4), row(kBase + 8, ob::SIDE_BID, 90, 0, 5)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 40}));
+    s.seal();   // [5, 8]: before [30, 40] in the order, sharing none of its instants
+    EXPECT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 40}))
+        << "a seal that changed no tie falsified it";
+    const auto book = s.at(kBase + 40);
+    EXPECT_TRUE(book.from_summary.has_value());
+    EXPECT_EQ(levels_of(book.rows), composed(*s.store, kBase + 40));
+}
+
+TEST(BookSummaryStore, ASegmentMergedWithARowAtOrBeforeItsTimeFalsifiesIt) {
+    // merge_segments() indexes rows no block published - the embedded engine's flush (C API) - so a row
+    // in it at or before a summary's time is one the summary does not hold (#278). Until then nothing
+    // there removed a summary.
+    Store s;
+    const std::string dir = s.segment({row(kBase + 10, ob::SIDE_BID, 100, 1, 1),
+                                       row(kBase + 20, ob::SIDE_BID, 99, 2, 2)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    // Rows after its time leave it alone.
+    EXPECT_EQ(s.store->merge_segments({s.written({row(kBase + 25, ob::SIDE_BID, 98, 3, 3)})}), 0u);
+    EXPECT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 20}));
+    // A row before it does not.
+    EXPECT_EQ(s.store->merge_segments({s.written({row(kBase + 15, ob::SIDE_BID, 100, 0, 4),
+                                                  row(kBase + 26, ob::SIDE_ASK, 105, 5, 5)})}), 0u);
+    EXPECT_TRUE(s.store->book_summaries("SUM", "EX").empty()) << "a falsified summary stayed";
+    EXPECT_FALSE(fs::exists(fs::path(dir) / ob::book_summary_file(kBase + 20)));
+    for (uint64_t t : {kBase + 15, kBase + 20, kBase + 26}) {
+        EXPECT_EQ(levels_of(s.at(t).rows), composed(*s.store, t)) << "at " << t - kBase;
+    }
 }
 
 TEST(BookSummaryStore, AStartReadsThemBackAndAReadStartsFromThem) {

@@ -204,14 +204,7 @@ void ColumnarStore::publish_blocks(const std::vector<std::shared_ptr<const RowBl
         unsealed_rows_ += rows;
     }
     if (!falsified.empty()) {
-        size_t tracks = 0;
-        for (const std::string& f : falsified) {
-            if (is_best_track_file(fs::path(f).filename().string())) ++tracks;
-        }
-        OB_LOG_INFO("columnar", "%zu book summar%s and %zu best track(s) removed: a row at or before "
-                                "the time each is as of was published after it",
-                    falsified.size() - tracks, falsified.size() - tracks == 1 ? "y" : "ies", tracks);
-        remove_summary_files(falsified, "a row at or before its time was published after it");
+        report_falsified(falsified, "a row at or before the time each is as of was published after it");
     }
     OB_LOG_DEBUG("columnar", "published %zu block(s) of %zu row(s) for queries to read unsealed",
                  blocks.size(), rows);
@@ -264,6 +257,7 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
     size_t refused = 0;
     size_t rows = 0;
     size_t taken = 0;
+    std::vector<std::string> falsified;
     {
         std::unique_lock<std::shared_mutex> lock(index_mtx_);
         auto& entry = by_symbol_[index_key(symbol, exchange)];
@@ -273,9 +267,22 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
         }
         unsealed_rows_ -= std::min(rows, unsealed_rows_);
         for (const auto& meta : segments) {
-            if (!insert_locked(meta)) ++refused;
+            if (!insert_locked(meta)) {
+                ++refused;
+                continue;
+            }
+            // A summary holds the rows of its instants in the order a read delivered them when it was
+            // composed; a segment that changes that order falsifies it as a late row does (#278). From
+            // the segment's first row: a summary is as of the newest segment's end when it is written, so
+            // none can be between that and the first instant whose order changes.
+            SymbolIndex& si = by_symbol_[index_key(meta.symbol, meta.exchange)];
+            if (reorders_locked(si, meta)) falsify_summaries_locked(si, meta.start_ts_ns, falsified);
         }
         if (entry.tiers.empty() && entry.blocks.empty()) by_symbol_.erase(index_key(symbol, exchange));
+    }
+    if (!falsified.empty()) {
+        report_falsified(falsified, "a seal put rows at or before the time each is as of in another "
+                                    "order than it was composed in");
     }
     if (taken != count) {
         OB_LOG_ERROR("columnar", "sealing %s.%s: asked to replace %zu block(s) and found %zu - the "
@@ -3207,6 +3214,34 @@ void ColumnarStore::remove_summary_files(const std::vector<std::string>& files, 
     }
 }
 
+void ColumnarStore::report_falsified(const std::vector<std::string>& files, std::string_view why) {
+    size_t tracks = 0;
+    for (const std::string& f : files) {
+        if (is_best_track_file(fs::path(f).filename().string())) ++tracks;
+    }
+    OB_LOG_INFO("columnar", "%zu book summar%s and %zu best track(s) removed: %.*s",
+                files.size() - tracks, files.size() - tracks == 1 ? "y" : "ies", tracks,
+                static_cast<int>(why.size()), why.data());
+    remove_summary_files(files, why);
+}
+
+bool ColumnarStore::reorders_locked(const SymbolIndex& si, const SegmentMeta& added) {
+    for (const WidthTier& tier : si.tiers) {
+        // The first of this tier's segments delivered after it: of those, the one that starts first, so
+        // the only one to look at - if it starts after `added` ends, so do the rest.
+        const auto& v = tier.segments;
+        const auto after = std::upper_bound(v.begin(), v.end(), added, segment_order_less);
+        if (after == v.end() || after->start_ts_ns > added.end_ts_ns) continue;
+        OB_LOG_DEBUG("columnar", "segment %s of %s.%s, [%llu, %llu], is delivered before %s, which starts "
+                                 "inside its range: a tie on a time they share changes places",
+                     added.dir_path.c_str(), added.symbol.c_str(), added.exchange.c_str(),
+                     static_cast<unsigned long long>(added.start_ts_ns),
+                     static_cast<unsigned long long>(added.end_ts_ns), after->dir_path.c_str());
+        return true;
+    }
+    return false;
+}
+
 void ColumnarStore::drop_summaries_in_locked(SymbolIndex& si, const std::string& dir) {
     const fs::path in(dir);
     for (auto s = si.summaries.begin(); s != si.summaries.end();) {
@@ -4069,6 +4104,7 @@ size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segment
     std::unique_lock<std::shared_mutex> lock(index_mtx_);
 
     size_t refused = 0;
+    std::vector<std::string> falsified;
     for (const auto& meta : new_segments) {
         // Defence in depth, not the fix. Since #136 a directory belongs to one segment rather
         // than to one event-time span, so two flushes covering the same span get two
@@ -4088,7 +4124,17 @@ size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segment
                          meta.dir_path.c_str(),
                          static_cast<unsigned long long>(meta.row_count));
             ++refused;
+            continue;
         }
+        // Its rows went in with it, not through publish_blocks() - the embedded engine's flush (C
+        // API) - so a summary as of its first row or later does not hold them (#278).
+        falsify_summaries_locked(by_symbol_[index_key(meta.symbol, meta.exchange)], meta.start_ts_ns,
+                                 falsified);
+    }
+    lock.unlock();
+    if (!falsified.empty()) {
+        report_falsified(falsified, "a segment merged into the index holds a row at or before the time "
+                                    "each is as of");
     }
     return refused;
 }
