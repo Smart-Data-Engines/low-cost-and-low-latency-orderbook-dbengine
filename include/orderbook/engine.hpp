@@ -230,6 +230,15 @@ public:
         while_syncing_wal_for_test_ = std::move(hook);
     }
 
+    /// Called by a snapshot between its cut and the walk over its files (#282) - `flush_mtx_` let go,
+    /// every row up to its position sealed - with no engine lock held: what a test uses to seal rows
+    /// written after the cut while the snapshot has still to list its files. Set under `flush_mtx_`,
+    /// and taken under it by the snapshot at the end of its cut.
+    void between_snapshot_cut_and_walk_for_test(std::function<void()> hook) {
+        std::lock_guard<std::mutex> no_flush(flush_mtx_);
+        between_snapshot_cut_and_walk_for_test_ = std::move(hook);
+    }
+
     void skip_vector_persistence_for_test() {
         skip_vector_persistence_.store(true, std::memory_order_relaxed);
     }
@@ -1520,6 +1529,7 @@ private:
     std::atomic<bool> skip_vector_persistence_{false};   ///< see skip_vector_persistence_for_test()
     std::function<void()> while_sealing_for_test_;       ///< see while_sealing_for_test()
     std::function<void()> while_syncing_wal_for_test_;   ///< see while_syncing_wal_for_test()
+    std::function<void()> between_snapshot_cut_and_walk_for_test_;   ///< see between_snapshot_cut_and_walk_for_test()
     /// Held ranges written down per persist. The WAL payload length is 16-bit, so this is a hard
     /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
     static constexpr std::size_t kMaxPersistedHeldRanges = 3000;

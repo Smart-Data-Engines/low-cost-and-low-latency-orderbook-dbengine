@@ -2342,6 +2342,8 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
     // exactly the rows the first hold drained - every row up to the position it captured, and no
     // other - and the vector it exported describes them.
     double sync_ms = 0.0, seals_ms = 0.0;
+    std::function<void()> between_hook;
+    std::unordered_set<std::string> cut_dirs;   // the segment directories of the cut (#282)
     {
         // flush_mtx_ before mtx_: this path writes segments, so it must not run
         // alongside flush_loop() or a client FLUSH.
@@ -2397,7 +2399,18 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                                  std::chrono::steady_clock::now() - t_merge).count();
         }
         if (failure) std::rethrow_exception(failure);
+        // The segments of this cut (#282): what the index holds now, still under flush_mtx_ - every row
+        // up to its position, and none after it, since nothing drains while flush_mtx_ is held. The pin
+        // keeps a merge and retention from moving them; it does not keep a FLUSH or a tick from sealing
+        // rows written after the cut into a new segment while the walk below runs, and the walk took any
+        // segment it found: a replica held that segment's rows from the snapshot and again from the
+        // stream that starts at the cut's position (CI's battery under ThreadSanitizer on PR #329).
+        for (const SegmentMeta& m : combined_store_.index()) {
+            cut_dirs.insert(fs::path(m.dir_path).lexically_normal().string());
+        }
+        between_hook = between_snapshot_cut_and_walk_for_test_;
     }
+    if (between_hook) between_hook();
 
     // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
     //
@@ -2415,6 +2428,7 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
 
     size_t total_bytes = 0;
     size_t total_rows = 0;
+    size_t after_the_cut = 0;
 
     // Walk the data directory for segment files.
     if (fs::exists(base_dir_)) {
@@ -2431,6 +2445,12 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                     (!replaced.empty() &&
                      replaced.count(entry.path().lexically_normal().string()) != 0)) {
                     it.disable_recursion_pending();
+                } else if (it.depth() == ColumnarStore::kSegmentDepth &&
+                           cut_dirs.count(entry.path().lexically_normal().string()) == 0) {
+                    // A segment sealed after the cut (#282): its rows come after the position the
+                    // manifest names, and whoever catches up from there is sent them again.
+                    it.disable_recursion_pending();
+                    ++after_the_cut;
                 }
                 continue;
             }
@@ -2554,6 +2574,11 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
 
     manifest.total_bytes = total_bytes;
     manifest.total_rows  = total_rows;
+    if (after_the_cut > 0) {
+        OB_LOG_INFO("engine", "Snapshot at %u:%zu: %zu segment directory(ies) sealed after its cut left out - "
+                              "their rows come after its position, and are sent from it",
+                    manifest.wal_file_index, manifest.wal_byte_offset, after_the_cut);
+    }
 
     // Write snapshot_manifest.json (at-most-one policy: overwrite previous), replaced whole.
     //

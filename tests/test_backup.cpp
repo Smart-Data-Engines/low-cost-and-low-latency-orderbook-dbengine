@@ -270,6 +270,30 @@ TEST(BackupCut, TheSealsAreWrittenWithoutTheEnginesLockAndHoldOnlyWhatTheCutDrai
     engine->close();
 }
 
+TEST(BackupCut, ASegmentSealedAfterTheCutIsInNoneOfItsFiles) {
+    // A snapshot takes its position and seals every row up to it under flush_mtx_, then lists its files
+    // without it. A FLUSH that seals rows written after the cut, in between, put their segment in the
+    // manifest beside a position that is before them: a replica held them from the snapshot and again
+    // from the stream (#282, found by CI's battery under ThreadSanitizer on PR #329), and a restore that
+    // replays the WAL from a backup's position would too.
+    TempDir dir;
+    auto engine = engine_at(dir.path);
+    fill(*engine, {"A"}, 10);
+    engine->between_snapshot_cut_and_walk_for_test([&] {
+        for (uint64_t n = 0; n < 5; ++n) write(*engine, "B", n);
+        engine->flush_incremental();   // B's rows sealed: a segment on the disk before the walk
+    });
+    auto snap = engine->create_snapshot_with_sequence_state();
+    engine->between_snapshot_cut_and_walk_for_test(nullptr);
+    ASSERT_FALSE(rows_of(*engine, "B").empty()) << "the hook sealed nothing: the case is not made";
+    for (const auto& f : snap.manifest.files) {
+        EXPECT_NE(f.path.rfind("B/", 0), 0u) << f.path << " was sealed after the cut, whose position is before it";
+    }
+    EXPECT_EQ(snap.manifest.total_rows, 10u * 3u) << "the manifest's rows are not those of its cut";
+    snap.pin.reset();
+    engine->close();
+}
+
 TEST(BackupCut, FlushAndTheCutSyncTheWalWithoutTheEnginesLock) {
     // #190 step 4: FLUSH and a snapshot's cut took the rows and synced the WAL under the engine's
     // lock, and a backup's cut held every writer 759 ms of its fsync. Between the two holds now,
