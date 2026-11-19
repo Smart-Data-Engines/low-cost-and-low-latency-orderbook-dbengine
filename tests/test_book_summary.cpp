@@ -266,6 +266,52 @@ TEST(BookSummaryStore, AReadAfterASummaryStartsFromItAndAnswersTheSame) {
     EXPECT_EQ(*s.at(kBase + 7).from_summary, kBase + 7);
 }
 
+TEST(BookSummaryStore, AReadFromASummaryReadsNoRowAtItsTimeNorTheSegmentItWasMadeAt) {
+    // The rows at a summary's time are in it (#272): a read from it starts at the instant after, and the
+    // segment the summary was made at - whose rows all come at or before its time - is not a candidate.
+    // It was read in full before, for the rows of its last instant, which were applied again to no effect.
+    Store s;
+    const std::string dir = s.segment({row(kBase + 3, ob::SIDE_BID, 100, 5, 1), row(kBase + 5, ob::SIDE_BID, 99, 6, 2),
+                                       row(kBase + 5, ob::SIDE_ASK, 101, 7, 3)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    s.segment({row(kBase + 6, ob::SIDE_BID, 99, 0, 4), row(kBase + 7, ob::SIDE_ASK, 102, 8, 5)});
+
+    const auto at_summary = s.at(kBase + 5);
+    ASSERT_TRUE(at_summary.from_summary.has_value());
+    EXPECT_EQ(at_summary.cost.kept, 0u) << "a row at the summary's time was applied again";
+    EXPECT_EQ(at_summary.cost.candidates, 0u) << "the segment the summary was made at was read";
+    EXPECT_EQ(levels_of(at_summary.rows), composed(*s.store, kBase + 5));
+
+    const auto after = s.at(kBase + 7);
+    ASSERT_TRUE(after.from_summary.has_value());
+    EXPECT_EQ(after.cost.kept, 2u) << "the rows after the summary's time, and those alone";
+    EXPECT_EQ(after.cost.candidates, 1u) << "the segment after the summary, and that alone";
+    EXPECT_EQ(levels_of(after.rows), composed(*s.store, kBase + 7));
+    ASSERT_TRUE(after.as_of.has_value());
+    EXPECT_EQ(after.as_of->timestamp_ns, kBase + 7);
+    EXPECT_EQ(after.as_of->sequence_number, 5u);
+}
+
+TEST(BookSummaryStore, ARowAtItsTimeSealedAfterItIsInItAndNotAppliedAgain) {
+    // A row at a summary's time can be in a block when the summary is written - which holds it, blocks
+    // included - and be sealed later into the segment after, beside rows after that time (#272). A read
+    // from the summary takes that segment and applies only its rows after the summary's time.
+    Store s;
+    const std::string dir = s.segment({row(kBase + 3, ob::SIDE_BID, 100, 5, 1), row(kBase + 5, ob::SIDE_BID, 99, 6, 2)});
+    s.block({row(kBase + 5, ob::SIDE_ASK, 101, 7, 3)});
+    ASSERT_TRUE(s.store->write_book_summary("SUM", "EX", dir).written);
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 5}));
+    s.block({row(kBase + 6, ob::SIDE_BID, 99, 0, 4), row(kBase + 7, ob::SIDE_ASK, 102, 8, 5)});
+    s.seal();   // the row at the summary's time and the two after it, in one segment
+    ASSERT_EQ(s.store->book_summaries("SUM", "EX"), (std::vector<uint64_t>{kBase + 5})) << "a seal falsified it";
+
+    const auto after = s.at(kBase + 7);
+    ASSERT_TRUE(after.from_summary.has_value());
+    EXPECT_EQ(after.cost.kept, 2u) << "the row at the summary's time was applied again";
+    EXPECT_EQ(after.cost.candidates, 1u);
+    EXPECT_EQ(levels_of(after.rows), composed(*s.store, kBase + 7));
+}
+
 TEST(BookSummaryStore, ARowAtOrBeforeItsTimeArrivingAfterItFalsifiesIt) {
     Store s;
     const std::string dir = s.segment({row(kBase + 10, ob::SIDE_BID, 100, 1),
