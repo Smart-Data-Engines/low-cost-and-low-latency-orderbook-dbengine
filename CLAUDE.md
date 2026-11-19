@@ -4719,6 +4719,19 @@ Learned the hard way. Check here before debugging.
      RSA-2048, kept the loop busy less than half the time, and a PING every half millisecond samples the
      loop in time, so its median did not move far. Attempts multiply a probability; they do nothing for a
      margin. The fix was the margin: RSA-4096, seventy times on the hosts.
+647. **Where an annotation puts its samples is not what an instruction costs: count the event it points
+     at.** #271's annotation put 91% of a function's samples on the instruction after a load that could
+     not be forwarded from the store buffer, which read as a stall worth most of the function. The change
+     that removed the load removed 76-79% of the flush thread's failed forwards - 7 a level, counted with
+     `perf stat -e ls_bad_status2.stli_other` on Zen 5 - and the thread's CPU fell by a few percent, not
+     by nine tenths: an out-of-order core keeps working while such a load waits, and the sample lands on
+     the instruction that waits last. Before estimating a gain from an annotation, count the event; the
+     counter is free and its answer is the same on every run.
+648. **A change can move the cost of a thread it does not touch, and that is layout, not work.** Marking
+     `fill_row()` `[[gnu::always_inline]]` changed the flush thread's code only, and on the m8a.xlarge's
+     deep shape the client loops took 4% more CPU a level - in every round and both positions - while
+     the micro-benchmark of the code changed was no faster. Compare every thread's CPU, not only the one
+     the change is for; a variant that helps nowhere and moves something it does not touch is not kept.
 
 ## Current state and open problems
 
