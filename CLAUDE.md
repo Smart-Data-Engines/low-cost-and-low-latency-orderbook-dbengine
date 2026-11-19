@@ -4764,6 +4764,12 @@ Learned the hard way. Check here before debugging.
      `max_success=25` (`tests/CMakeLists.txt`). Seed `14180367816294839680` fails #278's property at 25 cases,
      "after 15 tests and 143 shrinks" as in CI, and passes at 500: the cases a seed gives depend on the count as
      well. Rerun a CI failure with both, or with the `reproduce=` string RapidCheck prints.
+655. **A cut taken under a lock and a list of what it holds made after the lock is let go name two moments.**
+     A snapshot took its WAL position and sealed every row up to it under `flush_mtx_`, then listed its files by
+     walking the directory without it. Its pin kept a merge and retention from moving a file, and nothing kept a
+     FLUSH from sealing rows written after the cut into a new directory the walk then listed: a replica held them
+     twice (#282). Take what the cut holds - here the index's segment directories - while the lock is still
+     held, and let the slow work after it touch nothing else.
 
 ## Current state and open problems
 

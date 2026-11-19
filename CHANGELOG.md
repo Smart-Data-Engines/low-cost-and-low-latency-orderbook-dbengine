@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A snapshot lists the segments of its cut alone** (#282). A snapshot - what a replica bootstraps from, a mesh
+  peer joins with, and a backup is - took its WAL position and sealed every row up to it, then listed its files
+  without holding the flush's lock, so a FLUSH or a flush tick in between could seal rows written after that
+  position into a segment the snapshot then listed. A replica bootstrapped so held those rows twice: from the
+  snapshot and again from the stream sent from its position. The snapshot now lists only the segments the index
+  held at its cut.
+
 - **A book summary stays true when a seal puts an instant's rows in another order** (#278). A tie on a timestamp
   goes to the row a scan delivers last, and a seal of a block with a late row (a client's event time, #105) can
   give a segment that starts before one indexed already: at an instant the two share, the rows change places. A
