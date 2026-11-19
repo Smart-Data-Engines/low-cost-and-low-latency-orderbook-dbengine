@@ -197,6 +197,14 @@ here as `#N`.
 
 ### Changed
 
+- **A book summary writes each row it composes where the row stays** (#271). Composing the summary a seal
+  writes built each row on the stack and copied it twice, once into the book's label and once into its side,
+  with loads a processor cannot forward from its store buffer: seven a level on the thread that drains and
+  seals, counted on the m8a.xlarge, and two now. The composition's share of the node's samples under a
+  pipelined ingest fell from 5.3-6.5% to 4.3-5.6% on both hosts, and with sides 500 levels deep that thread
+  takes 45.6-46.9 ns of
+  CPU a level where it took 48.3-51.1 (m8a.xlarge); elsewhere the difference is within the rounds' spread.
+
 - **A write queues its rows for the flush without building two strings a level** (#270). Every level of
   every write is queued on its client loop for the columnar flush. The queue's entry carried the symbol and
   the exchange as two strings, built again for every level, in an entry put together on the stack and

@@ -2869,13 +2869,39 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
             track->entries.push_back(BestTrackEntry{instant, t});
         }
     };
-    const auto each = [&](const SnapshotRow& r) {
+    // The track's part of a row at `ts`: the instant before it closes when this one is another.
+    const auto note_instant = [&](uint64_t ts) {
         if (track != nullptr) {
-            if (pending && r.timestamp_ns != instant) close_instant();
-            instant = r.timestamp_ns;
+            if (pending && ts != instant) close_instant();
+            instant = ts;
             pending = true;
         }
+    };
+    const auto each = [&](const SnapshotRow& r) {
+        note_instant(r.timestamp_ns);
         return apply(r);
+    };
+    // apply(), for row `i` of a batch as the decoder gives it (#271): its side, quantity and price read
+    // from the columns as row_of() reads them, and a row kept written into its side's slot field by field.
+    // A row built on the stack and copied - into `out.as_of`, then into the side - was read back by wide
+    // loads of what narrow stores had just written, and applying a row waited on that.
+    const auto apply_at = [&](const RowBatch& b, uint32_t i) {
+        const uint8_t  side  = b.side.empty() ? uint8_t{0} : b.side[i];
+        const uint64_t qty   = b.qty.empty() ? uint64_t{0} : b.qty[i];
+        const int64_t  price = b.price.empty() ? int64_t{0} : b.price[i];
+        if (side == SIDE_BID) {
+            if (qty == 0) {
+                bids.remove(price);
+            } else {
+                fill_row(bids.place(price), b, i);
+            }
+        } else if (side == SIDE_ASK) {
+            if (qty == 0) {
+                asks.remove(price);
+            } else {
+                fill_row(asks.place(price), b, i);
+            }
+        }
     };
     start();
 
@@ -2903,15 +2929,19 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
         uint64_t filtered = 0;
         const BatchReader as_read = [&](const RowBatch& b) -> BatchVerdict {
             for (size_t k = 0; k < b.rows.size(); ++k) {
-                const SnapshotRow r = row_of(b, b.rows[k]);
-                if (r.timestamp_ns < last) {
+                const uint32_t i = b.rows[k];
+                const uint64_t ts = b.ts[i];
+                if (ts < last) {
                     in_order = false;
                     return {true, k};
                 }
-                last = r.timestamp_ns;
+                last = ts;
                 ++kept;
-                each(r);
+                note_instant(ts);
+                apply_at(b, i);
             }
+            // The row the book is as of: the last applied, once a batch rather than once a row.
+            if (!b.rows.empty()) fill_row(out.as_of.emplace(), b, b.rows.back());
             return {};
         };
         for (const SegmentMeta& m : g.segments) {

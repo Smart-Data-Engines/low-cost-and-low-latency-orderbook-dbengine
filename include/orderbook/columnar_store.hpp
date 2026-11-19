@@ -216,10 +216,15 @@ struct PartsScan {
 /// The fewest rows in range a scan is divided at: below it a scan is read on its query's thread.
 inline constexpr uint64_t kScanDivideMinRows = 32'768;
 
-/// Row `i` of a batch as the row scan hands it over: the fields of the columns the batch holds,
-/// zero in every field whose column it does not.
-inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
-    SnapshotRow row{};
+/// Row `i` of a batch as the row scan hands it over, written into `row`: the fields of the columns the
+/// batch holds, zero in every field whose column it does not.
+///
+/// For a reader that keeps the row, written where it keeps it (#271). Built on the stack and copied, as
+/// row_of() and an assignment do, the copy reads the row with wide loads of what narrow stores had just
+/// written, which a processor does not forward from its store buffer: composing a book summary waited
+/// on that for 91% of the time it spent applying a row.
+inline void fill_row(SnapshotRow& row, const RowBatch& b, uint32_t i) {
+    row = SnapshotRow{};
     row.timestamp_ns = b.ts[i];
     if (!b.seq.empty())   row.sequence_number = static_cast<uint64_t>(b.seq[i]);
     if (!b.side.empty())  row.side            = b.side[i];
@@ -227,6 +232,12 @@ inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
     if (!b.price.empty()) row.price           = b.price[i];
     if (!b.qty.empty())   row.quantity        = b.qty[i];
     if (!b.cnt.empty())   row.order_count     = b.cnt[i];
+}
+
+/// Row `i` of a batch as the row scan hands it over (fill_row()).
+inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
+    SnapshotRow row;
+    fill_row(row, b, i);
     return row;
 }
 

@@ -1,5 +1,6 @@
 // One side of a book composed by price (#266, price_side.hpp), against the std::map it replaces: after
-// every put and removal the same prices held, the same best price, and the same rows best first.
+// every put and removal the same prices held, the same best price, and the same rows best first -
+// whether a row is put or written into the slot place() gives (#271).
 
 #include "orderbook/price_side.hpp"
 
@@ -56,7 +57,20 @@ void walk() {
         } else {
             const ob::SnapshotRow r = row(price, static_cast<uint64_t>(*rc::gen::inRange(1, 1000)),
                                           static_cast<uint64_t>(n));
-            side.put(r);
+            if (*rc::gen::arbitrary<bool>()) {
+                side.put(r);
+            } else {
+                // A row written into its slot field by field, as a composition writes one it reads from
+                // a decoder's columns (#271).
+                ob::SnapshotRow& slot = side.place(price);
+                slot = ob::SnapshotRow{};
+                slot.timestamp_ns    = r.timestamp_ns;
+                slot.sequence_number = r.sequence_number;
+                slot.side            = r.side;
+                slot.price           = r.price;
+                slot.quantity        = r.quantity;
+                slot.order_count     = r.order_count;
+            }
             map.insert_or_assign(price, r);
         }
         if (n % 7 == 0) check_same(side, map);
@@ -96,6 +110,27 @@ TEST(PriceSide, ARemovedBestGivesWayToTheNextAndComesBackWhenPutAgain) {
     EXPECT_EQ(rows[0].price, 100);
     EXPECT_EQ(rows[0].quantity, 5u);
     EXPECT_EQ(rows[1].price, 98);
+}
+
+TEST(PriceSide, ARowTheSideHoldsPutAgainIsTheSameRow) {
+    // put() takes a row the side gave out through place() - itself, or copied under other prices while the
+    // side grows past its rows' capacity - and holds what was put.
+    ob::PriceSide<true> side;
+    side.place(100) = row(100, 7, 1);
+    for (int64_t p = 1; p <= 64; ++p) {
+        ob::SnapshotRow copy = side.place(100);
+        copy.price = 100 + p;
+        side.put(copy);
+        side.put(side.place(100));
+    }
+    const std::vector<ob::SnapshotRow> rows = side.best_first();
+    ASSERT_EQ(rows.size(), 65u);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i].price, 164 - static_cast<int64_t>(i));
+        EXPECT_EQ(rows[i].quantity, 7u);
+        EXPECT_EQ(rows[i].sequence_number, 1u);
+    }
+    EXPECT_EQ(side.best(), 164);
 }
 
 TEST(PriceSide, RemovingAPriceNotHeldChangesNothing) {
