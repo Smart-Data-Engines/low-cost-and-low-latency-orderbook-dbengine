@@ -197,6 +197,15 @@ here as `#N`.
 
 ### Changed
 
+- **The WAL files retention lets go are removed off the flush thread** (#277). The flush tick unlinked them
+  itself, and a 512 MB file took it 34-37 ms on ext4 and 16-17 ms on XFS, twice in a round of a pipelined
+  ingest, while the writers filled half the pending queue in 32-36 ms: most of the writes that still waited at
+  the queue's ceiling waited during one. A thread of their own removes them now; `close()` returns once the
+  removals asked for are done. Under the same ingest the flush thread takes 4-6% less CPU a level, and of the
+  writes that waited at the ceiling after a round's first 400 ms, six rounds had 0 where they had 4
+  (m9g.xlarge) and 1 where 11 (m8a.xlarge). The m8a.xlarge's batch p99 is 10-20% higher, the direction #276
+  found there; see the roadmap.
+
 - **A flush is asked for when half the pending queue's ceiling is queued** (#276). Writers asked for a tick only
   when the queue's million rows were full, so a node written faster than its interval drains - 12-16 M levels a
   second against the default 100 ms - stopped its writers at nearly every tick: 42-50 waits in a round of about
