@@ -4240,6 +4240,9 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     };
     std::vector<Collected> drained;
     std::unordered_map<ColumnarStore*, size_t> slot_of;
+    // The slot of each name's store, found once a drain (#275): a name stands for one pair, and a pair's
+    // store cannot change while this drain holds `flush_mtx_`. Two names under one store key share it.
+    std::unordered_map<const RowName*, size_t> slot_of_name;
     const auto publish = [&] {
         std::vector<std::shared_ptr<const RowBlock>> blocks;
         blocks.reserve(drained.size());
@@ -4272,6 +4275,7 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         }
         drained.clear();
         slot_of.clear();
+        slot_of_name.clear();
         unsealed_rows_.fetch_add(rows, std::memory_order_relaxed);
         combined_store_.publish_blocks(blocks);
     };
@@ -4297,17 +4301,29 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
             for (; chunk.first < chunk.rows.size(); ++chunk.first) {
                 const PendingRow& pr = chunk.rows[chunk.first];
                 if (pr.name != run_name) {
-                    ColumnarStore* store = &get_or_create_store(pr.name->symbol, pr.name->exchange, mtx_held);
-                    run_name = pr.name;
-                    auto [at, fresh] = slot_of.try_emplace(store, drained.size());
-                    if (fresh) {
-                        const auto hint = block_rows_hint_.find(store);
-                        drained.push_back(Collected{
-                            store,
-                            block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
-                            pr.row.timestamp_ns, pr.row.timestamp_ns, 0, true});
+                    // A run of another name: its slot, looked up in the stores only the first time this
+                    // drain meets the name (#275). get_or_create_store() builds `symbol.exchange` and
+                    // hashes it, and every run - a few updates of one pair under #190's ingest - paid for
+                    // that again.
+                    const auto known = slot_of_name.find(pr.name);
+                    size_t slot = 0;
+                    if (known != slot_of_name.end()) {
+                        slot = known->second;
+                    } else {
+                        ColumnarStore* store = &get_or_create_store(pr.name->symbol, pr.name->exchange, mtx_held);
+                        auto [at, fresh] = slot_of.try_emplace(store, drained.size());
+                        if (fresh) {
+                            const auto hint = block_rows_hint_.find(store);
+                            drained.push_back(Collected{
+                                store,
+                                block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
+                                pr.row.timestamp_ns, pr.row.timestamp_ns, 0, true});
+                        }
+                        slot = at->second;
+                        slot_of_name.emplace(pr.name, slot);
                     }
-                    current = &drained[at->second];
+                    run_name = pr.name;
+                    current = &drained[slot];
                 }
                 current->rows.push_back(pr.row);
                 current->min_ts_ns = std::min(current->min_ts_ns, pr.row.timestamp_ns);
