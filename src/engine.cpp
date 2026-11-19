@@ -23,10 +23,12 @@
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
+#include <compare>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -4249,6 +4251,45 @@ void Engine::flush_drain_pending() {
     drain_batch(batch, wal_.current_position(), /*mtx_held=*/true);
 }
 
+namespace {
+
+/// The rows of a run of pending rows, as an iterator `vector::insert()` takes (#284): the drain's block grows by
+/// them, each constructed where it stays. A template, so that the drain instantiates it with the engine's own
+/// pending row.
+template <typename Pending>
+class RowsOf {
+public:
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type        = SnapshotRow;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = const SnapshotRow*;
+    using reference         = const SnapshotRow&;
+
+    RowsOf() = default;
+    explicit RowsOf(const Pending* p) : p_(p) {}
+
+    reference operator*() const { return p_->row; }
+    pointer operator->() const { return &p_->row; }
+    reference operator[](difference_type n) const { return p_[n].row; }
+    RowsOf& operator++() { ++p_; return *this; }
+    RowsOf operator++(int) { RowsOf was = *this; ++p_; return was; }
+    RowsOf& operator--() { --p_; return *this; }
+    RowsOf operator--(int) { RowsOf was = *this; --p_; return was; }
+    RowsOf& operator+=(difference_type n) { p_ += n; return *this; }
+    RowsOf& operator-=(difference_type n) { p_ -= n; return *this; }
+    friend RowsOf operator+(RowsOf i, difference_type n) { return i += n; }
+    friend RowsOf operator+(difference_type n, RowsOf i) { return i += n; }
+    friend RowsOf operator-(RowsOf i, difference_type n) { return i -= n; }
+    friend difference_type operator-(const RowsOf& a, const RowsOf& b) { return a.p_ - b.p_; }
+    friend bool operator==(const RowsOf& a, const RowsOf& b) { return a.p_ == b.p_; }
+    friend auto operator<=>(const RowsOf& a, const RowsOf& b) { return a.p_ <=> b.p_; }
+
+private:
+    const Pending* p_{nullptr};
+};
+
+}  // namespace
+
 void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool mtx_held) {
     // `covered` is what `flush_drain_pending()` explains: a position every row here has its record
     // at or before, and that a sync has reached. From the flush tick it is the sync ticket's
@@ -4399,17 +4440,16 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
                 const PendingRow* const from = rows + chunk.first;
                 size_t n = 1;
                 while (chunk.first + n < end && from[n].name == run_name) ++n;
+                // Inserted rather than resized and written (#284): resize() zeroed the rows first, and on the
+                // m9g.xlarge glibc zeroes with its generic memset.
                 std::vector<SnapshotRow>& out = current->rows;
-                const size_t at = out.size();
-                out.resize(at + n);
-                SnapshotRow* const dst = out.data() + at;
+                out.insert(out.end(), RowsOf<PendingRow>(from), RowsOf<PendingRow>(from + n));
                 uint64_t lo      = current->min_ts_ns;
                 uint64_t hi      = current->max_ts_ns;
                 uint64_t own_max = current->max_own_seq;
                 bool all_own     = current->all_own;
                 for (size_t i = 0; i < n; ++i) {
                     const PendingRow& pr = from[i];
-                    dst[i] = pr.row;
                     lo = std::min(lo, pr.row.timestamp_ns);
                     hi = std::max(hi, pr.row.timestamp_ns);
                     if (pr.own) {
