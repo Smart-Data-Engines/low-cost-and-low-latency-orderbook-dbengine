@@ -8,6 +8,11 @@ handshakes run on --tls-handshake-threads now, and a loop is given a session who
 One client loop (`--io-threads 1`), so every session is on it; the PINGs go through the node's Unix
 socket, which is plaintext and served by the same loop. The control is the same node with
 `--tls-handshake-threads 0`, as every node was before #265.
+
+The nodes' certificates are RSA-4096 (#273). A PING every half millisecond samples the loop evenly in
+time, so the median one beside a storm is held only while handshakes keep the loop busy more than half
+the time. With RSA-2048 a slow runner's storm did not: on CI's Debug build the control's median rose to
+79-112 us against 41-46 beside it, two to two and a half times, in every attempt of a run.
 """
 from __future__ import annotations
 
@@ -76,8 +81,10 @@ print(made, flush=True)
 
 
 def make_cert(directory: Path, stem: str) -> tuple[Path, Path]:
+    # RSA-4096, whose signature costs a node several times what RSA-2048's does (#273): the storm's
+    # handshakes then keep a loop that does them busy most of the time on any runner.
     cert, key = directory / f"{stem}.pem", directory / f"{stem}.key"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key),
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:4096", "-keyout", str(key),
                     "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
                     "-addext", "subjectAltName=IP:127.0.0.1"],
                    check=True, capture_output=True, timeout=patience(60))
@@ -194,7 +201,8 @@ def nodes(tmp_path_factory):
 def test_a_handshake_storm_does_not_hold_the_sessions_beside_it(nodes):
     off, on = nodes
     # On the loop a PING waits behind the handshakes; off it, for a fraction of that: under a twentieth
-    # in #265's measurement (Release builds, RSA-2048), and a quarter is asked. Under a sanitizer the
+    # in #265's measurement (Release builds, RSA-2048), and a quarter is asked - of a storm with RSA-4096
+    # since #273, which holds the control's loop on a slow runner as well. Under a sanitizer the
     # server's own code, a PING's path with it, runs several times slower while the system's OpenSSL,
     # which is not instrumented, signs as fast, so half is asked there - the scaling patience() does
     # for the waits, applied to a ratio.
@@ -215,6 +223,8 @@ def test_a_handshake_storm_does_not_hold_the_sessions_beside_it(nodes):
         attempts.append((beside, held))
         if beside < held / fraction:
             break
+    print("medians beside and on the loop:", ", ".join(f"{b * 1e6:.0f} us and {h * 1e6:.0f} us"
+                                                      for b, h in attempts))
     assert attempts[-1][0] < attempts[-1][1] / fraction, (
         "the median PING beside the handshakes was not under 1/%d of it with them on the loop in any of %d "
         "attempts: %s" % (fraction, len(attempts), ", ".join(f"{b * 1e6:.0f} us against {h * 1e6:.0f}"
