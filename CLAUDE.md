@@ -4732,6 +4732,21 @@ Learned the hard way. Check here before debugging.
      deep shape the client loops took 4% more CPU a level - in every round and both positions - while
      the micro-benchmark of the code changed was no faster. Compare every thread's CPU, not only the one
      the change is for; a variant that helps nowhere and moves something it does not touch is not kept.
+649. **A test that says something did not happen has to wait for what could make it happen to be over.**
+     #276's tests read the tick counter 200 ms after the queue was drained to say no second tick was asked
+     for. A tick holds the flush through its seals - over a second in a Debug build - and a tick asked for
+     while it ran begins only after it, so two mutants that asked again passed: the window closed while the
+     first tick was still sealing. They take the flush's lock first, which the running tick holds to its
+     end, and then give the window.
+650. **Do not commit in a worktree while a mutation table runs in it.** A scratch branch made in #276's
+     worktree, with `git commit -a`, took in the mutant the table had just written to a header, and the
+     checkout back put the source under the table's build: that mutant's verdict was void and the scratch
+     commit carried it. A scratch build gets a worktree of its own; and the table's own log says which
+     mutant was in the tree when.
+651. **`perf sched timehist` shows `[unknown]` for the kernel's frames to a user who cannot read its
+     symbols, and as root refuses a data file another user owns.** #276's first off-CPU run printed no
+     stack at all; the second, as root on a file chowned to the user, printed nothing and said "not owned
+     by current user or root (use -f to override)". Read the data as root, on the file root wrote.
 
 ## Current state and open problems
 

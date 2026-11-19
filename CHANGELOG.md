@@ -197,6 +197,16 @@ here as `#N`.
 
 ### Changed
 
+- **A flush is asked for when half the pending queue's ceiling is queued** (#276). Writers asked for a tick only
+  when the queue's million rows were full, so a node written faster than its interval drains - 12-16 M levels a
+  second against the default 100 ms - stopped its writers at nearly every tick: 42-50 waits in a round of about
+  3 s, each for a tick to take the queue, sync its WAL and drain it. The row that brings the queue to half its
+  ceiling now asks for the tick, which runs while the writers fill the other half: under a pipelined ingest the
+  batches' p999 is 0.56-1.5 ms where it was 8.2-8.9 ms (m9g.xlarge) and 2.2-2.5 ms where 9.4-10.3 ms
+  (m8a.xlarge), with 2-8% more levels a second (medians of six rounds). On the m8a.xlarge, whose WAL is on
+  ext4, the p99 doubled (0.55-0.77 ms where 0.26-0.39 ms): its WAL appends are slow more often while the WAL is
+  synced, which the writers now write through rather than wait out at the ceiling; see the roadmap.
+
 - **A drain looks a pair's store up once** (#275). The thread that drains the pending queue built and hashed
   `symbol.exchange` for every run of one pair's rows; it now remembers each pair's slot for the drain. The
   lookup's 0.5-1.4% of a node's samples under a pipelined ingest is gone, about half of it spent again on the
