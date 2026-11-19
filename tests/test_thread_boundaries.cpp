@@ -242,6 +242,9 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
         {"Engine::seal_sync_loop",
          "no seal's sync completes again, so no checkpoint is appended, WAL retention stops and a "
          "FLUSH waits for it for good (#190)"},
+        {"Engine::wal_removal_loop",
+         "no WAL file retention lets go is removed again, so the log grows on its device until the "
+         "device is full; guarded per removal, a file it could not unlink going with the next (#277)"},
         {"FailoverManager::monitor_loop",
          "the node never learns about a role change (#82's shape), and a half-finished promotion "
          "leaves it a replica of itself (#130)"},
