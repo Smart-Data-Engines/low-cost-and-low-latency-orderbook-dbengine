@@ -5,15 +5,17 @@ which discards and replays - holds part of that stream until its primary says th
 Before #215 a primary lost in that window handed the role to it, and the node returning after it
 discarded its own copy: every write the joining node had not received was gone.
 
-The window is held open by the primary itself: the test pauses it the moment the replica says it is
-joining, and the catch-up it was serving is far larger than what a socket and a send queue hold, so
-the end of the catch-up cannot already be on its way. Then the primary dies. The premise is checked
-rather than assumed: the replica must say it is joining and must not have said the catch-up ended.
+The window is held open by the primary itself: the test pauses it the moment the replica decides to
+discard - watched from a thread started before the restart, since the decision comes before the node
+answers - and the replica has then asked for no catch-up, so no end of one can be on its way. Then
+the primary dies. The premise is checked rather than assumed: the replica must say it is joining and
+must not have said the catch-up ended.
 """
 from __future__ import annotations
 
 import os
 import socket
+import threading
 import time
 
 import pytest
@@ -24,7 +26,7 @@ from conftest import (ClusterManager, node_log_size, node_log_since, patience, r
 pytestmark = pytest.mark.failover
 
 LEVELS = 500
-BATCHES = 1500                     # 750 000 levels, about 24 MB of WAL: far beyond a queue and a socket
+BATCHES = 1500                     # 750 000 levels, about 18 MB of WAL
 LEASE_TTL = "5"
 
 
@@ -95,21 +97,37 @@ def test_a_primary_lost_while_its_replica_joins_loses_no_write():
         cluster.kill_node(replica.index)
         os.remove(os.path.join(replica.data_dir, "repl_state.txt"))
         offset = node_log_size(replica)
+
+        # The moment it decides to discard, the primary stops: the replica has asked for no catch-up
+        # yet, so it gets none, and it is joining for as long as the test likes. The decision's own
+        # line, which a build from before #215 writes too - so the same test run against one fails
+        # where the defect is, and not on a line it never had.
+        #
+        # Watched from a thread started before the restart (#268). restart_node() returns once the
+        # node answers a PING, trying every half a second, and the replica decides before it answers:
+        # a watch begun after the restart saw the line late. That was enough while the replica took
+        # seconds to apply the catch-up - every level a new best price on a side of a thousand, which
+        # insert_level() looked for from the front - and not once it found the level by halves: the
+        # catch-up was over 0.28 s after the decision, every time.
+        decided = threading.Event()
+        restarted = replica
+
+        def stop_the_primary_at_the_decision() -> None:
+            deadline = time.monotonic() + patience(60)
+            while time.monotonic() < deadline:
+                if "discarding and replaying from zero" in node_log_since(restarted, offset):
+                    cluster.pause_node(primary.index)
+                    decided.set()
+                    return
+                time.sleep(0.002)
+
+        watch = threading.Thread(target=stop_the_primary_at_the_decision, daemon=True)
+        watch.start()
         cluster.restart_node(replica.index)
         replica = cluster.nodes[replica.index]
-
-        # The moment it decides to discard, the primary stops: whatever it has queued is all the
-        # replica can still get, and 24 MB of catch-up do not fit there. The decision's own line,
-        # which a build from before #215 writes too - so the same test run against one fails where
-        # the defect is, and not on a line it never had.
-        deadline = time.monotonic() + patience(60)
-        while time.monotonic() < deadline:
-            if "discarding and replaying from zero" in node_log_since(replica, offset):
-                break
-            time.sleep(0.005)
-        else:
+        watch.join(timeout=patience(60) + 5)
+        if not decided.is_set():
             pytest.fail("the replica never discarded:\n" + node_log_since(replica, offset)[-3000:])
-        cluster.pause_node(primary.index)
         time.sleep(1.0)
         assert "no longer joining" not in node_log_since(replica, offset), (
             "the catch-up ended before the test could hold the window open; the premise is lost")

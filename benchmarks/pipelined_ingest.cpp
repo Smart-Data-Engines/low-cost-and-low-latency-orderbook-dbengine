@@ -32,6 +32,11 @@
 // the read half of the multi-reactor question: a read takes the engine's lock only to find the
 // buffer, so it is the work N client loops can do at once.
 //
+// With `deep:<D>` as the last argument (#268) every side of the four books is given D levels before
+// the clock starts, and each update then changes the quantities of `levels` of them spread over the
+// whole side rather than of the levels at its top: a feed's diff stream, where a side holds hundreds of
+// levels and an update moves any of them, and the shape in which finding a level in its side costs.
+//
 // scripts/measure_pipelined_ingest.py runs it against fresh nodes in interleaved rounds.
 
 #include <arpa/inet.h>
@@ -122,11 +127,13 @@ int connect_to(int port) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 7 || (argc == 8 && std::strcmp(argv[7], "book") != 0) || argc > 8) {
-        std::fprintf(stderr, "usage: %s <port> <server-pid> <connections> <batches-per-connection> <levels> <batch> [book]\n", argv[0]);
+    const bool deep_arg = argc == 8 && std::strncmp(argv[7], "deep:", 5) == 0;
+    if (argc < 7 || (argc == 8 && std::strcmp(argv[7], "book") != 0 && !deep_arg) || argc > 8) {
+        std::fprintf(stderr, "usage: %s <port> <server-pid> <connections> <batches-per-connection> <levels> <batch> [book | deep:<D>]\n", argv[0]);
         return 2;
     }
-    const bool book_mode = argc == 8;
+    const bool book_mode = argc == 8 && !deep_arg;
+    const int deep = deep_arg ? std::atoi(argv[7] + 5) : 0;
     const int port = std::atoi(argv[1]);
     const int pid = std::atoi(argv[2]);
     const int conns = std::atoi(argv[3]);
@@ -136,6 +143,10 @@ int main(int argc, char** argv) {
     // The pid may be 0: a node on another host (`OB_HOST`), whose threads are not readable here.
     if (port <= 0 || pid < 0 || conns < 1 || batches < 1 || levels < 1 || batch < 1) {
         std::fprintf(stderr, "every argument must be a positive number, the pid 0 or more\n");
+        return 2;
+    }
+    if (deep_arg && (deep < levels || deep > 1000)) {
+        std::fprintf(stderr, "deep:<D> takes a depth from the levels an update holds to 1000, the most a side holds\n");
         return 2;
     }
     constexpr int kVariants = 8;   // distinct prebuilt batches, so prices move between updates
@@ -149,7 +160,60 @@ int main(int argc, char** argv) {
     // Prebuilt so the client's formatting is not in the measurement: per connection, kVariants
     // buffers of `batch` MINSERTs over that connection's own four symbols.
     std::vector<std::vector<std::string>> payloads(static_cast<size_t>(conns));
+    // The prices of a deep side, the k-th level from its top: as the default updates' prices are.
+    const auto deep_price = [](bool bid, int k) { return bid ? 5'000'000LL - k * 100LL : 5'000'100LL + k * 100LL; };
     for (int c = 0; c < conns; ++c) {
+        if (deep > 0) {
+            // Every side of this connection's four books given its D levels before the clock starts.
+            std::string seed;
+            for (int sym = 0; sym < 4; ++sym) {
+                for (const char* side : {"bid", "ask"}) {
+                    char head[96];
+                    std::snprintf(head, sizeof head, "MINSERT C%02dS%d EX %s %d\n", c, sym, side, deep);
+                    seed += head;
+                    for (int k = 0; k < deep; ++k) {
+                        char line[64];
+                        std::snprintf(line, sizeof line, "%lld %d 1\n", deep_price(side[0] == 'b', k), 1000 + k);
+                        seed += line;
+                    }
+                }
+            }
+            const int fd = fds[static_cast<size_t>(c)];
+            if (::send(fd, seed.data(), seed.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(seed.size())) {
+                std::fprintf(stderr, "seeding connection %d failed\n", c);
+                return 1;
+            }
+            std::string acc;
+            char sbuf[4096];
+            int seeded = 0;
+            while (seeded < 8) {
+                const ssize_t got = ::recv(fd, sbuf, sizeof sbuf, 0);
+                if (got <= 0) { std::fprintf(stderr, "seeding connection %d: no answer\n", c); return 1; }
+                acc.append(sbuf, static_cast<size_t>(got));
+                size_t pos = 0, hit;
+                while ((hit = acc.find("OK\n\n", pos)) != std::string::npos) { ++seeded; pos = hit + 4; }
+                acc.erase(0, pos);
+            }
+            // Each update changes `levels` levels spread over the side - level l of update b in variant
+            // v at depth (l * D / levels + 7v + 13b) mod D - to quantities that move between variants.
+            for (int v = 0; v < kVariants; ++v) {
+                std::string p;
+                for (int b = 0; b < batch; ++b) {
+                    char head[96];
+                    const bool bid = b % 2 == 0;
+                    std::snprintf(head, sizeof head, "MINSERT C%02dS%d EX %s %d\n", c, (b / 2) % 4, bid ? "bid" : "ask", levels);
+                    p += head;
+                    for (int l = 0; l < levels; ++l) {
+                        const int k = (l * (deep / levels) + 7 * v + 13 * b) % deep;
+                        char line[64];
+                        std::snprintf(line, sizeof line, "%lld %d 1\n", deep_price(bid, k), 2000 + l + v);
+                        p += line;
+                    }
+                }
+                payloads[static_cast<size_t>(c)].push_back(std::move(p));
+            }
+            continue;
+        }
         if (book_mode) {
             // One batch of BOOK queries, which does not change between rounds, and before it one
             // MINSERT per side and symbol so every book has `levels` levels on both sides.

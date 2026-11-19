@@ -75,13 +75,15 @@ struct SoABuffer {
 /// @param price      Price of the level.
 /// @param qty        Quantity; if 0 the level is removed.
 /// @param cnt        Order count.
-/// @param descending true for bid (descending), false for ask (ascending).
-/// @return OB_OK, OB_ERR_FULL if depth would exceed MAX_LEVELS on a new insert.
+/// @param descending true for bid (descending), false for ask (ascending) - the side's own order, which
+///                   the search by halves for the price relies on (#268).
+/// @return OB_OK. A new price on a side at MAX_LEVELS evicts the worst level, or is discarded when it is
+///         worse than every level held; neither is an error.
 ob_status_t insert_level(SoASide& side, int64_t price, uint64_t qty,
                          uint32_t cnt, bool descending);
 
-/// Remove a level by price from a side.
-/// @return OB_OK if found and removed, OB_ERR_NOT_FOUND otherwise.
+/// Remove a level by price from a side, either side's order.
+/// @return OB_OK, whether the price was held or not.
 ob_status_t remove_level(SoASide& side, int64_t price);
 
 /// Apply a delta update to buf using the seqlock writer protocol.
@@ -97,7 +99,12 @@ ob_status_t apply_delta(SoABuffer& buf, const DeltaUpdate& update,
 /// `apply_delta()` follows: what a start's rebuild of a live book from history writes (#235). Here and
 /// not in the engine because the protocol is built on fences, which ThreadSanitizer cannot compile -
 /// this file is the one built without it.
-void install_book(SoABuffer& buf, const Level* bids, size_t n_bids, const Level* asks, size_t n_asks,
+///
+/// A side's levels out of its order, or a price in it twice, are put in one by one through
+/// `insert_level()`, which keeps the order its search by halves needs (#268). Returns whether both sides
+/// were in order as given - a book composed by price always is - so that a caller can say when they
+/// were not.
+bool install_book(SoABuffer& buf, const Level* bids, size_t n_bids, const Level* asks, size_t n_asks,
                   uint64_t sequence_number, uint64_t timestamp_ns);
 
 /// The update a snapshot is as of: one update's sequence number and timestamp.
