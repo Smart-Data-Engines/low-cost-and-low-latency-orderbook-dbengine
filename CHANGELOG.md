@@ -197,6 +197,11 @@ here as `#N`.
 
 ### Changed
 
+- **A drain's block and a store's columns grow without being zeroed first** (#284). #281 grew them by `resize()`,
+  which zeroes what it adds before the rows are written into it, and glibc's memset took 1.0-1.5% of the node's
+  samples on the flush thread under a pipelined ingest. Each row is now constructed where it stays: the flush
+  thread takes 3-6% less CPU a level on both test hosts (medians of six rounds).
+
 - **Every thread the node starts has a name of its own** (#283). The flush thread, the seal's sync, the WAL's
   removal, replication, the mesh, failover, the coordinator, metrics, snapshots, backups and the client pool's
   health check started their threads unnamed, and each carried the name of the thread that started it -
