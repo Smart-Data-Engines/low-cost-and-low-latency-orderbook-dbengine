@@ -75,6 +75,18 @@ public:
         ++size_;
     }
 
+    /// A new element at the back, value-initialised where it stays, for the caller to fill (#270).
+    /// `push_back()` takes an element the caller has built, and for the engine's pending rows that was
+    /// a row assembled on the client loop's stack by narrow stores and then copied in by wide loads of
+    /// those same bytes - which the processor cannot forward from its store buffer, so each waited
+    /// for the stores to reach the cache. A row filled in its slot is only ever written there.
+    T& emplace_back() {
+        if (chunks_.empty() || chunks_.back()->rows.size() == kChunkRows) chunks_.push_back(fresh());
+        T& added = chunks_.back()->rows.emplace_back();
+        ++size_;
+        return added;
+    }
+
     size_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
     /// Chunks queued plus chunks kept for reuse - the memory this queue holds, in chunks.

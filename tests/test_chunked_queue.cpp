@@ -56,6 +56,48 @@ TEST(ChunkedQueue, AChunkNeverMovesWhatItHolds) {
     EXPECT_GE(b.chunks[0]->rows.capacity(), Queue::chunk_rows());
 }
 
+TEST(ChunkedQueue, AnElementEmplacedIsValueInitialisedInItsPlaceAndKeepsTheOrder) {
+    // What the engine's pending rows are written with since #270: the slot itself, filled by the
+    // caller, in order with whatever was pushed, across chunks.
+    struct Pair {
+        int a;
+        int b;
+    };
+    ob::ChunkedQueue<Pair, 4> q(100);
+    for (int i = 0; i < 10; ++i) {
+        if (i % 3 == 0) {
+            q.push_back(Pair{i, -i});
+            continue;
+        }
+        Pair& p = q.emplace_back();
+        EXPECT_EQ(p.a, 0);
+        EXPECT_EQ(p.b, 0);
+        p.a = i;
+        p.b = -i;
+    }
+    EXPECT_EQ(q.size(), 10u);
+    auto b = q.take_all();
+    EXPECT_EQ(b.chunks.size(), 3u);   // 4 + 4 + 2
+    int expected = 0;
+    for (auto& c : b.chunks) {
+        for (size_t i = c->first; i < c->rows.size(); ++i, ++expected) {
+            EXPECT_EQ(c->rows[i].a, expected);
+            EXPECT_EQ(c->rows[i].b, -expected);
+        }
+    }
+    EXPECT_EQ(expected, 10);
+}
+
+TEST(ChunkedQueue, AnElementEmplacedInAChunkGivenBackIsValueInitialisedAgain) {
+    // A chunk comes back cleared and is reused; what a row left in it must not show through.
+    ob::ChunkedQueue<int, 4> q(100);
+    for (int i = 0; i < 4; ++i) q.emplace_back() = 7;
+    auto b = q.take_all();
+    ASSERT_EQ(b.chunks.size(), 1u);
+    EXPECT_EQ(q.give_back(std::move(b.chunks[0])), nullptr);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(q.emplace_back(), 0);
+}
+
 TEST(ChunkedQueue, TheLastElementsAreWhatAWriterJustAppendedEvenAcrossAChunk) {
     Queue q(100);
     for (int i = 0; i < 6; ++i) q.push_back(int{i});
