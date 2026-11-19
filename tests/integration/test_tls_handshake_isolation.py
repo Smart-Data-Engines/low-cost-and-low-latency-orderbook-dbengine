@@ -193,19 +193,32 @@ def nodes(tmp_path_factory):
 
 def test_a_handshake_storm_does_not_hold_the_sessions_beside_it(nodes):
     off, on = nodes
-    held, made_on = ping_median_beside_a_storm(on)
-    before = off.metric("ob_tls_handshakes_total")
-    beside, made_off = ping_median_beside_a_storm(off)
-    assert made_on > 0 and made_off > 0, "the storm made no handshake"
     # On the loop a PING waits behind the handshakes; off it, for a fraction of that: under a twentieth
     # in #265's measurement (Release builds, RSA-2048), and a quarter is asked. Under a sanitizer the
     # server's own code, a PING's path with it, runs several times slower while the system's OpenSSL,
     # which is not instrumented, signs as fast, so half is asked there - the scaling patience() does
     # for the waits, applied to a ratio.
     fraction = 2 if instrumented_run() else 4
-    assert beside < held / fraction, (f"the median PING beside the handshakes was {beside * 1e6:.0f} us, "
-                                      f"{held * 1e6:.0f} us with them on the loop")
-    assert off.metric("ob_tls_handshakes_total") >= before + made_off
+    # Up to three pairs of storms (#269). The comparison says something only when the storm held the
+    # loop it ran on, and on a shared CI runner a storm's processes can be starved of the CPU they need
+    # to make one: a run of PR #318 saw 79 us on the loop against 41 beside it, where the test hosts
+    # see 233-336 against 10. Noise of that kind weakens a storm in one attempt and not in three; the
+    # defect it guards - a handshake on the loop again - holds the PINGs beside it in every attempt, so
+    # attempts can only spare a run the runner spoiled, never a regression.
+    attempts = []
+    for _ in range(3):
+        held, made_on = ping_median_beside_a_storm(on)
+        before = off.metric("ob_tls_handshakes_total")
+        beside, made_off = ping_median_beside_a_storm(off)
+        assert made_on > 0 and made_off > 0, "the storm made no handshake"
+        assert off.metric("ob_tls_handshakes_total") >= before + made_off
+        attempts.append((beside, held))
+        if beside < held / fraction:
+            break
+    assert attempts[-1][0] < attempts[-1][1] / fraction, (
+        "the median PING beside the handshakes was not under 1/%d of it with them on the loop in any of %d "
+        "attempts: %s" % (fraction, len(attempts), ", ".join(f"{b * 1e6:.0f} us against {h * 1e6:.0f}"
+                                                             for b, h in attempts)))
     assert off.metric("ob_tls_handshakes_in_flight") == 0
     assert on.metric("ob_tls_handshakes_total") == 0, "a handshake left a loop with no threads"
 
