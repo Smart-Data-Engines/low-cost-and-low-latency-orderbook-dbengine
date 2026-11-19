@@ -4747,6 +4747,13 @@ Learned the hard way. Check here before debugging.
      symbols, and as root refuses a data file another user owns.** #276's first off-CPU run printed no
      stack at all; the second, as root on a file chowned to the user, printed nothing and said "not owned
      by current user or root (use -f to override)". Read the data as root, on the file root wrote.
+652. **A test that holds a lock and waits for a thread must be able to let the lock go before it waits for
+     that thread to end.** #277's tests hold the removal thread's lock and check that a tick returns. The
+     first waited for the tick through a `std::future` declared after the hold: a failed assertion destroyed
+     the future first, whose destructor waited for a tick that waited for the hold. The second ran the tick
+     on the very thread that held the lock. Both hung rather than failed under the mutant that made the tick
+     wait. Declare what waits for the other thread before the hold, run what may block on a thread of its
+     own, and bound the wait.
 
 ## Current state and open problems
 
