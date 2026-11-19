@@ -197,6 +197,11 @@ here as `#N`.
 
 ### Changed
 
+- **A drain looks a pair's store up once** (#275). The thread that drains the pending queue built and hashed
+  `symbol.exchange` for every run of one pair's rows; it now remembers each pair's slot for the drain. The
+  lookup's 0.5-1.4% of a node's samples under a pipelined ingest is gone, about half of it spent again on the
+  map that remembers.
+
 - **A book composed from a summary reads only the rows after the summary's time** (#272). A composition
   started at the summary's time, which took the segment the summary was made at: the summary a seal writes
   read the previous segment in full - and decoded it again - for the rows of its last instant, which the
