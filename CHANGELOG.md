@@ -197,6 +197,17 @@ here as `#N`.
 
 ### Changed
 
+- **A write queues its rows for the flush without building two strings a level** (#270). Every level of
+  every write is queued on its client loop for the columnar flush. The queue's entry carried the symbol and
+  the exchange as two strings, built again for every level, in an entry put together on the stack and
+  copied in - where a wide load of what narrow stores had just written stalled. An entry now carries a
+  pointer to a name made once per pair, and is written in its place: 64 bytes where it was 120, so at its
+  ceiling of a million rows the queue holds 64 MB of entries where it held 120. Under a pipelined ingest
+  the client loops take 148.3-149.7 ns of CPU a level where they took 166.7-167.5 (m9g.xlarge) and
+  107.8-109.7 where 121.9-124.2 (m8a.xlarge). A node then takes 11.27-11.41 million levels a second where it
+  took 10.30-10.43, and 13.44-13.88 where 12.46-12.64, with a batch's median at 153.9-155.2 us where it was
+  171.2-172.1 and 112.9-114.6 where 126.7-128.6.
+
 - **A write finds its level in a book side by halves** (#268). Every level of every write looked for its
   price from the front of its side, and a new price looked again for where it goes: on a side of
   Binance's diff stream, 269 levels at the median and a thousand at the 90th percentile, most of what
