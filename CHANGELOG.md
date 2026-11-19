@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **Every thread the node starts has a name of its own** (#283). The flush thread, the seal's sync, the WAL's
+  removal, replication, the mesh, failover, the coordinator, metrics, snapshots, backups and the client pool's
+  health check started their threads unnamed, and each carried the name of the thread that started it -
+  `ob_tcp_server` for the flush thread and its neighbours - so `top -H` and a profile could not tell them apart.
+  They are `ob-flush`, `ob-seal-sync`, `ob-wal-removal`, `ob-repl-primary` and so on now, listed in
+  `docs/operations.md`.
+
 - **A row's way from the pending queue into a store's columns costs less** (#281). A seal wrote a block's rows
   into the store's seven columns a `push_back` at a time, and a drain pushed each row into its pair's block and
   updated the block's range and flags through a pointer, each paying for its bookkeeping in memory for every row;
