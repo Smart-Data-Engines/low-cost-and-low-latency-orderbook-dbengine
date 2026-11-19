@@ -2769,6 +2769,16 @@ ColumnarStore::PricedBook ColumnarStore::book_at_by_price(uint64_t at, std::stri
     return compose_by_price(at, symbol, exchange, depth, nullptr);
 }
 
+namespace {
+
+/// The instant after `t` - the first a composition from a summary as of `t` reads rows at (#272) - or
+/// `t` itself at the clock's end, where there is none after.
+uint64_t after_instant(uint64_t t) {
+    return t == UINT64_MAX ? t : t + 1;
+}
+
+}  // namespace
+
 ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::string_view symbol,
                                                          std::string_view exchange, size_t depth,
                                                          BestTrack* track) const {
@@ -2810,13 +2820,15 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         gather_locked(0, at, symbol, exchange, at, g);
     }
-    uint64_t from = 0;
+    uint64_t from = 0;        // the summary's time, where the track starts
+    uint64_t rows_from = 0;   // the first time of a row applied to it: the instant after (#272)
     BookSummary summary;
     bool from_summary = false;
     if (g.summary.has_value()) {
         if (read_book_summary(g.summary->second, summary).empty()) {
             from_summary = true;
             from = summary.header.as_of_ts;
+            rows_from = after_instant(from);
         } else {
             // read_book_summary() said why. The rows themselves are the answer, from the first.
             g = Gathered{};
@@ -2914,7 +2926,7 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
     // comes before the one ahead of it. One that does - an event time a client gave - sends the
     // composition back to the merge, from the start.
     const auto reaches = [&](const std::shared_ptr<const RowBlock>& b) {
-        return !(b->max_ts_ns < from || b->min_ts_ns > at);
+        return !(b->max_ts_ns < rows_from || b->min_ts_ns > at);
     };
     const bool in_sequence =
         g.found && !g.segments.empty() &&
@@ -2945,7 +2957,7 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
             return {};
         };
         for (const SegmentMeta& m : g.segments) {
-            read_segment_rows(m, columns, from, at, RowFilter{}, as_read, ReadMode::kQuery, &filtered);
+            read_segment_rows(m, columns, rows_from, at, RowFilter{}, as_read, ReadMode::kQuery, &filtered);
             if (!in_order) break;
         }
         if (in_order) {
@@ -2964,7 +2976,7 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
             start();
         }
     }
-    if (!direct) out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{}, each);
+    if (!direct) out.cost = scan_gathered(g, rows_from, at, symbol, exchange, columns, RowFilter{}, each);
     if (track != nullptr) {
         if (pending) close_instant();
         track->header.entries = static_cast<uint32_t>(track->entries.size());
@@ -3263,9 +3275,12 @@ void ColumnarStore::gather_locked(uint64_t start_ns, uint64_t end_ns, std::strin
         if (s != summaries.begin()) {
             --s;
             out.summary = std::make_pair(s->first, s->second);
-            // The rows a read applies to it: from its own time on, which it holds too - a row at
-            // that time is applied again, to the same effect, in the same order (book_summary.hpp).
-            start_ns = std::max(start_ns, s->first);
+            // The rows a read applies to it: the ones after its time (#272). It holds every row at
+            // its time that the candidates gathered with it under this lock hold - a row published
+            // since that is not in it falsifies it, out of the index before the row can be read
+            // (book_summary.hpp) - so applying them again changed nothing, and it read the whole of
+            // the segment the summary was made at, for the rows of that segment's last instant.
+            start_ns = std::max(start_ns, after_instant(s->first));
         }
     }
     for (const auto& b : it->second.blocks) {
