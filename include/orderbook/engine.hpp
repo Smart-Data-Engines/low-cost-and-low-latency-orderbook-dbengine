@@ -1782,6 +1782,9 @@ private:
         size_t count{0};
         size_t rows{0};
         std::vector<SegmentMeta> metas;
+        /// The columns of the last of `metas`, copied as it was written, for its held columns (#274):
+        /// the summary the seal writes, and a query of it, read them without decoding the file.
+        ColumnarStore::SealedColumns held;
     };
     /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
     /// the share of a tick that drained `drained_rows` and the seals by age `credit` allows, which it

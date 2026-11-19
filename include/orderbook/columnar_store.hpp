@@ -995,12 +995,30 @@ public:
     /// written, which is what a tie between two rows of one level resolves by (#168).
     void publish_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks);
 
+    /// The columns of a segment a seal has just written, for the segment's held columns (#274): the
+    /// values a read of its file would decode, copied from the buffers the seal wrote it from. A column
+    /// is null where none is held - the store holds none, or its arena had no room for it - and a read
+    /// decodes that one from the file, as it does for a segment no seal handed any.
+    struct SealedColumns {
+        std::string dir;     ///< the segment's, once it is written
+        size_t rows{0};      ///< what the columns are long: the segment's rows, or none is held
+        std::array<DecodedColumns::Column, DecodedColumns::kSlots> columns{};
+        size_t held() const;
+    };
+
     /// Replace the first `count` blocks published for a symbol with the segments written from them,
     /// **in one step** under the index's lock: a query sees the blocks or the segments, never both
     /// and never neither. Returns how many of `segments` were refused as already indexed, like
-    /// merge_segments().
+    /// merge_segments(). `held`, when given, is the columns of one of `segments`, which its slot takes
+    /// once it is indexed (#274).
     size_t seal_blocks(const std::string& symbol, const std::string& exchange, size_t count,
-                       const std::vector<SegmentMeta>& segments);
+                       const std::vector<SegmentMeta>& segments, const SealedColumns* held = nullptr);
+
+    /// `writer`'s buffers - the rows of its active segment, which its next flush_segment() writes, in
+    /// this order - copied into this store's arena of held columns, for the segment's slot once it is
+    /// written and indexed (its `dir` is set then). Nothing when this store holds no columns, `writer`
+    /// has no active segment, or writes a format whose columns are not held.
+    SealedColumns copy_active_columns(const ColumnarStore& writer) const;
 
     /// Drop every published block, for a path that discards what this node holds - a resync, a
     /// snapshot install. Their rows are in the WAL the discard is also giving up on.

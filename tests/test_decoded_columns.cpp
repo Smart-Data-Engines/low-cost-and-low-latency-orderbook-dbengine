@@ -299,6 +299,131 @@ TEST(DecodedColumnsStore, ASecondReadOfAHeldSegmentReadsNoFile) {
     fs::rename(file + ".away", file);
 }
 
+TEST(DecodedColumnsStore, ASealHandsItsSegmentTheColumnsItWroteAndAReadDecodesNone) {
+    // #274: a seal's buffers hold the rows of the segment it has just written, and the summary the seal
+    // writes reads that segment next. The seal copies them for the segment's slot, so neither that read
+    // nor a query's decodes the file the encoder had just written - the file gone, every column answers.
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(64 * kMiB);
+    store.open_existing();
+    const auto rows = rows_from(kBase, 5000, 1000, /*shuffled=*/true);
+    store.publish_blocks({ob::RowBlock::make("A", "EX", rows)});
+
+    ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                             ob::ColumnarStore::OwnIndex::kNo);
+    writer.set_symbol_exchange("A", "EX");
+    writer.set_wal_position(77, 1, 0);
+    for (const auto& r : rows) writer.append(r);
+    // The rows of an hour, a second apart: the first rows rolled over into a segment of their own,
+    // and the copy is the rows the flush writes next - the hour after.
+    ob::ColumnarStore::SealedColumns held = store.copy_active_columns(writer);
+    EXPECT_EQ(held.held(), ob::DecodedColumns::kSlots);
+    const auto meta = writer.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    held.dir = meta->dir_path;
+    EXPECT_EQ(held.rows, meta->row_count);
+    std::vector<ob::SegmentMeta> segments = writer.take_rolled_segments();
+    ASSERT_EQ(segments.size(), 1u) << "the rows were to reach past an hour";
+    segments.push_back(*meta);
+    ASSERT_EQ(store.seal_blocks("A", "EX", 1, segments, &held), 0u);
+
+    // The file gone: every column of the segment answers, from what the seal handed over.
+    const std::string file = meta->dir_path + "/" + ob::kColumnsV3File;
+    fs::rename(file, file + ".away");
+    const auto lo = kBase + (rows.size() - meta->row_count) * kSec;
+    const auto got = read(store, ob::ColumnSet::all(), "A", lo, UINT64_MAX);
+    fs::rename(file + ".away", file);
+    EXPECT_EQ(got.size(), meta->row_count) << "a column of the segment was read from its file";
+    EXPECT_EQ(store.decoded_columns_stats().misses, 0u);
+
+    // What a store that decodes the file answers, row for row: the copy is the file's values.
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    EXPECT_TRUE(same_rows(got, read(plain, ob::ColumnSet::all(), "A", lo, UINT64_MAX)));
+}
+
+TEST(DecodedColumnsStore, ASealHandsALargeSegmentItsColumnsInTheArenaAndInVectors) {
+    // A segment as the engine seals one under load: 20 000 rows in an hour, so its 8- and 4-byte columns
+    // take slots of the arena and its 2- and 1-byte ones, under the arena's least class, vectors (#274).
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(64 * kMiB);
+    store.open_existing();
+    std::vector<ob::SnapshotRow> rows;
+    for (size_t i = 0; i < 20'000; ++i) {
+        rows.push_back(row_at(kBase + i * (kSec / 10), 1000 + static_cast<int64_t>(i % 977),
+                              static_cast<uint16_t>(i % 20)));
+    }
+    store.publish_blocks({ob::RowBlock::make("A", "EX", rows)});
+    ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                             ob::ColumnarStore::OwnIndex::kNo);
+    writer.set_symbol_exchange("A", "EX");
+    for (const auto& r : rows) writer.append(r);
+    ob::ColumnarStore::SealedColumns held = store.copy_active_columns(writer);
+    EXPECT_EQ(held.held(), ob::DecodedColumns::kSlots);
+    const auto meta = writer.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    ASSERT_TRUE(writer.take_rolled_segments().empty());
+    held.dir = meta->dir_path;
+    ASSERT_EQ(store.seal_blocks("A", "EX", 1, {*meta}, &held), 0u);
+
+    const std::string file = meta->dir_path + "/" + ob::kColumnsV3File;
+    fs::rename(file, file + ".away");
+    const auto got = read(store, ob::ColumnSet::all());
+    fs::rename(file + ".away", file);
+    EXPECT_EQ(got.size(), rows.size()) << "a column of the segment was read from its file";
+    EXPECT_EQ(store.decoded_columns_stats().misses, 0u);
+    EXPECT_GT(store.decoded_columns_stats().arena.mapped_bytes, 0u) << "no column was held in the arena";
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    EXPECT_TRUE(same_rows(got, read(plain, ob::ColumnSet::all())));
+}
+
+TEST(DecodedColumnsStore, ColumnsOfAnotherLengthThanTheSegmentAreNotHeld) {
+    // seal_blocks() holds a copy only for a segment of as many rows: a copy of other rows - a seal whose
+    // flush wrote other than its buffers held - would answer for the segment with rows it does not have.
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(64 * kMiB);
+    store.open_existing();
+    const auto rows = rows_from(kBase, 100, 1000);
+    store.publish_blocks({ob::RowBlock::make("A", "EX", rows)});
+    ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                             ob::ColumnarStore::OwnIndex::kNo);
+    writer.set_symbol_exchange("A", "EX");
+    for (const auto& r : rows) writer.append(r);
+    ob::ColumnarStore::SealedColumns held = store.copy_active_columns(writer);
+    ASSERT_EQ(held.held(), ob::DecodedColumns::kSlots);
+    const auto meta = writer.flush_segment();
+    ASSERT_TRUE(meta.has_value());
+    held.dir = meta->dir_path;
+    held.rows = meta->row_count + 1;
+    ASSERT_EQ(store.seal_blocks("A", "EX", 1, {*meta}, &held), 0u);
+    EXPECT_EQ(read(store, ob::ColumnSet::all()).size(), rows.size());
+    EXPECT_EQ(store.decoded_columns_stats().misses, ob::DecodedColumns::kSlots)
+        << "a column of the copy was held for a segment of another length";
+}
+
+TEST(DecodedColumnsStore, NoColumnsAreCopiedForAStoreThatHoldsNone) {
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    store.set_decoded_columns_budget(0);
+    store.open_existing();
+    ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                             ob::ColumnarStore::OwnIndex::kNo);
+    writer.set_symbol_exchange("A", "EX");
+    for (const auto& r : rows_from(kBase, 100, 1000)) writer.append(r);
+    EXPECT_EQ(store.copy_active_columns(writer).held(), 0u);
+    // Nor for a writer with no segment under way.
+    ob::ColumnarStore holding(dir.str());
+    holding.set_decoded_columns_budget(64 * kMiB);
+    ASSERT_TRUE(writer.flush_segment().has_value());
+    EXPECT_EQ(holding.copy_active_columns(writer).held(), 0u);
+}
+
 TEST(DecodedColumnsStore, ReadsWithAndWithoutHoldingAnswerTheSame) {
     TempDir dir;
     // Three segments: one row, a thousand out of time order, and ten thousand.

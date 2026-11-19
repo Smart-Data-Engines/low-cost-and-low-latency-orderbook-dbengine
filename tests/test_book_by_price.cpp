@@ -280,6 +280,28 @@ TEST(BookByPriceWithSummaries, ASealWritesThemAndAReadStartsFromTheNewest) {
     engine->close();
 }
 
+TEST(BookByPriceWithSummaries, ASummaryReadsWhatItsSealWroteWithoutDecodingIt) {
+    // #274: a seal hands the segment it writes the columns it wrote it from, and the summary the seal
+    // writes next reads that segment - and, since #272, no other - so no summary decodes a column.
+    TempDir dir("ob_bbp_sum_held_");
+    auto engine = open_engine(dir.path);
+    engine->set_decoded_columns_budget(size_t{64} << 20);
+    engine->set_book_summary_rows(4);
+    uint64_t ts = kT0;
+    for (int i = 0; i < 6; ++i) {
+        ASSERT_EQ(write(*engine, ob::SIDE_BID, {level(100 - i, 1), level(90 - i, 2)}, ++ts, false),
+                  ob::OB_OK);
+        ASSERT_EQ(write(*engine, ob::SIDE_ASK, {level(110 + i, 3)}, ++ts, i % 2 == 0), ob::OB_OK);
+        engine->flush_incremental();
+    }
+    ASSERT_FALSE(engine->store().book_summaries("BBP", "EX").empty());
+    const auto held = engine->store().decoded_columns_stats();
+    EXPECT_EQ(held.misses, 0u) << "a summary decoded a column its seal had written";
+    EXPECT_GT(held.hits, 0u) << "no summary read a held column";
+    EXPECT_EQ(book_at(*engine, ts), live_book(*engine));
+    engine->close();
+}
+
 TEST(BookByPriceWithSummaries, AStartRebuildsTheLiveBookFromTheNewestSummary) {
     TempDir dir("ob_bbp_sum_start_");
     std::vector<Level> before;

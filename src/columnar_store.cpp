@@ -260,10 +260,14 @@ void ColumnarStore::abandon_active() {
 }
 
 size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& exchange,
-                                  size_t count, const std::vector<SegmentMeta>& segments) {
+                                  size_t count, const std::vector<SegmentMeta>& segments,
+                                  const SealedColumns* held) {
     size_t refused = 0;
     size_t rows = 0;
     size_t taken = 0;
+    // The slot of the segment whose columns the seal handed over, taken with the lock and filled
+    // after it: a slot is filled under the budget's mutex and its own, never under the index's.
+    std::shared_ptr<DecodedColumns> slot;
     {
         std::unique_lock<std::shared_mutex> lock(index_mtx_);
         auto& entry = by_symbol_[index_key(symbol, exchange)];
@@ -275,7 +279,30 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
         for (const auto& meta : segments) {
             if (!insert_locked(meta)) ++refused;
         }
+        if (held != nullptr && held->held() > 0 && !held->dir.empty()) {
+            for (const WidthTier& tier : entry.tiers) {
+                for (const SegmentMeta& m : tier.segments) {
+                    if (m.dir_path != held->dir) continue;
+                    if (m.row_count == held->rows) {
+                        slot = m.decoded;
+                    } else {
+                        OB_LOG_WARN("columnar", "sealing %s.%s: the columns copied for %s are %zu row(s) "
+                                                "long and the segment has %llu - none is held",
+                                    symbol.c_str(), exchange.c_str(), held->dir.c_str(), held->rows,
+                                    static_cast<unsigned long long>(m.row_count));
+                    }
+                }
+            }
+        }
         if (entry.tiers.empty() && entry.blocks.empty()) by_symbol_.erase(index_key(symbol, exchange));
+    }
+    if (slot) {
+        size_t kept = 0;
+        for (size_t c = 0; c < DecodedColumns::kSlots; ++c) {
+            if (held->columns[c] && slot->put(c, held->columns[c], held->dir) == held->columns[c]) ++kept;
+        }
+        OB_LOG_DEBUG("columnar", "sealed %s.%s: %zu of %zu column(s) of %s held as written", symbol.c_str(),
+                     exchange.c_str(), kept, held->held(), held->dir.c_str());
     }
     if (taken != count) {
         OB_LOG_ERROR("columnar", "sealing %s.%s: asked to replace %zu block(s) and found %zu - the "
@@ -289,6 +316,53 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
     OB_LOG_DEBUG("columnar", "sealed %s.%s: %zu block(s), %zu row(s), into %zu segment(s)",
                  symbol.c_str(), exchange.c_str(), taken, rows, segments.size());
     return refused;
+}
+
+size_t ColumnarStore::SealedColumns::held() const {
+    return static_cast<size_t>(std::count_if(columns.begin(), columns.end(),
+                                             [](const DecodedColumns::Column& c) { return c != nullptr; }));
+}
+
+ColumnarStore::SealedColumns ColumnarStore::copy_active_columns(const ColumnarStore& writer) const {
+    SealedColumns out;
+    // Before the flush, which clears the buffers as it ends: until then they hold exactly the rows it
+    // writes, in its order - a rollover inside the seal has written the rows before it already.
+    if (!decoded_budget_ || !writer.has_active_segment_ || writer.active_row_count_ == 0 ||
+        !columns_in_one_file(writer.segment_format_.version)) {
+        return out;
+    }
+    out.rows = writer.ts_buf_.size();
+    ColumnArena* arena = decoded_budget_->arena();
+    // Where a read decodes a column to hold it: a slot of the arena, or a vector of its own for a column
+    // smaller than the arena's least class. A larger one the arena has no room for is not held - a
+    // vector that large would be memory the kernel maps afresh every seal - and a read decodes it.
+    const auto copy = [&](size_t c, const auto& buf) {
+        using T = typename std::decay_t<decltype(buf)>::value_type;
+        if (buf.empty()) return;
+        const size_t bytes = buf.size() * sizeof(T);
+        auto values = std::make_shared<ColumnValues>();
+        std::vector<T>& heap = values->values.emplace<std::vector<T>>();
+        ArenaBlock block = arena != nullptr ? arena->allocate(bytes) : ArenaBlock{};
+        if (block) {
+            std::memcpy(block.data(), buf.data(), bytes);
+            values->block = std::move(block);
+            values->count = buf.size();
+        } else if (bytes < ColumnArena::kMinClassBytes) {
+            heap.assign(buf.begin(), buf.end());
+        } else {
+            return;
+        }
+        out.columns[c] = std::move(values);
+    };
+    // Format 3's order, slot for slot: ts, price, qty, cnt, side, level, seq.
+    copy(0, writer.ts_buf_);
+    copy(1, writer.price_buf_);
+    copy(2, writer.qty_buf_);
+    copy(3, writer.cnt_buf_);
+    copy(4, writer.side_buf_);
+    copy(5, writer.level_buf_);
+    copy(6, writer.seq_buf_);
+    return out;
 }
 
 // ── The index, per symbol (#165) ──────────────────────────────────────────────

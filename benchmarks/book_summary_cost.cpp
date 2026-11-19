@@ -13,10 +13,12 @@
 // timed, which composes from the summary before it. Every `rows` rows, `summaries` times; the first two
 // are not counted, the first composing from the first row.
 //
-//   book_summary_cost <dir> [rows] [prices] [summaries]
+//   book_summary_cost <dir> [rows] [prices] [summaries] [held]
 //
 // Defaults: 65 536 rows, which is a summary's due at the engine's default; 500 prices a side; 20
-// summaries. `dir` is created and left with the store in it. One JSON line: the time a summary took and
+// summaries. The store holds decoded columns as a server's does by default (`--decoded-cache-mb 256`),
+// and each seal hands the segment it wrote its columns, as the engine's does since #274; `held` 0 seals
+// without them, so that a summary decodes the segment as it did before. `dir` is created and left with the store in it. One JSON line: the time a summary took and
 // that time over the rows it read, median and range.
 
 #include "orderbook/columnar_store.hpp"
@@ -49,13 +51,14 @@ double median(std::vector<double> v) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <dir> [rows] [prices] [summaries]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <dir> [rows] [prices] [summaries] [held]\n", argv[0]);
         return 2;
     }
     const std::string dir = argv[1];
     const size_t rows      = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 65'536;
     const size_t prices    = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 500;
     const size_t summaries = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 20;
+    const bool   held      = argc > 5 ? std::strtoull(argv[5], nullptr, 10) != 0 : true;
     if (rows == 0 || prices == 0 || summaries < 3) {
         std::fprintf(stderr, "rows and prices above 0, and 3 summaries or more\n");
         return 2;
@@ -65,6 +68,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(dir);
 
     ob::ColumnarStore store(dir);
+    store.set_decoded_columns_budget(size_t{256} << 20);
     std::mt19937_64 rng(266);
     // The top of a side changes most: a level's index exponentially distributed, a mean of a tenth
     // of the side.
@@ -108,12 +112,15 @@ int main(int argc, char** argv) {
                                  ob::ColumnarStore::OwnIndex::kNo);
         writer.set_symbol_exchange("BENCH", "EX");
         for (const auto& r : batch) writer.append(r);
+        ob::ColumnarStore::SealedColumns columns =
+            held ? store.copy_active_columns(writer) : ob::ColumnarStore::SealedColumns{};
         const auto meta = writer.flush_segment();
         if (!meta) {
             std::fprintf(stderr, "summary %zu: the writer sealed no segment\n", k);
             return 1;
         }
-        if (store.seal_blocks("BENCH", "EX", blocks, {*meta}) != 0) {
+        columns.dir = meta->dir_path;
+        if (store.seal_blocks("BENCH", "EX", blocks, {*meta}, &columns) != 0) {
             std::fprintf(stderr, "summary %zu: the segment was refused\n", k);
             return 1;
         }
@@ -133,10 +140,13 @@ int main(int argc, char** argv) {
     std::printf("{\"rows\": %zu, \"prices_a_side\": %zu, \"summaries\": %zu, \"book_prices\": %zu, "
                 "\"rows_read_p50\": %.0f, \"summary_ms_p50\": %.3f, \"summary_ms_min\": %.3f, "
                 "\"summary_ms_max\": %.3f, \"ns_a_row_p50\": %.1f, \"ns_a_row_min\": %.1f, "
-                "\"ns_a_row_max\": %.1f, \"summary_bytes\": %zu, \"track_entries\": %zu}\n",
+                "\"ns_a_row_max\": %.1f, \"summary_bytes\": %zu, \"track_entries\": %zu, \"held\": %d, "
+                "\"decoded_misses\": %llu, \"decoded_hits\": %llu}\n",
                 rows, prices, ms.size(), last.prices, median(rows_read), median(ms),
                 *std::min_element(ms.begin(), ms.end()), *std::max_element(ms.begin(), ms.end()),
                 median(ns_row), *std::min_element(ns_row.begin(), ns_row.end()),
-                *std::max_element(ns_row.begin(), ns_row.end()), last.bytes, last.track_entries);
+                *std::max_element(ns_row.begin(), ns_row.end()), last.bytes, last.track_entries,
+                held ? 1 : 0, static_cast<unsigned long long>(store.decoded_columns_stats().misses),
+                static_cast<unsigned long long>(store.decoded_columns_stats().hits));
     return 0;
 }

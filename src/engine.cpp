@@ -4494,7 +4494,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     for (const SealPick& p : picks) {
         ColumnarStore* store = by_age[p.index].second;
         const Unsealed& u = unsealed_.at(store);
-        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}});
+        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}, {}});
         sealed_rows += u.rows;
         if (p.why == SealReason::kRows) ++by_rows;
         if (p.why == SealReason::kAge) ++by_age_count;
@@ -4562,11 +4562,19 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
             lent = true;
             s.store->reserve_rows(s.rows);
             for (size_t i = 0; i < s.count; ++i) s.store->append_block(*u.blocks[i].block);
+            // The rows the flush writes, copied for the segment's held columns while the buffers hold
+            // them (#274): the summary this seal writes reads this segment next, and decoded it from
+            // the file the encoder had just written.
+            ColumnarStore::SealedColumns held = combined_store_.copy_active_columns(*s.store);
             auto meta = s.store->flush_segment();
             // Segments a rollover closed first: append() has no reference to the query index, so it
             // parks their metas here. Left uncollected, those rows are on disk and invisible.
             s.metas = s.store->take_rolled_segments();
-            if (meta.has_value()) s.metas.push_back(std::move(meta.value()));
+            if (meta.has_value()) {
+                held.dir = meta->dir_path;
+                s.held = std::move(held);
+                s.metas.push_back(std::move(meta.value()));
+            }
             s.store->swap_buffers(seal_buffers_);
             lent = false;
             written.push_back(std::move(s));
@@ -4590,7 +4598,7 @@ size_t Engine::merge_seals_locked(const std::vector<Seal>& seals) {
     const auto now = std::chrono::steady_clock::now();
     for (const Seal& s : seals) {
         refused += combined_store_.seal_blocks(s.store->symbol(), s.store->exchange(), s.count,
-                                               s.metas);
+                                               s.metas, &s.held);
         // Each segment written is looked at by the next tick's merges (#165 part 2b).
         for (const SegmentMeta& meta : s.metas) {
             note_segment_for_compaction(meta, now, /*arrived=*/true);
