@@ -132,10 +132,15 @@ TEST(WalRemoval, CloseRemovesTheFilesTheLastTickLetGoBeforeItReturns) {
     const std::vector<uint32_t> before = files_retention_may_take(*engine, dir.path);
     ASSERT_GE(before.size(), 4u);
 
+    // Both declared before the hold, for the reason the test above gives; and the tick on a thread of its own,
+    // since this one holds the removals and a tick that waited for them would wait for it.
+    std::future<void> tick;
     std::future<void> closed;
     {
         auto hold = engine->hold_wal_removals_for_test();
-        engine->flush_tick_leaving_the_sync_for_test();
+        tick = std::async(std::launch::async, [&engine] { engine->flush_tick_leaving_the_sync_for_test(); });
+        ASSERT_EQ(tick.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+            << "the tick did not return while the removal it asked for was held: it waits for it";
         closed = std::async(std::launch::async, [&engine] { engine->close(); });
         // close() cannot finish while the removal it waits for is held.
         EXPECT_EQ(closed.wait_for(std::chrono::milliseconds(300)), std::future_status::timeout)
