@@ -850,15 +850,43 @@ void ColumnarStore::append_block(const RowBlock& block) {
     // encoder falls back for exactly the quantities append() tests - so the flag changes no byte
     // it writes. Found by the mutation table: dropping the test here was the one row it could not
     // kill.
-    for (size_t i = 1; i < rows.size(); ++i) {
-        const SnapshotRow& row = rows[i];
-        price_buf_.push_back(row.price);
-        qty_buf_.push_back(row.quantity);
-        ts_buf_.push_back(row.timestamp_ns);
-        cnt_buf_.push_back(row.order_count);
-        side_buf_.push_back(row.side);
-        level_buf_.push_back(row.level_index);
-        seq_buf_.push_back(static_cast<int64_t>(row.sequence_number));
+    //
+    // The columns grow a tile of rows at a time and the rows are written through pointers into it (#281).
+    // Seven push_back()s a row loaded each column's end from the store, compared it with the capacity
+    // and stored it back - for every row, the char column's store keeping the compiler from holding any
+    // of them in a register - and that was most of append_block()'s samples under #190's ingest. A
+    // tile's resize() zeroes it, in the cache it is then written in; a seal reserved the rows already.
+    constexpr size_t kTile = 1024;
+    const SnapshotRow* src = rows.data() + 1;
+    for (size_t left = rows.size() - 1; left > 0;) {
+        const size_t n  = std::min(left, kTile);
+        const size_t at = price_buf_.size();
+        price_buf_.resize(at + n);
+        qty_buf_.resize(at + n);
+        ts_buf_.resize(at + n);
+        cnt_buf_.resize(at + n);
+        side_buf_.resize(at + n);
+        level_buf_.resize(at + n);
+        seq_buf_.resize(at + n);
+        int64_t*  const price = price_buf_.data() + at;
+        uint64_t* const qty   = qty_buf_.data() + at;
+        uint64_t* const ts    = ts_buf_.data() + at;
+        uint32_t* const cnt   = cnt_buf_.data() + at;
+        uint8_t*  const side  = side_buf_.data() + at;
+        uint16_t* const level = level_buf_.data() + at;
+        int64_t*  const seq   = seq_buf_.data() + at;
+        for (size_t i = 0; i < n; ++i) {
+            const SnapshotRow& row = src[i];
+            price[i] = row.price;
+            qty[i]   = row.quantity;
+            ts[i]    = row.timestamp_ns;
+            cnt[i]   = row.order_count;
+            side[i]  = row.side;
+            level[i] = row.level_index;
+            seq[i]   = static_cast<int64_t>(row.sequence_number);
+        }
+        src  += n;
+        left -= n;
     }
     active_row_count_ += rows.size() - 1;
     if (block.min_ts_ns < active_min_ts_) active_min_ts_ = block.min_ts_ns;

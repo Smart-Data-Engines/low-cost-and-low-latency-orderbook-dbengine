@@ -4337,6 +4337,19 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     // name is not in a chunk. Until then a row carried two strings, the run compared both of them on
     // every row, and it started again at each chunk because the strings it pointed at were cleared
     // with their chunk.
+    // A store's block is reserved to the rows of its last one, an eighth more, scaled by the rows this
+    // drain took against the last (#281). A block that outgrows its buffer copies every row it holds into
+    // one twice as big - a tenth of drain_batch()'s samples on the m8a.xlarge under #190's ingest - and a
+    // tick takes whatever was queued when it woke, so one take is larger than the last as often as not.
+    const size_t batch_rows = batch.rows();
+    // Both a block and a take are at most the pending queue's ceiling, a million rows, so the product
+    // fits; and no block of this drain holds more rows than it took.
+    const auto reserve_for = [&](size_t last_block) -> size_t {
+        if (last_block == 0) return 0;
+        const size_t want = last_block + last_block / 8;
+        const size_t scaled = last_drain_rows_ == 0 ? want : want * batch_rows / last_drain_rows_;
+        return std::clamp<size_t>(scaled, 1, std::max<size_t>(batch_rows, 1));
+    };
     const RowName* run_name = nullptr;
     Collected* current      = nullptr;
     size_t appended = 0;
@@ -4344,42 +4357,70 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         PendingQueue::Chunk& chunk = *batch.chunks[k];
         const size_t rows_here = chunk.size();
         try {
-            for (; chunk.first < chunk.rows.size(); ++chunk.first) {
-                const PendingRow& pr = chunk.rows[chunk.first];
-                if (pr.name != run_name) {
+            const PendingRow* const rows = chunk.rows.data();
+            const size_t end = chunk.rows.size();
+            while (chunk.first < end) {
+                const PendingRow& head = rows[chunk.first];
+                if (head.name != run_name) {
                     // A run of another name: its slot, looked up in the stores only the first time this
                     // drain meets the name (#275). get_or_create_store() builds `symbol.exchange` and
                     // hashes it, and every run - a few updates of one pair under #190's ingest - paid for
                     // that again.
-                    const auto known = slot_of_name.find(pr.name);
+                    const auto known = slot_of_name.find(head.name);
                     size_t slot = 0;
                     if (known != slot_of_name.end()) {
                         slot = known->second;
                     } else {
-                        ColumnarStore* store = &get_or_create_store(pr.name->symbol, pr.name->exchange, mtx_held);
+                        ColumnarStore* store = &get_or_create_store(head.name->symbol, head.name->exchange, mtx_held);
                         auto [at, fresh] = slot_of.try_emplace(store, drained.size());
                         if (fresh) {
                             const auto hint = block_rows_hint_.find(store);
                             drained.push_back(Collected{
                                 store,
-                                block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
-                                pr.row.timestamp_ns, pr.row.timestamp_ns, 0, true});
+                                block_rows_pool_->take(reserve_for(hint == block_rows_hint_.end() ? 0 : hint->second)),
+                                head.row.timestamp_ns, head.row.timestamp_ns, 0, true});
                         }
                         slot = at->second;
-                        slot_of_name.emplace(pr.name, slot);
+                        slot_of_name.emplace(head.name, slot);
                     }
-                    run_name = pr.name;
+                    run_name = head.name;
                     current = &drained[slot];
                 }
-                current->rows.push_back(pr.row);
-                current->min_ts_ns = std::min(current->min_ts_ns, pr.row.timestamp_ns);
-                current->max_ts_ns = std::max(current->max_ts_ns, pr.row.timestamp_ns);
-                if (pr.own) {
-                    current->max_own_seq = std::max(current->max_own_seq, pr.row.sequence_number);
-                } else {
-                    current->all_own = false;
+                // The run's rows in this chunk, taken in one step (#281). A push_back() a row loaded
+                // and stored the block's end, its range and its flags through `current` - the char
+                // members of the row it copied keeping the compiler from holding any of them in a
+                // register - and that was most of drain_batch()'s samples under #190's ingest. Here the
+                // block grows once a run and the range and flags are counted in locals. A throw leaves
+                // `chunk.first` at the run's first row, which is not taken, as a throw on any of its rows
+                // did.
+                const PendingRow* const from = rows + chunk.first;
+                size_t n = 1;
+                while (chunk.first + n < end && from[n].name == run_name) ++n;
+                std::vector<SnapshotRow>& out = current->rows;
+                const size_t at = out.size();
+                out.resize(at + n);
+                SnapshotRow* const dst = out.data() + at;
+                uint64_t lo      = current->min_ts_ns;
+                uint64_t hi      = current->max_ts_ns;
+                uint64_t own_max = current->max_own_seq;
+                bool all_own     = current->all_own;
+                for (size_t i = 0; i < n; ++i) {
+                    const PendingRow& pr = from[i];
+                    dst[i] = pr.row;
+                    lo = std::min(lo, pr.row.timestamp_ns);
+                    hi = std::max(hi, pr.row.timestamp_ns);
+                    if (pr.own) {
+                        own_max = std::max(own_max, pr.row.sequence_number);
+                    } else {
+                        all_own = false;
+                    }
                 }
-                ++appended;
+                current->min_ts_ns   = lo;
+                current->max_ts_ns   = hi;
+                current->max_own_seq = own_max;
+                current->all_own     = all_own;
+                appended += n;
+                chunk.first += n;
             }
         } catch (...) {
             // Since #165 part 2a a drain writes nothing - rows go to blocks, and a seal writes - so
@@ -4425,6 +4466,10 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     }
     batch.chunks.clear();
     publish();
+    // What the next drain scales its blocks' reservations by (#281). A drain that threw left the last.
+    last_drain_rows_ = appended;
+    OB_LOG_DEBUG("engine", "drained %zu row(s) of the %zu taken into %zu block(s)", appended, batch_rows,
+                 slot_of.size());
 
     // And kept for what this flush will say it covered once its segments are written (#159): the
     // checkpoint must claim these rows and nothing appended after them, and the WAL files before

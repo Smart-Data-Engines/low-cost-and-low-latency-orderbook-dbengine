@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A row's way from the pending queue into a store's columns costs less** (#281). A seal wrote a block's rows
+  into the store's seven columns a `push_back` at a time, and a drain pushed each row into its pair's block and
+  updated the block's range and flags through a pointer, each paying for its bookkeeping in memory for every row;
+  a block that outgrew its reservation copied every row it held. The seal now writes a tile of rows at a time, a
+  drain takes a run of one pair's rows in one step, and a block is reserved by the size of the take. Under a
+  pipelined ingest the flush thread takes 2-3% less CPU a level on both test hosts (medians of six rounds).
+
 - **A snapshot lists the segments of its cut alone** (#282). A snapshot - what a replica bootstraps from, a mesh
   peer joins with, and a backup is - took its WAL position and sealed every row up to it, then listed its files
   without holding the flush's lock, so a FLUSH or a flush tick in between could seal rows written after that
