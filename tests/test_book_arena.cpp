@@ -8,6 +8,7 @@
 #include "orderbook/book_arena.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/soa_buffer.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -122,8 +123,7 @@ TEST(BookArena, ABookHeldByAReaderOutlivesTheArenaItCameFrom) {
 }
 
 TEST(BookArena, TheEngineMakesItsBooksInTheArenaUnlessToldNotTo) {
-    const auto dir = std::filesystem::temp_directory_path() / "ob_test_book_arena_engine";
-    std::filesystem::remove_all(dir);
+    const auto dir = ob::test::own_temp_dir("ob_test_book_arena_engine_");
     ob::DeltaUpdate du{};
     std::snprintf(du.symbol, sizeof(du.symbol), "BTC-USD");
     std::snprintf(du.exchange, sizeof(du.exchange), "EX");

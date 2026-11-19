@@ -12,6 +12,7 @@
 
 #include "orderbook/engine.hpp"
 #include "orderbook/query_engine.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -30,7 +31,7 @@ namespace fs = std::filesystem;
 namespace {
 
 std::string make_temp_dir(const std::string& prefix) {
-    auto p = fs::temp_directory_path() / (prefix + std::to_string(std::rand()));
+    auto p = ob::test::own_temp_dir(prefix);
     fs::create_directories(p);
     return p.string();
 }

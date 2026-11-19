@@ -6,6 +6,7 @@
 // site in src/ names its thread; this holds what an open engine shows.
 
 #include "orderbook/engine.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -28,7 +29,7 @@ constexpr uint64_t kOneHourNs = 3'600'000'000'000ULL;
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& prefix)
-        : path((fs::temp_directory_path() / (prefix + std::to_string(std::rand()))).string()) {
+        : path(ob::test::own_temp_dir(prefix).string()) {
         fs::create_directories(path);
     }
     ~TempDir() {

@@ -10,6 +10,7 @@
 #include "orderbook/compression.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/data_model.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -26,12 +27,9 @@
 
 namespace {
 
-static std::atomic<uint64_t> dir_counter{0};
 
 static std::filesystem::path make_temp_dir(const std::string& suffix) {
-    auto base = std::filesystem::temp_directory_path() /
-                ("ob_repl_compress_" + suffix + "_" +
-                 std::to_string(dir_counter.fetch_add(1, std::memory_order_relaxed)));
+    auto base = ob::test::own_temp_dir("ob_repl_compress_" + suffix + "_");
     std::filesystem::create_directories(base);
     return base;
 }

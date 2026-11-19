@@ -25,13 +25,12 @@
 
 #include "orderbook/data_model.hpp"
 #include "orderbook/wal.hpp"
+#include "test_temp_dirs.hpp"
 
 namespace {
 
 std::filesystem::path make_temp_dir(const std::string& suffix) {
-    const auto base = std::filesystem::temp_directory_path() /
-                      ("ob_wal_pos_" + suffix + "_" +
-                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto base = ob::test::own_temp_dir("ob_wal_pos_" + suffix + "_");
     std::filesystem::create_directories(base);
     return base;
 }

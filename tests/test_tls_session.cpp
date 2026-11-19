@@ -11,6 +11,7 @@
 
 #include "orderbook/session.hpp"
 #include "orderbook/tls.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -39,7 +40,7 @@ namespace {
 struct KeyPair { std::string cert, key; };
 
 KeyPair generate(const std::string& tag) {
-    const auto dir = fs::temp_directory_path() / ("ob_tlss_" + tag + std::to_string(std::rand()));
+    const auto dir = ob::test::own_temp_dir("ob_tlss_" + tag + "_");
     fs::create_directories(dir);
     const std::string cert = (dir / "cert.pem").string();
     const std::string key  = (dir / "key.pem").string();

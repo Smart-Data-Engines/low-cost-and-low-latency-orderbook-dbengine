@@ -695,6 +695,15 @@ ob_add_engine_test(test_port_discipline
     test_port_discipline.cpp
 )
 
+# A test's temporary directories and files are its process's own (#285): a directory named the same in
+# every run is given what a crashed run of the same binary left there, and its data read as the test's.
+ob_add_engine_test(test_temp_dir_discipline
+    test_temp_dir_discipline.cpp
+)
+target_compile_definitions(test_temp_dir_discipline
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── Whole-engine static checks ─────────────────────────────────────────────────
 # Every thread body goes through an exception boundary (#112). Reads `src/` rather than naming
 # threads, because the list of threads is exactly what a hand-written check got wrong: counted by
