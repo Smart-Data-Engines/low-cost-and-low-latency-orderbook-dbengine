@@ -2914,6 +2914,11 @@ the handshakes are under the fraction asked. The defect it guards - a handshake 
 those PINGs as long as the control's in every attempt. Attempts can therefore spare a run the runner
 spoiled, and never a regression. A failure reports every attempt's two medians.
 
+Checked both ways on the x86 test host (`evidence/2026-11-19-handshake-storm-test/`). The test passes three
+runs of three. With the node meant to hand its handshakes off doing them on its loop, as the control does,
+it fails two runs of two after three attempts each, for example 318 us against 305, 312 against 246 and
+280 against 254. That run also stops asking the pool's counter, which would otherwise fail first.
+
 - Effort: S | Impact: a required check that fails for the runner's load, not for the code, now has to fail
   three times running to fail
 
