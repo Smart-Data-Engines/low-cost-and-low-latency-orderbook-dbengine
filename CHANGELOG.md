@@ -197,6 +197,12 @@ here as `#N`.
 
 ### Changed
 
+- **A book composed from a summary reads only the rows after the summary's time** (#272). A composition
+  started at the summary's time, which took the segment the summary was made at: the summary a seal writes
+  read the previous segment in full - and decoded it again - for the rows of its last instant, which the
+  summary holds. Composing a summary costs 28.6-28.9 ns a row where it cost 31.6-31.9 (m9g.xlarge) and
+  22.7-22.8 where 25.3 (m8a.xlarge), and under a pipelined ingest a round decodes half as many columns.
+
 - **A book summary writes each row it composes where the row stays** (#271). Composing the summary a seal
   writes built each row on the stack and copied it twice, once into the book's label and once into its side,
   with loads a processor cannot forward from its store buffer: seven a level on the thread that drains and
