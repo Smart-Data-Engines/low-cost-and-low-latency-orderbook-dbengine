@@ -272,3 +272,47 @@ TEST(BookLevelSearch, RemoveLevelTakesAPriceOutOfEitherSide) {
     }
 }
 
+// install_book() - a start's rebuild of a live book from history - is the one other writer of a side.
+// A book composed by price is in each side's order with each price once, and is put in as it is; levels
+// that are not are put in one by one, as updates would put them, so that the side keeps the order the
+// search by halves relies on, and the caller is told.
+TEST(BookLevelSearch, InstallBookKeepsASidesOrderWhateverItIsGiven) {
+    const auto side_of = [](const std::vector<ob::Level>& levels, bool descending) {
+        auto buf = make_buffer();
+        ob::SoASide& side = descending ? buf->bid : buf->ask;
+        for (const ob::Level& l : levels) reference_insert_level(side, l.price, l.qty, l.cnt, descending);
+        return buf;
+    };
+    const std::vector<ob::Level> bids_ordered = {{300, 1, 1, 0}, {200, 2, 1, 0}, {100, 3, 1, 0}};
+    const std::vector<ob::Level> asks_ordered = {{400, 4, 1, 0}, {500, 5, 1, 0}, {600, 6, 1, 0}};
+    {
+        auto buf = make_buffer();
+        EXPECT_TRUE(ob::install_book(*buf, bids_ordered.data(), bids_ordered.size(), asks_ordered.data(),
+                                     asks_ordered.size(), 7, 70));
+        EXPECT_EQ(difference(buf->bid, side_of(bids_ordered, true)->bid), "");
+        EXPECT_EQ(difference(buf->ask, side_of(asks_ordered, false)->ask), "");
+        EXPECT_EQ(buf->sequence_number.load(), 7u);
+    }
+    // Out of order, a price twice, and on each side the other side's order.
+    const std::vector<ob::Level> bids_mixed = {{100, 1, 1, 0}, {300, 2, 1, 0}, {200, 3, 1, 0}, {300, 9, 2, 0}};
+    const std::vector<ob::Level> asks_mixed = {{600, 4, 1, 0}, {500, 5, 1, 0}, {400, 6, 1, 0}};
+    {
+        auto buf = make_buffer();
+        EXPECT_FALSE(ob::install_book(*buf, bids_mixed.data(), bids_mixed.size(), asks_mixed.data(),
+                                      asks_mixed.size(), 8, 80));
+        EXPECT_EQ(difference(buf->bid, side_of(bids_mixed, true)->bid), "");
+        EXPECT_EQ(difference(buf->ask, side_of(asks_mixed, false)->ask), "");
+        EXPECT_EQ(buf->bid.depth, 3u);
+        // And a price held is found by an update afterwards, not taken a second time.
+        ob::Level again{300, 11, 1, 0};
+        ob::DeltaUpdate d{};
+        d.side = ob::SIDE_BID;
+        d.sequence_number = 9;
+        d.n_levels = 1;
+        bool gap = false;
+        ASSERT_EQ(ob::apply_delta(*buf, d, &again, gap), ob::OB_OK);
+        EXPECT_EQ(buf->bid.depth, 3u);
+        EXPECT_EQ(buf->bid.prices[0], 300);
+        EXPECT_EQ(buf->bid.quantities[0], 11u);
+    }
+}

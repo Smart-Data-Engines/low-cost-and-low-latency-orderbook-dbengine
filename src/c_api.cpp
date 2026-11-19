@@ -423,8 +423,14 @@ struct ob_engine {
                 level.cnt   = r.order_count;
                 (r.side == ob::SIDE_BID ? bids : asks).push_back(level);
             }
-            ob::install_book(buffer(symbol, exchange), bids.data(), bids.size(), asks.data(),
-                             asks.size(), /*sequence_number=*/0, book.as_of->timestamp_ns);
+            // Each side in its order with each price once, as a book composed by price is; one that is
+            // not is put in level by level, which keeps the order insert_level()'s search needs (#268).
+            if (!ob::install_book(buffer(symbol, exchange), bids.data(), bids.size(), asks.data(),
+                                  asks.size(), /*sequence_number=*/0, book.as_of->timestamp_ns)) {
+                OB_LOG_WARN("c_api", "live book of %s.%s restored from levels out of a side's order or with a "
+                                     "price twice: put in level by level, from %zu bid and %zu ask level(s)",
+                            symbol.c_str(), exchange.c_str(), bids.size(), asks.size());
+            }
             ++restored;
             levels += book.rows.size();
             OB_LOG_DEBUG("c_api", "live book of %s.%s restored from history: %zu bid and %zu ask "
