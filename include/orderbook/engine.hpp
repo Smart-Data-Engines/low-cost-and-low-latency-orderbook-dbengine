@@ -1022,6 +1022,9 @@ private:
     /// block is not grown - its rows copied again each time - on the way to its size. Under
     /// `flush_mtx_`, like `unsealed_`, and cleared wherever the stores are.
     std::unordered_map<ColumnarStore*, size_t> block_rows_hint_;
+    /// The rows the last drain that finished took, which the next scales its blocks' reservations by
+    /// (#281); 0 before the first. The drain's own, under `flush_mtx_`.
+    size_t last_drain_rows_{0};
     /// Where a sealed block's rows go back to and a drain takes them from (#165 part 2a); a
     /// drain takes about the pending queue's ceiling at most, so that is what is kept spare.
     std::shared_ptr<RowBufferPool> block_rows_pool_ = std::make_shared<RowBufferPool>(MAX_PENDING_ROWS);
