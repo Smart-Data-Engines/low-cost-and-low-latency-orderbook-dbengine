@@ -1339,6 +1339,19 @@ private:
 
     /// Queue the row of one level for the columnar flush, written in its slot (#270). Caller holds
     /// `mtx_`. `level_index` is the level's index in its update, as every row has always said.
+    ///
+    /// The row that brings the queue to half its ceiling asks for the flush (#276). The queue fills
+    /// at the write rate and empties a tick at a time, and until then only a writer that found no
+    /// room asked for a tick: under #190's ingest, 10.6-13.7 M levels a second against the default
+    /// 100 ms interval, the writers reached the ceiling before the interval did, 40-48 times in a
+    /// round of about 3 s, and each waited for a tick to take the queue, sync its WAL and drain it.
+    /// Asked for at half, the tick runs while the writers fill the other half, as often as the rate
+    /// needs. Between two takes of the queue one row reaches half, so one request is made: not again
+    /// by every writer between the request and the take, and not on account of the rows a tick holds
+    /// while it syncs and drains them, which count against the ceiling but are not in the queue -
+    /// either would follow each tick with another, for whatever came in while it ran. Rows put back
+    /// by a failed sync return all at once, not a row at a time: a flush that fails with half the
+    /// ceiling queued is retried by the interval or the ceiling, as before, not by every write.
     void queue_row(const RowName& name, const DeltaUpdate& delta, uint16_t level_index,
                    const Level& level, bool own) {
         PendingRow& pr = pending_rows_.emplace_back();
@@ -1352,6 +1365,7 @@ private:
         row.price           = level.price;
         row.quantity        = level.qty;
         row.order_count     = level.cnt;
+        if (pending_rows_.size() == MAX_PENDING_ROWS / 2) [[unlikely]] request_flush();
     }
     /// A queue of fixed-size chunks rather than a vector (stage 5 of #151): a flush tick takes
     /// every row queued so far in one short hold of mtx_, drains them without it, and gives each
