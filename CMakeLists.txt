@@ -494,10 +494,14 @@ target_link_libraries(orderbook_compaction PUBLIC orderbook_core)
 add_library(orderbook_admission STATIC src/admission.cpp src/sync_budget.cpp)
 target_link_libraries(orderbook_admission PUBLIC orderbook_core)
 
+# ── The names a pending row carries (#270) ────────────────────────────────────
+add_library(orderbook_row_names STATIC src/row_names.cpp)
+target_link_libraries(orderbook_row_names PUBLIC orderbook_core orderbook_logger)
+
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/engine_compaction.cpp src/replication.cpp
             src/book_arena.cpp src/wal_archive.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission orderbook_net)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission orderbook_net orderbook_row_names)
 
 # ── Backup and restore (#34) ──────────────────────────────────────────────────
 # The server's BACKUP and the offline ob_restore: engine-side, and nothing of the client, whose

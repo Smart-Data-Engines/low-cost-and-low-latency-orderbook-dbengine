@@ -16,6 +16,7 @@
 #include "orderbook/query_engine.hpp"
 #include "orderbook/snapshot.hpp"
 #include "orderbook/replication.hpp"
+#include "orderbook/row_names.hpp"
 #include "orderbook/scan_pool.hpp"
 #include "orderbook/book_arena.hpp"
 #include "orderbook/soa_buffer.hpp"
@@ -36,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -953,7 +955,17 @@ private:
     // install that clears this map (#92). `live_ptrs_` used to sit beside it as a raw-pointer
     // index of the same keys, populated and cleared in the same three places; one map cannot
     // disagree with itself.
-    std::unordered_map<std::string, std::shared_ptr<SoABuffer>> buffers_;
+    struct LiveBook {
+        std::shared_ptr<SoABuffer> buffer;
+        /// The name of the pair that made the book, from `row_names_` (#270): what a write of that
+        /// pair hands `RowNames::of()` as the name it expects, so that finding it hashes nothing.
+        const RowName* name{nullptr};
+    };
+    std::unordered_map<std::string, LiveBook> buffers_;
+
+    /// The names the pending rows carry (#270), one per (symbol, exchange) pair that ever had a row,
+    /// never freed while the engine lives. Made under `mtx_`; a name is read without it.
+    RowNames row_names_;
     // Where a new book's memory comes from (#51): this arena, or the heap when it is null.
     std::shared_ptr<BookArena> book_arena_ = std::make_shared<BookArena>(/*huge_pages=*/true);
 
@@ -1310,14 +1322,37 @@ private:
 
     // Pending rows for columnar flush
     struct PendingRow {
-        std::string symbol;
-        std::string exchange;
+        /// Its delta's symbol and exchange (#270). Two strings until then, built again for every
+        /// level of every write on the client loop; the name is made once per pair and stays put.
+        const RowName* name;
         SnapshotRow row;
         /// Whether this node wrote it (#184): a segment records its own rows' highest number, which
         /// a restart continues this node's counter from - every origin's highest, which is all a row
         /// could say, put holes in the stream a peer's frontier cannot pass.
-        bool own{true};
+        bool own;
     };
+    // 64 bytes where it was 120, and nothing to construct or destroy: a chunk is cleared without a
+    // walk over its rows (#270).
+    static_assert(sizeof(PendingRow) == 64, "a pending row is a name, a row and a flag");
+    static_assert(std::is_trivially_copyable_v<PendingRow> && std::is_trivially_destructible_v<PendingRow>,
+                  "a pending row owns nothing");
+
+    /// Queue the row of one level for the columnar flush, written in its slot (#270). Caller holds
+    /// `mtx_`. `level_index` is the level's index in its update, as every row has always said.
+    void queue_row(const RowName& name, const DeltaUpdate& delta, uint16_t level_index,
+                   const Level& level, bool own) {
+        PendingRow& pr = pending_rows_.emplace_back();
+        pr.name = &name;
+        pr.own = own;
+        SnapshotRow& row = pr.row;
+        row.timestamp_ns    = delta.timestamp_ns;
+        row.sequence_number = delta.sequence_number;
+        row.side            = delta.side;
+        row.level_index     = level_index;
+        row.price           = level.price;
+        row.quantity        = level.qty;
+        row.order_count     = level.cnt;
+    }
     /// A queue of fixed-size chunks rather than a vector (stage 5 of #151): a flush tick takes
     /// every row queued so far in one short hold of mtx_, drains them without it, and gives each
     /// chunk back as it is done. `chunked_queue.hpp` says what two swapped vectors did to memory
@@ -1393,7 +1428,8 @@ private:
     }
 
     // Backpressure: maximum number of pending rows before apply_delta blocks.
-    // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
+    // A million rows of 64 bytes - 64 MB, in chunks of 256 KiB - plus the names they point at, one per
+    // pair. 120 MB before #270, whose rows carried two strings. Prevents OOM under sustained ingestion.
     static constexpr size_t MAX_PENDING_ROWS = 1'000'000;
     std::condition_variable pending_cv_;  // signalled when pending_rows_ is drained
 
@@ -1406,6 +1442,9 @@ private:
     /// write on the hottest path in the engine (roadmap #66).
     SoABuffer&     get_or_create_buffer(const std::string& key, const char* symbol,
                                         const char* exchange);
+
+    /// The same book with the name of the pair that made it (#270), for a write that queues rows.
+    LiveBook&      get_or_create_book(const std::string& key, const char* symbol, const char* exchange);
 
     /// Convenience for callers that do not have the key yet.
     SoABuffer&     get_or_create_buffer(const std::string& symbol, const std::string& exchange);

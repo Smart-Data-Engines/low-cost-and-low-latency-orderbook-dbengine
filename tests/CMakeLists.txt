@@ -470,6 +470,17 @@ target_include_directories(test_chunked_queue PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 target_link_libraries(test_chunked_queue PRIVATE GTest::gtest_main rapidcheck rapidcheck_gtest)
 gtest_discover_tests(test_chunked_queue PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
+# Rows of several pairs, queued between each other and across chunks, stored under their own pair
+# (#270, whose drain finds a run of one pair by the pointer to its name).
+ob_add_engine_test(test_pending_row_names
+    test_pending_row_names.cpp
+)
+
+# The names a pending row carries by pointer (#270): one per pair, at an address that does not move.
+add_executable(test_row_names test_row_names.cpp)
+target_link_libraries(test_row_names PRIVATE orderbook_row_names GTest::gtest_main rapidcheck rapidcheck_gtest)
+gtest_discover_tests(test_row_names PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+
 ob_add_engine_test(test_sequence_numbers
     test_sequence_numbers.cpp
 )
