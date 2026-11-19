@@ -18,7 +18,7 @@ import tempfile
 import pytest
 
 from conftest import ClusterManager, free_port, patience, wait_for_role
-from test_compaction import Node, eventually, lowest_wal_file
+from test_compaction import Node, eventually, lowest_wal_file, request
 
 pytestmark = pytest.mark.replication
 
@@ -48,9 +48,19 @@ def fill(node_port: int, symbol: str, batches: int, first: int = 0) -> None:
 
 
 def serving(node: Node, symbol: str) -> list[int] | None:
-    """Every price, sorted; None while the node installs a snapshot."""
-    rows = node.rows_once_serving(symbol)
-    return None if rows is None else sorted(node.prices(symbol))
+    """Every price, sorted; None while the node installs a snapshot.
+
+    One request, so that the answer is one moment's (pitfall 576). Two - whether the node serves, then its
+    prices - let a new replica begin installing its snapshot between them: the second was answered
+    `ERR bootstrapping`, and the price reader raised inside the wait (PR #326's TSan run)."""
+    reply = request(node.port, f"SELECT * FROM '{symbol}'.'EX'")
+    if reply and reply[0].startswith("ERR") and "bootstrapping" in reply[0]:
+        return None
+    if reply and reply[0].startswith("ERR") and "not found" in reply[0]:
+        return []
+    assert reply and reply[0] == "OK" and len(reply) >= 2, reply
+    column = reply[1].split("\t").index("price")
+    return sorted(int(line.split("\t")[column]) for line in reply[2:])
 
 
 def test_a_replica_made_a_primary_after_a_snapshot_gives_a_new_replica_every_row():

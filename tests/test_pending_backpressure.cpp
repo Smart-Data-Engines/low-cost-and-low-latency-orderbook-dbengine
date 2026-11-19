@@ -19,11 +19,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <string>
@@ -75,23 +79,91 @@ std::string temp_dir(const std::string& prefix) {
     return path.string();
 }
 
-/// Write `kDeltas * kLevelsPerDelta` rows. Returns OB_OK, or the first refusal.
-ob::ob_status_t fill_past_the_ceiling(ob::Engine& engine) {
-    std::vector<ob::Level> levels(kLevelsPerDelta);
-    for (int d = 0; d < kDeltas; ++d) {
-        for (int l = 0; l < kLevelsPerDelta; ++l) {
-            levels[static_cast<size_t>(l)] = {10'000'000 - l, 100 + static_cast<uint64_t>(l),
-                                              1, 0};
-        }
-        ob::DeltaUpdate delta{};
-        std::strncpy(delta.symbol,   "BACKP", sizeof(delta.symbol)   - 1);
-        std::strncpy(delta.exchange, "EX",    sizeof(delta.exchange) - 1);
-        delta.timestamp_ns = 1'700'000'000'000'000'000ULL + static_cast<uint64_t>(d);
-        delta.side         = ob::SIDE_BID;
-        delta.n_levels     = static_cast<uint16_t>(kLevelsPerDelta);
-        if (auto st = engine.apply_delta(delta, levels.data()); st != ob::OB_OK) return st;
+/// Write delta number `d`, of `n_levels` rows.
+ob::ob_status_t write_delta(ob::Engine& engine, int d, int n_levels) {
+    std::vector<ob::Level> levels(static_cast<size_t>(n_levels));
+    for (int l = 0; l < n_levels; ++l) {
+        levels[static_cast<size_t>(l)] = {10'000'000 - l, 100 + static_cast<uint64_t>(l), 1, 0};
+    }
+    ob::DeltaUpdate delta{};
+    std::strncpy(delta.symbol,   "BACKP", sizeof(delta.symbol)   - 1);
+    std::strncpy(delta.exchange, "EX",    sizeof(delta.exchange) - 1);
+    delta.timestamp_ns = 1'700'000'000'000'000'000ULL + static_cast<uint64_t>(d);
+    delta.side         = ob::SIDE_BID;
+    delta.n_levels     = static_cast<uint16_t>(n_levels);
+    return engine.apply_delta(delta, levels.data());
+}
+
+/// Write deltas `from` to `to`, `kLevelsPerDelta` rows each. Returns OB_OK, or the first refusal.
+ob::ob_status_t write_deltas(ob::Engine& engine, int from, int to) {
+    for (int d = from; d < to; ++d) {
+        if (auto st = write_delta(engine, d, kLevelsPerDelta); st != ob::OB_OK) return st;
     }
     return ob::OB_OK;
+}
+
+/// Write `kDeltas * kLevelsPerDelta` rows. Returns OB_OK, or the first refusal.
+ob::ob_status_t fill_past_the_ceiling(ob::Engine& engine) { return write_deltas(engine, 0, kDeltas); }
+
+/// Half of `MAX_PENDING_ROWS`, in deltas: the last row of this many brings the queue to half its
+/// ceiling, and asks for the flush (#276).
+constexpr int kHalfTheCeiling = 500;
+
+uint64_t counter_or_fail(ob::Engine& engine, const std::string& name) {
+    const auto v = counter_value(engine.registry().serialize(), name);
+    EXPECT_TRUE(v.has_value()) << name << " is not in the exposition at all";
+    return v.value_or(0);
+}
+
+/// Waits up to `seconds` for a counter to reach `at_least`; returns its value then.
+uint64_t counter_once_at_least(ob::Engine& engine, const std::string& name, uint64_t at_least,
+                               int seconds) {
+    uint64_t v = 0;
+    for (int i = 0; i < seconds * 100; ++i) {
+        v = counter_or_fail(engine, name);
+        if (v >= at_least) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return v;
+}
+
+/// Waits up to `seconds` for the rows not yet in a segment to be `rows`; returns their number then.
+size_t queued_once_at(ob::Engine& engine, size_t rows, int seconds) {
+    size_t queued = 0;
+    for (int i = 0; i < seconds * 100; ++i) {
+        queued = engine.stats().pending_rows;
+        if (queued == rows) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return queued;
+}
+
+/// Returns once the tick that has taken the queue is over: a tick holds the flush's lock to its end, its seals
+/// included, and a tick asked for while it ran begins at once after it. Called once the queue is drained, so
+/// that the tick has begun. Without it a window for a second tick to show in closed while the first was
+/// still sealing - over a second in a Debug build - and a request it made the loop answer came after.
+void the_running_tick_is_over(ob::Engine& engine) { auto hold = engine.hold_flush_for_test(); }
+
+/// Writes `kDeltas` deltas, past the ceiling, with the flush held where it is about to take the
+/// queue: the tick asked for at half has begun - the loop cleared the request as it woke - and waits
+/// for the hold, so the writer goes on to the ceiling and waits there, and the hold is let go once it
+/// has. Since #276 that is how a writer reaches the ceiling at all: asked for at half, a tick takes
+/// the queue while the writers fill the other half.
+void write_past_the_ceiling_against_a_held_flush(ob::Engine& engine) {
+    std::future<ob::ob_status_t> rest;    // declared before the hold, so it is let go first
+    auto hold = engine.hold_flush_for_test();
+    ASSERT_EQ(write_deltas(engine, 0, kHalfTheCeiling), ob::OB_OK);
+    ASSERT_EQ(counter_once_at_least(engine, "ob_flush_ticks_total", 1, 30), 1u)
+        << "no tick began: half the ceiling was queued and no flush was asked for";
+    rest = std::async(std::launch::async,
+                      [&engine]() { return write_deltas(engine, kHalfTheCeiling, kDeltas); });
+    ASSERT_GE(counter_once_at_least(engine, "ob_writer_backpressure_waits_total", 1, 30), 1u)
+        << "the writer never waited, so it never reached the ceiling - or its wait is not counted";
+    hold.unlock();
+    ASSERT_EQ(rest.wait_for(std::chrono::seconds(60)), std::future_status::ready)
+        << "the writer did not finish within 60 s of the flush being let go";
+    ASSERT_EQ(rest.get(), ob::OB_OK)
+        << "a write was refused: the flush that was let go did not free room within the deadline";
 }
 
 }  // namespace
@@ -102,7 +174,9 @@ TEST(PendingBackpressure, AWriterAtTheCeilingWaitsForAFlushRatherThanForTheInter
     engine.open();
 
     // On another thread with a bound, so the unfixed code fails this test in a minute with a
-    // sentence rather than wedging the suite for an hour.
+    // sentence rather than wedging the suite for an hour. Since #276 the flush is asked for when half
+    // the ceiling is queued, so the writer may not reach the ceiling at all: "it finished" means a
+    // flush was asked for, at half or at the ceiling. That one at the ceiling still is, a test below.
     auto written = std::async(std::launch::async, [&engine]() { return fill_past_the_ceiling(engine); });
     const auto verdict = written.wait_for(std::chrono::seconds(60));
 
@@ -147,10 +221,7 @@ TEST(PendingBackpressure, TheWaitIsCountedSoAnOperatorCanSeeItHappened) {
     ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
     engine.open();
 
-    auto written = std::async(std::launch::async, [&engine]() { return fill_past_the_ceiling(engine); });
-    ASSERT_EQ(written.wait_for(std::chrono::seconds(60)), std::future_status::ready)
-        << "the writer never finished; the test above says what that means";
-    ASSERT_EQ(written.get(), ob::OB_OK);
+    ASSERT_NO_FATAL_FAILURE(write_past_the_ceiling_against_a_held_flush(engine));
 
     // The number is the point: a writer waited, and nothing about that is visible from outside
     // the process without it. Before #137 there was no line and no counter, which is why a node
@@ -166,6 +237,148 @@ TEST(PendingBackpressure, TheWaitIsCountedSoAnOperatorCanSeeItHappened) {
     ASSERT_TRUE(refusals.has_value());
     EXPECT_EQ(*refusals, 0u) << "a write was refused, so the flush never freed room";
 
+    engine.close();
+    fs::remove_all(dir);
+}
+
+TEST(PendingBackpressure, AWriterAtTheCeilingAsksForTheTickAfterTheOneItWaitsFor) {
+    // #137's request, after #276: a writer reaches the ceiling while a tick holds the queue, or after
+    // one has failed. The tick asked for at half is held here; the writer at the ceiling asks for the
+    // next, which takes what it wrote once the held one let it go - with the flush an hour away and no
+    // other row reaching half, there is no second tick without that request.
+    const std::string dir = temp_dir("backp_next_");
+    ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
+    engine.open();
+
+    ASSERT_NO_FATAL_FAILURE(write_past_the_ceiling_against_a_held_flush(engine));
+    // What the second tick takes depends on when it begins - with the writer's last rows or before
+    // them - so the ticks are counted, not the rows.
+    EXPECT_GE(counter_once_at_least(engine, "ob_flush_ticks_total", 2, 30), 2u)
+        << "the writer at the ceiling did not ask for the tick after the held one";
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 2u)
+        << "the held tick and the one the writer at the ceiling asked for, and no more";
+
+    engine.close();
+    fs::remove_all(dir);
+}
+
+TEST(PendingBackpressure, TheRowThatBringsTheQueueToHalfTheCeilingAsksForAFlush) {
+    // #276. The queue fills at the write rate and empties a tick at a time, and a writer asked for a
+    // tick only once the queue had no room left - so above a million rows an interval, every tick
+    // was one a writer had stopped for. The row that brings the queue to half the ceiling asks for
+    // it, and the tick runs while the writers fill the other half.
+    const std::string dir = temp_dir("backp_half_");
+    ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
+    engine.open();
+
+    // One row short of half. Nothing may tick - the interval is an hour away - and a window is given
+    // for a tick to show in.
+    ASSERT_EQ(write_deltas(engine, 0, kHalfTheCeiling - 1), ob::OB_OK);
+    ASSERT_EQ(write_delta(engine, kHalfTheCeiling - 1, kLevelsPerDelta - 1), ob::OB_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 0u)
+        << "499 999 rows queued were flushed, so something asks for a flush short of half the ceiling";
+
+    // The 500 000th row.
+    ASSERT_EQ(write_delta(engine, kHalfTheCeiling, 1), ob::OB_OK);
+    ASSERT_GE(counter_once_at_least(engine, "ob_flush_ticks_total", 1, 30), 1u)
+        << "half the ceiling was queued and no flush ran, so the writers would go on to the whole "
+           "of it and stop there, waiting for a tick nobody had asked for";
+    // Asked for once: a request the loop never clears would spin it.
+    ASSERT_EQ(queued_once_at(engine, 0, 30), 0u) << "the tick did not flush the queue within 30 s";
+    the_running_tick_is_over(engine);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 1u);
+    EXPECT_EQ(counter_or_fail(engine, "ob_writer_backpressure_waits_total"), 0u);
+
+    engine.close();
+    fs::remove_all(dir);
+}
+
+TEST(PendingBackpressure, RowsWrittenBeforeTheTickTakesTheQueueDoNotAskAgain) {
+    // #276. The loop clears the request as it wakes, and the tick takes the queue a moment later,
+    // under the engine's lock: a writer in between finds half the ceiling queued and nothing asked
+    // for. Asking again there would follow the tick with another, for whatever came in while it ran -
+    // which under a steady rate is every tick. The tick is held in between here.
+    const std::string dir = temp_dir("backp_window_");
+    ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
+    engine.open();
+
+    {
+        auto hold = engine.hold_flush_for_test();
+        ASSERT_EQ(write_deltas(engine, 0, kHalfTheCeiling), ob::OB_OK);
+        ASSERT_EQ(counter_once_at_least(engine, "ob_flush_ticks_total", 1, 30), 1u)
+            << "no tick began: half the ceiling was queued and no flush was asked for";
+        ASSERT_EQ(write_deltas(engine, kHalfTheCeiling, kHalfTheCeiling + 10), ob::OB_OK);
+    }
+    ASSERT_EQ(queued_once_at(engine, 0, 30), 0u) << "the held tick did not flush the queue within 30 s";
+    the_running_tick_is_over(engine);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 1u)
+        << "rows written while the tick was about to take them asked for another tick";
+
+    engine.close();
+    fs::remove_all(dir);
+}
+
+TEST(PendingBackpressure, TheRowsATickHoldsDoNotAskForTheNextOne) {
+    // #276. A tick's rows count against the ceiling until it has drained them, but they are not in
+    // the queue: a writer that asked for a tick on their account would follow every tick of half the
+    // ceiling with another, for whatever came in while it synced and drained.
+    const std::string dir = temp_dir("backp_held_");
+    ob::Engine engine(dir, kOneHourNs, kTheCeilingBinds);
+    engine.open();
+
+    // The first tick is held after it has taken the queue, until the test lets it go.
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false, released = false;
+    std::atomic<int> takes{0};
+    engine.while_syncing_wal_for_test([&] {
+        if (takes.fetch_add(1) != 0) return;
+        std::unique_lock<std::mutex> lock(m);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    });
+    const std::function<void()> release = [&] {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            released = true;
+        }
+        cv.notify_all();
+    };
+    // Let go and take the hook out on every way out of this test: the hook is set under the lock the
+    // held tick holds, and a hook left in would be called by close() after what it refers to is gone.
+    struct LetGo {
+        const std::function<void()>& let_go;
+        ob::Engine& e;
+        ~LetGo() {
+            let_go();
+            e.while_syncing_wal_for_test({});
+        }
+    } let_go{release, engine};
+
+    ASSERT_EQ(write_deltas(engine, 0, kHalfTheCeiling), ob::OB_OK);
+    {
+        std::unique_lock<std::mutex> lock(m);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30), [&] { return entered; }))
+            << "no tick took the queue: half the ceiling was queued and no flush was asked for";
+    }
+    // 500 000 rows are the held tick's and count against the ceiling; ten thousand more wait for the
+    // next tick, far short of half of it.
+    ASSERT_EQ(write_deltas(engine, kHalfTheCeiling, kHalfTheCeiling + 10), ob::OB_OK);
+    release();
+
+    ASSERT_EQ(queued_once_at(engine, 10'000, 30), 10'000u)
+        << "the held tick did not drain its rows within 30 s of being let go";
+    the_running_tick_is_over(engine);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 1u)
+        << "rows written while a tick held half the ceiling asked for another tick for ten thousand";
+
+    engine.while_syncing_wal_for_test({});
     engine.close();
     fs::remove_all(dir);
 }
