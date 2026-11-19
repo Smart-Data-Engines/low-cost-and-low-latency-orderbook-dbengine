@@ -156,11 +156,24 @@ public:
         flush_tick();
         // And the checkpoint its seal's sync was for (#190): a tick leaves that sync in the
         // background, and a test of what a tick leaves wants what the next one takes in.
-        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
-        receive_seal_sync(/*wait=*/true);
+        {
+            std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+            receive_seal_sync(/*wait=*/true);
+        }
+        // And the WAL files it let go, which it leaves to their own thread (#277).
+        await_wal_removals_for_test();
     }
-    /// One tick, leaving its seal's sync in the background as the loop's does (#190).
+    /// One tick, leaving its seal's sync in the background as the loop's does (#190), and its removal
+    /// of WAL files (#277).
     void flush_tick_leaving_the_sync_for_test() { flush_tick(); }
+    /// Returns once every removal of WAL files asked for is done (#277): what a test that reads the WAL
+    /// directory after a tick waits for. Holds no engine lock.
+    void await_wal_removals_for_test();
+    /// Hold every removal of WAL files where it is about to begin, until the lock is let go (#277): a
+    /// removal the device takes long over, on a test's schedule.
+    [[nodiscard]] std::unique_lock<std::mutex> hold_wal_removals_for_test() {
+        return std::unique_lock<std::mutex>(wal_removing_mtx_);
+    }
     /// Every unsealed block as if published `by` earlier, so that a test makes stores due by age
     /// without waiting `kSealAge` (#190 step 9).
     void age_unsealed_blocks_for_test(std::chrono::steady_clock::duration by);
@@ -1271,6 +1284,24 @@ private:
     uint64_t                     seal_sync_hold_from_{UINT64_MAX};   ///< see hold_seal_syncs_from_for_test()
     uint64_t                     seal_syncs_finished_{0};
 
+    /// The WAL files retention lets go are removed on a thread of their own (#277, wal_removal_loop()).
+    /// The unlink of a 512 MB file took the flush thread 34-37 ms on ext4 and 16-17 ms on XFS, twice in
+    /// a round of #190's ingest, while the writers filled the other half of the pending queue in 32-36 ms:
+    /// most of the steady state's writes that waited at the ceiling waited during one. A tick still
+    /// decides what may go, under mtx_, and asks; the thread removes every file below the highest index
+    /// asked for. Under wal_removal_mtx_: what was asked, what was done, whether a removal runs.
+    std::thread             wal_removal_thread_;
+    std::mutex              wal_removal_mtx_;
+    std::condition_variable wal_removal_cv_;
+    uint32_t                wal_removal_asked_{0};
+    uint32_t                wal_removal_done_{0};
+    bool                    wal_removal_running_{false};
+    bool                    wal_removal_stop_{false};
+    bool                    wal_removal_alive_{false};   ///< the loop runs
+    /// Held through every removal of WAL files - this thread's, and a new lineage's own in
+    /// begin_wal_lineage_locked() - so that two never walk the directory at once; and by a test.
+    std::mutex              wal_removing_mtx_;
+
     /// Set by a writer that has run out of room, cleared by the flush loop when it wakes.
     ///
     /// Without it a writer at the ceiling waits for `--flush-interval-ms` to elapse, because
@@ -1783,6 +1814,14 @@ private:
     void receive_seal_sync(bool wait);
     void seal_sync_loop();
     void stop_seal_sync();
+
+    /// Ask for the WAL files below `before_index` to be removed off the flush thread (#277); an index
+    /// no higher than one asked for already asks for nothing. Without the thread - before open(), after
+    /// close() - they are removed here.
+    void ask_wal_removal(uint32_t before_index);
+    void wal_removal_loop();
+    /// Stop the thread once every removal asked for is done.
+    void stop_wal_removal();
 
     /// flush_incremental(), and with `claim_regardless` a checkpoint whatever it sealed.
     void flush_everything(bool claim_regardless);

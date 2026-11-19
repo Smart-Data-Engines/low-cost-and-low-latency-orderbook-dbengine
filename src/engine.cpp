@@ -609,6 +609,18 @@ void Engine::open() {
         query_engine_->set_scan_pool(scan_pool_.get());
     }
 
+    // The removal of the WAL files retention lets go (#277), before the flush thread whose ticks ask
+    // for it; under every policy, since `none` lets files go as well.
+    if (!wal_removal_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+            wal_removal_stop_ = false;
+        }
+        wal_removal_thread_ = std::thread([this]() {
+            run_thread_body("engine", "wal_removal_loop", [this] { wal_removal_loop(); });
+        });
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() {
@@ -688,6 +700,9 @@ void Engine::close() {
     if (flush_thread_.joinable()) {
         flush_thread_.join();
     }
+    // The removals the last ticks asked for, done before close() returns (#277): a WAL directory left
+    // as a stop before #277 left it.
+    stop_wal_removal();
     // The archive's thread after the retention that read it.
     if (wal_archiver_) wal_archiver_->stop();
 
@@ -1153,7 +1168,12 @@ void Engine::begin_wal_lineage_locked(const char* why) {
                          old_dir.c_str(), wal_archiver_->archived_before(), pass.failure.c_str());
         }
     }
-    const size_t removed = wal_.truncate_before(first.file_index);
+    size_t removed = 0;
+    {
+        // Not beside the removal thread (#277): one walk of the directory at a time.
+        std::lock_guard<std::mutex> removing(wal_removing_mtx_);
+        removed = wal_.truncate_before(first.file_index);
+    }
     if (wal_archiver_) wal_archiver_->set_lineage(fresh);
     if (const int err = sync_directory(wal_dir_); err != 0) {
         OB_LOG_WARN("engine", "The WAL directory %s could not be synced after the old lineage's files "
@@ -3950,7 +3970,8 @@ void Engine::flush_tick() {
         // without it (stage 5 of #151). An unlink of a 512 MB WAL file, or of every file of every
         // expired segment, is I/O no writer ever needed to wait for - and both only read what they
         // are handed: `truncate_before()` touches nothing of the writer but its directory's name,
-        // and the combined store has its own lock, which queries take and writers do not.
+        // and the combined store has its own lock, which queries take and writers do not. The WAL's
+        // files are removed off this thread as well (#277): the next tick does not wait for them.
         uint32_t safe_truncate = 0;
         {
             TimedLock timed(mtx_, "flush tick: what retention may remove");
@@ -3993,7 +4014,7 @@ void Engine::flush_tick() {
             }
         }
         if (safe_truncate > 0) {
-            wal_.truncate_before(safe_truncate);
+            ask_wal_removal(safe_truncate);
         }
         if (wal_archiver_) publish_wal_archive_gauges();
 
@@ -5066,6 +5087,96 @@ void Engine::stop_seal_sync() {
     }
     seal_sync_cv_.notify_all();
     if (seal_sync_thread_.joinable()) seal_sync_thread_.join();
+}
+
+void Engine::ask_wal_removal(uint32_t before_index) {
+    // Caller holds no engine lock: the flush tick asks after it has decided, under mtx_, what may go.
+    bool here = false;
+    {
+        std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+        if (before_index <= wal_removal_asked_) return;   // asked for already, or done
+        wal_removal_asked_ = before_index;
+        here = !wal_removal_alive_;
+    }
+    if (!here) {
+        wal_removal_cv_.notify_all();
+        OB_LOG_DEBUG("engine", "The WAL files below %u are asked to be removed off the flush thread",
+                     before_index);
+        return;
+    }
+    // No thread to hand them to - before open(), after close() - so removed here, as before #277.
+    std::lock_guard<std::mutex> removing(wal_removing_mtx_);
+    const size_t removed = wal_.truncate_before(before_index);
+    {
+        std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+        wal_removal_done_ = std::max(wal_removal_done_, before_index);
+    }
+    wal_removal_cv_.notify_all();
+    OB_LOG_DEBUG("engine", "The WAL files below %u removed on the asking thread, the removal thread not "
+                           "running: %zu file(s)",
+                 before_index, removed);
+}
+
+void Engine::wal_removal_loop() {
+    std::unique_lock<std::mutex> lock(wal_removal_mtx_);
+    wal_removal_alive_ = true;
+    OB_LOG_DEBUG("engine", "WAL removal thread started");
+    for (;;) {
+        wal_removal_cv_.wait(lock, [this] {
+            return wal_removal_stop_ || wal_removal_asked_ > wal_removal_done_;
+        });
+        // Asked for before it was stopped, done before it stops: close() leaves the directory as a
+        // tick that removed its files itself did.
+        if (wal_removal_asked_ <= wal_removal_done_) break;
+        const uint32_t before = wal_removal_asked_;
+        wal_removal_running_ = true;
+        lock.unlock();
+
+        // Guarded as the seal sync is: a removal that throws - a file the process may not unlink - is
+        // said and the loop goes on, and the next index a tick asks for removes it with the rest, since
+        // every file below an index goes. Ended, no file would be removed again for the life of the node.
+        size_t removed = 0;
+        double took = 0;
+        try {
+            std::lock_guard<std::mutex> removing(wal_removing_mtx_);
+            const auto began = std::chrono::steady_clock::now();
+            removed = wal_.truncate_before(before);
+            took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began)
+                       .count();
+        } catch (const std::exception& e) {
+            OB_LOG_WARN("engine", "Removing the WAL files below %u failed (%s); the next file retention "
+                                  "lets go removes them with it",
+                        before, e.what());
+        }
+        if (removed > 0) {
+            OB_LOG_DEBUG("engine", "WAL files below %u removed off the flush thread: %zu file(s) in %.1f ms",
+                         before, removed, took);
+        }
+
+        lock.lock();
+        wal_removal_running_ = false;
+        wal_removal_done_ = std::max(wal_removal_done_, before);
+        wal_removal_cv_.notify_all();   // await_wal_removals_for_test(), stop_wal_removal()
+    }
+    wal_removal_alive_ = false;
+    wal_removal_cv_.notify_all();
+    OB_LOG_DEBUG("engine", "WAL removal thread stopped, files below %u removed", wal_removal_done_);
+}
+
+void Engine::stop_wal_removal() {
+    {
+        std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+        wal_removal_stop_ = true;
+    }
+    wal_removal_cv_.notify_all();
+    if (wal_removal_thread_.joinable()) wal_removal_thread_.join();
+}
+
+void Engine::await_wal_removals_for_test() {
+    std::unique_lock<std::mutex> lock(wal_removal_mtx_);
+    wal_removal_cv_.wait(lock, [this] {
+        return (!wal_removal_running_ && wal_removal_asked_ <= wal_removal_done_) || !wal_removal_alive_;
+    });
 }
 
 void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels, bool own) {

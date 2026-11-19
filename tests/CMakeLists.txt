@@ -718,6 +718,11 @@ ob_add_engine_test(test_field_usage
 ob_add_engine_test(test_pending_backpressure
     test_pending_backpressure.cpp
 )
+
+# The WAL files retention lets go are removed off the flush thread (#277).
+ob_add_engine_test(test_wal_removal
+    test_wal_removal.cpp
+)
 target_compile_definitions(test_field_usage
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
