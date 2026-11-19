@@ -272,11 +272,11 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
                 continue;
             }
             // A summary holds the rows of its instants in the order a read delivered them when it was
-            // composed; a segment that changes that order falsifies it as a late row does (#278).
+            // composed; a segment that changes that order falsifies it as a late row does (#278). From
+            // the segment's first row: a summary is as of the newest segment's end when it is written, so
+            // none can be between that and the first instant whose order changes.
             SymbolIndex& si = by_symbol_[index_key(meta.symbol, meta.exchange)];
-            if (const std::optional<uint64_t> from = reordered_from_locked(si, meta)) {
-                falsify_summaries_locked(si, *from, falsified);
-            }
+            if (reorders_locked(si, meta)) falsify_summaries_locked(si, meta.start_ts_ns, falsified);
         }
         if (entry.tiers.empty() && entry.blocks.empty()) by_symbol_.erase(index_key(symbol, exchange));
     }
@@ -3225,24 +3225,21 @@ void ColumnarStore::report_falsified(const std::vector<std::string>& files, std:
     remove_summary_files(files, why);
 }
 
-std::optional<uint64_t> ColumnarStore::reordered_from_locked(const SymbolIndex& si, const SegmentMeta& added) {
-    std::optional<uint64_t> from;
+bool ColumnarStore::reorders_locked(const SymbolIndex& si, const SegmentMeta& added) {
     for (const WidthTier& tier : si.tiers) {
         // The first of this tier's segments delivered after it: of those, the one that starts first, so
         // the only one to look at - if it starts after `added` ends, so do the rest.
         const auto& v = tier.segments;
         const auto after = std::upper_bound(v.begin(), v.end(), added, segment_order_less);
         if (after == v.end() || after->start_ts_ns > added.end_ts_ns) continue;
-        if (!from || after->start_ts_ns < *from) from = after->start_ts_ns;
-    }
-    if (from) {
-        OB_LOG_DEBUG("columnar", "segment %s of %s.%s is delivered before one indexed already that has rows "
-                                 "from %llu, inside its range [%llu, %llu]: a tie there changes places",
+        OB_LOG_DEBUG("columnar", "segment %s of %s.%s, [%llu, %llu], is delivered before %s, which starts "
+                                 "inside its range: a tie on a time they share changes places",
                      added.dir_path.c_str(), added.symbol.c_str(), added.exchange.c_str(),
-                     static_cast<unsigned long long>(*from), static_cast<unsigned long long>(added.start_ts_ns),
-                     static_cast<unsigned long long>(added.end_ts_ns));
+                     static_cast<unsigned long long>(added.start_ts_ns),
+                     static_cast<unsigned long long>(added.end_ts_ns), after->dir_path.c_str());
+        return true;
     }
-    return from;
+    return false;
 }
 
 void ColumnarStore::drop_summaries_in_locked(SymbolIndex& si, const std::string& dir) {

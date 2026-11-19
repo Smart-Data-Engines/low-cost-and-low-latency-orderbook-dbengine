@@ -1186,13 +1186,12 @@ private:
     static void remove_summary_files(const std::vector<std::string>& files, std::string_view why);
     /// The same, and an INFO line counting the summaries and tracks and saying why they went.
     static void report_falsified(const std::vector<std::string>& files, std::string_view why);
-    /// The first instant whose rows `added`, just put in `si`, puts in another order than a read
-    /// delivered them in before it went in (#278), or none. A tie on a timestamp goes to the row
-    /// delivered last - segments by start, then blocks - and the rows of a sealed segment were a
-    /// block's, delivered after every segment: they keep their place unless the segment starts before
-    /// one already indexed that has rows at an instant it has too. The start of the first such
-    /// segment, which is that instant or before it. Caller holds the lock.
-    static std::optional<uint64_t> reordered_from_locked(const SymbolIndex& si, const SegmentMeta& added);
+    /// Whether `added`, a sealed segment just put in `si`, can put the rows of an instant in another
+    /// order than a read delivered them in before it went in (#278). A tie on a timestamp goes to the
+    /// row delivered last - segments by start, then blocks - and its rows were a block's, delivered
+    /// after every segment: they keep their place unless a segment delivered after it now has a range
+    /// that reaches into its own. Caller holds the lock.
+    static bool reorders_locked(const SymbolIndex& si, const SegmentMeta& added);
     /// The summaries in an indexed segment's directory, put in its symbol's map. Caller holds the lock.
     void register_summaries_locked(const SegmentMeta& meta);
     /// The summaries whose files are in `dir`, out of `si`: the segment they are in is leaving the
