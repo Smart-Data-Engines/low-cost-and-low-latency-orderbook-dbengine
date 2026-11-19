@@ -194,13 +194,13 @@ uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* __restrict o
             g = h;
             if (g == 1) {
                 out[i] = put(negative, m);
-                ++i;
                 break;
             }
             d = Divisor(g);
             out[i] = put(negative, d.quotient(m));
         }
         if (g > 1) return g;
+        ++i;   // past the value at which the divisor came to 1, written above
     }
     // No divisor: the rest as they are.
     for (; i < n; ++i) {

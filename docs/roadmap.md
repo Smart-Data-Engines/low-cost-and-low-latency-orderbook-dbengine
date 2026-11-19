@@ -2946,7 +2946,9 @@ the hint (`tests/test_column_codec_equivalence.cpp`). The benchmark's hash of ev
 master's on both recordings, in both formats, on both test hosts, in every run of every step.
 
 **Measured** with Release builds on the test hosts, `master` (`1a8f725`, master's code and the
-benchmark) against this change (`dbb862b`; the commits since move two comments). Each build's rounds were
+benchmark) against this change (`dbb862b`). The commits since move two comments, and answer two CodeQL
+notes: a constant unused in one branch of a template, and a loop counter moved in the loop's body. Each
+build's rounds were
 interleaved with the other's: the benchmark three rounds each, and under #190's ingest three rounds each.
 
 | | m9g.xlarge before | after | m8a.xlarge before | after |

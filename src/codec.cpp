@@ -157,12 +157,12 @@ static inline uint64_t pack_values(const uint64_t* v, std::integer_sequence<unsi
 template <unsigned Sel>
 static inline uint64_t pack_word(const uint64_t* v) noexcept {
     constexpr unsigned bits = kSelectors[Sel].bits;
-    constexpr unsigned count = kSelectors[Sel].count;
     if constexpr (bits == 0) {
         (void)v;
         return uint64_t{Sel} << 60;
     } else {
-        return (uint64_t{Sel} << 60) | pack_values<bits>(v, std::make_integer_sequence<unsigned, count>{});
+        return (uint64_t{Sel} << 60) |
+               pack_values<bits>(v, std::make_integer_sequence<unsigned, kSelectors[Sel].count>{});
     }
 }
 
