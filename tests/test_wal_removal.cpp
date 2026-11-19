@@ -91,11 +91,14 @@ TEST(WalRemoval, ATickLeavesTheRemovalOfTheFilesItLetsGoToTheirOwnThread) {
     const std::vector<uint32_t> before = files_retention_may_take(*engine, dir.path);
     ASSERT_GE(before.size(), 4u) << "the writes did not make the WAL files this test needs";
 
+    // Declared before the hold, so that a failure below lets the hold go before this waits for the tick: the
+    // other way round, a tick that waited for the removal would wait for the hold, and the test for the tick.
+    std::future<void> tick;
     {
         // Held where a removal is about to begin: a tick that removed its files itself would remove
         // them anyway, and one that waited for the removal would not return.
         auto hold = engine->hold_wal_removals_for_test();
-        auto tick = std::async(std::launch::async, [&engine] { engine->flush_tick_leaving_the_sync_for_test(); });
+        tick = std::async(std::launch::async, [&engine] { engine->flush_tick_leaving_the_sync_for_test(); });
         ASSERT_EQ(tick.wait_for(std::chrono::seconds(10)), std::future_status::ready)
             << "the tick did not return while the removal it asked for was held: it waits for it";
         EXPECT_EQ(wal_files(dir.path), before)
