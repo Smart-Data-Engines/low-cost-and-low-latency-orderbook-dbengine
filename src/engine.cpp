@@ -180,7 +180,7 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
           [this](const std::string& key) -> std::shared_ptr<SoABuffer> {
               std::lock_guard<std::mutex> lock(mtx_);
               auto it = buffers_.find(key);
-              return (it == buffers_.end()) ? nullptr : it->second;
+              return (it == buffers_.end()) ? nullptr : it->second.buffer;
           },
           agg_))
     , repl_config_(std::move(repl_config))
@@ -1690,8 +1690,8 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
         const size_t removed = plan_side_replacements(
             writes, s, [this](const std::string& key, uint8_t side) -> const SoASide* {
                 const auto it = buffers_.find(key);
-                if (it == buffers_.end() || !it->second) return nullptr;
-                return side == SIDE_BID ? &it->second->bid : &it->second->ask;
+                if (it == buffers_.end() || !it->second.buffer) return nullptr;
+                return side == SIDE_BID ? &it->second.buffer->bid : &it->second.buffer->ask;
             });
         if (removed != 0) {
             registry_.increment_counter("ob_replace_side_removed_levels_total", removed);
@@ -1859,9 +1859,9 @@ void Engine::broadcast_to_replicas(const DeltaUpdate& delta, const Level* levels
 ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& delta,
                                     const Level* levels) {
     // Apply to SoA buffer using seqlock writer protocol.
-    SoABuffer& buf = get_or_create_buffer(key, delta.symbol, delta.exchange);
+    LiveBook& book = get_or_create_book(key, delta.symbol, delta.exchange);
     bool gap_detected = false;   // unused: gaps are decided per origin in observe_sequence()
-    const ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
+    const ob_status_t status = ob::apply_delta(*book.buffer, delta, levels, gap_detected);
 
     // Enqueue SnapshotRows for background columnar flush + collect them for subscribers.
     //
@@ -1872,19 +1872,13 @@ ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& d
     // `has_subscribers()` is one relaxed atomic read and it is checked first because zero
     // subscriptions is the case in every deployment that does not use them: nothing below runs and
     // no lock is taken. It may read high for a moment and never low, so a row is never dropped.
+    //
+    // A row carries its pair's name by pointer (#270), found once per update - the book's, compared
+    // and not hashed, unless another pair shares the book's key.
     const size_t rows_before = pending_rows_.size();
-
+    const RowName& name = row_names_.of(delta.symbol, delta.exchange, book.name);
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
-        pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/true});
+        queue_row(name, delta, i, levels[i], /*own=*/true);
     }
 
     // Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
@@ -2042,7 +2036,8 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     // 4. Apply winning levels to SoA buffer.
     if (!winning_levels.empty()) {
-        SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
+        LiveBook& book = get_or_create_book(symbol_key, delta.symbol, delta.exchange);
+        SoABuffer& buf = *book.buffer;
 
         // Build a filtered DeltaUpdate + Level array for winning levels only.
         if (winning_levels.size() == static_cast<size_t>(delta.n_levels)) {
@@ -2076,18 +2071,9 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
         // that subscribed from another thread is notified from here. That is what made the
         // unsynchronised subscription list a live race rather than a latent one.
         const size_t rows_before = pending_rows_.size();
-
+        const RowName& name = row_names_.of(delta.symbol, delta.exchange, book.name);
         for (uint16_t idx : winning_levels) {
-            SnapshotRow row{};
-            row.timestamp_ns    = delta.timestamp_ns;
-            row.sequence_number = delta.sequence_number;
-            row.side            = delta.side;
-            row.level_index     = idx;
-            row.price           = levels[idx].price;
-            row.quantity        = levels[idx].qty;
-            row.order_count     = levels[idx].cnt;
-
-            pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/false});
+            queue_row(name, delta, idx, levels[idx], /*own=*/false);
         }
 
         if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
@@ -3579,8 +3565,13 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
 
 SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symbol,
                                         const char* exchange) {
+    return *get_or_create_book(key, symbol, exchange).buffer;
+}
+
+Engine::LiveBook& Engine::get_or_create_book(const std::string& key, const char* symbol,
+                                             const char* exchange) {
     auto it = buffers_.find(key);
-    if (it != buffers_.end()) return *it->second;
+    if (it != buffers_.end()) return it->second;
 
     auto buf = book_arena_ ? std::allocate_shared<SoABuffer>(BookArenaAllocator<SoABuffer>(book_arena_))
                            : std::make_shared<SoABuffer>();
@@ -3593,8 +3584,11 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
     std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
 
-    auto& ref = *buf;
-    buffers_[key] = std::move(buf);
+    // The name its rows will carry, made now with the book: a write of this pair then finds it by
+    // comparing two strings rather than hashing them (#270).
+    const RowName& name = row_names_.of(symbol, exchange);
+    LiveBook& ref = buffers_[key];
+    ref = LiveBook{std::move(buf), &name};
 
     // Update gauge: symbol count after adding new symbol.
     registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
@@ -4282,32 +4276,29 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         combined_store_.publish_blocks(blocks);
     };
 
+    // The store is resolved per **run of one pair**, not per row. Pending rows arrive an update at a
+    // time and an update is one pair's levels, so consecutive rows almost always share a pair - and
+    // `get_or_create_store()` builds `symbol + "." + exchange` and hashes it on every call. Measured
+    // before this: `get_or_create_store` was **5.06%** of the server's CPU under a pipelining
+    // client, all of it inside this loop, for a lookup whose answer had just been computed. Same
+    // shape as #66, which found the write path building one symbol key four times.
+    //
+    // A run is the rows of one name, compared by pointer (#270), and it goes on across chunks: a
+    // name is not in a chunk. Until then a row carried two strings, the run compared both of them on
+    // every row, and it started again at each chunk because the strings it pointed at were cleared
+    // with their chunk.
+    const RowName* run_name = nullptr;
+    Collected* current      = nullptr;
     size_t appended = 0;
     for (size_t k = 0; k < batch.chunks.size(); ++k) {
         PendingQueue::Chunk& chunk = *batch.chunks[k];
         const size_t rows_here = chunk.size();
-
-        // The store is resolved per **run of one symbol**, not per row. Pending rows arrive an
-        // update at a time and an update is one symbol's levels, so consecutive rows almost always
-        // share a symbol — and `get_or_create_store()` builds `symbol + "." + exchange` and hashes
-        // it on every call. Measured before this: `get_or_create_store` was **5.06%** of the
-        // server's CPU under a pipelining client, all of it inside this loop, for a lookup whose
-        // answer had just been computed. Same shape as #66, which found the write path building one
-        // symbol key four times.
-        //
-        // A run starts again at each chunk: the pointers below point into this chunk's rows, and
-        // the chunk is cleared before the next one is read - so a run carried across would compare
-        // the next row with a destroyed string. It costs one lookup per chunk of 4096 rows.
-        const std::string* run_symbol   = nullptr;
-        const std::string* run_exchange = nullptr;
-        Collected* current              = nullptr;
         try {
             for (; chunk.first < chunk.rows.size(); ++chunk.first) {
                 const PendingRow& pr = chunk.rows[chunk.first];
-                if (current == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
-                    ColumnarStore* store = &get_or_create_store(pr.symbol, pr.exchange, mtx_held);
-                    run_symbol   = &pr.symbol;
-                    run_exchange = &pr.exchange;
+                if (pr.name != run_name) {
+                    ColumnarStore* store = &get_or_create_store(pr.name->symbol, pr.name->exchange, mtx_held);
+                    run_name = pr.name;
                     auto [at, fresh] = slot_of.try_emplace(store, drained.size());
                     if (fresh) {
                         const auto hint = block_rows_hint_.find(store);
@@ -4355,8 +4346,9 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
             throw;
         }
 
-        // Cleared, given back and released from the ceiling, all without mtx_ - destroying 4096
-        // rows is work no writer should wait behind, and the spare chunks have a lock of their own.
+        // Cleared, given back and released from the ceiling, all without mtx_ - the spare chunks have
+        // a lock of their own. Clearing destroyed 4096 rows, two strings each, until #270; a row
+        // owns nothing now, so it destroys none.
         // Taking mtx_ here instead starved the drain at four pipelining connections: ~250
         // acquisitions a tick, each behind every writer, and 10.6 -> 9.0 M levels/s (m9g.xlarge).
         // Given back **before** it leaves the ceiling, so a writer the release lets on finds the
@@ -5071,21 +5063,13 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels,
     // would append a second GAP for the same hole on every restart.
     const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
 
-    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
+    LiveBook& book = get_or_create_book(symbol_key, delta.symbol, delta.exchange);
     bool gap_detected = false;
-    (void)ob::apply_delta(buf, delta, levels, gap_detected);
+    (void)ob::apply_delta(*book.buffer, delta, levels, gap_detected);
 
+    const RowName& name = row_names_.of(delta.symbol, delta.exchange, book.name);
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
-        pending_rows_.push_back({delta.symbol, delta.exchange, row, own});
+        queue_row(name, delta, i, levels[i], own);
     }
 }
 
