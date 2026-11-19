@@ -723,6 +723,9 @@ ob_add_engine_test(test_pending_backpressure
 ob_add_engine_test(test_wal_removal
     test_wal_removal.cpp
 )
+ob_add_engine_test(test_thread_names
+    test_thread_names.cpp
+)
 target_compile_definitions(test_field_usage
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )

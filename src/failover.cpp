@@ -61,6 +61,7 @@ void FailoverManager::start() {
         monitor_thread_ = std::thread([this] {
             run_thread_body("failover", "monitor_loop", [this] { monitor_loop(); });
         });
+        name_thread(monitor_thread_, "ob-failover");
         return;
     }
 
@@ -107,6 +108,7 @@ void FailoverManager::start() {
     monitor_thread_ = std::thread([this] {
             run_thread_body("failover", "monitor_loop", [this] { monitor_loop(); });
         });
+    name_thread(monitor_thread_, "ob-failover");
 }
 
 // ── stop() ──────────────────────────────────────────────────────────────────

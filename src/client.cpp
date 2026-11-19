@@ -1568,6 +1568,7 @@ OrderbookPool::OrderbookPool(PoolConfig config)
     health_thread_ = std::thread([this] {
         run_thread_body("pool", "health_check_loop", [this] { health_check_loop(); });
     });
+    name_thread(health_thread_, "ob-pool-health");
 }
 
 OrderbookPool::~OrderbookPool() {

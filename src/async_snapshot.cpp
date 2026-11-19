@@ -94,6 +94,7 @@ bool AsyncSnapshotBuilder::start(uint64_t token, Producer produce) {
         worker_ = std::thread([work = std::move(work)]() mutable {
             run_thread_body("async_snapshot", "worker", work);
         });
+        name_thread(worker_, "ob-snapshot");
     } catch (const std::system_error& e) {
         running_ = false;
         OB_LOG_ERROR("async_snapshot", "Cannot start a worker for token %llu: %s",

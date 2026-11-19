@@ -280,12 +280,12 @@ TlsHandshakePool::TlsHandshakePool(unsigned threads, std::chrono::milliseconds t
     try {
         for (unsigned i = 0; i < threads; ++i) {
             TlsHandshakeWorker* w = workers_[i].get();
+            // Named so `top -H` says which thread is which; "ob-tls-63" is within the kernel's fifteen.
+            const std::string name = "ob-tls-" + std::to_string(i);
             threads_.push_back(std::thread([w] {
                 run_thread_body("tls", "a TLS handshake thread", [&] { w->run_loop(); });
             }));
-            // Named so `top -H` says which thread is which; "ob-tls-63" is within the kernel's fifteen.
-            const std::string name = "ob-tls-" + std::to_string(i);
-            pthread_setname_np(threads_.back().native_handle(), name.c_str());
+            name_thread(threads_.back(), name.c_str());
         }
     } catch (const std::exception& e) {
         // A thread the system would not start: those started are stopped and joined, which a

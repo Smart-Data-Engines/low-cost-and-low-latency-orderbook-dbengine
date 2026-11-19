@@ -50,6 +50,7 @@ void ShardCoordinator::start() {
     watch_thread_ = std::thread([this]() {
         run_thread_body("shard_coord", "watch_loop", [this] { watch_loop(); });
     });
+    name_thread(watch_thread_, "ob-shards-watch");
 
     OB_LOG_INFO("shard_coord", "Coordinator started for shard=%s: %s, map version=%lu",
                 config_.shard_id.c_str(), joined_ ? "in the shard map" : "not registered yet",
@@ -540,6 +541,7 @@ bool ShardCoordinator::initiate_migration(const std::string& symbol_key,
         std::lock_guard<std::mutex> lock(mtx_);
         if (migration_.phase != "unknown") migrating_ = false;
     });
+    name_thread(migration_thread_, "ob-shard-move");
     return true;
 }
 

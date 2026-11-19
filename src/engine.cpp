@@ -581,6 +581,7 @@ void Engine::open() {
         seal_sync_thread_ = std::thread([this]() {
             run_thread_body("engine", "seal_sync_loop", [this] { seal_sync_loop(); });
         });
+        name_thread(seal_sync_thread_, "ob-seal-sync");
     }
 
     // The WAL archive (#34), before the flush thread whose retention waits for it. Its lineage is the
@@ -619,6 +620,7 @@ void Engine::open() {
         wal_removal_thread_ = std::thread([this]() {
             run_thread_body("engine", "wal_removal_loop", [this] { wal_removal_loop(); });
         });
+        name_thread(wal_removal_thread_, "ob-wal-removal");
     }
 
     // Start background flush thread.
@@ -626,6 +628,7 @@ void Engine::open() {
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+    name_thread(flush_thread_, "ob-flush");
 }
 
 void Engine::set_loop_load(const LoopLoad* load, unsigned cpus) {
