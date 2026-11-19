@@ -22,7 +22,11 @@
 
 #include "orderbook/logger.hpp"
 
+#include <pthread.h>
+
+#include <cstring>
 #include <exception>
+#include <thread>
 #include <utility>
 
 namespace ob {
@@ -42,6 +46,17 @@ void run_thread_body(const char* component, const char* name, Body&& body) noexc
     } catch (...) {
         OB_LOG_ERROR(component, "%s ended on a non-standard exception and that thread is gone",
                      name);
+    }
+}
+
+/// Name a thread as `top -H`, `perf` and `/proc/<pid>/task/*/comm` show it (#283): `ob-` and what it does, at
+/// most 15 characters, the kernel's limit. Called where the thread is started, beside the boundary above, and
+/// held by the same test (`tests/test_thread_boundaries.cpp`). A thread nobody named carried the name of the
+/// one that started it: the flush thread, the seal's sync and the WAL's removal were all `ob_tcp_server` in a
+/// profile, which could not tell them apart.
+inline void name_thread(std::thread& t, const char* name) noexcept {
+    if (const int err = pthread_setname_np(t.native_handle(), name); err != 0) {
+        OB_LOG_WARN("thread", "a thread could not be named %s: %s", name, std::strerror(err));
     }
 }
 

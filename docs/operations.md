@@ -325,8 +325,11 @@ What does matter:
 
 ### CPU placement
 
-The hot path is the client event loops (`--io-threads`, named `ob-io-0` …), one flush thread, and
-in multi-master one more io loop. By default there is **one client loop per CPU the node may use**
+The hot path is the client event loops (`--io-threads`, named `ob-io-0` …), one flush thread
+(`ob-flush`), and in multi-master one more io loop (`ob-mm-io`). Beside them the seal's sync
+(`ob-seal-sync`) and the removal of the WAL files retention lets go (`ob-wal-removal`) work in the
+background, and every other thread of the node has an `ob-` name of its own too (#283), so `top -H`
+says which of them takes the CPU. By default there is **one client loop per CPU the node may use**
 and each spins for 10 µs after an event where there is a CPU to spare — the `boost` profile, sized
 at startup to the mask and the cgroup limit it finds (`docs/cli.md`, "Profiles"). On a host the
 engine shares with other work, `--profile eco` is one loop blocking between events, the engine as it

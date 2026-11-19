@@ -1000,6 +1000,7 @@ void CoordinatorClient::watch_leader(LeaseEventCallback cb) {
     impl_->watch_thread = std::thread([watch = std::move(watch)]() mutable {
         run_thread_body("coordinator", "watch", watch);
     });
+    name_thread(impl_->watch_thread, "ob-coord-watch");
 }
 
 void CoordinatorClient::stop_watch() {

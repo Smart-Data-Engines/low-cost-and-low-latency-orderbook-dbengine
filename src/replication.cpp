@@ -475,6 +475,7 @@ void ReplicationManager::start() {
     running_.store(true, std::memory_order_release);
     thread_ = std::thread([this]() {
         run_thread_body("repl_mgr", "run_loop", [this] { run_loop(); });
+    name_thread(thread_, "ob-repl-primary");
     });
 }
 
@@ -2116,6 +2117,7 @@ void ReplicationClient::start() {
     running_.store(true, std::memory_order_release);
     thread_ = std::thread([this]() {
         run_thread_body("repl_client", "run_loop", [this] { run_loop(); });
+    name_thread(thread_, "ob-repl-replica");
     });
 }
 

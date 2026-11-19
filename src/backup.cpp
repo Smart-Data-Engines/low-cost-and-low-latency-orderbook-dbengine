@@ -1125,6 +1125,7 @@ BackupRunner::Start BackupRunner::start(std::string& name) {
         thread_ = std::thread([this, name]() {
             run_thread_body("backup", "backup", [this, &name] { run(name); });
         });
+        name_thread(thread_, "ob-backup");
     }
     if (finished.joinable()) finished.join();
     OB_LOG_INFO("backup", "Backup %s started into %s", name.c_str(), dir_.c_str());

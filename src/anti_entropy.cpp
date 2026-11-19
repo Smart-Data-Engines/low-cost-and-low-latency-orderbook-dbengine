@@ -61,6 +61,7 @@ void AntiEntropyManager::start() {
                 config_.interval_seconds);
 
     thread_ = std::thread([this] { run_thread_body("anti_entropy", "loop", [this] { loop(); }); });
+    name_thread(thread_, "ob-anti-entropy");
 }
 
 // ── stop ──────────────────────────────────────────────────────────────────────
