@@ -138,6 +138,12 @@ size_t queued_once_at(ob::Engine& engine, size_t rows, int seconds) {
     return queued;
 }
 
+/// Returns once the tick that has taken the queue is over: a tick holds the flush's lock to its end, its seals
+/// included, and a tick asked for while it ran begins at once after it. Called once the queue is drained, so
+/// that the tick has begun. Without it a window for a second tick to show in closed while the first was
+/// still sealing - over a second in a Debug build - and a request it made the loop answer came after.
+void the_running_tick_is_over(ob::Engine& engine) { auto hold = engine.hold_flush_for_test(); }
+
 /// Writes `kDeltas` deltas, past the ceiling, with the flush held where it is about to take the
 /// queue: the tick asked for at half has begun - the loop cleared the request as it woke - and waits
 /// for the hold, so the writer goes on to the ceiling and waits there, and the hold is let go once it
@@ -276,10 +282,12 @@ TEST(PendingBackpressure, TheRowThatBringsTheQueueToHalfTheCeilingAsksForAFlush)
 
     // The 500 000th row.
     ASSERT_EQ(write_delta(engine, kHalfTheCeiling, 1), ob::OB_OK);
-    EXPECT_GE(counter_once_at_least(engine, "ob_flush_ticks_total", 1, 30), 1u)
+    ASSERT_GE(counter_once_at_least(engine, "ob_flush_ticks_total", 1, 30), 1u)
         << "half the ceiling was queued and no flush ran, so the writers would go on to the whole "
            "of it and stop there, waiting for a tick nobody had asked for";
     // Asked for once: a request the loop never clears would spin it.
+    ASSERT_EQ(queued_once_at(engine, 0, 30), 0u) << "the tick did not flush the queue within 30 s";
+    the_running_tick_is_over(engine);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 1u);
     EXPECT_EQ(counter_or_fail(engine, "ob_writer_backpressure_waits_total"), 0u);
@@ -304,7 +312,8 @@ TEST(PendingBackpressure, RowsWrittenBeforeTheTickTakesTheQueueDoNotAskAgain) {
             << "no tick began: half the ceiling was queued and no flush was asked for";
         ASSERT_EQ(write_deltas(engine, kHalfTheCeiling, kHalfTheCeiling + 10), ob::OB_OK);
     }
-    EXPECT_EQ(queued_once_at(engine, 0, 30), 0u) << "the held tick did not flush the queue within 30 s";
+    ASSERT_EQ(queued_once_at(engine, 0, 30), 0u) << "the held tick did not flush the queue within 30 s";
+    the_running_tick_is_over(engine);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 1u)
         << "rows written while the tick was about to take them asked for another tick";
@@ -362,8 +371,9 @@ TEST(PendingBackpressure, TheRowsATickHoldsDoNotAskForTheNextOne) {
     ASSERT_EQ(write_deltas(engine, kHalfTheCeiling, kHalfTheCeiling + 10), ob::OB_OK);
     release();
 
-    EXPECT_EQ(queued_once_at(engine, 10'000, 30), 10'000u)
+    ASSERT_EQ(queued_once_at(engine, 10'000, 30), 10'000u)
         << "the held tick did not drain its rows within 30 s of being let go";
+    the_running_tick_is_over(engine);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     EXPECT_EQ(counter_or_fail(engine, "ob_flush_ticks_total"), 1u)
         << "rows written while a tick held half the ceiling asked for another tick for ten thousand";
