@@ -4712,6 +4712,14 @@ Learned the hard way. Check here before debugging.
      (`std::min(end - buf, sizeof(buf))`), and the ARM Release build is the check that reaches
      GCC 14 - the packages are built with GCC 12, CI with the runner's.
 
+646. **A retry fixes noise, not a weakness of the setup: before adding attempts, ask what every attempt
+     meets.** #269 gave the handshake storm test three attempts because one CI run saw its control's loop
+     held two times where the hosts see twenty-five, and read that as a runner spoiling one run. The next
+     failure (#273) was 2.2-2.4 in all three attempts: on that runner the storm, two Python processes and
+     RSA-2048, kept the loop busy less than half the time, and a PING every half millisecond samples the
+     loop in time, so its median did not move far. Attempts multiply a probability; they do nothing for a
+     margin. The fix was the margin: RSA-4096, seventy times on the hosts.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
