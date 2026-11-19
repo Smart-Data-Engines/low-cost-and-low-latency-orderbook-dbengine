@@ -2900,6 +2900,66 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 268. A write looked for its price in a book side from the front ✅ **P1**
+
+**Found in the node's CPU profile under #190's ingest, after #267** (spec
+`smart-data-engine-workspace/specs/book-level-search/`, evidence `evidence/2026-11-19-book-level-search/`).
+Every level of every write goes through `insert_level()` on its client loop, under its side's seqlock.
+It looked for the price from the front of the side, and for a new price looked again for where it goes.
+
+The ingest's books are 80 levels deep, where it was 3% of the node's samples. A side of Binance's diff
+stream holds 269 levels at the median and the whole thousand at the 90th percentile.
+`benchmarks/book_apply_cost` (new) replays a recording's updates through `apply_delta()`. On binance-diff
+it put a level at 141 ns on the m9g.xlarge and 109 ns on the m8a.xlarge in the release packages' build.
+
+**One search by halves** finds the first slot whose price does not come before the one sought. That is its
+own slot when the side holds it, and where it goes when the side does not. These are the slots the two
+searches found, because a side holds each price once, in its order, without a branch in the loop.
+- `remove_level()` - no caller, in the header - looks for the price itself: it named the bids' order for
+  either side.
+- `install_book()`, the one other writer of a side (a start's rebuild of a live book), puts levels that are
+  out of their side's order, or a price twice, in one by one through `insert_level()` and says so. A book
+  composed by price never is one; the engine and the embedded API log it at WARN if one ever is.
+- **Tried and left out:** a search by halves to a window of 16 or 32 and a scan of it - level or slower
+  wherever it was measured.
+
+**The books are master's.** `tests/test_book_level_search.cpp` copies `insert_level()` as it was and holds
+the side to it after every update of any sequence: prices that collide, prices that fill a side past
+`MAX_LEVELS`, removals, on both sides. The benchmark's hash of every book was master's in every run of
+both builds on both hosts.
+
+**Measured** with Release builds on the test hosts, master's code with the benchmarks (`5823812`) against
+this change (`e889cfa`), each build's rounds interleaved with the other's:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| a level of binance-diff, applied | 140.2-141.1 ns | 26.6-27.2 ns | 108.6-109.4 ns | 23.6-23.7 ns |
+| a level of binance-top20 | 24.1 ns | 7.6 ns | 21.0 ns | 5.9-6.0 ns |
+| #190's ingest with sides 500 deep: the client loops' CPU a level | 266-268 ns | 172-175 ns | 135.8-136.9 ns | 134.4-135.5 ns |
+| the same ingest, levels a second | 6.31-6.35 M | 9.81-10.14 M | 11.38-11.61 M | 11.52-11.63 M |
+| the same ingest, a batch at p50 | 298-300 us | 177-179 us | 140.7-141.6 us | 138.3-139.9 us |
+
+The m8a.xlarge's benchmark rows are of the release packages' target (`-march=x86-64`). The host
+compiler's own default there is x86-64-v3, at which GCC 15 makes the front-to-back loop wide (AVX2). At
+that target a level of binance-diff took 35.2-39.9 ns and takes 23.7, and the node under the ingest is the
+host build - which is why its row moves by 1%. With the books 80 deep, as #190 runs the ingest, the client
+loops take 164-166 ns a level where they took 173 on ARM, and the same on x86.
+
+On the m8a.xlarge, the first run of the deep ingest had the base build first in each round. There #268's
+node took 4-7% more CPU, all of it kernel time on the flush thread, which the change does not touch. With
+the branch first, the same extra time went to the base: it belongs to the second node of a round.
+
+What is left on binance-diff is shifting the arrays for a price added or removed near the top of a deep
+side. A side kept best price last would remove it, and would change every reader of a side.
+
+Mutation table (`mutations/` in the evidence, i3-7100U): 7 mutants, every one killed by the test of what
+it breaks. Two of them are killed by a crash: a shift whose length wraps when a full side takes a price
+worse than every level, or a price taken as held past the side. The control survives: the search's steps
+as a branch rather than conditional moves, the same slots.
+
+- Effort: S | Impact: applying a level of Binance's diff stream costs 19-22% of what it did on ARM and in
+  the x86 packages; a writer on books 500 deep pushes 54-61% more levels a second on ARM
+
 ### 267. A seal did more work encoding its columns than the bytes it wrote needed ✅ **P2**
 
 **Found in the node's CPU profile under #190's ingest, after #266** (spec
