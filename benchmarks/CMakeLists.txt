@@ -125,6 +125,13 @@ target_link_libraries(column_codec_cost PRIVATE orderbook_column_codec)
 add_executable(seal_encode_cost seal_encode_cost.cpp)
 target_link_libraries(seal_encode_cost PRIVATE orderbook_columnar)
 
+# ── What applying a recording's updates to the live books costs, a level at a time (#268) ──
+#
+# Compiled, deliberately not run: it reads the recording CSV it is given and prints one JSON object, the
+# ns a level, the depth of the sides and a hash of the books.
+add_executable(book_apply_cost book_apply_cost.cpp)
+target_link_libraries(book_apply_cost PRIVATE orderbook_soa)
+
 # ── What a reply's numbers cost to write (#251) ───────────────────────────────
 #
 # Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object,

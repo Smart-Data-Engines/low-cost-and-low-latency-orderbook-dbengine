@@ -182,6 +182,11 @@ ob_add_soa_test(test_soa_buffer
     test_soa_buffer.cpp
 )
 
+# ── #268: a side's levels against insert_level() before its search by halves ──
+ob_add_soa_test(test_book_level_search
+    test_book_level_search.cpp
+)
+
 # ── Tasks 3.2–3.5: WAL property and unit tests ────────────────────────────────
 # How many CPUs this process can use (stage 3 of using the whole machine): the affinity mask and
 # the tightest cgroup CPU limit, as a pure function of what the process sees, plus the real reader.

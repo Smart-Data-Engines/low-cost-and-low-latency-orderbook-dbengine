@@ -197,6 +197,15 @@ here as `#N`.
 
 ### Changed
 
+- **A write finds its level in a book side by halves** (#268). Every level of every write looked for its
+  price from the front of its side, and a new price looked again for where it goes: on a side of
+  Binance's diff stream, 269 levels at the median and a thousand at the 90th percentile, most of what
+  applying a level cost. One search by halves finds the same slots. A level of that stream takes 26.6-27.2
+  ns where it took 140.2-141.1 (m9g.xlarge) and 23.6-23.7 where 108.6-109.4 (m8a.xlarge, the release
+  packages' target). A pipelined writer on books 500 levels deep pushes 9.8-10.1 million levels a second
+  where it pushed 6.3, with a batch's median at 177-179 us where it was 298-300 (m9g.xlarge). The books are
+  the ones the search from the front kept, held by a test against a copy of it.
+
 - **A seal encodes its columns into the same bytes for 26-41% less** (#267). After #266, encoding
   a segment's columns was the largest item of the flush thread - the one every writer's rows go through -
   in the node's profile under a pipelined ingest. The transforms divide as they find their divisor, in

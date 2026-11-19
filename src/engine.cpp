@@ -207,8 +207,14 @@ void install_live_book(SoABuffer& buf, const ColumnarStore::PricedBook& book) {
         level.cnt   = r.order_count;
         (r.side == SIDE_BID ? bids : asks).push_back(level);
     }
-    install_book(buf, bids.data(), bids.size(), asks.data(), asks.size(),
-                 book.as_of->sequence_number, book.as_of->timestamp_ns);
+    // A book composed by price is in each side's order with each price once; install_book() puts in
+    // one that is not level by level, which keeps the order its search by halves needs (#268).
+    if (!install_book(buf, bids.data(), bids.size(), asks.data(), asks.size(), book.as_of->sequence_number,
+                      book.as_of->timestamp_ns)) {
+        OB_LOG_WARN("engine", "live book of %s.%s restored from levels out of a side's order or with a price "
+                              "twice: put in level by level, from %zu bid and %zu ask level(s)",
+                    buf.symbol, buf.exchange, bids.size(), asks.size());
+    }
 }
 
 }  // namespace
