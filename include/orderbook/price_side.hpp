@@ -25,9 +25,20 @@ template <bool HighestFirst>
 class PriceSide {
 public:
     /// The row that sets `r.price` now: the price added, or its row replaced.
+    ///
+    /// Copied first: place() may move the rows, and `r` may be one of them.
     void put(const SnapshotRow& r) {
+        const SnapshotRow row = r;
+        place(row.price) = row;
+    }
+
+    /// Where the row that sets `price` now goes: its row when the side holds the price, a new one when
+    /// it does not (#271). The caller writes the whole row there - `price` its price - before it asks
+    /// this side anything else. A composition writes a row it reads from a decoder's columns there
+    /// field by field, rather than building it on its stack and having put() copy it.
+    SnapshotRow& place(int64_t price) {
         if ((used_ + 1) * 4 > table_.size() * 3) rehash();
-        size_t i = home(r.price);
+        size_t i = home(price);
         size_t reuse = kNone;
         for (;; i = (i + 1) & mask_) {
             Slot& s = table_[i];
@@ -36,32 +47,30 @@ public:
                 if (reuse == kNone) reuse = i;
                 continue;
             }
-            if (s.price == r.price) {
-                rows_[s.row] = r;
-                return;
-            }
+            if (s.price == price) return rows_[s.row];
         }
         uint32_t row;
         if (!free_.empty()) {
             row = free_.back();
             free_.pop_back();
-            rows_[row] = r;
         } else {
             row = static_cast<uint32_t>(rows_.size());
-            rows_.push_back(r);
+            rows_.emplace_back();
         }
         if (reuse == kNone) {
             reuse = i;
             ++used_;
         }
-        table_[reuse] = Slot{r.price, row, kFull};
+        table_[reuse] = Slot{price, row, kFull};
         ++live_;
         // The best known stays known: a new price better than it is the best now.
-        if (best_known_ && Worse{}(best_, r.price)) best_ = r.price;
-        heap_.push_back(r.price);
+        if (best_known_ && Worse{}(best_, price)) best_ = price;
+        heap_.push_back(price);
         std::push_heap(heap_.begin(), heap_.end(), Worse{});
         // A heap of prices most of which are gone is rebuilt from the ones held.
         if (heap_.size() > 2 * live_ + 64) rebuild_heap();
+        // Taken last: emplace_back() may have moved the rows.
+        return rows_[row];
     }
 
     /// The price no longer held; nothing when it was not.
