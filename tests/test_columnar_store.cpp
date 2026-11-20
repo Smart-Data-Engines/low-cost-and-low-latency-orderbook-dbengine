@@ -19,6 +19,7 @@
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
 #include "segment_blocks.hpp"
+#include "test_temp_dirs.hpp"
 
 namespace fs = std::filesystem;
 
@@ -26,12 +27,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-static std::atomic<uint64_t> g_dir_counter{0};
 
 static fs::path make_temp_dir(const std::string& suffix = "") {
-    auto base = fs::temp_directory_path() /
-                ("ob_col_test_" + suffix + "_" +
-                 std::to_string(g_dir_counter.fetch_add(1)));
+    auto base = ob::test::own_temp_dir("ob_col_test_" + suffix + "_");
     fs::create_directories(base);
     return base;
 }

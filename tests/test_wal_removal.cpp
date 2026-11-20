@@ -10,6 +10,7 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -36,7 +37,7 @@ constexpr size_t kSmallWalFiles = 64 * 1024;
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& prefix)
-        : path((fs::temp_directory_path() / (prefix + std::to_string(std::rand()))).string()) {
+        : path(ob::test::own_temp_dir(prefix).string()) {
         fs::create_directories(path);
     }
     ~TempDir() {

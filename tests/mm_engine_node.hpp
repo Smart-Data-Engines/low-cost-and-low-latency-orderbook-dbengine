@@ -11,6 +11,7 @@
 #include "orderbook/types.hpp"
 #include "orderbook/version_vector.hpp"
 #include "orderbook/wal.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -29,13 +30,10 @@ namespace mm_engine {
 
 namespace fs = std::filesystem;
 
-inline std::atomic<uint64_t> g_dir_counter{0};
-
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& prefix) {
-        auto p = fs::temp_directory_path() /
-                 (prefix + std::to_string(g_dir_counter.fetch_add(1, std::memory_order_relaxed)));
+        auto p = ob::test::own_temp_dir(prefix);
         fs::create_directories(p);
         path = p.string();
     }

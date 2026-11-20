@@ -22,6 +22,7 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 #include "orderbook/data_model.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/crc32c.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -77,10 +78,7 @@ namespace {
 
 // Unique temp directory helper (same pattern as test_wal.cpp).
 static std::filesystem::path make_repl_temp_dir(const std::string& suffix = "") {
-    static std::atomic<uint64_t> counter{0};
-    auto base = std::filesystem::temp_directory_path() /
-                ("ob_repl_test_" + suffix + "_" +
-                 std::to_string(counter.fetch_add(1, std::memory_order_relaxed)));
+    auto base = ob::test::own_temp_dir("ob_repl_test_" + suffix + "_");
     std::filesystem::create_directories(base);
     return base;
 }

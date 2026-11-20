@@ -14,6 +14,7 @@
 #include "test_ports.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -26,14 +27,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
-static std::atomic<uint64_t> g_dir_counter{0};
 static std::atomic<uint16_t> g_port{ob::test::kPortsMmDedup};
 
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& prefix) {
-        auto p = fs::temp_directory_path() /
-                 (prefix + std::to_string(g_dir_counter.fetch_add(1, std::memory_order_relaxed)));
+        auto p = ob::test::own_temp_dir(prefix);
         fs::create_directories(p);
         path = p.string();
     }

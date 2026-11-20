@@ -10,6 +10,7 @@
 
 #include "orderbook/machine.hpp"
 #include "orderbook/tcp_server.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -29,7 +30,7 @@
 namespace {
 
 std::filesystem::path write_config(const std::string& body, const std::string& name) {
-    const auto path = std::filesystem::temp_directory_path() / ("ob_cfg_" + name + ".conf");
+    const auto path = ob::test::own_temp_file("ob_cfg_" + name + "_", ".conf");
     std::ofstream out(path);
     out << body;
     return path;
@@ -256,6 +257,7 @@ TEST(WalDirInConfig, TheFlagAndTheFileNameTheWalsDirectory) {
     const std::string printed = ob::format_config(resolve({"--data-dir", "/srv/ob"}));
     EXPECT_NE(printed.find("wal-dir"), std::string::npos) << printed;
     EXPECT_NE(printed.find("/srv/ob"), std::string::npos) << printed;
+    std::filesystem::remove(path);
 }
 
 TEST(AdvertiseHostInConfig, ALoopbackAddressWithACoordinatorElsewhereIsNamed) {
@@ -294,6 +296,7 @@ TEST(AdvertiseHostInConfig, TheFlagAndTheFileNameTheHostPublished) {
     const std::string printed = ob::format_config(resolve({"--advertise-host", "10.1.2.3"}));
     EXPECT_NE(printed.find("advertise-host"), std::string::npos) << printed;
     EXPECT_NE(printed.find("10.1.2.3"), std::string::npos) << printed;
+    std::filesystem::remove(path);
 }
 
 TEST(MachineInConfig, ResolvingTheConfigurationReadsTheMachine) {

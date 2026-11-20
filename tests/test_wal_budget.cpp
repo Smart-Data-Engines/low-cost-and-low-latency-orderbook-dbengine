@@ -8,6 +8,7 @@
 // (evidence/2026-10-14-write-ceiling-slower/ before it).
 
 #include "orderbook/engine.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -57,7 +58,7 @@ uint64_t budget_waits(ob::Engine& engine) {
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& prefix)
-        : path((fs::temp_directory_path() / (prefix + std::to_string(std::rand()))).string()) {
+        : path(ob::test::own_temp_dir(prefix).string()) {
         fs::create_directories(path);
     }
     ~TempDir() {
