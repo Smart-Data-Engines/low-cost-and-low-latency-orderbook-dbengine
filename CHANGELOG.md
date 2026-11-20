@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
+  seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
+  before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
+  summary; the summaries and their best tracks are byte for byte the same. Under a pipelined ingest the flush thread
+  takes 11-20% less CPU a level on both test hosts (medians of six rounds), and the m9g.xlarge's p999 batch latency
+  is about halved. `ob_book_summaries_from_sealed_rows_total` counts the summaries composed so.
+
 - **A drain's block and a store's columns grow without being zeroed first** (#284). #281 grew them by `resize()`,
   which zeroes what it adds before the rows are written into it, and glibc's memset took 1.0-1.5% of the node's
   samples on the flush thread under a pipelined ingest. Each row is now constructed where it stays: the flush

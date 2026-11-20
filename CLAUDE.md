@@ -4770,6 +4770,25 @@ Learned the hard way. Check here before debugging.
      FLUSH from sealing rows written after the cut into a new directory the walk then listed: a replica held them
      twice (#282). Take what the cut holds - here the index's segment directories - while the lock is still
      held, and let the slow work after it touch nothing else.
+656. **`resize()` on a buffer about to be written zeroes it first.** #281 grew a drain's block and a seal's column
+     tiles by `resize()` and wrote the rows through pointers into them: value-initialisation is a memset, which
+     glibc does on the m9g.xlarge with its generic loop - 1.10-1.52% of the node's samples on the flush thread,
+     0.98-1.27% on the m8a.xlarge, where `perf` could not name it (libc without symbols there: `objdump` the
+     address on the host). Grow by `insert()` from an iterator over the source, and every value is constructed
+     where it stays (#284).
+657. **A test's temporary directory named the same in every run is the next run's after a crash.** A counter that
+     starts at 0 in every process, `std::rand()` without a seed and a fixed name all hand the next run of the binary
+     the directory a crashed run left, and the test opens that run's data as its own: a mutant of #284 crashed
+     `test_pending_row_names`, and the next run - the table's next mutant, a control - stored every row twice and
+     was reported killed. Name temporary paths through `tests/test_temp_dirs.hpp`, which
+     `test_temp_dir_discipline` holds every test to (#285), and give each run of a mutation table a `TMPDIR` of its
+     own.
+658. **Where work sits relative to an asynchronous sync matters as much as how much of it there is.** #286's first
+     version moved the summaries' composition from after the tick asks for the segments' background `syncfs` to
+     before it: the flush thread's CPU fell, and the next tick's WAL sync met the `syncfs` more often - ticks whose
+     WAL sync took 12 ms or more went from 13 to 73 - and writers waited for room in the queue twice as often. A CPU
+     profile cannot show it. A diagnostic build with the slow-tick warning at 15 ms (it names the tick's phases),
+     and the writers' waits and p999 a round, did. Compare those, not the CPU alone.
 
 ## Current state and open problems
 
