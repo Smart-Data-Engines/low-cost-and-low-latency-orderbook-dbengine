@@ -25,6 +25,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -148,10 +149,20 @@ struct Store {
     TempDir dir;
     std::unique_ptr<ob::ColumnarStore> store = std::make_unique<ob::ColumnarStore>(dir.path.string());
     std::vector<std::vector<ob::SnapshotRow>> pending;
+    std::vector<std::shared_ptr<const ob::RowBlock>> pending_blocks;
+    /// A summary is given the blocks its segment's seal wrote, as the engine's are (#286), and composed from
+    /// their rows when the index allows; otherwise every summary is composed from the segments.
+    bool from_sealed_rows = false;
+    std::vector<std::shared_ptr<const ob::RowBlock>> sealed;   ///< the last seal's blocks
+    std::string sealed_dir;                                     ///< and its segment
+    size_t from_seal = 0;        ///< summaries composed from the rows of their seal's blocks
+    std::string seal_why_not;    ///< why the last summary was not
 
     void block(const std::vector<ob::SnapshotRow>& rows) {
-        store->publish_blocks({ob::RowBlock::make("SUM", "EX", rows)});
+        auto b = ob::RowBlock::make("SUM", "EX", rows);
+        store->publish_blocks({b});
         pending.push_back(rows);
+        pending_blocks.push_back(std::move(b));
     }
     std::string seal() {
         ob::ColumnarStore writer(dir.path.string(), ob::ColumnarStore::kDefaultSegmentDurationNs,
@@ -163,7 +174,10 @@ struct Store {
         auto meta = writer.flush_segment();
         if (!meta) return {};
         if (store->seal_blocks("SUM", "EX", pending.size(), {*meta}) != 0) return {};
+        sealed = std::move(pending_blocks);
+        sealed_dir = meta->dir_path;
         pending.clear();
+        pending_blocks.clear();
         return meta->dir_path;
     }
     std::string segment(const std::vector<ob::SnapshotRow>& rows) {
@@ -176,6 +190,9 @@ struct Store {
         store->open_existing();
         const auto again = std::move(pending);
         pending.clear();
+        pending_blocks.clear();
+        sealed.clear();   // the blocks a seal kept go with the process
+        sealed_dir.clear();
         for (const auto& rows : again) block(rows);
     }
     size_t compared = 0;   ///< summaries written and compared
@@ -210,11 +227,17 @@ struct Store {
         return {};
     }
 
-    /// A summary, and whether its two files are the oracle's: "" when they are, or what differs.
+    /// A summary, and whether its two files are the oracle's: "" when they are, or what differs. Given the
+    /// last seal's blocks when that seal was this segment's.
     std::string summarise_and_compare(const std::string& seg_dir) {
         // The summary it will start from: the newest one the index holds, before the one written.
         const std::vector<uint64_t> before = store->book_summaries("SUM", "EX");
-        const ob::ColumnarStore::SummaryWrite w = store->write_book_summary("SUM", "EX", seg_dir);
+        const bool given = from_sealed_rows && sealed_dir == seg_dir;
+        const ob::ColumnarStore::SummaryWrite w = store->write_book_summary(
+            "SUM", "EX", seg_dir, given ? std::span<const std::shared_ptr<const ob::RowBlock>>(sealed)
+                                        : std::span<const std::shared_ptr<const ob::RowBlock>>());
+        if (w.from_sealed_rows) ++from_seal;
+        seal_why_not = w.sealed_rows_why_not;
         if (!w.written) {
             last_why_not = w.why_not;
             return {};
@@ -253,10 +276,11 @@ struct Store {
 
 }  // namespace
 
-TEST(BookSummaryBytes, AWalkOfABookSummarisedTwentyTimesIsTheOraclesEveryTime) {
-    // A book of 40 prices a side, 2 000 rows between summaries, times a microsecond apart - the shape a
-    // busy symbol's seals give, scaled down to run in a test.
-    Store s;
+namespace {
+
+/// A book of 40 prices a side, 2 000 rows between summaries, times a microsecond apart - the shape a busy
+/// symbol's seals give, scaled down to run in a test - summarised after each of twenty seals.
+void walk(Store& s) {
     std::mt19937_64 rng(266);
     std::uniform_int_distribution<int> level(0, 39);
     std::uniform_int_distribution<int> tenth(0, 9);
@@ -279,6 +303,137 @@ TEST(BookSummaryBytes, AWalkOfABookSummarisedTwentyTimesIsTheOraclesEveryTime) {
     }
 }
 
+}  // namespace
+
+TEST(BookSummaryBytes, AWalkOfABookSummarisedTwentyTimesIsTheOraclesEveryTime) {
+    Store s;
+    walk(s);
+    EXPECT_EQ(s.compared, 20u);
+    EXPECT_EQ(s.from_seal, 0u);
+}
+
+namespace {
+
+/// Rows of both sides at `from`, `from + 10`, ...: `n` of them, in time order.
+std::vector<ob::SnapshotRow> rows_from(uint64_t from, int n, uint64_t seq) {
+    std::vector<ob::SnapshotRow> rows;
+    for (int i = 0; i < n; ++i) {
+        rows.push_back(row(from + static_cast<uint64_t>(i) * 10, i % 2 == 0 ? ob::SIDE_BID : ob::SIDE_ASK,
+                           100 + i % 5, static_cast<uint64_t>(1 + i), seq + static_cast<uint64_t>(i)));
+    }
+    return rows;
+}
+
+/// A store with a summary to start from: a segment at kBase.. and its summary, written from the segments.
+void with_a_summary(Store& s) {
+    const std::string first = s.segment(rows_from(kBase, 20, 1));
+    ASSERT_FALSE(first.empty());
+    ASSERT_EQ(s.summarise_and_compare(first), "");
+    ASSERT_EQ(s.compared, 1u);
+}
+
+}  // namespace
+
+TEST(BookSummaryFromTheSealedRows, ABlockPublishedAfterTheSealWithARowInItsSpanKeepsThemFromUse) {
+    Store s;
+    s.from_sealed_rows = true;
+    with_a_summary(s);
+    const std::string dir = s.segment(rows_from(kBase + 1000, 20, 100));
+    // A client's event time inside the segment's span, after the summary the composition starts from: not
+    // among the sealed blocks' rows, and a summary as of the segment's end holds it.
+    s.block({row(kBase + 1005, ob::SIDE_BID, 100, 77, 500)});
+    EXPECT_EQ(s.summarise_and_compare(dir), "");
+    EXPECT_EQ(s.from_seal, 0u);
+    EXPECT_EQ(s.seal_why_not, "a published block has rows after the summary");
+}
+
+TEST(BookSummaryFromTheSealedRows, ARowBeforeTheNewestSummaryKeepsThemFromUse) {
+    Store s;
+    s.from_sealed_rows = true;
+    with_a_summary(s);   // as of kBase + 190
+    const std::string second = s.segment(rows_from(kBase + 500, 20, 50));
+    ASSERT_EQ(s.summarise_and_compare(second), "");   // as of kBase + 690, from the sealed blocks' rows
+    ASSERT_EQ(s.from_seal, 1u);
+    const std::string dir = s.segment(rows_from(kBase + 1000, 20, 100));
+    // A row between the two summaries' times falsifies the newer and takes it out of the index; the older
+    // stays, and the rows after it are more than the last seal's.
+    s.block({row(kBase + 600, ob::SIDE_ASK, 101, 66, 600)});
+    EXPECT_EQ(s.summarise_and_compare(dir), "");
+    EXPECT_EQ(s.from_seal, 1u);
+    EXPECT_EQ(s.seal_why_not, "the index holds other rows after the summary");
+}
+
+TEST(BookSummaryFromTheSealedRows, ALaterSegmentIndexedBeforeTheSummaryKeepsThemFromUse) {
+    Store s;
+    s.from_sealed_rows = true;
+    with_a_summary(s);
+    s.segment(rows_from(kBase + 1000, 20, 100));
+    const std::vector<std::shared_ptr<const ob::RowBlock>> first_seal = s.sealed;
+    const std::string first_dir = s.sealed_dir;
+    // Another seal indexes rows after it before the summary is written: the summary is as of the symbol's
+    // latest row, and the first seal's blocks do not hold the rows between.
+    const std::string later = s.segment(rows_from(kBase + 2000, 20, 200));
+    s.sealed = first_seal;
+    s.sealed_dir = later;   // the first seal's blocks offered for the later segment's summary
+    EXPECT_EQ(s.summarise_and_compare(later), "");
+    EXPECT_EQ(s.from_seal, 0u);
+    EXPECT_EQ(s.seal_why_not, "the index holds other rows after the summary");
+}
+
+TEST(BookSummaryFromTheSealedRows, AnotherSegmentIndexedInItsSpanKeepsThemFromUse) {
+    Store s;
+    s.from_sealed_rows = true;
+    with_a_summary(s);
+    const std::string dir = s.segment(rows_from(kBase + 1000, 20, 100));
+    const std::vector<std::shared_ptr<const ob::RowBlock>> its_blocks = s.sealed;
+    // A segment of rows after the summary and before the seal's first - client event times - indexed before
+    // the summary is written: those rows rank before the seal's segment and are not among its blocks' rows.
+    s.segment({row(kBase + 503, ob::SIDE_ASK, 104, 9, 700), row(kBase + 504, ob::SIDE_BID, 99, 8, 701)});
+    s.sealed = its_blocks;
+    s.sealed_dir = dir;
+    EXPECT_EQ(s.summarise_and_compare(dir), "");
+    EXPECT_EQ(s.from_seal, 0u);
+    EXPECT_EQ(s.seal_why_not, "the index holds other rows after the summary");
+}
+
+TEST(BookSummaryFromTheSealedRows, ASealWhoseFirstRowsAreAtItsSummarysTimeAppliesThemOnce) {
+    // An instant split between two seals: its first rows sealed, the rest in a block when the summary is
+    // written - which holds them, a block's rows at or before its time being in it - and sealed after. The
+    // next summary applies the rows after that instant, as one composed from the segments does (#272).
+    Store s;
+    s.from_sealed_rows = true;
+    const std::string dir = s.segment(rows_from(kBase, 20, 1));   // the last at kBase + 190
+    s.block({row(kBase + 190, ob::SIDE_ASK, 103, 5, 300), row(kBase + 190, ob::SIDE_BID, 98, 6, 301)});
+    ASSERT_EQ(s.summarise_and_compare(dir), "");
+    s.block(rows_from(kBase + 200, 10, 400));
+    const std::string next = s.seal();
+    ASSERT_FALSE(next.empty());
+    EXPECT_EQ(s.summarise_and_compare(next), "");
+    EXPECT_EQ(s.from_seal, 1u);
+}
+
+TEST(BookSummaryFromTheSealedRows, ASegmentWhoseRowsGoBackInTimeIsComposedFromTheSegment) {
+    Store s;
+    s.from_sealed_rows = true;
+    with_a_summary(s);
+    std::vector<ob::SnapshotRow> rows = rows_from(kBase + 1000, 20, 100);
+    std::swap(rows[5], rows[6]);   // two rows of the segment out of time order
+    const std::string dir = s.segment(rows);
+    EXPECT_EQ(s.summarise_and_compare(dir), "");
+    EXPECT_EQ(s.from_seal, 0u);
+    EXPECT_EQ(s.seal_why_not, "its segment's rows go back in time");
+}
+
+TEST(BookSummaryBytes, TheSameWalkWithEachSummaryComposedFromItsSealsRowsIsTheOraclesEveryTime) {
+    // The engine's way since #286: a summary is composed from the rows of the blocks its seal wrote - every
+    // summary but the first, which has no summary to start from.
+    Store s;
+    s.from_sealed_rows = true;
+    walk(s);
+    EXPECT_EQ(s.compared, 20u);
+    EXPECT_EQ(s.from_seal, 19u);
+}
+
 namespace {
 
 /// How a sequence of the property below is drawn: the prices a row takes, how often a row is late (one in
@@ -295,6 +450,7 @@ struct Shape {
 /// compared with the oracle's.
 void any_sequence(const Shape& shape) {
     Store s;
+    s.from_sealed_rows = *rc::gen::arbitrary<bool>();
     uint64_t latest = kBase;
     const int steps = *rc::gen::inRange(1, 16);
     for (int i = 0; i < steps; ++i) {
@@ -357,6 +513,9 @@ void any_sequence(const Shape& shape) {
     RC_ASSERT(why.empty());
     RC_CLASSIFY(s.compared == 1, "one summary compared");
     RC_CLASSIFY(s.compared > 1, "more than one compared");
+    RC_CLASSIFY(s.from_seal > 0, "a summary composed from its seal's blocks");
+    RC_CLASSIFY(s.from_sealed_rows && s.from_seal < s.compared, "a seal's blocks not used");
+    RC_ASSERT(s.from_sealed_rows || s.from_seal == 0u);
     RC_ASSERT(s.compared > 0u);
 }
 

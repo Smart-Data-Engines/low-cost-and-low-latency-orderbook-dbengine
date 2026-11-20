@@ -224,6 +224,9 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_book_summaries_written_total",
                                      "Summaries of a symbol's book by price written beside its "
                                      "segments, each the start of the book reads after it"));
+    counters_.push_back(make_counter("ob_book_summaries_from_sealed_rows_total",
+                                     "Book summaries composed from the rows of the blocks their seal wrote "
+                                     "rather than read back from the segment (#286)"));
     counters_.push_back(make_counter("ob_book_summary_bytes_total",
                                      "Bytes of the book summaries written"));
     // Best tracks (#243): the best of each side beside each summary, which a series reads.
