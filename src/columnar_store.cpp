@@ -2906,6 +2906,19 @@ public:
         return apply(r);
     }
 
+    /// One row of a run that has to come in time order, as a decoder gives a segment's (#286): false - and
+    /// in_order() false, the row not applied - when it is before the one ahead of it.
+    bool apply_row_in_order(const SnapshotRow& r) {
+        if (r.timestamp_ns < last_) {
+            in_order_ = false;
+            return false;
+        }
+        last_ = r.timestamp_ns;
+        ++kept_;
+        note_instant(r.timestamp_ns);
+        return apply(r);
+    }
+
     bool in_order() const { return in_order_; }
     uint64_t kept() const { return kept_; }
 
@@ -3121,6 +3134,63 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
     return out;
 }
 
+std::optional<ColumnarStore::PricedBook> ColumnarStore::compose_from_sealed_rows(
+        uint64_t as_of, std::string_view symbol, std::string_view exchange, const std::string& dir,
+        std::span<const std::shared_ptr<const RowBlock>> sealed, BestTrack& track, std::string& why) const {
+    // What compose_by_price(as_of) would gather, under the same lock: the newest summary, and after it the one
+    // segment the seal wrote, from the rows these blocks hold - and nothing else.
+    Gathered g;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        gather_locked(0, as_of, symbol, exchange, as_of, g);
+    }
+    if (!g.found || !g.summary.has_value()) {
+        why = "no summary to start from";
+        return std::nullopt;
+    }
+    if (g.segments.size() != 1 || g.segments.front().dir_path != dir || !g.segments.front().time_range_is_rows) {
+        why = "the index holds other rows after the summary";
+        return std::nullopt;
+    }
+    if (!g.blocks.empty()) {
+        why = "a published block has rows after the summary";
+        return std::nullopt;
+    }
+    BookSummary base;
+    if (!read_book_summary(g.summary->second, base).empty()) {
+        why = "the summary does not read back";
+        return std::nullopt;
+    }
+    PricedBook book;
+    BestTrack composed;
+    PriceComposer c(book, &composed);
+    const uint64_t from = base.header.as_of_ts;
+    c.start(&base, from);
+    // The segment's rows are the blocks' rows, block after block, in the order the seal appended them; from
+    // the instant after the summary's time (#272) to the summary's own, as a read of the segment takes them.
+    const uint64_t rows_from = after_instant(from);
+    uint64_t filtered = 0;
+    for (const auto& b : sealed) {
+        for (const SnapshotRow& r : b->rows) {
+            if (r.timestamp_ns < rows_from || r.timestamp_ns > as_of) {
+                ++filtered;
+                continue;
+            }
+            if (!c.apply_row_in_order(r)) {
+                why = "its segment's rows go back in time";
+                return std::nullopt;
+            }
+        }
+    }
+    book.cost.candidates    = 1;
+    book.cost.kept          = c.kept();
+    book.cost.delivered     = c.kept();
+    book.cost.rows_filtered = filtered;
+    c.finish(SIZE_MAX);
+    track = std::move(composed);
+    return book;
+}
+
 namespace {
 
 /// `bytes` at `path` through a temporary and a rename, with no sync of its own: a book summary (#233)
@@ -3154,9 +3224,9 @@ int write_unsynced(const std::string& path, std::string_view bytes) {
 
 }  // namespace
 
-ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(std::string_view symbol,
-                                                              std::string_view exchange,
-                                                              const std::string& dir) {
+ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(
+        std::string_view symbol, std::string_view exchange, const std::string& dir,
+        std::span<const std::shared_ptr<const RowBlock>> sealed) {
     SummaryWrite out;
     // As of the latest time a segment of the symbol holds a row at: a block's rows are the next
     // seal's, and a summary that waited for them would falsify itself on the next restart, when the
@@ -3189,7 +3259,24 @@ ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(std::string_view s
     out.as_of_ts = as_of;
     // The best of each side through the same composition, for the track beside the summary (#243).
     BestTrack track;
-    const PricedBook book = compose_by_price(as_of, symbol, exchange, SIZE_MAX, &track);
+    PricedBook book;
+    // From the rows of the blocks the seal wrote, when they are all the rows after the newest summary (#286):
+    // the same rows in the same order as a read of the segment would give, without reading it back.
+    if (!sealed.empty()) {
+        std::string why;
+        if (auto composed = compose_from_sealed_rows(as_of, symbol, exchange, dir, sealed, track, why)) {
+            book = std::move(*composed);
+            out.from_sealed_rows = true;
+        } else {
+            out.sealed_rows_why_not = why;
+            OB_LOG_DEBUG("columnar", "book summary of %.*s.%.*s as of %llu not composed from the rows its seal "
+                                     "wrote: %s",
+                         static_cast<int>(symbol.size()), symbol.data(),
+                         static_cast<int>(exchange.size()), exchange.data(),
+                         static_cast<unsigned long long>(as_of), why.c_str());
+        }
+    }
+    if (!out.from_sealed_rows) book = compose_by_price(as_of, symbol, exchange, SIZE_MAX, &track);
     track.header.as_of_ts = as_of;
     out.rows_read = book.cost.kept;
     out.prices = book.rows.size();

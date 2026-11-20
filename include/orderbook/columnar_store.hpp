@@ -867,9 +867,17 @@ public:
         size_t track_entries{0};
         size_t track_bytes{0};
         std::string track_why_not;
+        /// Composed from the rows of the blocks its seal wrote (#286), not by reading the segment back; or
+        /// why not.
+        bool from_sealed_rows{false};
+        std::string sealed_rows_why_not;
     };
-    SummaryWrite write_book_summary(std::string_view symbol, std::string_view exchange,
-                                    const std::string& dir);
+    /// With `sealed` - the blocks a seal of `dir`'s segment wrote it from, in their order - the summary is
+    /// composed from their rows rather than by reading the segment back, when the index shows they are all
+    /// the rows a composition would apply: the newest summary before `as_of`, then that one segment, and no
+    /// published block with a row in the span. Otherwise, and when its rows go back in time, as without.
+    SummaryWrite write_book_summary(std::string_view symbol, std::string_view exchange, const std::string& dir,
+                                    std::span<const std::shared_ptr<const RowBlock>> sealed = {});
 
     /// The times of a symbol's summaries, oldest first: what a read can start from.
     std::vector<uint64_t> book_summaries(std::string_view symbol, std::string_view exchange) const;
@@ -1172,6 +1180,13 @@ private:
     /// write_book_summary() writes beside the summary. The caller sets the track's `as_of_ts`.
     PricedBook compose_by_price(uint64_t at, std::string_view symbol, std::string_view exchange,
                                 size_t depth, BestTrack* track) const;
+    /// write_book_summary()'s composition from the rows of the blocks a seal wrote: the book and, in `track`,
+    /// its best track; empty, with `why`, when the index holds more than that one segment after the newest
+    /// summary, or a block, or the rows go back in time (#286).
+    std::optional<PricedBook> compose_from_sealed_rows(uint64_t as_of, std::string_view symbol,
+                                                       std::string_view exchange, const std::string& dir,
+                                                       std::span<const std::shared_ptr<const RowBlock>> sealed,
+                                                       BestTrack& track, std::string& why) const;
     /// scan_by_time() over what gather_locked() took.
     TimeOrderedCost scan_gathered(const Gathered& g, uint64_t start_ns, uint64_t end_ns,
                                   std::string_view symbol, std::string_view exchange,

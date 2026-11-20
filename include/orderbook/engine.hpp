@@ -1848,6 +1848,10 @@ private:
         size_t count{0};
         size_t rows{0};
         std::vector<SegmentMeta> metas;
+        /// The blocks the seal wrote its segment from, kept for write_book_summaries() when the seal makes a
+        /// summary due (#286): their rows are the segment's, and the summary is composed from them rather
+        /// than by reading the segment back. Empty otherwise.
+        std::vector<std::shared_ptr<const RowBlock>> sealed;
     };
     /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
     /// the share of a tick that drained `drained_rows` and the seals by age `credit` allows, which it
@@ -1856,14 +1860,18 @@ private:
                                    AgeSealCredit* credit = nullptr);
     /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
     /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
-    /// `flush_mtx_`; `mtx_` or not.
-    std::exception_ptr write_seals(std::vector<Seal>& seals);
+    /// `flush_mtx_`; `mtx_` or not. `with_summaries`: the caller writes the summaries the seals make due
+    /// (write_book_summaries()), and a seal that makes one due keeps its blocks for it (#286).
+    std::exception_ptr write_seals(std::vector<Seal>& seals, bool with_summaries = false);
     /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
     /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
     size_t merge_seals_locked(const std::vector<Seal>& seals);
     /// Write the summaries a seal has made due (#233): one for each symbol that took in
     /// `book_summary_rows_` rows - more for a deep book - since its last. Without `mtx_`.
     void write_book_summaries(const std::vector<Seal>& seals);
+    /// Whether write_book_summaries() will write a summary for `s`'s symbol after it: the same rule, the
+    /// rows counted so far unchanged (#286).
+    bool summary_due_after(const Seal& s) const;
     /// Where replay starts: the drain's position, or the oldest unsealed block's start if that is
     /// earlier - claiming a waiting block's rows would lose them in a crash. **With blocks waiting
     /// this position alone does not say which segments are durable** (#165 part 2a): a seal writes

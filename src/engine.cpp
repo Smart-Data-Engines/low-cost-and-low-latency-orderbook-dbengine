@@ -264,6 +264,14 @@ void Engine::restore_live_books_locked() {
     OB_LOG_INFO("engine", "live books restored from the store installed: %zu symbol(s)", restored);
 }
 
+bool Engine::summary_due_after(const Seal& s) const {
+    if (book_summary_rows_ == 0 || s.metas.empty()) return false;
+    const auto it = summary_progress_.find(s.store->symbol() + std::string(1, '\0') + s.store->exchange());
+    const uint64_t rows   = (it == summary_progress_.end() ? 0 : it->second.rows) + s.rows;
+    const size_t   prices = it == summary_progress_.end() ? 0 : it->second.prices;
+    return rows >= std::max<uint64_t>(book_summary_rows_, kBookSummaryRowsPerPrice * prices);
+}
+
 void Engine::write_book_summaries(const std::vector<Seal>& seals) {
     if (book_summary_rows_ == 0) return;
     for (const Seal& s : seals) {
@@ -277,20 +285,22 @@ void Engine::write_book_summaries(const std::vector<Seal>& seals) {
         if (p.rows < due) continue;
         const auto started = std::chrono::steady_clock::now();
         const ColumnarStore::SummaryWrite w =
-            combined_store_.write_book_summary(symbol, exchange, s.metas.back().dir_path);
+            combined_store_.write_book_summary(symbol, exchange, s.metas.back().dir_path, s.sealed);
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started).count();
         if (w.written) {
             p.rows = 0;
             p.prices = w.prices;
             registry_.increment_counter("ob_book_summaries_written_total");
+            if (w.from_sealed_rows) registry_.increment_counter("ob_book_summaries_from_sealed_rows_total");
             registry_.increment_counter("ob_book_summary_bytes_total", w.bytes);
             registry_.increment_counter("ob_best_track_bytes_total", w.track_bytes);
             OB_LOG_DEBUG("engine", "book summary %s.%s: %zu price(s) as of %llu, %zu bytes, from %llu "
-                                   "row(s) read, in %.2f ms; best track: %s",
+                                   "row(s) %s, in %.2f ms; best track: %s",
                          symbol.c_str(), exchange.c_str(), w.prices,
                          static_cast<unsigned long long>(w.as_of_ts), w.bytes,
-                         static_cast<unsigned long long>(w.rows_read), ms,
+                         static_cast<unsigned long long>(w.rows_read),
+                         w.from_sealed_rows ? "of the blocks its seal wrote" : "read back", ms,
                          w.track_why_not.empty()
                              ? (std::to_string(w.track_entries) + " entr" +
                                 (w.track_entries == 1 ? "y, " : "ies, ") +
@@ -4644,7 +4654,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     for (const SealPick& p : picks) {
         ColumnarStore* store = by_age[p.index].second;
         const Unsealed& u = unsealed_.at(store);
-        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}});
+        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}, {}});
         sealed_rows += u.rows;
         if (p.why == SealReason::kRows) ++by_rows;
         if (p.why == SealReason::kAge) ++by_age_count;
@@ -4689,7 +4699,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     return seals;
 }
 
-std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
+std::exception_ptr Engine::write_seals(std::vector<Seal>& seals, bool with_summaries) {
     if (while_sealing_for_test_ && !seals.empty()) while_sealing_for_test_();
     std::exception_ptr failure;
     std::vector<Seal> written;
@@ -4719,6 +4729,14 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
             if (meta.has_value()) s.metas.push_back(std::move(meta.value()));
             s.store->swap_buffers(seal_buffers_);
             lent = false;
+            // The blocks of a seal that makes a summary due, kept until write_book_summaries() composes it
+            // from their rows (#286) - a few milliseconds past the merge that would have let them go - so
+            // the summary does not read the segment back. After the background sync is asked, as the
+            // composition was before: it runs while the sync does.
+            if (with_summaries && s.metas.size() == 1 && summary_due_after(s)) {
+                s.sealed.reserve(s.count);
+                for (size_t i = 0; i < s.count; ++i) s.sealed.push_back(u.blocks[i].block);
+            }
             written.push_back(std::move(s));
         } catch (const std::exception& e) {
             s.store->abandon_active();
@@ -4809,7 +4827,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
     using SealClock = std::chrono::steady_clock;
     const auto started = SealClock::now();
     std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows, credit);
-    const std::exception_ptr write_failure = write_seals(seals);
+    const std::exception_ptr write_failure = write_seals(seals, /*with_summaries=*/true);
     const auto written = SealClock::now();
 
     if (seals.empty() && !claim_regardless) {
