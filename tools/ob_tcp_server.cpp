@@ -5,7 +5,8 @@
 //
 // Signals:
 //   SIGINT / SIGTERM → graceful shutdown
-//   SIGHUP           → read the TLS certificate, key and CA again (#238)
+//   SIGHUP           → read the TLS certificate, key and CA again (#238), and the client
+//                      secrets and permissions (#258)
 
 #include "orderbook/tcp_server.hpp"
 #include "orderbook/version.hpp"
@@ -125,8 +126,9 @@ static int run_server(int argc, char* argv[]) {
 
     ob::TcpServer server(std::move(config));
 
-    // Monitor thread: polls g_shutdown_requested and calls server.shutdown(), and reloads TLS on
-    // SIGHUP - here rather than in the handler, which may not take a lock or allocate.
+    // Monitor thread: polls g_shutdown_requested and calls server.shutdown(), and reloads TLS and
+    // the client credentials on SIGHUP - here rather than in the handler, which may not take a lock
+    // or allocate.
     //
     // `monitor_done` is a second flag rather than a reuse of the first, and the difference is what
     // the log says. Reusing it made a failed bind print "Shutdown requested - the epoll loop will
@@ -146,7 +148,10 @@ static int run_server(int argc, char* argv[]) {
             const uint32_t asked = g_reload_requested.load(std::memory_order_relaxed);
             if (asked != reloads_handled) {
                 reloads_handled = asked;
+                // Independent: a refused certificate leaves the credentials to be read, and the
+                // other way round (#258).
                 server.reload_tls();
+                server.reload_credentials();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }

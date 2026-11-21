@@ -252,6 +252,17 @@ groups:
             the certificate it had. The ERROR line in its log names the file and the reason: a key
             that does not match the certificate, a key others may read, a file it cannot read.
             docs/operations.md, "Replacing a certificate".
+      - alert: OrderbookAuthReloadFailed
+        expr: sum by (instance) (increase(ob_auth_reload_failures_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a reload of the client credentials was refused"
+          description: >-
+            The node read its client secrets and permissions again and refused them, so the
+            credentials it had are still in force - an identity meant to be revoked still
+            authenticates. The ERROR line in its log names the file and the reason. Fix the file
+            and send the node SIGHUP (systemctl reload). docs/operations.md, "Changing who may connect".
 
   - name: orderbook-engine-clients
     rules:

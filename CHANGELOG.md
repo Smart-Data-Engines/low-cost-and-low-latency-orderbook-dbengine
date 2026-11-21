@@ -11,6 +11,14 @@ here as `#N`.
 
 ### Added
 
+- **The client secrets and permissions are read again on `SIGHUP`** (#258), after the certificate:
+  adding a client, rotating a secret or revoking one no longer takes a restart. A file the start
+  would refuse is refused and the credentials in force stay; one it takes is in force for the next
+  `AUTH`, and the open sessions of the identities it removed or changed are closed at their loop's
+  next pass, with no answer they did not ask for. The cluster secret, and `--migration-identity`'s
+  secret, still take a restart. `ob_auth_reloads_total`, `ob_auth_reload_failures_total`,
+  `ob_auth_reload_sessions_closed_total` and the `OrderbookAuthReloadFailed` alert.
+
 - **The client port's TLS handshakes are driven off the client loops** (#265), on
   `--tls-handshake-threads N` threads (default 1, `ob-tls-N`; 0 keeps them on the loops). A loop drove
   each new TLS session's handshake between the events of all its others, so two processes opening

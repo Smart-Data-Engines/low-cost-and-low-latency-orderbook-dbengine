@@ -141,6 +141,15 @@ alert two weeks before. A reload does not read `--tls-peer-names`, so taking one
 of a cluster is still a restart. [docs/operations.md](docs/operations.md), "Replacing a
 certificate".
 
+**A client is added, rotated or revoked without a restart** (#258). The same `SIGHUP` reads
+`--auth-secret-file` and `--auth-acl-file` again, held to the start's rules - a file the start would
+refuse leaves the credentials in force, and `OrderbookAuthReloadFailed` pages on it. A file it takes
+is in force for the next `AUTH`, and the open sessions of an identity it removed or changed - its
+secret, its role, its lists - are closed within about 200 ms, so revoking a compromised client does not
+wait for that client to reconnect. The cluster secret is read at the start only: every node of a
+cluster holds it at once, so changing it is a restart of the cluster.
+[docs/operations.md](docs/operations.md), "Changing who may connect".
+
 What has not changed: an attacker with that level of network control over a **plaintext** cluster
 link already reads every row and can inject records into the stream, authentication or not. So
 **authentication alone is not a reason to move a node onto a network you do not trust** — with TLS

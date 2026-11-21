@@ -106,6 +106,10 @@ struct Permissions {
 
     /// Whether `symbol` on `exchange` is inside both lists.
     bool reaches(std::string_view symbol, std::string_view exchange) const;
+
+    /// The same role and the same lists, in the same order: what a reload compares to tell a
+    /// session whose permissions changed (#258).
+    bool operator==(const Permissions&) const = default;
 };
 
 /// Refuse a permissions file (#31) that is not a regular file, that someone other than
@@ -162,6 +166,9 @@ public:
 
     size_t size() const { return credentials_.size(); }
     bool   empty() const { return credentials_.empty(); }
+
+    /// The identities, in the file's order - names only, for a reload's log line (#258).
+    std::vector<std::string> identities() const;
 
 private:
     friend bool stores_share_a_secret(const SecretStore& a, const SecretStore& b);
