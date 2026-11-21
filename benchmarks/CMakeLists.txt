@@ -92,6 +92,13 @@ target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)
 add_executable(segment_read_cost segment_read_cost.cpp)
 target_link_libraries(segment_read_cost PRIVATE orderbook_columnar)
 
+# ── What composing a book summary costs at a seal (#266) ─────────────────────
+#
+# Compiled, deliberately not run: it writes a store into the directory it is given and prints one
+# JSON object, the time a summary took and that time over the rows it read.
+add_executable(book_summary_cost book_summary_cost.cpp)
+target_link_libraries(book_summary_cost PRIVATE orderbook_columnar)
+
 # ── What each column of a store's segments takes, under each candidate encoding (segment format v3) ──
 #
 # Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
@@ -110,6 +117,20 @@ endif()
 # Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object.
 add_executable(column_codec_cost column_codec_cost.cpp)
 target_link_libraries(column_codec_cost PRIVATE orderbook_column_codec)
+
+# ── What a seal's encoding of its columns costs, as a store pays it (#267) ────
+#
+# Compiled, deliberately not run: it reads the data directory it is given and prints one JSON object,
+# the time a row of every seal, of the searched ones and of the others, and a hash of what they wrote.
+add_executable(seal_encode_cost seal_encode_cost.cpp)
+target_link_libraries(seal_encode_cost PRIVATE orderbook_columnar)
+
+# ── What applying a recording's updates to the live books costs, a level at a time (#268) ──
+#
+# Compiled, deliberately not run: it reads the recording CSV it is given and prints one JSON object, the
+# ns a level, the depth of the sides and a hash of the books.
+add_executable(book_apply_cost book_apply_cost.cpp)
+target_link_libraries(book_apply_cost PRIVATE orderbook_soa)
 
 # ── What a reply's numbers cost to write (#251) ───────────────────────────────
 #

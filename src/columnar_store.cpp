@@ -4,6 +4,7 @@
 #include "orderbook/codec.hpp"
 #include "orderbook/column_codec.hpp"
 #include "orderbook/crc32c.hpp"
+#include "orderbook/price_side.hpp"
 #include "orderbook/logger.hpp"
 
 #include <fcntl.h>
@@ -15,11 +16,13 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <compare>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -203,14 +206,7 @@ void ColumnarStore::publish_blocks(const std::vector<std::shared_ptr<const RowBl
         unsealed_rows_ += rows;
     }
     if (!falsified.empty()) {
-        size_t tracks = 0;
-        for (const std::string& f : falsified) {
-            if (is_best_track_file(fs::path(f).filename().string())) ++tracks;
-        }
-        OB_LOG_INFO("columnar", "%zu book summar%s and %zu best track(s) removed: a row at or before "
-                                "the time each is as of was published after it",
-                    falsified.size() - tracks, falsified.size() - tracks == 1 ? "y" : "ies", tracks);
-        remove_summary_files(falsified, "a row at or before its time was published after it");
+        report_falsified(falsified, "a row at or before the time each is as of was published after it");
     }
     OB_LOG_DEBUG("columnar", "published %zu block(s) of %zu row(s) for queries to read unsealed",
                  blocks.size(), rows);
@@ -263,6 +259,7 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
     size_t refused = 0;
     size_t rows = 0;
     size_t taken = 0;
+    std::vector<std::string> falsified;
     {
         std::unique_lock<std::shared_mutex> lock(index_mtx_);
         auto& entry = by_symbol_[index_key(symbol, exchange)];
@@ -272,9 +269,22 @@ size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& 
         }
         unsealed_rows_ -= std::min(rows, unsealed_rows_);
         for (const auto& meta : segments) {
-            if (!insert_locked(meta)) ++refused;
+            if (!insert_locked(meta)) {
+                ++refused;
+                continue;
+            }
+            // A summary holds the rows of its instants in the order a read delivered them when it was
+            // composed; a segment that changes that order falsifies it as a late row does (#278). From
+            // the segment's first row: a summary is as of the newest segment's end when it is written, so
+            // none can be between that and the first instant whose order changes.
+            SymbolIndex& si = by_symbol_[index_key(meta.symbol, meta.exchange)];
+            if (reorders_locked(si, meta)) falsify_summaries_locked(si, meta.start_ts_ns, falsified);
         }
         if (entry.tiers.empty() && entry.blocks.empty()) by_symbol_.erase(index_key(symbol, exchange));
+    }
+    if (!falsified.empty()) {
+        report_falsified(falsified, "a seal put rows at or before the time each is as of in another "
+                                    "order than it was composed in");
     }
     if (taken != count) {
         OB_LOG_ERROR("columnar", "sealing %s.%s: asked to replace %zu block(s) and found %zu - the "
@@ -809,6 +819,50 @@ void ColumnarStore::append_row(const SnapshotRow& row, uint64_t own_seq) {
     active_own_max_ = std::max(active_own_max_, own_seq);
 }
 
+namespace {
+
+/// One field of each row of a block, as an iterator `vector::insert()` takes (#284): a column grows by its
+/// values, each constructed where it stays. resize() zeroed a tile before it was written, and on the m9g.xlarge
+/// glibc zeroes with its generic memset - 1.1-1.5% of the node's samples under #190's ingest after #281.
+template <typename T, auto Field>
+class FieldOfRows {
+public:
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type        = T;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = void;
+    using reference         = T;
+
+    FieldOfRows() = default;
+    explicit FieldOfRows(const SnapshotRow* row) : row_(row) {}
+
+    T operator*() const { return static_cast<T>(row_->*Field); }
+    T operator[](difference_type n) const { return static_cast<T>(row_[n].*Field); }
+    FieldOfRows& operator++() { ++row_; return *this; }
+    FieldOfRows operator++(int) { FieldOfRows was = *this; ++row_; return was; }
+    FieldOfRows& operator--() { --row_; return *this; }
+    FieldOfRows operator--(int) { FieldOfRows was = *this; --row_; return was; }
+    FieldOfRows& operator+=(difference_type n) { row_ += n; return *this; }
+    FieldOfRows& operator-=(difference_type n) { row_ -= n; return *this; }
+    friend FieldOfRows operator+(FieldOfRows i, difference_type n) { return i += n; }
+    friend FieldOfRows operator+(difference_type n, FieldOfRows i) { return i += n; }
+    friend FieldOfRows operator-(FieldOfRows i, difference_type n) { return i -= n; }
+    friend difference_type operator-(const FieldOfRows& a, const FieldOfRows& b) { return a.row_ - b.row_; }
+    friend bool operator==(const FieldOfRows& a, const FieldOfRows& b) { return a.row_ == b.row_; }
+    friend auto operator<=>(const FieldOfRows& a, const FieldOfRows& b) { return a.row_ <=> b.row_; }
+
+private:
+    const SnapshotRow* row_{nullptr};
+};
+
+/// The `n` rows from `from` appended to `column`, by the one field of theirs it holds.
+template <auto Field, typename T>
+void append_field(std::vector<T>& column, const SnapshotRow* from, size_t n) {
+    column.insert(column.end(), FieldOfRows<T, Field>(from), FieldOfRows<T, Field>(from + n));
+}
+
+}  // namespace
+
 void ColumnarStore::append_block(const RowBlock& block) {
     const std::vector<SnapshotRow>& rows = block.rows;
     if (rows.empty()) return;
@@ -842,15 +896,26 @@ void ColumnarStore::append_block(const RowBlock& block) {
     // encoder falls back for exactly the quantities append() tests - so the flag changes no byte
     // it writes. Found by the mutation table: dropping the test here was the one row it could not
     // kill.
-    for (size_t i = 1; i < rows.size(); ++i) {
-        const SnapshotRow& row = rows[i];
-        price_buf_.push_back(row.price);
-        qty_buf_.push_back(row.quantity);
-        ts_buf_.push_back(row.timestamp_ns);
-        cnt_buf_.push_back(row.order_count);
-        side_buf_.push_back(row.side);
-        level_buf_.push_back(row.level_index);
-        seq_buf_.push_back(static_cast<int64_t>(row.sequence_number));
+    //
+    // The columns grow a tile of rows at a time (#281): seven push_back()s a row loaded each column's end
+    // from the store, compared it with the capacity and stored it back - for every row, the char column's
+    // store keeping the compiler from holding any of them in a register - and that was most of
+    // append_block()'s samples under #190's ingest. Each column takes the tile's values by one insert(),
+    // constructed where they stay (#284) - a tile's resize() zeroed it first - and the seven passes over a
+    // tile read it from the cache; a seal reserved the rows already.
+    constexpr size_t kTile = 1024;
+    const SnapshotRow* src = rows.data() + 1;
+    for (size_t left = rows.size() - 1; left > 0;) {
+        const size_t n = std::min(left, kTile);
+        append_field<&SnapshotRow::price>(price_buf_, src, n);
+        append_field<&SnapshotRow::quantity>(qty_buf_, src, n);
+        append_field<&SnapshotRow::timestamp_ns>(ts_buf_, src, n);
+        append_field<&SnapshotRow::order_count>(cnt_buf_, src, n);
+        append_field<&SnapshotRow::side>(side_buf_, src, n);
+        append_field<&SnapshotRow::level_index>(level_buf_, src, n);
+        append_field<&SnapshotRow::sequence_number>(seq_buf_, src, n);
+        src  += n;
+        left -= n;
     }
     active_row_count_ += rows.size() - 1;
     if (block.min_ts_ns < active_min_ts_) active_min_ts_ = block.min_ts_ns;
@@ -2508,6 +2573,64 @@ BatchVerdict take_in_steps(ScanPart& part, const RowBatch& batch) {
     return {};
 }
 
+namespace {
+
+/// The rows a segment may give a range, from its metadata, as if spread evenly over its time - all of
+/// them when its range is one instant (#246, #260).
+uint64_t segment_rows_in_range(const SegmentMeta& m, uint64_t start_ns, uint64_t end_ns) {
+    const uint64_t lo = std::max(m.start_ts_ns, start_ns);
+    const uint64_t hi = std::min(m.end_ts_ns, end_ns);
+    const uint64_t span = m.end_ts_ns - m.start_ts_ns;
+    if (hi < lo) return 0;
+    if (span == 0) return m.row_count;
+    return static_cast<uint64_t>(static_cast<double>(m.row_count) *
+                                 (static_cast<double>(hi - lo) + 1.0) /
+                                 (static_cast<double>(span) + 1.0));
+}
+
+}  // namespace
+
+uint64_t ColumnarStore::rows_in_range_at_most(uint64_t start_ns, uint64_t end_ns,
+                                              std::string_view symbol, std::string_view exchange,
+                                              uint64_t enough) const {
+    // scan_set()'s walk of the index without its copies, and no further than `enough`: asked before
+    // every read a client loop may hand off (#260), most of them small, which pay for this walk.
+    uint64_t rows = 0;
+    size_t   segments = 0;
+    size_t   blocks = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        const auto it = by_symbol_.find(index_key(symbol, exchange));
+        if (it == by_symbol_.end()) return 0;
+        for (const auto& b : it->second.blocks) {
+            if (rows >= enough) break;
+            if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) {
+                rows += b->rows.size();
+                ++blocks;
+            }
+        }
+        for (const WidthTier& tier : it->second.tiers) {
+            const auto& v = tier.segments;
+            const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
+            auto i = std::lower_bound(
+                v.begin(), v.end(), from,
+                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+            for (; rows < enough && i != v.end() && i->start_ts_ns <= end_ns; ++i) {
+                if (i->end_ts_ns < start_ns) continue;
+                rows += segment_rows_in_range(*i, start_ns, end_ns);
+                ++segments;
+            }
+        }
+    }
+    OB_LOG_DEBUG("columnar", "%.*s.%.*s [%llu, %llu]: at most %llu row(s) in %zu segment(s) and %zu "
+                 "block(s)%s", static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(start_ns), static_cast<unsigned long long>(end_ns),
+                 static_cast<unsigned long long>(rows), segments, blocks,
+                 rows >= enough ? ", counted no further" : "");
+    return rows;
+}
+
 ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t end_ns,
                                                    std::string_view symbol,
                                                    std::string_view exchange, ColumnSet columns,
@@ -2556,16 +2679,7 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
     uint64_t in_range = 0;
     uint64_t largest = 0;
     for (Slot& s : slots) {
-        const SegmentMeta& m = *s.meta;
-        const uint64_t lo = std::max(m.start_ts_ns, start_ns);
-        const uint64_t hi = std::min(m.end_ts_ns, end_ns);
-        const uint64_t span = m.end_ts_ns - m.start_ts_ns;
-        const uint64_t rows =
-            span == 0 || hi < lo
-                ? (hi < lo ? 0 : m.row_count)
-                : static_cast<uint64_t>(static_cast<double>(m.row_count) *
-                                        (static_cast<double>(hi - lo) + 1.0) /
-                                        (static_cast<double>(span) + 1.0));
+        const uint64_t rows = segment_rows_in_range(*s.meta, start_ns, end_ns);
         in_range += rows;
         largest = std::max(largest, rows);
     }
@@ -2719,31 +2833,214 @@ ColumnarStore::PricedBook ColumnarStore::book_at_by_price(uint64_t at, std::stri
     return compose_by_price(at, symbol, exchange, depth, nullptr);
 }
 
+namespace {
+
+/// The instant after `t` - the first a composition from a summary as of `t` reads rows at (#272) - or
+/// `t` itself at the clock's end, where there is none after.
+uint64_t after_instant(uint64_t t) {
+    return t == UINT64_MAX ? t : t + 1;
+}
+
+}  // namespace
+
+namespace {
+
+/// The composition by price that compose_by_price() and compose_from_seal() share (#286): the two sides, the last
+/// row applied and the best track's instants. Rows go in from a summary's book, a batch at a time as a decoder
+/// gives them (#266, #271), or a row at a time as a merge delivers them (#233, #243). One class, so that a
+/// summary composed from a seal's own columns and one composed from the segment's file cannot differ.
+class PriceComposer {
+public:
+    PriceComposer(ColumnarStore::PricedBook& out, BestTrack* track) : out_(out), track_(track) {}
+
+    /// The book the composition starts from - `summary`'s, or none - and the track's first entry at `from`, the
+    /// summary's time. Again, from nothing, when a read gives up on the order it hoped for.
+    void start(const BookSummary* summary, uint64_t from) {
+        bids_.clear();
+        asks_.clear();
+        out_.as_of.reset();
+        out_.from_summary.reset();
+        if (summary != nullptr) {
+            for (const SnapshotRow& r : summary->rows) apply(r);
+            SnapshotRow label{};
+            label.timestamp_ns    = summary->header.as_of_ts;
+            label.sequence_number = summary->header.as_of_seq;
+            out_.as_of = label;
+            out_.from_summary = summary->header.as_of_ts;
+        }
+        instant_  = 0;
+        pending_  = false;
+        last_     = 0;
+        in_order_ = true;
+        kept_     = 0;
+        if (track_ != nullptr) {
+            track_->header.from_ts = from;
+            track_->header.from_first_row = !out_.from_summary.has_value();
+            track_->entries.assign(1, BestTrackEntry{from, top_now()});
+        }
+    }
+
+    /// A batch's rows as a decoder gives them, each at or after the one before it in time. At a row before
+    /// it, the rows ahead of that one applied, in_order() false, and the verdict to stop there.
+    BatchVerdict apply_batch(const RowBatch& b) {
+        for (size_t k = 0; k < b.rows.size(); ++k) {
+            const uint32_t i = b.rows[k];
+            const uint64_t ts = b.ts[i];
+            if (ts < last_) {
+                in_order_ = false;
+                return {true, k};
+            }
+            last_ = ts;
+            ++kept_;
+            note_instant(ts);
+            apply_at(b, i);
+        }
+        // The row the book is as of: the last applied, once a batch rather than once a row.
+        if (!b.rows.empty()) fill_row(out_.as_of.emplace(), b, b.rows.back());
+        return {};
+    }
+
+    /// One row as the merge delivers it.
+    bool apply_row(const SnapshotRow& r) {
+        note_instant(r.timestamp_ns);
+        return apply(r);
+    }
+
+    /// One row of a run that has to come in time order, as a decoder gives a segment's (#286): false - and
+    /// in_order() false, the row not applied - when it is before the one ahead of it.
+    bool apply_row_in_order(const SnapshotRow& r) {
+        if (r.timestamp_ns < last_) {
+            in_order_ = false;
+            return false;
+        }
+        last_ = r.timestamp_ns;
+        ++kept_;
+        note_instant(r.timestamp_ns);
+        return apply(r);
+    }
+
+    bool in_order() const { return in_order_; }
+    uint64_t kept() const { return kept_; }
+
+    /// The track's last instant closed, and the best `depth` prices of each side put in the book.
+    void finish(size_t depth) {
+        if (track_ != nullptr) {
+            if (pending_) close_instant();
+            track_->header.entries = static_cast<uint32_t>(track_->entries.size());
+        }
+        out_.bid_prices = bids_.size();
+        out_.ask_prices = asks_.size();
+        take(bids_, depth);
+        take(asks_, depth);
+    }
+
+private:
+    bool apply(const SnapshotRow& r) {
+        out_.as_of = r;
+        if (r.side == SIDE_BID) {
+            if (r.quantity == 0) {
+                bids_.remove(r.price);
+            } else {
+                bids_.put(r);
+            }
+        } else if (r.side == SIDE_ASK) {
+            if (r.quantity == 0) {
+                asks_.remove(r.price);
+            } else {
+                asks_.put(r);
+            }
+        }
+        return true;
+    }
+
+    // The best of each side where the composition starts, and after each instant at which it changed: the
+    // rows of one instant are applied together, and the best after all of them is the one in force, as a
+    // series takes it (#243).
+    BookTop top_now() {
+        BookTop t;
+        if (!bids_.empty()) {
+            t.has_bid = true;
+            t.bid = bids_.best();
+        }
+        if (!asks_.empty()) {
+            t.has_ask = true;
+            t.ask = asks_.best();
+        }
+        return t;
+    }
+
+    void close_instant() {
+        if (const BookTop t = top_now(); !(t == track_->entries.back().top)) {
+            track_->entries.push_back(BestTrackEntry{instant_, t});
+        }
+    }
+
+    // The track's part of a row at `ts`: the instant before it closes when this one is another.
+    void note_instant(uint64_t ts) {
+        if (track_ != nullptr) {
+            if (pending_ && ts != instant_) close_instant();
+            instant_ = ts;
+            pending_ = true;
+        }
+    }
+
+    // apply(), for row `i` of a batch as the decoder gives it (#271): its side, quantity and price read from
+    // the columns as row_of() reads them, and a row kept written into its side's slot field by field. A row
+    // built on the stack and copied - into `out.as_of`, then into the side - was read back by wide loads of
+    // what narrow stores had just written, and applying a row waited on that.
+    void apply_at(const RowBatch& b, uint32_t i) {
+        const uint8_t  side  = b.side.empty() ? uint8_t{0} : b.side[i];
+        const uint64_t qty   = b.qty.empty() ? uint64_t{0} : b.qty[i];
+        const int64_t  price = b.price.empty() ? int64_t{0} : b.price[i];
+        if (side == SIDE_BID) {
+            if (qty == 0) {
+                bids_.remove(price);
+            } else {
+                fill_row(bids_.place(price), b, i);
+            }
+        } else if (side == SIDE_ASK) {
+            if (qty == 0) {
+                asks_.remove(price);
+            } else {
+                fill_row(asks_.place(price), b, i);
+            }
+        }
+    }
+
+    template <typename Side>
+    void take(const Side& side, size_t depth) {
+        size_t level = 0;
+        for (const SnapshotRow& row : side.best_first()) {
+            if (level >= depth) break;
+            SnapshotRow r = row;
+            // A position past what the field holds only in a read of more than 65535 prices a side, which
+            // nothing answers: the live book holds 1000.
+            r.level_index = static_cast<uint16_t>(std::min<size_t>(level, UINT16_MAX));
+            ++level;
+            out_.rows.push_back(r);
+        }
+    }
+
+    ColumnarStore::PricedBook& out_;
+    BestTrack* track_;
+    // The row holding each price, by side: a table from price to row and the best price at hand, sorted once
+    // at the end (#266). A std::map here was half of what composing a summary cost.
+    PriceSide<true>  bids_;
+    PriceSide<false> asks_;
+    uint64_t instant_{0};
+    bool     pending_{false};
+    uint64_t last_{0};
+    bool     in_order_{true};
+    uint64_t kept_{0};
+};
+
+}  // namespace
+
 ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::string_view symbol,
                                                          std::string_view exchange, size_t depth,
                                                          BestTrack* track) const {
     PricedBook out;
-    // The row holding each price, by side. Ordered maps, so the best come first without a sort,
-    // and a removal is one erase.
-    std::map<int64_t, SnapshotRow, std::greater<>> bids;
-    std::map<int64_t, SnapshotRow> asks;
-    const auto apply = [&](const SnapshotRow& r) {
-        out.as_of = r;
-        if (r.side == SIDE_BID) {
-            if (r.quantity == 0) {
-                bids.erase(r.price);
-            } else {
-                bids.insert_or_assign(r.price, r);
-            }
-        } else if (r.side == SIDE_ASK) {
-            if (r.quantity == 0) {
-                asks.erase(r.price);
-            } else {
-                asks.insert_or_assign(r.price, r);
-            }
-        }
-        return true;
-    };
+    PriceComposer c(out, track);
     ColumnSet columns;
     columns.add(QueryColumn::TimestampNs);
     columns.add(QueryColumn::SequenceNumber);
@@ -2760,91 +3057,138 @@ ColumnarStore::PricedBook ColumnarStore::compose_by_price(uint64_t at, std::stri
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         gather_locked(0, at, symbol, exchange, at, g);
     }
-    uint64_t from = 0;
+    uint64_t from = 0;        // the summary's time, where the track starts
+    uint64_t rows_from = 0;   // the first time of a row applied to it: the instant after (#272)
+    BookSummary summary;
+    bool from_summary = false;
     if (g.summary.has_value()) {
-        BookSummary summary;
         if (read_book_summary(g.summary->second, summary).empty()) {
-            for (const SnapshotRow& r : summary.rows) apply(r);
-            SnapshotRow label{};
-            label.timestamp_ns    = summary.header.as_of_ts;
-            label.sequence_number = summary.header.as_of_seq;
-            out.as_of = label;
-            out.from_summary = summary.header.as_of_ts;
+            from_summary = true;
             from = summary.header.as_of_ts;
+            rows_from = after_instant(from);
         } else {
             // read_book_summary() said why. The rows themselves are the answer, from the first.
-            bids.clear();
-            asks.clear();
-            out.as_of.reset();
             g = Gathered{};
             std::shared_lock<std::shared_mutex> lock(index_mtx_);
             gather_locked(0, at, symbol, exchange, std::nullopt, g);
         }
     }
-    if (track == nullptr) {
-        out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{}, apply);
-    } else {
-        // The best of each side where the composition starts, and after each instant at which it
-        // changed: the rows of one instant are applied together, and the best after all of them is
-        // the one in force, as a series takes it (#243).
-        const auto top_now = [&]() {
-            BookTop t;
-            if (!bids.empty()) {
-                t.has_bid = true;
-                t.bid = bids.begin()->first;
-            }
-            if (!asks.empty()) {
-                t.has_ask = true;
-                t.ask = asks.begin()->first;
-            }
-            return t;
-        };
-        track->header.from_ts = from;
-        track->header.from_first_row = !out.from_summary.has_value();
-        track->entries.assign(1, BestTrackEntry{from, top_now()});
-        uint64_t instant = 0;
-        bool pending = false;
-        const auto close_instant = [&]() {
-            if (const BookTop t = top_now(); !(t == track->entries.back().top)) {
-                track->entries.push_back(BestTrackEntry{instant, t});
-            }
-        };
-        out.cost = scan_gathered(g, from, at, symbol, exchange, columns, RowFilter{},
-                                 [&](const SnapshotRow& r) {
-                                     if (pending && r.timestamp_ns != instant) close_instant();
-                                     instant = r.timestamp_ns;
-                                     pending = true;
-                                     return apply(r);
-                                 });
-        if (pending) close_instant();
-        track->header.entries = static_cast<uint32_t>(track->entries.size());
-    }
-    out.bid_prices = bids.size();
-    out.ask_prices = asks.size();
-    const auto take = [&](const auto& side) {
-        size_t level = 0;
-        for (const auto& [price, row] : side) {
-            if (level >= depth) break;
-            SnapshotRow r = row;
-            // A position past what the field holds only in a read of more than 65535 prices a
-            // side, which nothing answers: the live book holds 1000.
-            r.level_index = static_cast<uint16_t>(std::min<size_t>(level, UINT16_MAX));
-            ++level;
-            out.rows.push_back(r);
-        }
+    // The book the composition starts from - the summary's, or none - and the track's first entry.
+    c.start(from_summary ? &summary : nullptr, from);
+
+    // A summary's span is mostly the segment sealed since the summary it starts from, and the row at
+    // the summary's time that ends the segment before it: segments whose rows come in time order one
+    // after another, and no block with a row in the span. Then the rows are applied as the decoder
+    // gives them, a batch at a time and the segments in the order the merge ranks them, rather than
+    // copied into runs, sorted if they need it and merged (#266). The merge hands over the earliest
+    // time first and, at one time, the lower rank: the same rows in the same order, as long as no row
+    // comes before the one ahead of it. One that does - an event time a client gave - sends the
+    // composition back to the merge, from the start.
+    const auto reaches = [&](const std::shared_ptr<const RowBlock>& b) {
+        return !(b->max_ts_ns < rows_from || b->min_ts_ns > at);
     };
-    take(bids);
-    take(asks);
+    const bool in_sequence =
+        g.found && !g.segments.empty() &&
+        std::all_of(g.segments.begin(), g.segments.end(),
+                    [](const SegmentMeta& m) { return m.time_range_is_rows; }) &&
+        std::none_of(g.blocks.begin(), g.blocks.end(), reaches);
+    bool direct = false;
+    if (in_sequence) {
+        uint64_t filtered = 0;
+        const BatchReader as_read = [&](const RowBatch& b) -> BatchVerdict { return c.apply_batch(b); };
+        for (const SegmentMeta& m : g.segments) {
+            read_segment_rows(m, columns, rows_from, at, RowFilter{}, as_read, ReadMode::kQuery, &filtered);
+            if (!c.in_order()) break;
+        }
+        if (c.in_order()) {
+            direct = true;
+            out.cost.candidates    = g.segments.size();
+            out.cost.blocks        = g.blocks.size();
+            out.cost.kept          = c.kept();
+            out.cost.delivered     = c.kept();
+            out.cost.rows_filtered = filtered;
+        } else {
+            OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: its segments' rows are not in "
+                                     "time order; composed again through the merge",
+                         static_cast<int>(symbol.size()), symbol.data(),
+                         static_cast<int>(exchange.size()), exchange.data(),
+                         static_cast<unsigned long long>(at));
+            c.start(from_summary ? &summary : nullptr, from);
+        }
+    }
+    if (!direct) {
+        out.cost = scan_gathered(g, rows_from, at, symbol, exchange, columns, RowFilter{},
+                                 [&](const SnapshotRow& r) { return c.apply_row(r); });
+    }
+    c.finish(depth);
     OB_LOG_DEBUG("columnar", "book by price of %.*s.%.*s at %llu: %zu bid and %zu ask price(s), %zu "
-                             "answered; from %s, then %llu row(s) read from %zu candidate(s)",
+                             "answered; from %s, then %llu row(s) read from %zu candidate(s), %s",
                  static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
                  static_cast<unsigned long long>(at), out.bid_prices, out.ask_prices,
                  out.rows.size(),
                  out.from_summary ? ("the summary as of " + std::to_string(*out.from_summary)).c_str()
                                   : "the first row",
-                 static_cast<unsigned long long>(out.cost.kept), out.cost.candidates);
+                 static_cast<unsigned long long>(out.cost.kept), out.cost.candidates,
+                 direct ? "in sequence as decoded" : "merged by time");
     return out;
+}
+
+std::optional<ColumnarStore::PricedBook> ColumnarStore::compose_from_sealed_rows(
+        uint64_t as_of, std::string_view symbol, std::string_view exchange, const std::string& dir,
+        std::span<const std::shared_ptr<const RowBlock>> sealed, BestTrack& track, std::string& why) const {
+    // What compose_by_price(as_of) would gather, under the same lock: the newest summary, and after it the one
+    // segment the seal wrote, from the rows these blocks hold - and nothing else.
+    Gathered g;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        gather_locked(0, as_of, symbol, exchange, as_of, g);
+    }
+    if (!g.found || !g.summary.has_value()) {
+        why = "no summary to start from";
+        return std::nullopt;
+    }
+    if (g.segments.size() != 1 || g.segments.front().dir_path != dir || !g.segments.front().time_range_is_rows) {
+        why = "the index holds other rows after the summary";
+        return std::nullopt;
+    }
+    if (!g.blocks.empty()) {
+        why = "a published block has rows after the summary";
+        return std::nullopt;
+    }
+    BookSummary base;
+    if (!read_book_summary(g.summary->second, base).empty()) {
+        why = "the summary does not read back";
+        return std::nullopt;
+    }
+    PricedBook book;
+    BestTrack composed;
+    PriceComposer c(book, &composed);
+    const uint64_t from = base.header.as_of_ts;
+    c.start(&base, from);
+    // The segment's rows are the blocks' rows, block after block, in the order the seal appended them; from
+    // the instant after the summary's time (#272) to the summary's own, as a read of the segment takes them.
+    const uint64_t rows_from = after_instant(from);
+    uint64_t filtered = 0;
+    for (const auto& b : sealed) {
+        for (const SnapshotRow& r : b->rows) {
+            if (r.timestamp_ns < rows_from || r.timestamp_ns > as_of) {
+                ++filtered;
+                continue;
+            }
+            if (!c.apply_row_in_order(r)) {
+                why = "its segment's rows go back in time";
+                return std::nullopt;
+            }
+        }
+    }
+    book.cost.candidates    = 1;
+    book.cost.kept          = c.kept();
+    book.cost.delivered     = c.kept();
+    book.cost.rows_filtered = filtered;
+    c.finish(SIZE_MAX);
+    track = std::move(composed);
+    return book;
 }
 
 namespace {
@@ -2880,9 +3224,9 @@ int write_unsynced(const std::string& path, std::string_view bytes) {
 
 }  // namespace
 
-ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(std::string_view symbol,
-                                                              std::string_view exchange,
-                                                              const std::string& dir) {
+ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(
+        std::string_view symbol, std::string_view exchange, const std::string& dir,
+        std::span<const std::shared_ptr<const RowBlock>> sealed) {
     SummaryWrite out;
     // As of the latest time a segment of the symbol holds a row at: a block's rows are the next
     // seal's, and a summary that waited for them would falsify itself on the next restart, when the
@@ -2915,7 +3259,24 @@ ColumnarStore::SummaryWrite ColumnarStore::write_book_summary(std::string_view s
     out.as_of_ts = as_of;
     // The best of each side through the same composition, for the track beside the summary (#243).
     BestTrack track;
-    const PricedBook book = compose_by_price(as_of, symbol, exchange, SIZE_MAX, &track);
+    PricedBook book;
+    // From the rows of the blocks the seal wrote, when they are all the rows after the newest summary (#286):
+    // the same rows in the same order as a read of the segment would give, without reading it back.
+    if (!sealed.empty()) {
+        std::string why;
+        if (auto composed = compose_from_sealed_rows(as_of, symbol, exchange, dir, sealed, track, why)) {
+            book = std::move(*composed);
+            out.from_sealed_rows = true;
+        } else {
+            out.sealed_rows_why_not = why;
+            OB_LOG_DEBUG("columnar", "book summary of %.*s.%.*s as of %llu not composed from the rows its seal "
+                                     "wrote: %s",
+                         static_cast<int>(symbol.size()), symbol.data(),
+                         static_cast<int>(exchange.size()), exchange.data(),
+                         static_cast<unsigned long long>(as_of), why.c_str());
+        }
+    }
+    if (!out.from_sealed_rows) book = compose_by_price(as_of, symbol, exchange, SIZE_MAX, &track);
     track.header.as_of_ts = as_of;
     out.rows_read = book.cost.kept;
     out.prices = book.rows.size();
@@ -3044,6 +3405,34 @@ void ColumnarStore::remove_summary_files(const std::vector<std::string>& files, 
     }
 }
 
+void ColumnarStore::report_falsified(const std::vector<std::string>& files, std::string_view why) {
+    size_t tracks = 0;
+    for (const std::string& f : files) {
+        if (is_best_track_file(fs::path(f).filename().string())) ++tracks;
+    }
+    OB_LOG_INFO("columnar", "%zu book summar%s and %zu best track(s) removed: %.*s",
+                files.size() - tracks, files.size() - tracks == 1 ? "y" : "ies", tracks,
+                static_cast<int>(why.size()), why.data());
+    remove_summary_files(files, why);
+}
+
+bool ColumnarStore::reorders_locked(const SymbolIndex& si, const SegmentMeta& added) {
+    for (const WidthTier& tier : si.tiers) {
+        // The first of this tier's segments delivered after it: of those, the one that starts first, so
+        // the only one to look at - if it starts after `added` ends, so do the rest.
+        const auto& v = tier.segments;
+        const auto after = std::upper_bound(v.begin(), v.end(), added, segment_order_less);
+        if (after == v.end() || after->start_ts_ns > added.end_ts_ns) continue;
+        OB_LOG_DEBUG("columnar", "segment %s of %s.%s, [%llu, %llu], is delivered before %s, which starts "
+                                 "inside its range: a tie on a time they share changes places",
+                     added.dir_path.c_str(), added.symbol.c_str(), added.exchange.c_str(),
+                     static_cast<unsigned long long>(added.start_ts_ns),
+                     static_cast<unsigned long long>(added.end_ts_ns), after->dir_path.c_str());
+        return true;
+    }
+    return false;
+}
+
 void ColumnarStore::drop_summaries_in_locked(SymbolIndex& si, const std::string& dir) {
     const fs::path in(dir);
     for (auto s = si.summaries.begin(); s != si.summaries.end();) {
@@ -3112,9 +3501,12 @@ void ColumnarStore::gather_locked(uint64_t start_ns, uint64_t end_ns, std::strin
         if (s != summaries.begin()) {
             --s;
             out.summary = std::make_pair(s->first, s->second);
-            // The rows a read applies to it: from its own time on, which it holds too - a row at
-            // that time is applied again, to the same effect, in the same order (book_summary.hpp).
-            start_ns = std::max(start_ns, s->first);
+            // The rows a read applies to it: the ones after its time (#272). It holds every row at
+            // its time that the candidates gathered with it under this lock hold - a row published
+            // since that is not in it falsifies it, out of the index before the row can be read
+            // (book_summary.hpp) - so applying them again changed nothing, and it read the whole of
+            // the segment the summary was made at, for the rows of that segment's last instant.
+            start_ns = std::max(start_ns, after_instant(s->first));
         }
     }
     for (const auto& b : it->second.blocks) {
@@ -3903,6 +4295,7 @@ size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segment
     std::unique_lock<std::shared_mutex> lock(index_mtx_);
 
     size_t refused = 0;
+    std::vector<std::string> falsified;
     for (const auto& meta : new_segments) {
         // Defence in depth, not the fix. Since #136 a directory belongs to one segment rather
         // than to one event-time span, so two flushes covering the same span get two
@@ -3922,7 +4315,17 @@ size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segment
                          meta.dir_path.c_str(),
                          static_cast<unsigned long long>(meta.row_count));
             ++refused;
+            continue;
         }
+        // Its rows went in with it, not through publish_blocks() - the embedded engine's flush (C
+        // API) - so a summary as of its first row or later does not hold them (#278).
+        falsify_summaries_locked(by_symbol_[index_key(meta.symbol, meta.exchange)], meta.start_ts_ns,
+                                 falsified);
+    }
+    lock.unlock();
+    if (!falsified.empty()) {
+        report_falsified(falsified, "a segment merged into the index holds a row at or before the time "
+                                    "each is as of");
     }
     return refused;
 }

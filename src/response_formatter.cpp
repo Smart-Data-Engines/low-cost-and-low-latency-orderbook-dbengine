@@ -729,6 +729,28 @@ std::string format_push(uint64_t subscription_id, const QueryResult& row) {
     return std::string(line, p);
 }
 
+static_assert(kPushHeadRoom >= 5 + 21 + decimal_text::kWriteRoom, "room for PUSH, an id and its tab");
+static_assert(kPushRowRoom >= kMaxQueryRowBytes + decimal_text::kWriteRoom, "room for a row's line");
+
+char* format_push_head(char* out, char* end, uint64_t subscription_id) {
+    std::memcpy(out, "PUSH ", 5);
+    return put_field(out + 5, end, subscription_id, '\t');
+}
+
+char* format_push_row(char* out, char* end, const SnapshotRow& row) {
+    // Through the QueryResult notify_subscribers() builds for a row callback, and format_push()'s
+    // put_seven(): the bytes of a pushed row cannot differ between the two paths.
+    QueryResult r{};
+    r.timestamp_ns    = row.timestamp_ns;
+    r.sequence_number = row.sequence_number;
+    r.price           = row.price;
+    r.quantity        = row.quantity;
+    r.order_count     = row.order_count;
+    r.side            = row.side;
+    r.level           = row.level_index;
+    return put_seven(out, end, r);
+}
+
 std::string format_error(std::string_view message) {
     std::string out;
     out.reserve(5 + message.size());

@@ -1407,7 +1407,7 @@ and getting data into their existing Python stack without a copy.
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
 
 ### 45. Streaming subscriptions ✅
-- `SUBSCRIBE 'SYM'.'EXCH'` pushing updates to the client
+- `SUBSCRIBE * FROM 'SYM'.'EXCH'` pushing updates to the client
 - Backpressure policy per subscriber, slow-consumer disconnect
 - **The claim has been corrected in the meantime, because it was the half that was free.** The
   README listed "streaming subscriptions" among the features, and a reader takes a feature list on a
@@ -1418,7 +1418,7 @@ and getting data into their existing Python stack without a copy.
   `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
   client polls. The README now says exactly that.
 - **Done.** Spec: `smart-data-engine-workspace/specs/streaming-subscriptions/`.
-  `SUBSCRIBE 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
+  `SUBSCRIBE * FROM 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
   as `PUSH <id>` with the same seven columns as a query row. Bounded queue per subscriber
   (`--max-subscriber-queue-bytes`, 8 MB ≈ 140 000 rows), overflow closes the session, per-session
   limit on subscriptions, five metrics, and `subscribe()` / `poll()` in the Python client.
@@ -2899,6 +2899,1325 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 286. A seal's book summary read back the segment the seal had just written, to compose it ✅ **P3**
+
+**Found in a profile by caller at #284's head** (spec `smart-data-engine-workspace/specs/summary-from-the-seals-columns/`,
+evidence `evidence/2026-11-20-summary-from-the-seals-columns/`): Release builds with frame pointers under #190's
+ingest, `perf record --call-graph fp`, on both hosts. Writing the book summaries took 9.2-9.6% of the node's samples
+on the m9g.xlarge and 8.0-9.1% on the m8a.xlarge - a third of the flush thread - and of it decoding the segment the
+seal had written a moment before 2.2-2.4%. A summary falls due at nearly every seal of a busy symbol, and
+`write_book_summary()` composed it by reading that segment back.
+
+**Now** a seal that makes a summary due keeps the blocks it wrote its segment from, whose rows are the segment's in
+its order, and `write_book_summary()` composes the summary from them - through the same composition, moved into one
+class (`PriceComposer`) so that the two ways cannot differ - when the index shows they are all a composition would
+apply: the newest summary, then the seal's segment alone, and no published block with a row in the span; and when
+the rows go back in time, or the index holds anything else, it composes as before. The composition stays after the
+background sync of the segments is asked, as it was, so it runs while the sync does. Only the flush tick keeps the
+blocks. `ob_book_summaries_from_sealed_rows_total` counts the summaries composed so.
+
+**The first version** composed the summary inside the seal from its column buffers, and was left: the flush thread's
+CPU fell, but the work the tick had done after asking the sync moved before it, and the next tick's WAL sync met the
+segments' sync more often - ticks whose WAL sync took 12 ms or more went from 13 to 73 (m9g.xlarge, sides 500 deep),
+the writers waited for room in the queue about twice as often, on both hosts. Diagnostic builds of b284, the first
+version and this one, side by side on both hosts, put this one lowest in the flush thread's CPU and the ticks' p90,
+and its WAL syncs near b284's. A segment's write had cleared four of the seven column buffers, which the first
+version's tests found.
+
+**Measured** with Release builds on the test hosts, #284's head against this change, six rounds a build in each shape:
+
+| the flush thread's CPU a level, median | m9g.xlarge flat | deep | m8a.xlarge flat | deep |
+|---|---|---|---|---|
+| #284 | 43.2 ns | 44.4 ns | 35.4 ns | 38.1 ns |
+| #286 | 34.4 ns | 36.0 ns | 29.4 ns | 33.8 ns |
+
+Decoding on the flush thread fell from 1.7-2.5% of the node's samples to 0.06-0.19%; every summary but each symbol's
+first was composed from the sealed rows. The node's CPU fell 3.4-5.5%, but on the m8a.xlarge's deep shape, where the
+client loops took 3.6% more a level, a thread the change does not touch (pitfall 648; the diagnostic builds went the
+other way). p999 fell on the m9g.xlarge (medians 897 to 393 us flat, 743 to 405 deep) and stayed within the rounds'
+spread on the m8a.xlarge, as did the writers' waits.
+
+**Tests.** The oracle test (`test_book_summary_equivalence`) runs its walk and its properties both ways, with a case
+of each way the index rules the blocks out - a block published after the seal with a row in the span, the newest
+summary falsified while an older stays, a later segment indexed, another segment in the span before the seal's, rows
+going back in time - and an instant split between two seals; an engine's summaries but its first are composed from
+the sealed rows (`test_book_by_price`). ctest passed 2290 of 2290 on both hosts (Debug): #285's 2282 and the eight
+new; the integration battery on x86 passed 615 and failed none, in 35:55, with 21 skipped as before.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U): seven mutants killed - the rows applied though they
+go back in time or from the summary's own time, an instant's rows taken as going back, the blocks used with other
+segments after the summary, with the seal's segment the last of several or with a published block in the span, and
+the counter not counted. Three controls survive: the rows' upper bound not filtered, and the blocks kept at every
+seal of the tick or at seals outside it. The first version's table found four gaps in the tests, each written then.
+
+- Effort: M | Impact: the flush thread takes 11-20% less CPU a level on both test hosts, and the m9g.xlarge's p999
+  is about halved
+
+### 285. A test's data directory was named the same in every run, and a crashed run's was the next run's ✅ **P3**
+
+**Found by #284's mutation table** (evidence `evidence/2026-11-19-own-temp-dirs/`, and
+`evidence/2026-11-19-grow-without-zeroing/mutations/`): a control that changed nothing a test can see - a seal's
+tile of 256 rows rather than 1 024 - was killed by `test_pending_row_names`. That test named its data directory
+by a counter that starts at 0 in every process, so every run wrote `/tmp/pending_row_names_0`; the mutant before
+the control had crashed the same test (`malloc(): invalid size`) and left the directory with its WAL, and the
+control's run opened it as its own and stored 3860 rows of a pair where it had written 1930. Reproduced by hand:
+the crash leaves the directory (204K), the next run fails so, and the run after it passes.
+
+Fifty-seven places in forty-three of the tests' files built a path under the temporary directory that every run
+of the binary named the same: by a counter, by `std::rand()` - which without a seed gives every process the same
+numbers - or by a fixed name; one of them in `tests/mm_engine_node.hpp`, which five test files share. A run that
+crashes, or is killed by its timeout, leaves its directory for the next run of the binary - locally, on a test
+host, in a mutation table - and the next run reads it.
+
+**Now** `tests/test_temp_dirs.hpp` gives a test a directory created by the call and named by a prefix, the
+process's id and a number the process counts, passing over a name that is taken, and a file path named the same
+way, a leftover file of that name removed. All fifty-seven go through it.
+
+**Tests.** `test_temp_dir_discipline`: every path a test builds under the temporary directory goes through the
+header, names its process by `getpid()` or is a `mkdtemp` template in the same statement - with the rule's own
+cases, a counter, an unseeded `std::rand()`, a fixed name and a `/` on the next line found, a process id, a
+template, the directory itself and a comment not; and the helper does what it says - a new empty directory, a
+taken name passed over with what is in it left alone, a leftover file removed, `TMPDIR` honoured. ctest passed 2282
+of 2282 on both hosts (Debug): #284's 2275 and the seven new; the integration battery on x86 passed 615 and failed
+none, in 35:23, with 21 skipped as before.
+
+**Mutation table** (`mutations/`, the i3-7100U, each run with a `TMPDIR` of its own): six mutants killed - a name
+without the process's id, a taken name reused with its data, a leftover file kept, the rule taking a process id as
+no proof, the rule not looking past the end of a line for the `/`, and `test_pending_row_names` put back to its
+counter. Two controls survive: the name's separator another character, and a leftover under a file's name removed
+even when it is a directory. The first run had the separator's control killed: the test of a taken name copied the
+helper's naming to plant its directory, and with another separator the helper never reached it; the test asks the
+helper for the name now.
+
+- Effort: S | Impact: a test run after a crashed one reads its own data, not the crashed run's
+
+### 284. A drain's block and a store's columns were zeroed before their rows were written into them ✅ **P3**
+
+**Found in the node's profile at #283's head** (evidence `evidence/2026-11-19-grow-without-zeroing/`): under
+#190's ingest the flush thread spent 1.10-1.52% of the node's samples in glibc's memset on the m9g.xlarge and
+0.98-1.27% on the m8a.xlarge - its AVX-512 loop, which `perf` could not name there - where #278's head spent
+0.17-0.35% and 0.30-0.47%. #281 grew the drain's block and `append_block()`'s column tiles by `resize()` and wrote
+the rows through pointers into them; `resize()` value-initialises what it adds, so every row was zeroed, then
+written.
+
+**Now** a drain's run goes into its block by `insert()` through an iterator over the pending rows, its range and
+flags counted in a pass of their own, and each of the store's seven columns takes a tile's values by one
+`insert()` through an iterator over the field it holds: every value is constructed where it stays.
+
+**Measured** with Release builds on the test hosts, #283's head against this change, six rounds a build in each
+shape, the order turned about every round:
+
+| the flush thread's CPU a level, median | m9g.xlarge flat | deep | m8a.xlarge flat | deep |
+|---|---|---|---|---|
+| #283 | 47.5 ns | 47.8 ns | 36.7 ns | 41.0 ns |
+| #284 | 44.4 ns | 45.0 ns | 35.6 ns | 38.9 ns |
+
+memset fell to 0.21-0.26% of the node's samples on the m9g.xlarge's flush thread and 0.38-0.57% on the
+m8a.xlarge's. Throughput, the node's CPU and the batches' p99 and p999 stay within the rounds' spread. Two other
+ways of writing a seal's tile - 256 rows rather than 1 024, and one pass into arrays on the stack with contiguous
+inserts after it - were measured beside this one on both hosts and took no less.
+
+**Tests.** The change adds none: what it changes is held by the drain's and the seal's own tests, which the
+mutation table killed with. ctest passed 2275 of 2275 on both hosts (Debug), as many as #283's; the integration
+battery on x86 passed 615 and failed none, in 36:07, with 21 skipped as before.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U): six mutants killed - a column taken from another
+field, either iterator one short, values cut to 32 bits, a run's last row left out of its block, a run's range
+counted without it - and three controls survive: a tile of 256 rows, the drain's block grown by `resize()` as #281
+did, and one column taken a `push_back()` a row. The table's first run had the first control killed: a mutant
+that crashed left its data directory, which the next run of the same test - named the same in every process -
+opened as its own (#285).
+
+- Effort: S | Impact: the flush thread takes 3-6% less CPU a level on both test hosts
+
+### 283. A thread the node started without a name carried its creator's, and a profile could not tell them apart ✅ **P3**
+
+**Found reading #277's profile** (evidence `evidence/2026-11-19-thread-names/`): the flush thread, the seal's sync
+and the WAL's removal were all `ob_tcp_server` in `perf`, `top -H` and `/proc/<pid>/task/*/comm` - the name of the
+thread that started them - so a profile counted the removal's unlinks as the flush thread's. Twenty of the
+twenty-three thread construction sites in `src/` named nothing - only the client loops, the TLS handshake pool and
+the WAL archiver did: the engine's three, replication's two, the mesh's io loop and its reconnects, failover's
+two, the coordinator's, the peer registry's two and the shard router's watches, the shard coordinator's two,
+anti-entropy, metrics, the snapshot worker, the backup and the client pool's health check.
+
+**Now** `name_thread()` sits beside `run_thread_body()` in `thread_boundary.hpp`, and every site calls it where
+it starts its thread: `ob-flush`, `ob-seal-sync`, `ob-wal-removal`, `ob-repl-primary`, `ob-repl-replica`,
+`ob-mm-io`, `ob-mm-reconnect`, `ob-failover` and so on, each within the kernel's fifteen characters. A running
+node's threads are all `ob-` names now (`server-threads.txt` in the evidence). `docs/operations.md` names the
+threads beside the hot path.
+
+**Tests.** `test_thread_boundaries` holds it as it holds the boundary (#112): every `std::thread` construction
+in `src/` is named in the statement after it, or names itself, with the rule's own cases - a named and an
+unnamed construction told apart, a name two statements later not the thread's own, a thread that names itself.
+The TLS handshake pool named its threads two statements after starting them and now names them in the next.
+`test_thread_names`: an open engine's three threads have their names, and none is left once `close()` has
+joined them - waited for, since the kernel lets a joined thread's entry in `/proc` go a moment after the join
+returns (one run in ten failed before the wait). ctest passed 2275 of 2275 on both hosts (Debug): #281's 2270
+and the five new. The integration battery on x86 passed 615 and failed none, in 36:06.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U): `name_thread()` naming nothing, the flush
+thread started without its name, and the TLS pool's threads named a statement later are each killed; the control
+- a naming the kernel refused not logged - survives.
+
+- Effort: S | Impact: `top -H` and a profile say which of the node's threads takes the CPU
+
+### 281. A row's way from the pending queue into a store's columns paid for its bookkeeping row by row ✅ **P3**
+
+**Found in the node's profile at #277's head** (evidence `evidence/2026-11-19-rows-into-columns/`, `found/`):
+under #190's ingest, on both hosts and in both shapes, `drain_batch` took 2.6-3.4% of the node's samples and
+`append_block` 1.9-3.0% - together the flush thread's largest single theme, outside the receive path the client
+loops spend most of theirs in. The m8a.xlarge's annotation says where: `append_block` pushed each row into the
+store's seven columns, and a `push_back` loads its column's end from the store, compares it with the capacity and
+stores it back, for every row - the char column's store keeping the compiler from holding any end in a register;
+the drain pushed each row into its pair's block and kept the block's range and flags through a pointer to it, and
+a tenth of its samples were a block that outgrew its buffer copying every row it held into one twice as big.
+
+**Now** a seal writes a block's rows into the columns a tile of 1 024 rows at a time, through pointers into the
+tile, which its `resize()` zeroed while it is in the cache. A drain takes a run of one pair's rows in one step:
+the block grows once a run, the range and flags are counted in locals, and the chunk's position moves a run at a
+time, so a throw still leaves the run's first row first in line. A store's block is reserved to its last one's
+rows and an eighth more, scaled by the rows this drain took against the last - a tick takes whatever was queued
+when it woke.
+
+**Measured** with Release builds on the test hosts, #278's head (`4671fe0`) against this change, six rounds a
+build in each shape without a profiler, and three under `perf record` for the shares:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| the flush thread's CPU a level (flat) | 47.5-48.9 ns | 45.8-47.5 ns | 36.7-37.8 ns | 35.6-37.2 ns |
+| the flush thread's CPU a level (sides 500 deep) | 48.6-51.7 ns | 46.9-49.4 ns | 39.4-40.6 ns | 38.3-40.3 ns |
+| `drain_batch`, of the node's samples (flat) | 3.05-3.34% | 1.99-2.28% | 3.25-3.27% | 2.81-2.88% |
+| `drain_batch` (deep) | 2.93-3.03% | 2.09-2.28% | 2.61-2.92% | 2.55-2.90% |
+| `append_block` (flat) | 2.54-3.04% | 1.91-2.08% | 2.41-2.55% | 1.24-1.50% |
+| `append_block` (deep) | 2.63-2.70% | 1.86-2.13% | 1.90-2.07% | 1.27-1.39% |
+
+The drain's growth copies went from 10.35% of its samples to 0.97% (the m8a.xlarge's annotation, `annotate-b281/`).
+On the m8a.xlarge what is left of the drain is mostly the first load of each row, which the writer's core wrote.
+The m8a.xlarge's deep shape took 5.39-5.48 s of the node's CPU against 5.64-5.71, and gave 14.5-15.0 M levels a
+second against 14.0-14.4 and a batch median of 110-113 us against 117-119 - and its client loops took 109-110 ns a
+level against 115-116, a thread this change does not touch, as pitfall 648 warns; elsewhere they are within the
+rounds' spread. p99 and p999 are within the spread everywhere.
+
+**Tests.** The drain's and the seal's own: the rows of pairs queued between each other and across chunks
+(`test_pending_row_names`), a block's range with rows out of time order (`test_lazy_flush`), appending a block
+against appending its rows (`test_row_blocks`), a segment's own highest number (`test_mm_per_origin_numbering`).
+ctest passed 2270 of 2270 on both hosts (Debug), as many as #282's; the integration battery on x86 passed 615 and
+failed none, in 35:24.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U): seven mutants, each killed by the test of what it
+breaks - a tile begun at the row the last one began at, a tile's level column written from the side, a block's
+last part under a tile left out, a run's last row passed over and left out, a block's range from each run's
+first row, a block of a peer's rows said to be this node's own, and the chunk's position moved a row short of
+the run. The two controls survive: a run cut at one row - the drain row by row, its range and flags in locals -
+and the reservation unscaled. The first run had the run's last row cut from the run rather than from the block:
+the row then began the next run, the same mutant as the control, and it survived (`table-b1-equivalent.log`).
+
+The medians of the flush thread's CPU a level fall 2.0-3.2%, less than the two functions' shares do; where the
+rest went on that thread these rounds do not say.
+
+- Effort: S | Impact: the flush thread 2-3% cheaper a level on both hosts (medians); the drain's growth copies
+  gone
+
+### 282. A snapshot listed a segment sealed after its cut, and a replica held its rows twice ✅ **P1**
+
+**Found by CI on PR #329** (#280), in the integration battery under ThreadSanitizer (spec
+`smart-data-engine-workspace/specs/snapshot-files-of-its-cut/`, evidence
+`evidence/2026-11-19-snapshot-files-of-its-cut/`): `test_compaction.py`'s
+`test_a_replica_bootstrapped_while_the_primary_merges_holds_every_row_once` left the replica with 67 000 rows of
+CMR3 where the primary held 66 000. The nodes' logs CI kept say how. A snapshot takes its WAL position and seals
+every row up to it under `flush_mtx_` - the cut - and then lists its files, walking the data directory without
+it. The snapshot took 15:48666; a MINSERT of CMR3 was appended at 15:48666 a moment later; a client's FLUSH sealed
+it into a new segment; and the walk listed that segment. The replica held its 1 000 rows from the snapshot and
+again from the stream it was sent from 15:48666. The pin kept a merge and retention from moving a file, not a
+FLUSH or a tick from sealing. A backup is the same cut (#34), and a restore that replays the WAL from its
+position would hold such rows twice as well.
+
+**Now** the cut takes the index's segment directories while it still holds `flush_mtx_` - every row up to its
+position, and none after it, since nothing drains while that is held - and the walk leaves every other segment
+directory out, with an INFO line that counts them. Nothing is held longer: the walk and its checksums stay out
+of every lock. The old check for a merged segment's replaced inputs is now one the cut's directories make too.
+
+**Tests.** `test_backup`: a test seam between the cut and the walk writes a second symbol's rows and seals
+them, and none of the manifest's files is theirs, and its rows are the cut's - against the walk before this
+change the manifest listed the second symbol's segment, and counted 45 rows where the cut held 30. The tests of
+replication's, the mesh's and compaction's snapshots pass as they did. ctest passed 2270 of 2270 on both hosts
+(Debug): #280's 2269 and the new one. The integration battery on x86 passed 615 tests and failed none, in 35:23,
+the test that found this among them.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U): three mutants, each killed by `test_backup` - the
+walk taking every segment it finds, as before; the cut's directories taken before its own seals are written; and
+taken after the seam, without `flush_mtx_`. The two controls survive: the directories left out not counted
+aloud, and the check for a merged segment's replaced inputs removed - no replaced input is in the index.
+
+- Effort: S | Impact: a replica bootstrapped, a mesh peer joined or a backup taken while the node seals holds
+  every row once. Pitfall 655
+
+### 280. A test's next session could take a descriptor a WAL sync had held, not the one it waited for ✅ **P3**
+
+**Found by #278's integration battery on x86** (evidence `evidence/2026-11-19-next-session-descriptor/` and
+#278's `tests/x86/descriptor-race/`). `test_large_answer_isolation`'s
+`test_an_answer_whose_session_was_closed_goes_to_no_session_after_it` closes bob's session while its large read
+waits off the loop, and needs the next session the node accepts to be given bob's descriptor, so that the answer
+finds a session there and is dropped by the connection's id. The kernel gives the lowest free descriptor, which
+is bob's only if none below it came free since bob's was taken. A tick's WAL sync holds a duplicate of the WAL's
+descriptor for the sync's length (`sync ticket: ... descriptor N` at DEBUG): one taken while the eight sessions
+before bob's connected - 13, with them on 14 to 21 and bob on 22 - is free again when the next session connects,
+and it took 13. On the m8a.xlarge the file failed so in 2 of 10 runs on master and in 3 of 5 with #278; alone,
+the test passed 10 of 10.
+
+**The test opens sessions until one is given bob's descriptor**, four at most, the ones before it holding what
+came free; the check that bob's answer comes back only after that session has the descriptor is unchanged. On
+the same host the file passed 40 runs of 40, and the node's log of 20 of them shows the case met in 4: bob on 22,
+the first session after it on 13 (once 14), the second on 22.
+
+- Effort: S | Impact: a test whose premise a background sync broke in about one run of its file in five on x86
+  holds it, and still makes its case
+
+### 279. After a seal of a late row, a tie on a timestamp can go to the row written earlier **P3**
+
+**Found fixing #278.** #168 settled what a read answers for a level at an instant: the row with the latest
+timestamp at or before it, a tie going to the later written. What decides the tie is the order a scan
+delivers rows in - segments by start, then blocks - and that is the order of writing only while every
+segment starts after the ones before it. A block with a late row (an event time a client gave, #105) is
+sealed into a segment that starts before a segment written earlier, and at an instant both hold, the earlier
+written row is delivered last and wins. #278's counterexample: rows 41 and 42 remove bid 90 at instant 22 and
+row 571 sets it at the same instant, written after them; while row 571 is in a block the price is in the book
+at 22, and after the seal it is not. A read of that instant answers differently before and after the seal.
+
+#278 keeps the book summaries and tracks true to the order as it is after each seal; the order itself is
+this item. Settling it means a rank for a tie that the layout does not change - the order of writing, kept
+with a segment - in scans, compositions and compaction alike.
+
+- Effort: M | Impact: one answer for a tied instant whatever the segments' layout, as #168 says; reachable
+  only with event times out of order and two rows of one price at one nanosecond
+
+### 278. A book summary kept the order of an instant's rows that a later seal changed ✅ **P2**
+
+**Found by CI on PR #327** (#277), in the `coverage` job (spec
+`smart-data-engine-workspace/specs/summary-tie-order/`, evidence `evidence/2026-11-19-summary-tie-order/`).
+`BookSummaryBytes.AnySequenceOfPublishesSealsAndSummariesWritesTheOraclesBytes`, on seed
+`14180367816294839680`, wrote a best track of 79 bytes where the oracle's had 80. The seed fails the same way
+on master's tree, and with #272 undone (two tracks of 80 bytes that differ); the test drives a `ColumnarStore`
+alone, and #277 does not touch it.
+
+**What was wrong.** A tie on a timestamp goes to the row a scan delivers last: segments by start, then blocks
+(`incremental-books/design.md`). A book summary and its track hold the rows of their instants in the order a
+read delivered them when they were composed, and the store kept them true against rows published after them
+(#233), not against a change of that order. A seal does change it: a block's rows, delivered after every
+segment, go into a segment at its place by start, and a block with a late row - an event time a client gave
+(#105) - makes a segment that starts before one indexed already. At an instant the two share, the rows change
+places. In the counterexample a row setting bid 90 at instant 22, published before the summary as of 22 and
+sealed after it, won the tie against two rows removing the price at that instant, then lost it: a composition
+no longer gave the summary's book, and the next summary, composed from it, wrote another track than the
+oracle. And `merge_segments()`, the embedded engine's flush (C API), put rows in the index that no block had
+published and removed no summary at all.
+
+**Now** a seal whose new segment is delivered before a segment indexed already that starts inside its range
+falsifies the summaries and tracks from its start, as a late row's publication does. A seal in the order of
+time finds no such segment, and neither does one before a segment it shares no instant with. A summary is as
+of the newest segment's end when it is written, so none lies between the sealed segment's start and the first
+instant whose order changes: falsifying from the start removes no summary that was still true.
+`merge_segments()` falsifies from each new segment's first row. Compaction already refused a merge that would
+move (`replace_segments()`).
+
+**What it does not change** is which row wins: after a seal like the one above it is the earlier written,
+where #168 says a tie goes to the later written. That is #279.
+
+**Tests.** `test_book_summary`: the counterexample - the seal removes the summary and its track, and a read
+at 16 and at 22 gives what a composition gives - and its edge, a segment that starts at the very instant the
+sealed one ends; the control, a seal before a segment it shares no instant with, which removes nothing; and
+`merge_segments()` with rows after a summary, then with one before it. The property takes its shape as a
+parameter, and a second shape ties rows on their times: three prices, a late row one in three and close, a
+block published before every summary. Both now check after every step, and after the last seal, that every
+summary the store holds is the book a composition gives at its time - book_summary.hpp's promise itself;
+before, a stale summary was found only if a later one composed from it (pitfall 653). On eight fixed seeds, 500
+cases each, master's store fails the tied shape on three - after 58, 178 and 287 cases - and the original on none;
+with this change all sixteen pass, and so does CI's seed at its 25 cases (pitfall 654). ctest passed 2269 of 2269 on both hosts (Debug): #277's 2264 and five new. The
+integration battery on x86 passed 614 tests and failed one, `test_large_answer_isolation`'s
+`test_an_answer_whose_session_was_closed_goes_to_no_session_after_it`: the session after bob's took descriptor 13
+where the test waited for bob's 22. A tick's WAL sync held 13 - its own duplicate of the WAL's descriptor, `sync
+ticket: ... descriptor 13` in the node's log - while the sessions before bob's connected, and let it go before the
+next came. Master fails it the same way, in 2 of 10 runs of its file on that host: the test's premise, not this
+change - #280.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U and ARM, the same verdicts): seven mutants, each
+killed by the test of what it breaks - a seal that falsifies nothing, one that falsifies whenever a segment is
+delivered after it, one that always does, one that looks in its own width's tier alone, one that takes a segment
+starting at the sealed one's last instant for one beyond it, and `merge_segments()` falsifying nothing or from a
+segment's last row. The two controls survive: the check's DEBUG line gone, and the tiers searched from the widest.
+
+- Effort: S | Impact: book summaries and best tracks true under late rows, whatever a seal does to the order
+  of an instant's rows; and true under the embedded engine's flush
+
+### 277. A tick removed the WAL files retention let go on the flush thread ✅ **P3**
+
+**Found under #190's ingest after #276** (spec `smart-data-engine-workspace/specs/wal-removal-off-the-flush-thread/`,
+evidence `evidence/2026-11-19-wal-removal-off-the-flush-thread/`, and #276's `slow/`). Twice a round a tick removed
+a 512 MB WAL file in its retention phase, on the flush thread: 33.8-36.5 ms on the m8a.xlarge (ext4), 15.5-17.0 ms
+on the m9g.xlarge (XFS). The writers fill the other half of the pending queue in 32-36 ms, so the next tick came
+late: 9 of the 11 writes that waited at the ceiling in the m8a.xlarge's steady state, and 3 of the 4 on the
+m9g.xlarge, waited during such a tick or just after it.
+
+**A tick now asks a thread of their own to remove the files** (`wal_removal_loop()`). It still decides, under the
+engine's lock, which files no checkpoint, replica or archive needs, and does not wait for the removal. The thread
+removes every file below the highest index asked for. `close()` stops it once the removals asked for are done, so
+the directory a stop leaves is as before; without the thread the removal is done where it is asked. A new WAL
+lineage's own removal and the thread's are kept apart by a lock.
+
+**Measured** with Release builds on the test hosts, #276's head (`fe90b63`) against this change, six rounds a build
+in each shape, without a profiler:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| writes that waited at the ceiling, a round (flat) | 2-8 | 2-4 | 6-8 | 2-4 |
+| writes that waited at the ceiling, a round (sides 500 deep) | 2-8 | 2-4 | 6-8 | 0-4 |
+| the flush thread's CPU a level (flat) | 48.3-50.3 ns | 46.1-48.3 ns | 37.8-39.2 ns | 35.6-37.8 ns |
+| the flush thread's CPU a level (sides 500 deep) | 49.4-55.0 ns | 48.1-51.1 ns | 41.9-43.1 ns | 39.4-40.8 ns |
+
+With each tick's phases logged (three rounds in each shape): no tick's retention phase passed 1.8 ms, the writes
+that waited at the ceiling after a round's first 400 ms went from 4 to 0 (m9g.xlarge) and from 11 to 1
+(m8a.xlarge), and the batches over 10 ms from 27 to 23 and from 44 to 24. Levels a second, p99 and p999 are within
+the rounds' spread, but for the m8a.xlarge's p99, 10-20% higher, the direction #276 found there.
+
+**Tests.** `test_wal_removal`: a tick returns while the removal it asked for is held, and the files stay until it
+is let go; a test tick returns once its files are removed; `close()` does not return before the removal its last
+tick asked for. `FlushTickStatic` checks that the tick asks without the engine's lock and the thread removes
+without it, and `ThreadBoundaries` lists the new loop with what its death would cost - both read the source, and
+the targeted runs did not include them: the full ctest on the hosts found them (pitfall 644).
+ctest passed 2264 of 2264 on both hosts (Debug): #276's 2261 and the three new ones. The integration battery
+on x86 passed 615 tests and failed none, in 35:43.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U and ARM): a tick asking for no removal, removing
+the files itself, or removing them under the removal's own lock, and `close()` not stopping the thread, are each
+killed - the last by the run's bound, since the engine's destruction then waits on a condition variable the thread
+still waits on. The two controls survive: the thread started after the flush thread, and a request no higher than
+one before waking it anyway. Two runs were stopped because a test hung, rather than failed, under the mutant whose
+tick waits for its removal (pitfall 652); both tests are fixed.
+
+- Effort: S | Impact: the flush thread 4-6% cheaper a level, and the writes that waited at the ceiling in steady
+  state nearly gone; the tail over 10 ms nearly halved on the m8a.xlarge
+
+### 276. Writers reached the pending queue's ceiling before anything asked for a tick ✅ **P2**
+
+**Found under #190's ingest** (spec `smart-data-engine-workspace/specs/flush-at-half-the-ceiling/`, evidence
+`evidence/2026-11-19-flush-at-half-the-ceiling/`). The pending queue holds a million rows (#137). A writer that
+found no room asked for a flush and waited for it; otherwise a tick came at `--flush-interval-ms`, 100 ms by
+default, or at half the WAL budget (#190 step 9). In #275's rounds of the ingest, 10.6-13.7 M levels a second,
+the queue reached its ceiling before the interval came: a round of about 3 s counted 40-48 writes that waited
+(`ob_writer_backpressure_waits_total`), each for a tick to take the queue, sync its WAL and drain it, and the
+batches' p999 was 8.6-11.5 ms against a p99 of 0.23-0.41 ms.
+
+**Now the row that brings the queue to half its ceiling asks for the flush** (`queue_row()`), and the tick runs
+while the writers fill the other half. Between two takes of the queue one row reaches half, so one request is
+made:
+- not again by every writer between the request and the take - the loop clears the request as it wakes, and
+  the tick takes the queue a moment later;
+- not on account of the rows a running tick holds while it syncs and drains them, which count against the
+  ceiling but are not in the queue.
+
+Either would follow each tick with another, for whatever came in while it ran. Rows put back by a failed sync
+return all at once, so a flush that fails with half the ceiling queued is retried by the interval or the
+ceiling, as before.
+
+**Measured** with Release builds on the test hosts, #275's head (`94c1e68`) against this change, six rounds a
+build in each shape, without a profiler:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| levels a second (flat) | 13.0-13.5 M | 13.7-14.1 M | 14.7-15.1 M | 15.5-15.7 M |
+| levels a second (sides 500 deep) | 12.3-12.7 M | 13.3-13.7 M | 13.5-14.3 M | 13.9-14.5 M |
+| writes that waited at the ceiling, a round | 42-46 | 2-6 | 44-50 | 6-11 |
+| batch p999 (flat) | 8.2-8.5 ms | 0.56-1.2 ms | 9.4-10.3 ms | 2.3-2.5 ms |
+| batch p999 (sides 500 deep) | 8.3-8.9 ms | 0.72-1.5 ms | 9.6-10.2 ms | 2.2-2.5 ms |
+| batch p99 (flat) | 0.22-0.26 ms | 0.18-0.25 ms | 0.26-0.35 ms | 0.55-0.61 ms |
+| batch p99 (sides 500 deep) | 0.24-0.27 ms | 0.24-0.27 ms | 0.31-0.39 ms | 0.61-0.77 ms |
+| ticks, a round | 59-62 | 82-84 | 57-59 | 76-80 |
+
+The flush thread took the same CPU a level in both builds, and so did the node, except on the m8a.xlarge's deep
+shape: 5.60-5.80 s against 5.40-5.69, its client loops 4-6% more a level.
+
+**What is left of the tail** (`slow/` in the evidence, from rounds with each tick's phases logged):
+- The batches' maximum, 16-41 ms as in the base, is the start of a round: the WAL budget grows from its first
+  4 MiB, and the first seals of every store come together in ticks whose seals take 20-81 ms.
+- In steady state a tick of half a million rows takes 19-34 ms (10th to 90th percentile) against 32-36 ms for
+  the writers to bring as many: at 14-16 M levels a second the flush thread is near its limit.
+- Twice a round a tick removed a 512 MB WAL file on the flush thread: 15.5-17.0 ms on XFS, 33.8-36.5 ms on ext4.
+  Most of the steady state's remaining waits at the ceiling came during or just after one: the removal is the
+  next thing to take off the flush thread.
+
+**On the m8a.xlarge the batches' p99 doubled, and it is the node's.** With the ingest run from the other host,
+off the node's CPUs, it is 0.77-0.79 ms against the base's 0.29-0.33 (`remote/` in the evidence). The node's own
+account of its slow batches (`locks/`: the slow-lock line at 0.2 ms) says where it goes: WAL appends - a `write()`
+under the engine's lock - that take 0.2-2 ms, and the other writer waiting for the lock behind them, in about
+equal parts. A round has 168 such appends where the base had 96: in the base the writers sat at the ceiling
+through much of each tick, its WAL sync included, and now they write through it, and on ext4 an append to a file
+being synced is slow more often. What the append waits on is not all known. Its sleeps in ext4's write path
+doubled, but reserving each WAL file's blocks took most of them away and left the p99 where it was; and it is not
+waiting for a CPU, the client loops' work (the same cycles, instructions and cache fills a level), the flush
+thread's holds of the lock, the syncs alone or the number of ticks alone (`offcpu/`, `prealloc/`, `cache/`,
+`nosync/`, `quarters/`). The m9g.xlarge, whose data directory is XFS, shows no change of p99. A WAL append outside
+the engine's lock would take away the half that is the other writer waiting; that is a change of its own.
+
+**Three quarters of the ceiling, measured and left out** (branch `scratch/three-quarters`, not pushed): as many
+levels a second; on the m8a.xlarge a p99 about a fifth lower, but no better p999 and more writes at the ceiling
+(10-14 a round against 6-8); on the m9g.xlarge a worse p999. Half keeps the tail this item is for.
+
+**Tests.** `test_pending_backpressure`:
+- the 499 999th row asks for nothing and the 500 000th for one tick, which runs without a writer waiting;
+- rows written between the request and the tick's take, and rows written while a tick holds half the ceiling,
+  ask for no second tick;
+- a writer at the ceiling still asks for the tick after the one it waits for (#137's request).
+
+#137's two tests that need a writer at the ceiling now hold the flush to get one there: asked for at half, a tick
+takes the queue before the writers reach it. ctest passed 2261 of 2261 on both hosts (Debug): #275's 2257 and
+four new ones. The integration battery on x86 passed 615 tests and failed none, in 35:54.
+
+**Mutation table** (`mutations/` in the evidence, the i3-7100U and ARM): 7 mutants, each killed by the test of
+what it breaks - no request at half, the row after or before half asking, every row from half on asking, a
+writer asking once it finds half queued (as the WAL budget does), the rows a tick holds counted towards half,
+and no request at the ceiling. The two controls survive: half written as twice the queue against the ceiling,
+and the request made before the row's fields are written. The first run found the tests weak: they read the
+tick counter 200 ms after the queue was drained, while the first tick was still sealing - over a second in a
+Debug build - so a second tick it caused came after the check. They wait for the running tick to be over now.
+
+- Effort: S | Impact: the batches' p999 under a pipelined ingest down 4-15 times on both hosts, 2-8% more levels
+  a second; on the m8a.xlarge (ext4) the p99 doubled, the WAL's appends slow while it is synced
+
+### 275. A drain looked a pair's store up again for every run of its rows ✅ **P3**
+
+**Found in the profile after #270** (evidence `evidence/2026-11-19-drain-store-per-name/`). The drain resolves
+a run of one pair's rows to its store's slot, and since #270 finds a run by the pointer to the pair's name.
+Each run still called `get_or_create_store()`, which builds `symbol.exchange` and hashes it. Under #190's
+ingest a run is a few updates of one pair, and the lookup was 0.5-1.4% of the node's samples.
+
+**A drain now keeps the slot of each name it has met**, in a map keyed by the name's pointer and cleared with
+the slots when it publishes. A name stands for one pair, whose store cannot change while the drain holds
+`flush_mtx_`, and two names under one store key share its slot as they shared its store.
+
+**Measured** with Release builds on the test hosts, #272's head (`aa8999f`) against this change:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| `get_or_create_store`, of the node's samples (flat) | 0.60-0.82% | 0 | 0.95-1.43% | 0 |
+| `drain_batch` itself (flat) | 2.62-2.93% | 3.30-3.39% | 2.46-2.77% | 3.11-3.50% |
+| the flush thread's CPU a level (flat) | 50.8-54.7 ns | 50.3-53.1 ns | 40.3-42.8 ns | 39.2-40.8 ns |
+| the flush thread's CPU a level (sides 500 deep) | 53.9-56.9 ns | 51.1-53.3 ns | 43.9-45.0 ns | 43.1-45.0 ns |
+
+The map's lookup, inlined into `drain_batch`, takes back about half of what the change saves. A table keyed by
+the pointer without `std::unordered_map`'s modulo and node could take the rest. The net change is small: clear
+on ARM's deep shape, and within the rounds' spread elsewhere, in its favour.
+
+**Tests.** ctest passed 2257 of 2257 on both hosts (Debug), as on #272. The integration battery on x86 passed
+615 tests and failed none, in 35:23. `test_pending_row_names` stores rows of three pairs, queued between each
+other and across chunks, under their own pair. The mutation table (`mutations/`, the i3-7100U and ARM) has two
+mutants, both killed by it: a name taking whichever slot the map holds first, and the slot of the run before.
+The two controls survive: the map never answering, and the map not cleared at a publish that nothing reads
+after.
+
+- Effort: S | Impact: a drain hashes a pointer a run where it built and hashed a string; small, clear on ARM's
+  deep shape
+
+### 272. A composition from a summary read the segment the summary was made at, for rows it held ✅ **P2**
+
+**Found under #190's ingest, after #270** (spec `smart-data-engine-workspace/specs/summary-after-its-instant/`,
+evidence `evidence/2026-11-19-summary-after-its-instant/`). A book composed from a summary applied the rows
+from the summary's time on, that time included. This covers the summary a seal writes, a book read at an
+instant, and a start's live books. Every row at that time is in the summary: a summary in the index holds
+every row of the symbol at or before its time, and a row published later with such a time falsifies it and
+takes it out of the index first (`book_summary.hpp`). Applying them again changed nothing. But gathering from
+that time took the segment the summary was made at, whose last instant is the summary's time, so the summary
+a seal writes read the previous segment in full - 114 000 rows under that ingest - for the rows of its last
+instant. A round of 315 seals and 310 summaries counted 3378 misses of the decoded columns against 258 hits.
+
+**Now `gather_locked()` starts a read from a summary at the instant after its time**, or at the time itself
+at the clock's end. `compose_by_price()` reads its rows from there, and the best track still starts at the
+summary's time, with the summary's best.
+
+**The same books, summaries and tracks:**
+- `test_book_summary_equivalence` holds them to the oracle, and now counts the rows a summary says it read
+  after its time.
+- `AReadFromASummaryReadsNoRowAtItsTimeNorTheSegmentItWasMadeAt` checks that a read at a summary's time reads
+  nothing, and a read after it reads only the segment after it.
+- `ARowAtItsTimeSealedAfterItIsInItAndNotAppliedAgain` covers a row at the summary's time that was in a
+  block when the summary was written and was sealed later beside rows after it. A read from the summary does
+  not apply it again.
+
+**Measured** with Release builds on the test hosts, #271's head (`40a8744`) against this change:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| `book_summary_cost`, ns a row at p50 | 31.6-31.9 | 28.6-28.9 | 25.3 | 22.7-22.8 |
+| misses of the decoded columns, a round (flat) | 3558-3690 | 1890-1974 | 3336-3660 | 1758-1830 |
+| decoding, of the node's samples (flat) | 4.15-4.41% | 2.82-3.00% | 4.07-4.38% | 2.61-3.16% |
+| the flush thread's CPU a level (sides 500 deep) | 55.0-60.8 ns | 52.2-54.4 ns | 47.8-55.8 ns | 43.9-46.1 ns |
+| the node's CPU (sides 500 deep) | 7.64-7.88 s | 7.55-7.67 s | 5.99-6.24 s | 5.79-5.89 s |
+
+The hits of the decoded columns went from 222-312 a round to none: the previous segment is not asked for at
+all. On the flat shape the flush thread's and the node's CPU stay within the rounds' spread.
+
+**Tests.** ctest passed 2257 of 2257 on both hosts (Debug): #271's 2255 and the two new tests above. The
+integration battery on x86 passed 615 tests and failed none, in 35:20.
+
+**Mutation table** (`mutations/`, the i3-7100U and ARM): 4 mutants, each killed by the test of what it
+breaks. The first run had one surviving: rows at the summary's time applied again. With the gather right, no
+candidate the tests built held such a row, so the second test above was written and the table run again. Two
+controls survive:
+- a block at the summary's time sending the composition to the merge, which reads the same rows;
+- the instant after the clock's end wrapping to its start. No test can reach it - a row at the clock's end is
+  an input bound outside this work - and wrapping re-applies every row to the same book.
+
+**Tried after this and left out:** the seal handing the segment it writes the columns it wrote it from, for
+its held columns (branch `perf/seal-holds-its-columns`, spec `specs/seal-holds-its-columns/`, evidence
+`evidence/2026-11-19-seal-holds-its-columns/`; the spec and scripts number it 274, which no item here
+takes). The idea was that the summary would read them without decoding, and in `book_summary_cost` it cost
+13-20% less a row. Under the ingest it did not pay:
+- The arena of held columns is full, and a tick's copies took its slack before any was put. The large
+  columns of most segments were not copied: 250-400 hits a round against about 1900 columns read.
+- The copies that were made cost the flush thread more than the decoding they saved: on ARM `memcpy` rose
+  about 0.65 points of the node's samples and decoding fell about 0.4. A copy reads and writes every byte of
+  a decoded column; decoding reads the smaller encoded one.
+
+- Effort: S | Impact: a summary a seal writes costs 8-10% less a row on both hosts, and decodes one segment
+  where it decoded two
+
+### 271. Composing a book summary copied each row from where it had just been written ✅ **P3**
+
+**Found in the flush thread's call graph under #190's ingest, after #270** (spec
+`smart-data-engine-workspace/specs/summary-rows-in-place/`, evidence `evidence/2026-11-19-summary-rows-in-place/`).
+On the m8a.xlarge the flush thread is 30% of the node's samples. The book summary a seal writes is 10.7%:
+about 6% composing it in `compose_by_price()`, and 3.5% decoding the segment the seal had just encoded. The
+function that applies a row had 91% of its samples on one instruction. That instruction came after a
+32-byte load, for `out.as_of = r`, of the row `row_of()` had just written to the stack field by field: a load
+the store buffer does not forward. `PriceSide::put()` copied the same row again.
+
+**The row is written where it stays.**
+- `fill_row()` writes `row_of()`'s fields into a row the caller holds, and `row_of()` is written through it,
+  so there is one mapping from columns to fields.
+- `PriceSide::place(price)` is what `put()` was without the copy: the slot of the price's row, held from
+  then on, for the caller to write. `put()` copies its row first, then writes it there.
+- On `compose_by_price()`'s direct path - rows in time order, as the decoder gives them - a row is applied
+  from its batch's columns. The side, quantity and price are read as `row_of()` reads them, and a row the
+  side keeps is written into its slot by `fill_row()`. `out.as_of` is written once a batch, from its last
+  row. The merge and the start from a summary keep the path they had.
+
+**The same bytes.** `test_book_summary_equivalence` holds every summary and track to an oracle that composes
+from a plain scan of every row, after any sequence of publishes, seals, late rows, summaries and restarts.
+`test_book_by_price` and `test_best_track` hold the books and the series. `test_price_side`'s walk now writes
+rows through `place()` as well as `put()`.
+
+**Counted, not inferred.** On the m8a.xlarge (Zen 5) `perf stat` counted `ls_bad_status2.stli_other`, the
+loads that could not complete for a store they could not be forwarded from, per level written:
+- on the flush thread 8.6-9.1 before and 1.9-2.1 after;
+- on the client loops 17.0-17.3 at #268's head and 10.8-11.1 after #270, which is what #270 removed.
+
+What the flush thread saves is far less than the 91% suggested: an out-of-order core hides much of such a wait
+(pitfall 647).
+
+**Measured** with Release builds on the test hosts, #270's head (`a7b5123`) against this change:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| `book_summary_cost`, ns a row at p50 | 31.5-31.8 | 31.4-31.8 | 26.5-26.7 | 25.2-25.4 |
+| the composition, of the node's samples (flat) | 5.7-6.1% | 5.2-5.4% | 5.3-5.7% | 4.3-4.7% |
+| the flush thread's CPU a level (flat) | 52.8-56.1 ns | 52.8-55.0 ns | 44.7-48.6 ns | 42.5-45.3 ns |
+| the flush thread's CPU a level (sides 500 deep) | 55.8-57.8 ns | 55.0-55.8 ns | 48.3-51.1 ns | 45.6-46.9 ns |
+| the node's CPU (sides 500 deep) | 7.60-7.80 s | 7.62-7.69 s | 5.95-6.03 s | 5.85-5.90 s |
+
+The client loops took the same CPU a level in both builds. A small step, clear only on x86's deep shape.
+
+**Tried and left out:** `fill_row()` always inlined, since the compiler had called it out of line at 0.6%
+of the node's samples. It was no faster anywhere. On x86's deep shape the client loops, which do not run
+this code, took 4% more CPU a level in every round: layout, not work (pitfall 648).
+
+**Tests.** ctest passed 2255 of 2255 on both hosts (Debug): #270's 2254 and the new `PriceSide` test. The
+integration battery on x86 passed 615 tests and failed none, in 35:33. The mutation table (`mutations/`, the
+i3-7100U and ARM) has 6 mutants, each killed by the test of what it breaks: the book's row from a batch's first
+row, a row without its sequence number, a held price given a new row, a better price not made the best, the
+track left out, a row of no quantity kept. Both controls survive.
+
+**What is left in the summary** is decoding again what the seal had just encoded: the new segment, and the
+previous one, read in full for the rows of its last instant. A composition starts from a summary's time, and a
+row at that time is applied again.
+
+- Effort: S | Impact: the flush thread fails to forward 2 loads a level from its store buffer where it failed
+  9, and composing a summary takes 0.3-1.4 points fewer of the node's samples; small, clear on x86's deep shape
+
+### 273. The handshake storm test's control was not held on a slow runner ✅ **P2**
+
+**Found when #269 did not hold**: on PR #321, which changes no TLS code, `integration-tests` failed the
+storm test (#265) in all three of its attempts - 46 us beside the handshakes against 103, 111 and 112 us
+with them on the loop, where a quarter is asked. #269 had taken a weak storm for noise that a second
+attempt would not meet; on that runner it was what every attempt met.
+
+**Why the control was weak.** The pinger sends a PING every half millisecond, so its PINGs sample the loop
+evenly in time, and the median one beside a storm is held only while handshakes keep the loop busy more
+than half the time. CI's integration job builds Debug, and the storm is two Python processes opening
+connections back to back: on a slow runner an RSA-2048 signature did not keep the control's loop busy that
+long, and its median rose two to two and a half times.
+
+**The nodes' certificates are RSA-4096**, whose signature costs a node several times RSA-2048's: the storm
+keeps a loop that signs busy most of the time on any runner. On the m8a.xlarge (Debug, `~/p260`):
+
+| | beside the handshakes | on the loop |
+|---|---|---|
+| #273, three runs | 14 us | 1008-1011 us |
+| #273, three runs pinned to two CPUs (`taskset -c 0,1`: the node, the storm and the pinger) | 16-17 us | 1172-1217 us |
+| a handshake on the loop again (both nodes `--tls-handshake-threads 0`, the pool's counter not asked), three runs | 870-1247 us | 901-1216 us |
+
+Every run of the first two passes at its first attempt, and every one of the third fails all three. The test
+prints every attempt's medians, so a run that passes also says by how much. The test as master had it
+passed on that host in every run, pinned or not (`runs/`): what it needs is a slower machine than the hosts.
+
+- Effort: S | Impact: the control of a required check is held by a margin of about seventy where it had two
+  and a half on a slow runner
+
+### 270. A write built two strings for every level it queued for the flush ✅ **P1**
+
+**Found in the node's CPU profile under #190's ingest, after #268** (spec
+`smart-data-engine-workspace/specs/pending-row-name/`, evidence `evidence/2026-11-19-pending-row-name/`).
+Every level of every write is queued on its client loop for the columnar flush, in `apply_in_memory()`.
+The queue's entry, `PendingRow`, carried the symbol and the exchange as two `std::string`s beside the row
+and the `own` flag: 120 bytes. A level cost two `strlen`s and two string constructions, and the entry was
+put together on the stack and copied into the queue's chunk. `apply_in_memory` was 7.2-7.8% of the node's
+samples on the m9g.xlarge and 7.9-9.8% on the m8a.xlarge. On the m8a.xlarge 95% of its samples were on one
+instruction: a 32-byte load of the row the compiler had just written to the stack in stores of 16, 1, 2
+and 8 bytes, which a processor does not forward from its store buffer.
+
+**A row carries its pair's name by pointer.**
+- `RowNames` (`include/orderbook/row_names.hpp`) makes one `RowName` per (symbol, exchange) pair and never
+  removes one. A name keeps its address as long as the engine lives, so a row may hold it for however long
+  it waits.
+- The book map keeps, beside each book, the name of the pair that made it. A write hands that name to
+  `RowNames::of()` as the one it expects, so it costs two short strings compared and nothing hashed. A pair
+  under the same book key as another gets its own name, as it got its own strings.
+- `PendingRow` is the pointer, the row and the flag: 64 bytes, trivially copyable and trivially destroyed.
+  `ChunkedQueue::emplace_back()` gives out the slot and `Engine::queue_row()` writes the row in it. All
+  three paths that queue rows do this: a write, a peer's record and the WAL's replay.
+- The drain finds a run of one pair by the pointer, and a run carries across chunks.
+- At its ceiling of a million rows, the queue holds 64 MB of entries where it held 120.
+
+**The rows are the ones a client wrote.** In `tests/test_pending_row_names.cpp`, three pairs - two symbols
+on one exchange and one of them on another - are queued between each other by single writes and by
+batches, across more than one chunk. Their rows are stored under their own pair, every field.
+`tests/test_row_names.cpp` holds the table to:
+- a name per pair;
+- two names for two pairs that share a book key;
+- an expected name used only when it is the pair asked for;
+- addresses that stay put while the table grows.
+
+**Measured** with Release builds on the test hosts: #268's head (`a829f44`, the tree of `5bda921`) against
+this change, under #190's pipelined ingest. Each build ran four rounds, and the order of the two builds was
+turned about every round:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| the client loops' CPU a level | 166.7-167.5 ns | 148.3-149.7 ns | 121.9-124.2 ns | 107.8-109.7 ns |
+| levels a second | 10.30-10.43 M | 11.27-11.41 M | 12.46-12.64 M | 13.44-13.88 M |
+| a batch at p50 | 171.2-172.1 us | 153.9-155.2 us | 126.7-128.6 us | 112.9-114.6 us |
+| the node's CPU | 8.11-8.22 s | 7.32-7.38 s | 6.12-6.24 s | 5.49-5.68 s |
+| `apply_in_memory`, of the node's samples | 7.2-7.5% | 2.4-2.6% | 7.9-9.8% | 1.4-1.8% |
+| sides 500 deep: the client loops' CPU a level | 174.2-175.0 ns | 155.0-156.9 ns | 134.7-135.3 ns | 116.1-117.2 ns |
+| sides 500 deep: levels a second | 9.87-10.03 M | 10.79-11.17 M | 11.57-11.83 M | 12.69-13.07 M |
+
+The flush thread, which drains the queue, also takes less CPU a level: 55.0-55.8 ns where it took 58.6-61.4
+on ARM, and 43.9-48.1 where it took 47.5-49.2 on x86. One round of the deep shape on x86 went the other
+way, 56.7 ns against the base's 51.4-51.9. The difference there was kernel time on the flush thread, 9.3%
+of the node's samples where every other round had 4.5-5.8%; its user time was the same as theirs.
+
+**What is left.**
+- On ARM, `memcpy` (6.4-7.1% of the node's samples) and `malloc` with `free` (9.5-10.5%) on the client loops
+  hardly moved. A call-graph profile puts them in the receive path: `Session::feed`, `parse_minsert`,
+  `tokenize_into` and `Command`.
+- The largest part of the write path's own cost is now on the flush thread: the book summary a seal writes,
+  composed from the segment the seal has just encoded and decoded again. That is about 8.5% of the node's
+  samples on x86 and 9% on ARM.
+- A level of a deep side spends an eighth of its cost shifting the arrays. Most of the rest is the search
+  by halves waiting on its loads (`shift/` in the evidence).
+
+**Tests.** ctest passed 2254 of 2254 on both hosts (Debug): master's 2245 and nine new ones, six of them
+in `test_row_names`, two in `test_chunked_queue` and one in `test_pending_row_names`. The integration
+battery on x86 passed 615 tests and failed none, in 35:44, as on #268's head (pytest also counts 21 skipped:
+the Binance modules and the others outside the report's categories).
+
+**Mutation table** (`mutations/` in the evidence), run on the i3-7100U and again on ARM with the same
+result: 6 mutants, each killed by the test of what it breaks.
+- A row that says this node wrote it whoever did is killed by #184's numbering tests.
+- A level index of 0 on every row and a run in the drain that never changes pair are killed by the test
+  of three pairs.
+- The name table's two mutants and the queue's one are killed by their own tests.
+
+The two controls survive: the name found by hashing on every update rather than taken from the book, and
+the drain starting a run again at every chunk as it did before - the same rows in the same stores either
+way. Two mutants as first written left a parameter unused, so they did not build (`-Werror`). They were
+reshaped to keep it read (pitfall 221).
+
+- Effort: S | Impact: a pipelined writer pushes 6-13% more levels a second through one node, its batches'
+  median 8-14% shorter, on both hosts; the client loops spend 10-14% less CPU a level, and the pending
+  queue holds its million rows in 64 MB where it took 120
+
+### 269. The handshake storm test compared PINGs from a storm that had not held a loop ✅ **P3**
+
+**Found when it failed on PR #318** (#267), which changes no TLS code: `integration-tests` reported
+`the median PING beside the handshakes was 41 us, 79 us with them on the loop`, against the quarter
+`test_a_handshake_storm_does_not_hold_the_sessions_beside_it` (#265) asks. On the test hosts the same
+comparison is 10 us against 233-336. A storm on a shared CI runner is two processes opening TLS
+connections back to back, and starved of CPU they made too few handshakes to hold the loop they ran on.
+The comparison then says nothing, in either direction.
+
+**The test makes its pair of storms up to three times**, and passes on the first attempt whose PINGs beside
+the handshakes are under the fraction asked. The defect it guards - a handshake on the loop again - holds
+those PINGs as long as the control's in every attempt. Attempts can therefore spare a run the runner
+spoiled, and never a regression. A failure reports every attempt's two medians.
+
+Checked both ways on the x86 test host (`evidence/2026-11-19-handshake-storm-test/`). The test passes three
+runs of three. With the node meant to hand its handshakes off doing them on its loop, as the control does,
+it fails two runs of two after three attempts each, for example 318 us against 305, 312 against 246 and
+280 against 254. That run also stops asking the pool's counter, which would otherwise fail first.
+
+- Effort: S | Impact: a required check that fails for the runner's load, not for the code, now has to fail
+  three times running to fail
+
+### 268. A write looked for its price in a book side from the front ✅ **P1**
+
+**Found in the node's CPU profile under #190's ingest, after #267** (spec
+`smart-data-engine-workspace/specs/book-level-search/`, evidence `evidence/2026-11-19-book-level-search/`).
+Every level of every write goes through `insert_level()` on its client loop, under its side's seqlock.
+It looked for the price from the front of the side, and for a new price looked again for where it goes.
+
+The ingest's books are 80 levels deep, where it was 3% of the node's samples. A side of Binance's diff
+stream holds 269 levels at the median and the whole thousand at the 90th percentile.
+`benchmarks/book_apply_cost` (new) replays a recording's updates through `apply_delta()`. On binance-diff
+it put a level at 141 ns on the m9g.xlarge and 109 ns on the m8a.xlarge in the release packages' build.
+
+**One search by halves** finds the first slot whose price does not come before the one sought. That is its
+own slot when the side holds it, and where it goes when the side does not. These are the slots the two
+searches found, because a side holds each price once, in its order, without a branch in the loop.
+- `remove_level()` - no caller, in the header - looks for the price itself: it named the bids' order for
+  either side.
+- `install_book()`, the one other writer of a side (a start's rebuild of a live book), puts levels that are
+  out of their side's order, or a price twice, in one by one through `insert_level()` and says so. A book
+  composed by price never is one; the engine and the embedded API log it at WARN if one ever is.
+- **Tried and left out:** a search by halves to a window of 16 or 32 and a scan of it - level or slower
+  wherever it was measured.
+
+**The books are master's.** `tests/test_book_level_search.cpp` copies `insert_level()` as it was and holds
+the side to it after every update of any sequence: prices that collide, prices that fill a side past
+`MAX_LEVELS`, removals, on both sides. The benchmark's hash of every book was master's in every run of
+both builds on both hosts.
+
+**Measured** with Release builds on the test hosts, master's code with the benchmarks (`5823812`) against
+this change (`e889cfa`), each build's rounds interleaved with the other's:
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| a level of binance-diff, applied | 140.2-141.1 ns | 26.6-27.2 ns | 108.6-109.4 ns | 23.6-23.7 ns |
+| a level of binance-top20 | 24.1 ns | 7.6 ns | 21.0 ns | 5.9-6.0 ns |
+| #190's ingest with sides 500 deep: the client loops' CPU a level | 266-268 ns | 172-175 ns | 135.8-136.9 ns | 134.4-135.5 ns |
+| the same ingest, levels a second | 6.31-6.35 M | 9.81-10.14 M | 11.38-11.61 M | 11.52-11.63 M |
+| the same ingest, a batch at p50 | 298-300 us | 177-179 us | 140.7-141.6 us | 138.3-139.9 us |
+
+The m8a.xlarge's benchmark rows are of the release packages' target (`-march=x86-64`). The host
+compiler's own default there is x86-64-v3, at which GCC 15 makes the front-to-back loop wide (AVX2). At
+that target a level of binance-diff took 35.2-39.9 ns and takes 23.7, and the node under the ingest is the
+host build - which is why its row moves by 1%. With the books 80 deep, as #190 runs the ingest, the client
+loops take 164-166 ns a level where they took 173 on ARM, and the same on x86.
+
+On the m8a.xlarge, the first run of the deep ingest had the base build first in each round. There #268's
+node took 4-7% more CPU, all of it kernel time on the flush thread, which the change does not touch. With
+the branch first, the same extra time went to the base: it belongs to the second node of a round.
+
+What is left on binance-diff is shifting the arrays for a price added or removed near the top of a deep
+side. A side kept best price last would remove it, and would change every reader of a side.
+
+**The change made one integration test lose its premise, six runs of six on the x86 test host.**
+`test_a_primary_lost_while_its_replica_joins_loses_no_write` (#215) stops the primary when the replica
+decides to discard its store. It watched for that decision only after `restart_node()` returned, which
+waits for a PING answer and tries every half a second. That was enough while the replica took seconds to
+apply the catch-up: every level a new best price on a side of a thousand, the search from the front's
+worst case. With the search by halves the catch-up was over 0.28 s after the decision, before the watch
+began. A thread started before the restart now stops the primary within milliseconds of the line, before
+the replica has asked for any catch-up. Six runs of six pass on this change and on its base. With a joining
+replica standing for election again, #215's defect, the test fails twice of two.
+
+Mutation table (`mutations/` in the evidence, i3-7100U): 7 mutants, every one killed by the test of what
+it breaks. Two of them are killed by a crash: a shift whose length wraps when a full side takes a price
+worse than every level, or a price taken as held past the side. The control survives: the search's steps
+as a branch rather than conditional moves, the same slots.
+
+- Effort: S | Impact: applying a level of Binance's diff stream costs 19-22% of what it did on ARM and in
+  the x86 packages; a writer on books 500 deep pushes 54-61% more levels a second on ARM
+
+### 267. A seal did more work encoding its columns than the bytes it wrote needed ✅ **P2**
+
+**Found in the node's CPU profile under #190's ingest, after #266** (spec
+`smart-data-engine-workspace/specs/seal-encode-cost/`, evidence `evidence/2026-11-19-seal-encode-cost/`).
+With the book summary halved, the largest item of the thread that flushes and seals was encoding the
+segment's columns: 24-29% of the thread and 7.9-8.8% of the node's samples. A seal writes each of its seven
+columns in the encoding its store's last segment chose, and every sixteenth searches over the candidates
+(segment format 3, design §3). `benchmarks/seal_encode_cost` (new) seals the segments of a recording as a
+store seals them. It put binance-diff at 33.7-34.5 ns a row on the m8a.xlarge and 37.8-38.5 on the
+m9g.xlarge, and binance-top20 at 16.6-17.7 and 23.6-24.5. Its profile split the work:
+- the two transforms, 30-45%: `for` went over a column four times - the minimum, the differences, their
+  divisor, the quotients - and `delta` three;
+- choosing Simple8b selectors, 21-27%: from the first selector, 240 zeros, on every word, with the widths'
+  running maximum a chain a value, and the words into a vector made and copied each time;
+- finding runs, 10-13%: a branch a value, which cannot be predicted where runs are a value or two long;
+- LZ4, 10-22%, which is the format's and stays.
+
+**The encoder writes the same bytes with less work.**
+- **The transforms divide as they find their divisor, in one pass.**
+  - Whether a value is a multiple and its quotient come from one product.
+  - A value the divisor does not divide makes it smaller, and the quotients so far are multiplied by the
+    old over the new.
+  - Corrections may rewrite a column's worth of values once. Past that, the rest is written undivided
+    while its divisor is found, and one last pass divides the whole, so a column a client sends cannot
+    make it more than three passes.
+  - The minimum of `for` runs four chains side by side, and a multiple takes one branch a value.
+- **Simple8b** starts at the first selector the first value fits, and judges a selector's window from the
+  values' widths eight at a time. Adding `0x80 - (bits + 1)` to each byte sets its top bit exactly when the
+  width is past the selector's bits. A whole word is packed with constant shifts, as the decoder unpacks
+  it since #49, into a buffer the thread keeps (`encode_simple8b_into()`).
+- **Runs are found without a branch a value.** Each value writes the run that would start at it, and the
+  count moves by whether one does. Eight values that start none are passed over by one test.
+- **A block of values** is packed through a 64-bit accumulator. Before, each value was ORed into eight
+  bytes the value before had just written.
+- **`encode_as()`** transforms into the thread's stream.
+- **Tried and left out:** compressing the search's losing LZ4 candidates only as far as they could still
+  win. That is 1-2% of the whole, and a bound tight enough to matter would have to trust LZ4's own check
+  never to refuse a candidate that fits.
+
+**The bytes are master's.** `tests/column_codec_reference.hpp` is the encoder master had at `0ed158b`,
+copied. Every block `encode_as()` writes, in every encoding, and every block and choice `encode()` makes
+has to be the copy's. That covers a seal's and a merge's policies, formats 3 and 4, and every encoding as
+the hint (`tests/test_column_codec_equivalence.cpp`). The benchmark's hash of every block it wrote was
+master's on both recordings, in both formats, on both test hosts, in every run of every step.
+
+**Measured** with Release builds on the test hosts, `master` (`1a8f725`, master's code and the
+benchmark) against this change (`dbb862b`). The commits since move two comments, and answer two CodeQL
+notes: a constant unused in one branch of a template, and a loop counter moved in the loop's body. Each
+build's rounds were
+interleaved with the other's: the benchmark three rounds each, and under #190's ingest three rounds each.
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| a seal's encoding, binance-diff, format 3, a row | 37.80-38.00 ns | 23.54-23.82 ns | 33.66-33.90 ns | 20.70-20.83 ns |
+| the same, format 4 | 37.75-37.87 ns | 23.52-23.82 ns | 34.33-34.49 ns | 20.53-20.84 ns |
+| binance-top20, format 3 | 24.12-24.39 ns | 14.59-14.71 ns | 17.29-17.63 ns | 12.31-12.61 ns |
+| binance-top20, format 4 | 23.58-23.75 ns | 14.28-14.35 ns | 16.55-16.93 ns | 11.81-12.19 ns |
+| under the ingest, encoding's share of the node's samples | 9.0-9.1% | 5.5-5.7% | 8.4-8.7% | 6.2-6.4% |
+| the node's CPU for the ingest | 8.65-8.67 s | 8.34-8.46 s | 6.31-6.41 s | 6.12-6.15 s |
+
+The ingest's rate and the writer's waits are what they were: 9.89-10.06 M levels a second against
+9.76-9.92 on ARM, and 12.34-12.61 against 12.14-12.51 on x86. A searched seal of binance-diff takes
+102-116 ns a row where it took 159-188. What is left under the ingest is Simple8b, finding runs, the
+transforms' one pass and LZ4, each 0.5-2.3% of the node's samples.
+
+Tests: `tests/test_column_codec_equivalence.cpp` has three tests:
+- any column of pieces: runs, one width, steps of a tick, a price ladder, the edges of uint64 and
+  Simple8b, and multiples of a divisor;
+- a divisor that shrinks late, up to 70 times at random positions, through the corrections and past
+  their budget;
+- columns shaped like a segment's.
+
+The equivalence test found a bug of the change on its first run: a reused stream wrote the last column's
+scale into a block of `none`. `prop_simple8b_encode_matches_the_previous_encoder` holds the selector to the
+encoder before #49.
+
+Mutation table (`mutations/` in the evidence, ARM): 13 mutants, every one killed by the test of what it
+breaks. Both controls survive, each correct and slower: corrections to the divisor past any budget, and a
+selector's window read to its end after a width too wide. One of the killed mutants takes the value where
+the corrections' budget ran out for one before it. Both properties kill it, so the end of the budget is
+reached in the cases they draw.
+
+- Effort: M | Impact: a seal's encoding costs 26-41% less on both hosts' recordings, writing the same bytes
+
+### 266. A book summary at a seal decoded again what the seal had encoded, and applied it through a map ✅ **P2**
+
+**Found in the node's CPU profile under #190's ingest** (`evidence/2026-11-14-ingest-profile/`; spec
+`smart-data-engine-workspace/specs/book-summary-cost/`, evidence `evidence/2026-11-14-book-summary-cost/`).
+The thread that flushes and seals - the one every writer's rows go through - spent a quarter to a third of
+its time composing book summaries (#233, #243, #247): after a seal of a busy symbol, `write_book_summary()`
+composes the book as of the segment's end from the summary before it and every row since, through
+`compose_by_price()`, which answers every book read by price too. `benchmarks/book_summary_cost` (new) put
+a summary of 65 536 rows at 64-73 ns a row on the m8a.xlarge and 74-78 on the m9g.xlarge, and its profile
+half of that in applying each row to a `std::map` a side - a node a price, a copy of the row in it, a
+pointer chased a level - a quarter in reading the span's segments into runs, and a fifth in merging them.
+
+**A composition keeps its prices in a table** (`PriceSide`, `price_side.hpp`): open addressing from a price
+to the row that set it, the best price at the top of a heap whose removed prices it takes out when it
+reaches them - and known without a look until the best is removed - and the rows sorted by price once, at
+the end. **And a span whose segments come in time order one after another, with no block reaching it, is
+applied as it is decoded**: the segments in the order the merge ranks them, each batch's rows applied
+rather than copied into runs and merged. A row before the one ahead of it - an event time a client gave -
+sends the composition back to the merge, from the start. A summary's span holds the segment sealed since
+it and the row at the summary's time that ends the one before, so a condition of one segment never held.
+A third measure - the reader called without `std::function`, one run handed over without the heap - moved
+nothing and is not in it. The summary's and the track's bytes are an oracle's after any sequence of
+publishes, seals, late rows, summaries and restarts.
+
+Measured with Release builds on the test hosts, `master` (`d50edb2`) against this change (`2e8efdb`, its
+last commit since changing tests and a DEBUG line): the benchmark three runs each; under #190's ingest
+three rounds each, the two builds one after the other on each host.
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| composing a summary of 65 536 rows, 500 prices a side, a row (p50) | 74.2-77.9 ns | 33.0-33.3 ns | 63.6-72.9 ns | 29.7-29.9 ns |
+| the summary (p50) | 4.86-5.11 ms | 2.17-2.19 ms | 4.17-4.78 ms | 1.95-1.96 ms |
+| under the ingest, the summary's share of the node's samples | 10.7-10.9% | 5.3-5.5% | 9.1-9.3% | 5.1-5.5% |
+| the node's CPU for the ingest | 9.10-9.27 s | 8.55-8.72 s | 6.50-6.58 s | 6.36-6.55 s |
+
+The ingest's rate and the writer's waits are what they were. The spec asked the summary's share of the
+flush thread to fall by half on both hosts; it fell from 32% to 18-19% on ARM and from 26-27% to 15-17% on
+x86. What is left is decoding the segment the seal has just encoded, and applying its rows: a book kept as
+the rows are sealed would leave neither, and is a larger change of its own.
+
+Tests: `tests/test_price_side.cpp` (a side against the std::map it replaces after every put and removal,
+prices a tick or a hundred apart; a removed best giving way to the next), and
+`tests/test_book_summary_equivalence.cpp` (the summary's and the track's bytes against an oracle that
+composes from a plain scan and encodes with the files' own encoders, and the rows a summary says it read;
+a walk of a book summarised twenty times, and any sequence of publishes, seals, late rows, summaries and
+restarts, each case comparing at least once).
+
+Mutation table (`mutations/` in the evidence, ARM): 9 mutants, every one killed by the test of what it
+breaks, and the control - every price hashed to the table's first slot, correct and slower - survives. One
+of them, a block reaching the span left to the direct read, passed the bytes property and was killed by the
+summary store's tests: every summary the property wrote came after a seal of every block. It now leaves a
+block pending before some, and kills that mutant itself.
+
+- Effort: M | Impact: a summary at a seal costs less than half of what it did
+
+### 265. A client loop signed for every new TLS session, and every session on it waited ✅ **P2**
+
+**Found asking what else holds a client loop after #260 and #261** (spec
+`smart-data-engine-workspace/specs/tls-handshake-off-the-loop/`, evidence
+`evidence/2026-11-14-tls-handshake-probe/` and `evidence/2026-11-14-tls-handshake-off-the-loop/`). A
+loop drove each of its TLS sessions' handshakes itself (`Session::continue_tls_handshake()`,
+`SSL_accept()`), between the events of every other session it serves: with an RSA-2048 certificate about
+1 300 handshakes a second on the m9g.xlarge and 2 200 on the m8a.xlarge. Two processes opening
+connections back to back - clients reconnecting after a failover, or one reconnecting in a loop - raised
+the median `PING` of a session on the same loop 31-36 times with an RSA-2048 certificate, on both test
+hosts, and a feed's writes on that loop waited behind the handshakes the same way.
+
+**The client port's handshakes run on threads of their own** (`TlsHandshakePool`,
+`--tls-handshake-threads N`, default 1, threads `ob-tls-0` …). The accepting loop hands a TLS connection
+to one, which drives `SSL_accept()` on the connection's events in an epoll of its own and gives the loop
+the connection was dealt to a session whose handshake is done (`Reactor::hand_off_established()`,
+`Session::enable_tls_done()`). A handshake that fails is closed on its thread, and so is one not done
+within `--tls-handshake-timeout-ms` (default 10 000): a client that connected and never began its
+handshake held its place in `--max-sessions` for as long as it stayed connected, and gives it back now.
+A session adopted with its handshake done is resumed in its loop's next pass (`append_resumed()`, #260's
+resume as a step of its own), for an OpenSSL that holds what came behind the client's `Finished` in its
+buffer - which without read-ahead, off in every context here, it does not. With
+`--tls-handshake-threads 0` the loops drive the handshakes, as before.
+
+Measured on the test hosts with Release builds, `master` (`113de4b`) against this change on it
+(`5b0b334`, before it was moved onto #263 and #264; the evidence maps each commit to the one it became),
+one client loop, three rounds of each certificate with the builds taking turns: a process `PING`s every
+half millisecond through the Unix socket, plain and served by the same loop, while two processes - or
+one, in the rows that say so - open TLS connections back to back for 5 s, each a full TLS 1.3 handshake
+and the banner.
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| `PING` p50 beside RSA-2048 handshakes, two processes opening them | 233-248 us | 10.4-10.5 us | 333-336 us | 10.5-10.6 us |
+| its p99 | 483-497 us | 25-30 us | 524-532 us | 30-39 us |
+| the same with one process: p50 | 348-349 us | 7.5 us | 110-114 us | 8.0 us |
+| its p99 | 591-592 us | 16-17 us | 303-307 us | 15-16 us |
+| `PING` p50 beside ECDSA P-256 handshakes, two processes | 112.6-113.2 us | 14.2-14.3 us | 11.4-15.5 us | 8.6-8.8 us |
+| its p99 | 151-152 us | 119-178 us | 192-197 us | 87-219 us |
+| the same with one process: p50 | 33.5-34.6 us | 7.5 us | 10.6-10.8 us | 5.8-6.9 us |
+| its p99 | 100-109 us | 18-19 us | 165-166 us | 16 us |
+| `PING` p50 with no handshake | 7.3-7.5 us | 7.3-7.5 us | 9.2-9.3 us | 9.1-9.2 us |
+| RSA-2048 handshakes a second, two processes | 1 281-1 290 | 1 295-1 298 | 2 204-2 214 | 2 272-2 276 |
+| ECDSA P-256 handshakes a second, two processes | 4 075 | 3 975-3 993 | 3 598-3 672 | 3 609-3 646 |
+| one connection to its banner on an idle node, RSA-2048, p50 | 894-895 us | 892-894 us | 655-661 us | 657-660 us |
+
+With two processes opening connections the host's four CPUs carry five busy threads - theirs, the
+pinger's, the loop's and the handshake thread's - and with ECDSA, whose handshakes cost a loop less, the
+p99 is about what it was on both hosts; with one process it is a fifth and a tenth of it. One thread
+takes about as many handshakes a second as the loop did, 2.5% fewer to 3.3% more, and a connection waits
+for its banner as long as it did.
+
+Tests: `tests/test_tls_handshake_pool.cpp` (a handshake done and handed to the loop it was dealt to,
+with an SSL its session writes through; one that fails, one that never starts and one under way when the
+pool stops, each closed with its place given back; six connections on two threads each reaching its
+loop), the flags' defaults and both ends of their ranges in `tests/test_cli_args.cpp`, and
+`tests/integration/test_tls_handshake_isolation.py` (a `PING` beside a handshake storm under a quarter of
+the one with the handshakes on the loop, with the metrics; a command sent right behind the handshake
+answered; a connection that never sends its ClientHello closed at its deadline, its place given back; a
+certificate replaced on `SIGHUP` presented by the next handshake on the threads).
+
+Mutation table (`arm/mutations/` in the evidence): 10 mutants, 9 killed - each by the test of what it
+breaks - and one surviving as expected with the control: a session adopted with its handshake done and
+not resumed, which only a context with read-ahead would need.
+
+- Effort: M | Impact: a burst of TLS connections no longer holds the sessions already served
+
+### 264. Nothing ran the test suite on ARM, which the release ships ✅ **P2**
+
+**Found by #262.** The release's ARM64 packages are built and accepted on every pull request
+(`package-arm64`, #42), but the C++ suite ran on x86 alone: #262's test failed 16 runs of 20 on the
+m9g.xlarge's Debug build, with nothing wrong in the book, and passed every run CI had made. Anyone
+running the suite on ARM was told the book was broken, and a defect that only ARM's ordering or
+codec paths show would have reached a release the same way.
+
+**`build-and-test-arm64`** builds the tree in Debug on GitHub's ARM runner (`ubuntu-24.04-arm`) and
+runs what `build-and-test` runs on x86: the whole ctest, `-j1`, and the failover manager's tests
+against a real etcd. Its FetchContent cache is keyed by the architecture as well - `build/_deps`
+holds the dependencies' builds. `.github/rulesets/master.json` requires it, fifteen contexts now, and
+`check_contexts.py` holds the file, the workflows and the two documents that state the count to one
+another; the live ruleset takes the file once this is merged, as its README orders. The integration
+battery stays on x86, where its patience was calibrated.
+
+- Effort: S | Impact: a failure on ARM fails the pull request, not a user's node
+
+### 263. A write paid for every subscriber of its book, on the writer's thread, and more for each one ✅ **P1**
+
+**Found asking what a feed's writer pays for the clients subscribed to its book** (spec
+`smart-data-engine-workspace/specs/subscription-fanout/`, evidence
+`evidence/2026-11-14-subscription-fanout/`). A write's notification called each subscription's
+callback once a row, and the server's took the hub's mutex, searched every queue of the hub for its
+own, formatted the whole row into a new string and appended it - on the writer's thread, a client
+loop's for a `MINSERT`, so every session of that loop waited as well. With S sessions subscribed to one
+book, a `MINSERT` of 20 levels cost its writer 10 us at S = 0, 41 us at 10, 350 us at 100 and 5.1 ms at
+1 000 on the m9g.xlarge with one client loop, and as much with four, where most subscribers were on
+other loops. A push cost 152 ns at S = 10 and 252 ns at 1 000, and at 1 000 the search alone was 32%
+of the node's CPU.
+
+**A write reaches each subscription once.**
+- **One call a subscription and write** (`Engine::subscribe_batch()`, `SubscriptionBatch`): the
+  server's subscriptions take the rows of a write their conditions allow at once - one lock and one
+  lookup each. The C API's row callback is unchanged.
+- **The hub keeps its queues by id**, not in a vector searched in turn.
+- **A row's text is made once a write**, in the notification's scratch (`NotifyScratch`), and shared
+  by every subscription the row reaches under its own `PUSH <id>\t`, made once a call:
+  `format_push_head()` and `format_push_row()` write `format_push()`'s bytes, which a test pins.
+- **A drain gives a queue back room** for as many bytes as it took, up to 64 KiB, on the subscriber's
+  loop: the writes before the next drain append into it rather than grow a string from nothing, a
+  reallocation at a time, on the writer's thread. A queue counts its lines as they are added, and the
+  drain no longer counts them in the bytes.
+
+Measured on the test hosts of 14 November with Release builds: #261 (`d921e65`) against this change on
+it (`c2f1d18`), three rounds each, a writer sending `MINSERT`s of 20 levels of one book as fast as their
+answers come for 10 s while S sessions subscribed to the book are read to their end by a process of
+their own (`fanout_probe.py`); the writer's cost a push is its p50 less the p50 with no subscriber, over
+the pushes a write makes:
+
+| `MINSERT` of 20 levels, p50 | one loop before | after | four loops before | after |
+|---|---|---|---|---|
+| no subscriber | 10.3-10.4 us | 10.3-10.4 us | 10.3-10.4 us | 10.3-10.4 us |
+| 10 subscribers of its book | 40.8-41.0 us | 27.9-28.1 us | | |
+| 100 | 346-355 us | 200-202 us | 372-386 us | 83-86 us |
+| 300 | 1 149-1 167 us | 621-632 us | | |
+| 1 000 | 5.04-5.08 ms | 2.05-2.09 ms | 4.59-4.70 ms | 0.91-0.94 ms |
+| the writer's cost a push at 1 000 | 252-254 ns | 102-104 ns | 229-234 ns | 45-46 ns |
+
+On the m8a.xlarge, the same:
+
+| `MINSERT` of 20 levels, p50 | one loop before | after | four loops before | after |
+|---|---|---|---|---|
+| no subscriber | 7.2 us | 7.2 us | 7.2 us | 7.2 us |
+| 10 subscribers of its book | 30.0-31.5 us | 21.4-22.0 us | | |
+| 100 | 266-273 us | 168-169 us | 283-288 us | 46-63 us |
+| 300 | 903-960 us | 488-497 us | | |
+| 1 000 | 4.98-5.07 ms | 1.62-1.72 ms | 3.66-3.82 ms | 0.62-0.69 ms |
+| the writer's cost a push at 1 000 | 249-253 ns | 80-86 ns | 183-190 ns | 31-34 ns |
+
+With four loops the writer pays for a push a fifth of what it did on the m9g.xlarge and a sixth on the
+m8a.xlarge, and its book's subscribers take as many more pushes: 8 140-8 566 writes of a
+1 000-subscriber book in 10 s where 2 078-2 140, and 12 779-15 458 where 2 521-2 618. With one loop the
+writer's loop also sends every push - a thousand sockets written a write - and what is left is mostly
+that, the kernel's: in the profile at 1 000 subscribers the hub's work fell from 31% and 34% of the
+node's CPU (`enqueue`) to 7% and 3% (`enqueue_batch`). The pushes are the bytes they were.
+
+**And the documentation's `SUBSCRIBE`.** The README, `docs/query-language.md`'s wire example and #45's
+entry here showed `SUBSCRIBE 'SYM'.'EXCH'`, which no version accepts - v0.1.0 answers it
+`ERR query does not parse as a subscription`, as `master` does. The form is
+`SUBSCRIBE * FROM 'SYM'.'EXCH'`, the one the clients and the tests send. Pitfall 645: the ARM host's
+GCC 14 failed the first version's Release build on `-Wrestrict` where clang and GCC 12 and 15 saw
+nothing.
+
+Tests: `tests/test_subscription_hub.cpp` (300 subscriptions of one book, each given its own lines and
+the rows a row callback is given, in order; two subscriptions of different conditions given the text
+of the rows each allows under its own id; a write past the ceiling marking the queue where it passes
+and adding nothing after; each drain counting the rows it moved and no more), the pieces of a push
+pinned to `format_push()` for 4 000 rows (`tests/test_response_formatter.cpp`), `QueryBookStatic`
+reading `subscribe_batch()` for the write lock as it reads `subscribe()`, and
+`tests/integration/test_subscriptions.py`'s two hundred sessions on two loops each given a hundred
+rows in order. Mutation table (`arm/m263-mutations*.log` in the evidence): 11 mutants, 8 killed - each
+by the test of what it breaks - and three surviving as expected: a row formatted again for each
+subscription and a drain's room not capped, which change what the work costs and not what is
+pushed, and the control.
+
+- Effort: M | Impact: a feed's writer pays about a fifth of what it did for each subscriber of its
+  book, and its subscribers are sent four times as much
+
+### 262. A test's control raced the scheduler, and failed four runs in five on the ARM host ✅ **P2**
+
+**Found running the whole suite on the m9g.xlarge, for a change to the client loop.** `SoABuffer.TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt`
+(#239) reads a book's label while a writer makes 2 000 000 updates, and its control asks that the label
+moved more than 1 000 times under the reads - that they raced the writer at all. The writer stopped
+at its count, and on the Graviton host's Debug build the reads had seen 200-740 moves by then: the test
+failed 16 runs of 20 on `master` (`a585c7e`), with nothing wrong in the book. CI runs the suite on x86,
+where the count is met, so no run of it said so; anyone running the suite on ARM is told the book is
+broken.
+
+**The race is established, not hoped for**, as pitfall 105 asks: the reads go on until the writer has
+made its 2 000 000 updates **and** the label has moved more than 1 000 times under them, within a
+minute, and the writer writes until they stop. What the test checks of every read is unchanged, and so
+is the load it checks it under - at least as many updates as before. 30 runs of 30 on the same host,
+315-439 ms each.
+
+- Effort: S | Impact: the suite passes on ARM as it does on x86
+
+### 261. A FLUSH held its client loop, and every session on it, for as long as it wrote ✅ **P1**
+
+**Found after #260, asking what else one session's command costs the sessions on its loop** (spec
+`smart-data-engine-workspace/specs/flush-off-the-loop/`, evidence
+`evidence/2026-11-07-flush-off-the-loop/`). `FLUSH` called `Engine::flush_incremental()` on its client
+loop. The flush's phases already kept other loops' writers out of it - the engine's lock only to take
+the rows waiting, the segments written without it - but its own loop waited for all of it: a `PING`
+beside a `FLUSH` of 500 000 rows in 1 000 books waited 112-180 ms on the m9g.xlarge, with the
+background flush at its default 100 ms too, and the Python client's `flush()` is a FLUSH.
+
+**Past its refusals, a FLUSH is answered on the threads of #260.** A read-only node, a replica and a
+bootstrap still refuse it on the loop; otherwise `take_flush()` hands it to `--large-read-threads`, its
+session waits for its answer - what came behind it in the session, what comes later in the socket - and
+a read sent after it sees what it wrote. Its answer is the one it had, `OK` or the failed sync's `ERR`,
+built in one place for both (`flush_answer()`). A session in rings, and a node with
+`--large-read-threads 0`, flush on the loop. `OffLoopReads` is `OffLoopWork` (`take_read()`,
+`take_flush()`), and a session's flag `waiting_off_loop()`.
+
+Measured on the test hosts of 14 November with Release builds, one client loop and no flush in the
+background (`--flush-interval-ms 600000`): #260 on `master` (`4c04172`) against this change on it
+(`d921e65`), three rounds each, the `PING`s sent by a process of their own and counted while the FLUSH
+was answered (`evidence/2026-11-14-off-the-loop-on-master/`; first measured on its first branch with the
+same result, `evidence/2026-11-07-flush-off-the-loop/`):
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| longest `PING` beside a FLUSH of 500 000 rows in 1 000 books | 141.5-148.7 ms | 24-31 us | 146.9-182.3 ms | 30-147 us |
+| the same of 100 000 rows in 100 books | 25.8-27.7 ms | 13-47 us | 32.1-35.4 ms | 13-26 us |
+| the FLUSH of 500 000 rows itself | 141.7-148.9 ms | 141.9-149.6 ms | 147.0-182.8 ms | 167.1-178.0 ms |
+
+A FLUSH with nothing waiting pays for the hand to the thread and back: 19.5-19.6 us at p50 where it
+took 14.1-15.8 on the m9g.xlarge, and 10.1-10.9 where 7.0-8.9 on the m8a.xlarge. One that has a row to
+write is the WAL's sync, 3.8 ms and 7.5 ms at p50 after one `INSERT`, as it was.
+
+Tests: `tests/integration/test_flush_isolation.py` (a `PING` beside a FLUSH of 300 000 rows in 1 000
+books under a tenth of the one on the loop, with the metrics; a session's answers in order around a
+FLUSH, a read and a `PING` sent while it is written seeing what it wrote; a read-only node refusing on
+its loop). Mutation table (`mutations/` in the evidence, ARM): 8 mutants, 7 killed - each by the test of what
+it breaks - and the control survives.
+
+- Effort: S | Impact: a client's FLUSH no longer holds the sessions of its loop
+
+### 260. A large read held its client loop, and every session on it, for as long as it was answered ✅ **P1**
+
+**Found measuring #257** (spec `smart-data-engine-workspace/specs/large-answer-off-the-loop/`,
+evidence `evidence/2026-11-07-large-answer-off-the-loop/`). A client loop ran a `SELECT` to its last
+byte - scan, formatting, compression, sending - before it served another session, and the sessions on
+it are every Nth connection of the node, the ones writing a feed among them: a `PING` beside a
+`SELECT` of a million rows (45 MB) on the same loop waited 14-22 ms on the m9g.xlarge and 15-18 ms
+on the m8a.xlarge, and 52-55 ms and 48-52 ms in a session with `COMPRESS LZ4`. For a database
+whose point is latency, an analyst's query is not allowed to hold a feed's writes for tens of
+milliseconds.
+
+**A large read is answered on threads of its own** (`--large-read-threads N`, default 2, `ob-read-N`;
+0 is every read on its loop, as before).
+- **The engine hands it back before it reads a row** (`ReadGate`, `QueryEngine::execute()`): once the
+  query is parsed and its book found, a read whose scan the index puts at 100 000 rows or more. A row
+  query with no price, side or level condition is decided by its `LIMIT`, without the index; one with
+  a condition reads the range to find its rows, and time buckets read every row of theirs, so the
+  rows in range decide them (`rows_in_range_at_most()`: the index under its shared lock, nothing
+  copied, counted no further than the threshold). The live book's functions and snapshots read the
+  book and stay.
+- **Its session is paused** until the answer comes back through the loop's mailbox (an eventfd in its
+  epoll): what came behind the read in the same write waits in the session, what comes later waits in
+  the socket, so a session's answers come in the order it asked and a write sent after the read is
+  not in it. The answer is queued as the loop queues its own - LZ4 frame, the ceiling of #257 - and
+  the session is resumed by an event the loop adds to its pass. A session closed meanwhile - its client
+  gone, with answers still queued for it - has its answer dropped, and not given to the session that
+  has its descriptor now. A session in rings stays on its loop: the loop makes its events, and none
+  would resume it.
+- **One flush sends a megabyte at most** (`Session::kSendSlice`), on the socket and through TLS. With
+  the read off the loop, a `PING` beside it still waited for its sending on the ARM host: 30-48 us
+  while the answer was built, 4.7-10.3 ms while it went out, because a reader as fast as the loop never
+  filled its socket and the flush sent the whole answer. A flush that stops at the slice says so, and
+  the loop arms `EPOLLOUT` again - edge-triggered, nothing else would report the socket - which
+  answers on the next pass, after the pass's other sessions.
+
+Measured on the test hosts of 14 November (the same instance types) with Release builds, eight million
+rows of one book and one client loop: `master` (`e14c69e`) against this change on it (`4c04172`), three
+rounds each, the `PING`s and writes sent by a process of their own and counted while the read was
+answered (`evidence/2026-11-14-off-the-loop-on-master/`). The change was built and first measured on
+the branch of PR #309, client credentials read again on `SIGHUP`, with the same result
+(`perf/large-answer-off-the-loop`, `e900fd0`, `evidence/2026-11-07-large-answer-off-the-loop/`).
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| longest `PING`, `SELECT` of 1M rows | 11.9-24.6 ms | 0.13-0.41 ms | 14.0-18.3 ms | 0.08-0.26 ms |
+| longest `PING`, the same in LZ4 | 55.0-59.3 ms | 0.15-0.47 ms | 41.3-50.1 ms | 0.03-0.07 ms |
+| longest `MINSERT` of 20 levels beside it | 12.5-20.5 ms | 0.46-0.64 ms | 13.3-16.4 ms | 0.19-2.05 ms |
+| `SELECT ... LIMIT 100`, p50 | 22.3-23.3 us | 22.6-23.0 us | 13.2-14.0 us | 13.0-14.0 us |
+| `SELECT` of about a millisecond of the book, p50 | 60.2-79.5 us | 60.9-61.3 us | 64.3-64.6 us | 64.3-64.9 us |
+
+The read itself takes as long: 0.033-0.036 s before and after in text and 0.097-0.100 and 0.098-0.100
+in LZ4 on the m9g.xlarge; 0.041-0.046 and 0.035-0.043 in text and 0.094-0.103 and 0.103-0.106 in LZ4 on
+the m8a.xlarge. A writer beside it takes turns of the loop the read had held - 1.7-2.6 times the
+batches while the read was answered on the m9g.xlarge, 1.7-2.3 on the m8a.xlarge - and the read with it
+took 0.039-0.043 s where 0.035-0.040, and 0.042-0.047 where 0.036-0.039. The writer's longest beside the
+read is no longer than its own: with no read beside it the same writer met 3.7-3.9 ms at the longest on
+the m9g.xlarge and 4.0-4.1 ms on the m8a.xlarge, with a write past 1 ms in 10-15% and 46-49% of its
+50 ms windows.
+
+**Two versions before this one.** The first asked the index before `execute()`: it parsed the query a
+second time and copied every candidate's metadata, and `LIMIT 100` of a range of eight million rows
+went from 13.6-14.0 to 17.2-17.8 us at p50 (x86) and from 22.7-23.7 to 32.7-32.8 (ARM). It also counted
+a `LIMIT` as what a scan reads under a condition on the rows, which reads the range to find them. The
+first test of isolation measured a `PING` from a thread of the test's own process, which waited for the
+interpreter's lock while the reader took 26 MB in: 18.7 ms beside a read off the loop that the node
+answered beside in 0.05-0.18 ms (pitfall 642).
+
+Tests: `tests/test_off_loop_reads.cpp` (the index's count and where it stops, the gate from its
+threshold on, `LIMIT` with and without a condition, buckets, the live book's functions, the mailbox,
+the pool), `SessionOutput.AFlushSendsASliceAtMostAndSaysWhenItStoppedThere` and
+`TlsSession.AFlushSendsASliceAtMostToAReaderThatKeepsUp`, `tests/integration/test_large_answer_isolation.py`
+(a `PING` beside a read under a tenth of the one on the loop; the threshold read from the metrics; the
+order of a session's answers with a second write while its read is off the loop; LZ4; a session closed
+with answers queued for it; TLS against the Unix socket's plain answer, to a reader that keeps up)
+and `test_rings.py`'s `large_read`, off the loop through the socket and on it through rings.
+Mutation table (`mutations/` in the evidence, on the final tree): 23 mutants, 21 killed, each by the
+test of what it breaks, and the control survives. So does a pass that cannot take every session it
+resumes into its 64 events and sleeps with the rest left: no test fills a pass, and that path is held
+by reading it.
+
+- Effort: L | Impact: an analyst's query no longer holds the writes and reads of the sessions beside
+  it
+
+### 259. The C++ client's compress option could not compress a session in any build ✅ **P3**
+
+**Found reading the reply path for #257**, where an answer is one LZ4 frame on a session that
+compresses. `ClientConfig::compress` - and `PoolConfig::compress`, which the pool and the shard router
+pass on - asked for an LZ4 session, and nothing in the client could hold one:
+- built as the project builds it, the negotiation answered "LZ4 compression not compiled in";
+- built with `OB_CLIENT_LZ4`, it compared the answer with `OK COMPRESS LZ4\n`, while the server's
+  answer ends at its empty line like every `OK`, so every connection failed as `server does not
+  support LZ4 compression`;
+- and had the comparison matched, nothing the client sent or read was framed.
+
+No test set the option and no document named it: an option nobody had ever seen work.
+
+`compress = true` is refused by `connect()` before a socket is opened, naming the Python client's
+`compress=True` as the way to an LZ4 session; the negotiation, the flag it set and the
+`OB_CLIENT_LZ4` CMake option are gone. A C++ client that compresses is a feature to build when a
+deployment needs one, with the framing the Python client has.
+
+`ClientUnit.CompressIsRefusedByNameBeforeAnythingIsOpened`, with the same client without the option
+refused by the closed port it dials as its control.
+
+- Effort: S | Impact: an option that failed with a wrong reason fails with the right one
 
 ### 258. Adding, rotating or revoking a client took a restart ✅ **P2**
 
@@ -16544,7 +17863,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #193, #194, #223.** Every other item above #58 is marked closed, and
+**Open: #169, #193, #194, #223, #279.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -16825,8 +18144,95 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #307](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/42399166508),
-on the tree of #257, `e54bad9` on `master`. The rows below lead with that run.
+Verified by [the full CI run for PR #334](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/44641179991),
+on the tree of #285, `e8da94b` on `master`. The rows below lead with that run.
+
+**Against PR #333's run (2275 and 634) C++ is +7 and integration +0, and the seven reconcile to their file:**
+#285's (PR #334) - `TempDirRule.APathNamedTheSameInEveryRunIsNotTheProcesss`, `TempDirRule.AProcessIdAMkdtempTemplateOrTheDirectoryItselfIsTheProcesss`, `TempDirDiscipline.EveryPathATestBuildsUnderTheTemporaryDirectoryIsItsProcesss`, `OwnTempDir.IsANewEmptyDirectoryNamedByTheProcess`, `OwnTempDir.ADirectoryLeftUnderItsNamePassesOverIt`, `OwnTempDir.IsUnderTMPDIRWhenItIsSet` and `OwnTempFile.AFileLeftUnderItsNameIsRemovedAndNothingIsCreated`, all in the new `tests/test_temp_dir_discipline.cpp`.
+
+**Against PR #332's run (2275 and 634), PR #333's was C++ +0 and integration +0:** PR #333 changed how a drain's block and a store's columns grow, not how many tests there are.
+
+**Against PR #331's run (2270 and 634) C++ is +5 and integration +0, and the five reconcile to their files:**
+#283's (PR #332) - `ThreadNamesRule.ItSeesANamedThreadAndAnUnnamedOneDifferently`, `ThreadNamesRule.ANameTwoStatementsLaterIsNotTheThreadsOwn`, `ThreadNamesRule.AThreadThatNamesItselfIsNamed` and `ThreadNames.EveryThreadIsNamedWhereItIsStarted` in `tests/test_thread_boundaries.cpp`, and `ThreadNames.AnOpenEnginesOwnThreadsHaveTheirNames` in the new `tests/test_thread_names.cpp`.
+
+**Against PR #330's run (2270 and 634), PR #331's was C++ +0 and integration +0:** PR #331 changed how a drain and a seal move rows, not how many tests there are.
+
+**Against PR #329's run (2269 and 634) C++ is +1 and integration +0, and the one reconciles to its file:**
+#282's (PR #330) - `ASegmentSealedAfterTheCutIsInNoneOfItsFiles` in `tests/test_backup.cpp`.
+
+**Against PR #328's run (2269 and 634), PR #329's was C++ +0 and integration +0:** PR #329 changed how a test waits for a descriptor, not how many tests there are.
+
+**Against PR #327's run (2264 and 634) C++ is +5 and integration +0, and the five reconcile to their files:**
+#278's (PR #328) - `ASealThatPutsTheRowsOfAnInstantInAnotherOrderFalsifiesTheSummariesFromIt`,
+`ASealThatReachesTheFirstInstantOfASegmentAfterItFalsifiesToo`, `ASealBeforeASegmentItSharesNoInstantWithFalsifiesNothing`
+and `ASegmentMergedWithARowAtOrBeforeItsTimeFalsifiesIt` in `tests/test_book_summary.cpp`, and
+`AnySequenceWithItsRowsTiedOnTheirTimesWritesTheOraclesBytes` in `tests/test_book_summary_equivalence.cpp`.
+
+**Against PR #326's run (2261 and 634) C++ is +3 and integration +0, and the three reconcile to their file:**
+#277's (PR #327) - `ATickLeavesTheRemovalOfTheFilesItLetsGoToTheirOwnThread`,
+`ATestTickReturnsOnceItsFilesAreRemoved` and `CloseRemovesTheFilesTheLastTickLetGoBeforeItReturns` in the new
+`tests/test_wal_removal.cpp`.
+
+**Against PR #325's run (2257 and 634) C++ is +4 and integration +0, and the four reconcile to their file:**
+#276's (PR #326) - `TheRowThatBringsTheQueueToHalfTheCeilingAsksForAFlush`,
+`RowsWrittenBeforeTheTickTakesTheQueueDoNotAskAgain`, `TheRowsATickHoldsDoNotAskForTheNextOne` and
+`AWriterAtTheCeilingAsksForTheTickAfterTheOneItWaitsFor` in `tests/test_pending_backpressure.cpp`.
+
+**Against PR #324's run (2257 and 634), PR #325's was C++ +0 and integration +0:** PR #325 changed
+how a drain finds a pair's store, not how many tests there are.
+
+**Against PR #323's run (2255 and 634) C++ is +2 and integration +0, and the two reconcile to their file:**
+#272's (PR #324) - `AReadFromASummaryReadsNoRowAtItsTimeNorTheSegmentItWasMadeAt` and
+`ARowAtItsTimeSealedAfterItIsInItAndNotAppliedAgain` in `tests/test_book_summary.cpp`.
+
+**Against PR #322's run (2254 and 634) C++ is +1 and integration +0, and the one reconciles to its file:**
+#271's (PR #323) - `ARowTheSideHoldsPutAgainIsTheSameRow` in `tests/test_price_side.cpp`.
+
+**Against PR #321's run (2254 and 634), PR #322's was C++ +0 and integration +0:** PR #322 changed
+the certificates one test signs with, not how many tests there are.
+
+**Against PR #320's run (2245 and 634) C++ is +9 and integration +0, and the nine reconcile to files:**
+#270's (PR #321) - the six of the new `tests/test_row_names.cpp`, two in `tests/test_chunked_queue.cpp`
+and the one of the new `tests/test_pending_row_names.cpp`.
+
+**Against PR #319's run (2245 and 634), PR #320's was C++ +0 and integration +0:** PR #320 changed
+how many times one test makes its pair of storms, not how many tests there are.
+
+**Against PR #318's run (2241 and 634) C++ is +4 and integration +0, and the four reconcile to their file:**
+#268's (PR #319) - the four of the new `tests/test_book_level_search.cpp`.
+
+**Against PR #317's run (2238 and 634) C++ is +3 and integration +0, and the three reconcile to their file:**
+#267's (PR #318) - the three of the new `tests/test_column_codec_equivalence.cpp`.
+
+**Against PR #316's run (2231 and 634) C++ is +7 and integration +0, and the seven reconcile to files:**
+#266's (PR #317) - the five of the new `tests/test_price_side.cpp` and the two of the new
+`tests/test_book_summary_equivalence.cpp`.
+
+**Against PR #315's run (2223 and 630) C++ is +8 and integration +4, and both reconcile to files:**
+#265's (PR #316) - the five of the new `tests/test_tls_handshake_pool.cpp` and three more in
+`tests/test_cli_args.cpp`; the four of the new `tests/integration/test_tls_handshake_isolation.py`.
+
+**Against PR #314's run (2223 and 630), PR #315's was C++ +0 and integration +0:** PR #315 added a job
+that runs the same C++ suite on ARM (#264), not a test.
+
+**Against PR #313's run (2218 and 629) C++ is +5 and integration +1, and both reconcile to files:**
+#263's (PR #314) - one more in `tests/test_response_formatter.cpp` and four more in
+`tests/test_subscription_hub.cpp`; one more in `tests/integration/test_subscriptions.py`.
+
+**Against PR #312's run (2218 and 626) C++ is +0 and integration +3, and the three reconcile to their file:**
+#261's (PR #313) - the three of the new `tests/integration/test_flush_isolation.py`.
+
+**Against PR #311's run (2210 and 620) C++ is +8 and integration +6, and both reconcile to files:**
+#260's (PR #312) - the six of the new `tests/test_off_loop_reads.cpp`,
+`SessionOutput.AFlushSendsASliceAtMostAndSaysWhenItStoppedThere` in `tests/test_tcp_server.cpp` and
+`TlsSession.AFlushSendsASliceAtMostToAReaderThatKeepsUp` in `tests/test_tls_session.cpp`; the six of the
+new `tests/integration/test_large_answer_isolation.py`.
+
+**Against PR #310's run (2210 and 620), PR #311's was C++ +0 and integration +0:** PR #311 changed
+what one test waits for before it checks, not how many tests there are.
+
+**Against PR #307's run (2209 and 620) C++ is +1 and integration +0, and the one reconciles to its file:**
+#259's (PR #310) - `ClientUnit.CompressIsRefusedByNameBeforeAnythingIsOpened` in `tests/test_client.cpp`.
 
 **Against PR #306's run (2197 and 618) C++ is +12 and integration +2, and both reconcile to files:**
 #257's (PR #307) - the eleven of the new `tests/test_answer_ceiling.cpp` and
@@ -17149,9 +18555,9 @@ ran 265 tests, because `re.search` returns the *first* match and pytest's verdic
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 2209 | **2209 on PR #307's tree**, measured by CI - 12 more than PR #306's, #257's (PR #307). **Before that**, 2197 on PR #306's tree, measured by CI - 11 more than PR #305's, #256's (PR #306). **Before that**, 2186 on PR #305's tree, measured by CI - 1 more than PR #304's, #254's (PR #305). **Before that**, 2185 on PR #304's tree, measured by CI - 4 more than PR #301's, #252's and #253's (PR #302). **Before that**, 2181 on PR #301's tree, measured by CI - 7 more than PR #300's, #251's (PR #301). **Before that**, 2174 on PR #300's tree, measured by CI - as many as PR #299's. **Before that**, 2174 on PR #299's tree, measured by CI - 1 more than PR #298's, #49's (PR #299). **Before that**, 2173 on PR #298's tree, measured by CI - as many as PR #297's. **Before that**, 2173 on PR #297's tree, measured by CI - 2 more than PR #296's, #223's (PR #297). **Before that**, 2171 on PR #296's tree, measured by CI - 5 more than PR #295's, #250's (PR #296). **Before that**, 2166 on PR #295's tree, measured by CI - 2 more than PR #292's, #223's (PR #294). **Before that**, 2164 on PR #292's tree, measured by CI - 9 more than PR #290's, #248's and #249's (PR #291, PR #292). **Before that**, 2155 on PR #290's tree, measured by CI - 1 more than PR #287's, #247's (PR #290). **Before that**, 2154 on PR #287's tree, measured by CI - 30 more than PR #280's, the tests of #246's two stages (PR #281, PR #287). **Before that**, 2124 on PR #280's tree, measured by CI - 347 more than PR #225's, over the pull requests since. **Before that**, 1777 on PR #225's tree, measured by CI — one more than the row before, in `tests/test_tls_client.cpp` — and `ctest -j1` gave **1777/1777 in 180.82 s** on the m9g.xlarge at `b659ed0`, 1777/1777 in 364.27 s on the i3-7100U at `b659ed0` and 1777/1777 in 173.97 s on the m8a.xlarge (x86-64, Ubuntu 26.04) at `0a01d50`, each the code of that head. **Before that**, 1776 on PR #224's tree, measured by CI — twenty-three more than the row before, in the new `tests/test_series_of_the_book.cpp` and `tests/test_time_buckets.cpp` — and `ctest -j1` gave **1776/1776 in 183.99 s** on the m9g.xlarge at that head and 1776/1776 in 349.78 s on the i3-7100U at that head. **Before that**, 1753 on PR #223's tree, measured by CI — eleven more than the row before, in the new `tests/test_book_at_an_instant.cpp` and `tests/test_compaction_store.cpp` — and `ctest -j1` gave **1753/1753 in 185.47 s** on the m9g.xlarge at that head and 1753/1753 in 330.84 s on the i3-7100U at `8f504fa`, the same code. **Before that**, 1742 on PR #222's tree, measured by CI — three more than the row before, in `tests/test_admission.cpp` — and `ctest -j1` gave **1742/1742 in 180.28 s** on the m9g.xlarge at that head and 1742/1742 in 333.59 s on the i3-7100U at `2ecb7c5`, the same code. **Before that**, 1739 on PR #221's tree, measured by CI — five more than the row before, in `tests/test_admission.cpp`, `tests/test_mm_pending_peers.cpp` and `tests/test_cli_config.cpp` — and `ctest -j1` gave **1739/1739 in 185.02 s** on the m9g.xlarge at that head and 1739/1739 in 328.47 s on the i3-7100U at `c51362e`, the same code. **Before that**, 1734 on PR #220's tree, measured by CI — five more than the row before, #205's, in `tests/test_lazy_flush.cpp` — and `ctest -j1` gave **1734/1734 in 185.10 s** on the m9g.xlarge at that head and 1734/1734 in 331.13 s on the i3-7100U at `e5c9379`, the same code. **Before that**, 1729 on PR #185's tree, measured by CI — unchanged, since #185 changes only CodeQL's workflow. **Before that**, 1729 on PR #219's tree, measured by CI — twenty-three more than the row before, #44 step 1's, in the new `tests/test_time_buckets.cpp` and `tests/test_c_api.cpp` — and `ctest -j1` gave **1729/1729 in 183.72 s** on the m9g.xlarge at that head and 1729/1729 in 346.14 s on the i3-7100U at `d451119`, the same tree but for the test table. **Before that**, 1706 on PR #218's tree, measured by CI — five more than the row before, #190 step 6's, in the new `tests/test_seal_sync_background.cpp` — and `ctest -j1` gave **1706/1706 in 182.76 s** on the m9g.xlarge at that head and 1706/1706 in 326.67 s on the i3-7100U. **Before that**, 1701 on PR #217's tree, measured by CI — three more than the row before, #203's, in `tests/test_cli_args.cpp` — and `ctest -j1` gave **1701/1701 in 181.40 s** on the m9g.xlarge at that head and 1701/1701 in 338.39 s on the i3-7100U. **Before that**, 1698 on PR #216's tree, measured by CI — fifteen more than the row before, #190 step 5's, in the new `tests/test_admission.cpp` and `tests/test_engine_admission.cpp` — and `ctest -j1` gave **1698/1698 in 180.03 s** on the m9g.xlarge at that head and 1698/1698 in 320.56 s on the i3-7100U. **Before that**, 1683 on PR #215's tree, measured by CI — twenty-six more than the row before, #204's, in the new `tests/test_handover_decision.cpp` and `tests/test_handover_stream.cpp` — and `ctest -j1` gave **1683/1683 in 182.60 s** on the m9g.xlarge at `d6c2b60`, the commit before the last two (a test's bound and the roadmap). **Before that**, 1657 on PR #214's tree, measured by CI — twelve more than the row before, #200's, six each in `tests/test_query_agg_execution.cpp` and `tests/test_query_conditions.cpp` — and `ctest -j1` gave **1657/1657 in 176.52 s** on the m9g.xlarge at that head. **Before that**, 1645 on PR #213's tree, measured by CI — unchanged, since #201's C++ test is in `tests/test_etcd_integration.cpp`, which ctest does not run — and `ctest -j1` gave **1645/1645 in 178.20 s** on the m9g.xlarge at that head. **Before that**, 1645 on PR #212's tree, measured by CI — thirteen more than the row before, #199's, in the new `tests/test_query_conditions.cpp` — and `ctest -j1` gave **1645/1645 in 180.23 s** on the m9g.xlarge at that head and 1645/1645 in 309.12 s on the i3-7100U the commit before. **Before that**, 1632 on PR #211's tree, measured by CI — unchanged, since #42 rewrote one test of `tests/test_version.cpp` and added none — and locally `ctest -j1` gave **1632/1632 in 336.87 s** on the i3-7100U on that branch. **Before that**, 1632 on PR #210's tree, measured by CI — ten more than the row before, #49's step 3, in the new `tests/test_query_response_builder.cpp` — and locally `ctest -j1` gave **1632/1632 in 333.94 s** on the i3-7100U on that branch. **Before that**, 1622 on PR #209's tree, measured by CI — five more than the row before, #49's step 2: four in `tests/test_columnar_store.cpp`, one in `tests/test_codec.cpp` — and locally `ctest -j1` gave **1622/1622 in 355.01 s** on the i3-7100U on that branch. **Before that**, 1617 on PR #208's tree, measured by CI — five more than the row before, #198's and #49's: four in `tests/test_codec.cpp`, one in `tests/test_columnar_store.cpp` — and locally `ctest -j1` gave **1617/1617 in 291.14 s** on the i3-7100U on that branch. **Before that**, 1612 on PR #207's tree, measured by CI — unchanged, since #56 added no C++ test — and locally `ctest -j1` gave **1612/1612 in 287.89 s** on the i3-7100U on that branch. **Before that**, 1612 on PR #206's tree, measured by CI — one more than the row before, #190's step 4, in `tests/test_backup.cpp` — and locally `ctest -j1` gave **1612/1612 in 285.56 s** on the i3-7100U on that branch. **Before that**, 1611 on PR #205's tree, measured by CI — three more than the row before, all #197's, in the new `tests/test_snapshot_lineage.cpp` — and locally `ctest -j1` gave **1611/1611 in 296.43 s** on the i3-7100U on that branch. **Before that**, 1608 on PR #204's tree, measured by CI — twenty-three more than the row before, all #34's, in the new `tests/test_backup.cpp` — and locally `ctest -j1` gave **1608/1608 in 324.75 s** on the i3-7100U on that branch. **Before that**, 1585 on PR #203's tree, measured by CI — unchanged, since #35 added no C++ test — and locally `ctest -j1` gave **1585/1585 in 287.27 s** on the i3-7100U on that branch. **Before that**, 1585 on PR #202's tree, measured by CI — three more than the row before, all #196's second part: one in `tests/test_symbol_migration.cpp` and two in `tests/test_client.cpp` — and locally `ctest -j1` gave **1585/1585 in 277.12 s** on the i3-7100U on that branch. **Before that**, 1582 on PR #201's tree, measured by CI — twenty more than the row before, all #196's first part, in the new `tests/test_symbol_migration.cpp` — and locally `ctest -j1` gave **1582/1582 in 288.06 s** on the i3-7100U on that branch. **Before that**, 1562 on PR #200's tree, measured by CI — nineteen more than the row before, all #189's: ten in `tests/test_mm_vector_changes.cpp`, seven in `tests/test_version_vector.cpp` and two in `tests/test_sequence_tracker.cpp` — and locally `ctest -j1` gave **1562/1562 in 279.20 s** on the i3-7100U on that branch. **Before that**, 1543 on PR #199's tree, measured by CI — fifteen more than the row before, all #174's: eleven in `tests/test_wal_replay_blocks.cpp` and four in `tests/test_start_reads_wal_once.cpp` — and locally `ctest -j1` gave **1543/1543 in 288.98 s** on the i3-7100U on that branch. **Before that**, 1528 on PR #198's tree, measured by CI — ten more than the row before, all #175's: five in `tests/test_coordinator_leader_read.cpp`, four in `tests/test_shard_map.cpp` and one in `tests/test_cli_config.cpp` — and locally `ctest -j1` gave **1528/1528 in 281.44 s** on the i3-7100U on that branch. **Before that**, 1518 on PR #197's tree, measured by CI — fifteen more than the row before, all #187's: ten in the new `tests/test_mm_legacy_numbering.cpp` and five in `tests/test_sequence_tracker.cpp` — and locally `ctest -j1` gave **1518/1518 in 291.48 s** on the i3-7100U on that branch. **Before that**, 1503 on PR #196's tree, measured by CI — seventeen more than the row before, all #176's in `tests/test_mm_snapshot.cpp`: three codec tests, eight from running the transfer and damage tests in both widths and six in `MMSnapshotLarge` — and locally `ctest -j1` gave **1503/1503 in 255.87 s** on the i3-7100U on that branch. **Before that**, 1486 on PR #195's tree, measured by CI — eight more than the row before, all #191's and #192's in `tests/test_mm_snapshot.cpp` — and locally `ctest -j1` gave **1486/1486 in 263.03 s** on the i3-7100U on that branch. **Before that**, 1478 on PR #194's tree, measured by CI — ten more than the row before, all #186's: seven in the new `tests/test_wal_dir.cpp`, two in `tests/test_mm_restart_origins.cpp` and one in `tests/test_cli_config.cpp` — and locally `ctest -j1` gave **1478/1478 in 262.75 s** on the i3-7100U on that branch. **Before that**, 1468 on PR #193's tree, measured by CI — ten more than the row before, all #188's in `tests/test_mm_snapshot.cpp` — and locally `ctest -j1` gave **1466/1466 in 274.24 s** on the i3-7100U on that branch, before its last two tests. **Before that**, 1458 on PR #192's tree, measured by CI — sixteen more than the row before, all #177's: eleven in `tests/test_version_vector.cpp`, two in `tests/test_mm_catchup_rounds.cpp`, two in `tests/test_mm_snapshot.cpp` and one in `tests/test_mm_restart_origins.cpp` — and locally `ctest -j1` gave **1458/1458 in 291.07 s** on the i3-7100U on that branch. **Before that**, 1442 on PR #191's tree, measured by CI — sixteen more than the row before, over two pull requests: twelve in PR #190's (#184, #185), nine in the new `tests/test_mm_per_origin_numbering.cpp` and three in `tests/test_sequence_tracker.cpp`, and four in PR #191's (#182), three in `tests/test_conflict_resolver.cpp` and one in `tests/test_mm_stats.cpp` — and locally `ctest -j1` gave **1442/1442 in 260.23 s** on the i3-7100U on #182's branch, and 1438/1438 in 264.25 s on #184's. **Before that**, 1426 on PR #188's tree, measured by CI — nineteen more than the row before: seven in the new `tests/test_mm_restart_origins.cpp`, eight in `tests/test_mm_catchup_rounds.cpp` (#183's two and part D of #180's six) and four in `tests/test_sequence_tracker.cpp` (#180) — and locally `ctest -j1` gave **1426/1426 in 246.20 s** on the i3-7100U on that branch. **Before that**, 1407 on PR #187's tree, measured by CI — seventeen more than the row before: eight in the new `tests/test_wal_cursor.cpp`, eight in the new `tests/test_mm_catchup_rounds.cpp` and two in the new `tests/test_mm_receive.cpp`, less Property 8 of `tests/test_mm_networking.cpp` (#178) — and locally `ctest -j1` gave **1407/1407 in 250.73 s** on the i3-7100U on that branch, before its last four commits, which changed no C++. **Before that**, 1390 on PR #186's tree, measured by CI — forty-two more than the row before, all of them part 2b of #165's: twenty in the new `tests/test_compaction_store.cpp`, eleven in the new `tests/test_compaction_policy.cpp` and eleven in the new `tests/test_compaction.cpp` — and locally `ctest -j1` gave **1390/1390 in 252.07 s** on the i3-7100U on that branch. **Before that**, 1348 on PR #184's tree, measured by CI — unchanged, because #172 added none — and locally `ctest -j1` passed on that branch. **Before that**, 1348 on PR #183's tree, measured by CI — forty-seven more than the row before, all of them part 2a of #165's: sixteen in the new `tests/test_row_blocks.cpp`, seventeen in the new `tests/test_lazy_flush.cpp` and fourteen in the new `tests/test_seal_epochs.cpp` — and locally `ctest -j1` gave **1348/1348 in 268.80 s** on the i3-7100U on that branch. **Before that**, 1301 on PR #180's tree, measured by CI — five more than the row before, all five in the new `tests/test_snapshot_query.cpp` (#167 and #168) — and locally `ctest -j1` gave **1301/1301 in 235.78 s** on the i3-7100U on that branch. **Before that**, 1296 on PR #179's tree, measured by CI — fourteen more than the row before, all fourteen in the new `tests/test_segment_index.cpp` (part 1 of #165) — and locally `ctest -j1` gave **1296/1296 in 226.59 s** on the i3-7100U on that branch. **Before that**, 1282 on PR #178's tree, measured by CI — eleven more than the row before, all eleven in the new `tests/test_segment_time_range.cpp` (#166) — and locally `ctest -j1` gave **1282/1282 in 231.86 s** on the i3-7100U on #166's branch. **Before that**, 1271 on PR #177's tree, and locally 1271/1271 in 256.94 s on #164's branch. **Before that**, 1249 on PR #176's tree, and locally 1249/1249 in 226.63 s on #163's branch. **Before that**, 1239 on PR #175's tree, and locally 1239/1239 in 223.84 s on #162's branch; and 1236 on PR #174's tree, and locally 1236/1236 in 223.5 s on #160's branch. **Before that**, 1236 on PR #173's tree, and locally 1236/1236 in 216.0 s on #159's branch. **Before that**, 1228 on PR #172's tree, and locally 1228/1228 in 226.7 s on #158's branch rebased onto PR #171's merge. **Before that**, 1182 on PR #169's tree. **Before that**, 1181, measured by CI on #151's tree; locally `ctest -j1` gave **1181/1181 in 262 s** on the i3-7100U on #151's branch, with the build clean and warning-free. **Before that**, 1151, and locally 1151 passed in a single `ctest -j1` run on the i3-7100U with the build clean and warning-free. **Before that**, all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 620 | **620 in 37:46** on the GitHub runner for PR #307's tree, 2 more than PR #306's, #257's (PR #307). **Before that**, 618 in 38:33 on the GitHub runner for PR #306's tree, 7 more than PR #305's, #256's (PR #306). **Before that**, 611 in 38:15 on the GitHub runner for PR #305's tree, as many as PR #304's. **Before that**, 611 in 38:23 on the GitHub runner for PR #304's tree, as many as PR #301's. **Before that**, 611 in 38:20 on the GitHub runner for PR #301's tree, as many as PR #300's. **Before that**, 611 in 38:27 on the GitHub runner for PR #300's tree, as many as PR #299's. **Before that**, 611 in 38:18 on the GitHub runner for PR #299's tree, as many as PR #298's. **Before that**, 611 in 38:24 on the GitHub runner for PR #298's tree, as many as PR #297's. **Before that**, 611 in 38:10 on the GitHub runner for PR #297's tree, as many as PR #296's. **Before that**, 611 in 38:24 on the GitHub runner for PR #296's tree - 2 more than PR #295's, #250's in `test_mixed_versions.py` and `test_backup.py`. **Before that**, 609 in 38:24 on the GitHub runner for PR #295's tree, as many as PR #292's. **Before that**, 609 in 38:13 on the GitHub runner for PR #292's tree - 2 more than PR #290's, #249's in `test_scan_pool.py`. **Before that**, 607 in 37:45 on the GitHub runner for PR #290's tree, as many as PR #287's. **Before that**, 607 in 38:11 on the GitHub runner for PR #287's tree - 9 more than PR #280's, `test_scan_pool.py`'s. **Before that**, 598 in 37:40 on the GitHub runner for PR #280's tree - 105 more than PR #225's, over the pull requests since. **Before that**, `493 passed, 2 skipped in 36:34` on the GitHub runner for PR #225's tree — unchanged — and `486 passed, 9 skipped in 34:39` on the m9g.xlarge at `b659ed0`, the code of that head. **Before that**, `493 passed, 2 skipped in 36:09` on the GitHub runner for PR #224's tree — five more than the row before, in `tests/integration/test_time_buckets.py` — and `486 passed, 9 skipped in 34:32` on the m9g.xlarge at that head. **Before that**, `488 passed, 2 skipped in 36:13` on the GitHub runner for PR #223's tree — one more than the row before, in `tests/integration/test_snapshot_query.py` — and `481 passed, 9 skipped in 34:30` on the m9g.xlarge at that head. **Before that**, `487 passed, 2 skipped in 36:03` on the GitHub runner for PR #222's tree — unchanged — and `480 passed, 9 skipped in 34:43` on the m9g.xlarge at that head. **Before that**, `487 passed, 2 skipped in 36:31` on the GitHub runner for PR #221's tree — unchanged — and `480 passed, 9 skipped in 34:41` on the m9g.xlarge at that head. **Before that**, `487 passed, 2 skipped in 36:52` on the GitHub runner for PR #220's tree — unchanged, since #205 adds no integration test — and `479 passed, 1 failed, 9 skipped in 34:40` on the m9g.xlarge at that head, the failure #206. **Before that**, `487 passed, 2 skipped in 36:08` on the GitHub runner for PR #185's tree — unchanged. **Before that**, `487 passed, 2 skipped in 36:51` on the GitHub runner for PR #219's tree — eleven more than the row before, #44 step 1's, the new `test_time_buckets.py` and one in `test_cpp_client.py` — and `480 passed, 9 skipped in 34:25` on the m9g.xlarge at that head. **Before that**, `476 passed, 2 skipped in 36:31` on the GitHub runner for PR #218's tree — unchanged, since #190 step 6 adds no integration test — and `469 passed, 9 skipped in 34:37` on the m9g.xlarge at that head. **Before that**, `476 passed, 2 skipped in 36:37` on the GitHub runner for PR #217's tree — five more than the row before, #203's, the new `test_bind_addresses.py` — and `469 passed, 9 skipped in 34:38` on the m9g.xlarge at that head. **Before that**, `471 passed, 2 skipped in 35:51` on the GitHub runner for PR #216's tree — unchanged, since #190 step 5 adds no integration test — and `464 passed, 9 skipped in 34:37` on the m9g.xlarge at that head. **Before that**, `471 passed, 2 skipped in 36:12` on the GitHub runner for PR #215's tree — four more than the row before, #204's, `test_handover.py`'s two and two in `test_mixed_versions.py` — and `464 passed, 9 skipped in 34:27` on the m9g.xlarge at `d6c2b60`. **Before that**, `467 passed, 2 skipped in 35:45` on the GitHub runner for PR #214's tree — four more than the row before, #200's, two each in `test_aggregations.py` and `test_where_conditions.py` — and `460 passed, 9 skipped in 33:57` on the m9g.xlarge at that head. **Before that**, `463 passed, 2 skipped in 35:46` on the GitHub runner for PR #213's tree — three more than the row before, #201's, in the new `test_failover_follows_successor.py` — and `456 passed, 9 skipped in 34:10` on the m9g.xlarge at that head. **Before that**, `460 passed, 2 skipped in 34:52` on the GitHub runner for PR #212's tree — eight more than the row before, #199's, in the new `test_where_conditions.py` — and `453 passed, 9 skipped in 33:28` on the m9g.xlarge at that head. **Before that**, `452 passed, 2 skipped in 35:45` on the GitHub runner for PR #211's tree — unchanged, since #42 added no integration test — and locally `445 passed, 9 skipped in 35:22` on the i3-7100U on that branch, its second run: the first, beside another session's test suite, failed eleven tests that need the session cluster's replica. **Before that**, `452 passed, 2 skipped in 35:04` on the GitHub runner for PR #210's tree — unchanged, since #49's step 3 added no integration test — and locally `445 passed, 9 skipped in 35:57` on the i3-7100U on that branch, and `445 passed, 9 skipped in 33:06` on the m9g.xlarge. **Before that**, `452 passed, 2 skipped in 35:25` on the GitHub runner for PR #209's tree — unchanged, since #49's step 2 added no integration test — and locally `445 passed, 9 skipped in 34:51` on the i3-7100U on that branch, and `445 passed, 9 skipped in 33:01` on the m9g.xlarge, the battery's first run on ARM. **Before that**, `452 passed, 2 skipped in 35:26` on the GitHub runner for PR #208's tree — unchanged, since #198 and #49's step 1 added no integration test — and locally `445 passed, 9 skipped in 34:26` on the i3-7100U on that branch. **Before that**, `452 passed, 2 skipped in 34:48` on the GitHub runner for PR #207's tree — eight more than the row before, all #56's, in the new `test_mixed_versions.py` — and locally `445 passed, 9 skipped in 34:36` on the i3-7100U on that branch. **Before that**, `444 passed, 2 skipped in 35:07` on the GitHub runner for PR #206's tree — unchanged, since #190's step 4 added no integration test — and locally `437 passed, 9 skipped in 34:32` on the i3-7100U on that branch. **Before that**, `444 passed, 2 skipped in 34:26` on the GitHub runner for PR #205's tree — three more than the row before, all #197's, in the new `test_replica_lineage.py` — and locally `436 passed, 9 skipped in 34:08` on the i3-7100U on that branch, before its third test. **Before that**, `441 passed, 2 skipped in 34:24` on the GitHub runner for PR #204's tree — five more than the row before, all #34's, in the new `test_backup.py` — and locally `434 passed, 9 skipped in 33:31` on the i3-7100U on that branch. **Before that**, `436 passed, 2 skipped in 33:37` on the GitHub runner for PR #203's tree — one more than the row before, #35's in `test_metrics.py` — and locally only `test_metrics.py` on that branch, 11 passed. **Before that**, `435 passed, 2 skipped in 33:50` on the GitHub runner for PR #202's tree — five more than the row before, all #196's second part, in the new `test_shard_migration.py` — and locally `428 passed, 9 skipped in 33:51` on the i3-7100U on that branch. **Before that**, `430 passed, 2 skipped in 33:18` on the GitHub runner for PR #201's tree — one more than the row before, #196's adoption test in `test_shard_control_plane.py` — and locally `423 passed, 9 skipped in 32:59` on the i3-7100U on that branch. **Before that**, `429 passed, 2 skipped in 33:49` on the GitHub runner for PR #200's tree — unchanged, since #189 added no integration test — and locally `422 passed, 9 skipped in 32:44` on the i3-7100U on that branch. **Before that**, `429 passed, 2 skipped in 33:39` on the GitHub runner for PR #199's tree — unchanged, since #174 added no integration test — and locally `422 passed, 9 skipped in 33:47` on the i3-7100U on that branch. **Before that**, `429 passed, 2 skipped in 33:10` on the GitHub runner for PR #198's tree — eleven more than the row before, all #175's, in the new `test_shard_control_plane.py` — and locally `422 passed, 9 skipped in 33:33` on the i3-7100U on that branch. **Before that**, `418 passed, 2 skipped in 32:44` on the GitHub runner for PR #197's tree — unchanged, because #187's probe needs the build before #184 and is not in the battery — and locally `411 passed, 9 skipped in 32:19` on the i3-7100U on that branch. **Before that**, `418 passed, 2 skipped in 33:12` on the GitHub runner for PR #196's tree — one more than the row before, and **no xfail for the first time**: #176's `test_mm_snapshot_many_files.py` without its marker — and locally `411 passed, 9 skipped in 32:03` on the i3-7100U on that branch. **Before that**, `417 passed, 2 skipped, 1 xfailed in 33:04` on the GitHub runner for PR #195's tree — unchanged, because #191 and #192 added none — and locally `410 passed, 9 skipped, 1 xfailed in 32:09` on the i3-7100U on that branch. **Before that**, `417 passed, 2 skipped, 1 xfailed in 32:56` on the GitHub runner for PR #194's tree — one more than the row before, #186's in `test_crash_recovery.py`, a node with `--wal-dir` killed and brought back — and locally `410 passed, 9 skipped, 1 xfailed in 31:48` on the i3-7100U on that branch, the seven power-cut tests, which need root, among the skips. **Before that**, `416 passed, 2 skipped, 1 xfailed in 34:36` on the GitHub runner for PR #193's tree — one more than the row before, #188's in `test_mm_snapshot_bootstrap.py` — and locally the multi-master modules on that branch, `45 passed, 2 skipped, 1 xfailed in 9:50`. **Before that**, `415 passed, 2 skipped, 1 xfailed in 32:25` on the GitHub runner for PR #192's tree — two more than the row before, #177's two tests of `test_mm_version_vector_scale.py` without their markers, so one xfail where there were three, #176's — and locally `408 passed, 9 skipped, 1 xfailed in 33:27` on the i3-7100U on that branch, the seven power-cut tests, which need root, among the skips. **Before that**, `413 passed, 2 skipped, 3 xfailed in 33:33` on the GitHub runner for PR #191's tree — two more than the row before, both PR #190's in `test_mm_multi_writer.py`: #184's test without its marker, and #185's, a restarted node that claims nothing it did not write; PR #191 added none, and PR #190's own run gave 413 in 32:53 — and locally `413 passed, 2 skipped, 3 xfailed in 33:23` on the i3-7100U on #184's branch, with the power-cut tests on, before its rebase; #182's branch ran the multi-master modules, 42 passed, 2 skipped and 3 xfailed in 10:19. **Before that**, `411 passed, 2 skipped, 4 xfailed in 32:55` on the GitHub runner for PR #188's tree — four more than the row before: #179's and #180's tests in `test_mm_restart.py` without their markers and its third, the node back within a tick (part D of #180), and the control of the new `test_mm_multi_writer.py`, whose other test is #184's strict xfail, with #177's three beside it — and locally `411 passed, 2 skipped, 4 xfailed in 33:40` on the i3-7100U on that branch, on part D's first version; its final tree ran the nine `test_mm_*.py` modules again, 27 passed and 4 xfailed. **Before that**, `407 passed, 2 skipped, 5 xfailed in 33:28` on the GitHub runner for PR #187's tree — two more than the row before: `test_mm_catchup_ceiling.py` and the control of `test_mm_version_vector_scale.py`, with five strict xfails beside them (#176, #177, #179, #180), the first this battery has run since its skip gate was written, which is why that gate reads the report now (pitfall 471) — and locally `407 passed, 2 skipped, 5 xfailed in 33:00` on the i3-7100U on that branch. **Before that**, `405 passed, 2 skipped in 29:23` on the GitHub runner for PR #186's tree — five more than the row before, all in the new `test_compaction.py` (part 2b of #165) — and locally `405 passed, 2 skipped in 29:58` on the i3-7100U on that branch, one commit before its head, whose one C++ change was a destructor `ctest` covers. **Before that**, `400 passed, 2 skipped in 29:08` on the GitHub runner for PR #184's tree — seven more than the row before, all in the new `test_sharded_pool.py` (#172) — and locally `400 passed, 2 skipped in 30:15` on the i3-7100U on that branch. **Before that**, `393 passed, 2 skipped in 28:56` on the GitHub runner for PR #183's tree — twelve more than the row before: nine in the new `test_reply_attribution.py` (#170 and #171, PR #181) and three in the new `test_lazy_flush.py` (part 2a of #165) — and locally `393 passed, 2 skipped in 29:36` on the i3-7100U on that branch. **Before that**, `381 passed, 2 skipped in 25:15` on the GitHub runner for PR #180's tree — three more, all in the new `test_snapshot_query.py` (#167 and #168) — and locally `380 passed, 1 failed, 2 skipped in 26:24` on the i3-7100U on that branch, the failure the one #170 is about. **Before that**, `378 passed, 2 skipped in 25:45` on PR #179's tree — unchanged, because part 1 of #165 added none; its wire measurement is the soak — and locally `378 passed, 2 skipped in 25:51` on the i3-7100U on that branch. **Before that**, `378 passed, 2 skipped in 25:05` on PR #178's tree — six more, all in the new `test_segment_time_range.py` (#166) — and locally `378 passed, 2 skipped in 26:01` on the i3-7100U on #166's branch, with `OB_POWER_CUT_TESTS=1`. **Before that**, `372 passed, 2 skipped in 25:25` on PR #177's tree, and locally 372 in 26:06 on #164's branch. **Before that**, `364 passed, 2 skipped in 25:05` on PR #176's tree, and locally 364 in 24:48 on #163's branch. **Before that**, `363 passed, 2 skipped in 24:34` on PR #175's tree, and locally 363 in 24:52 on #162's branch; and `360 passed, 2 skipped in 24:15` on PR #174's tree, the six power-cut tests among them, and locally 360 in 24:35 on #160's branch. **Before that**, `345 passed, 2 skipped in 23:55` on PR #173's tree, and locally 345 in 23:51 on #159's branch. **Before that**, `340 passed, 2 skipped in 23:25` on PR #172's tree, and locally 340 in 22:55 on #158's code before its rebase. **Before that**, `330 passed, 2 skipped in 22:38` on PR #169's tree, and before that `327 passed, 2 skipped in 22:56`, and before that `299 passed, 2 skipped in 22:44`, and before that all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 620 | **620 in 46:28** on the GitHub runner for PR #307's tree, against **37:46** uninstrumented on the same runner. **Before that**, 618 in 45:53 on the GitHub runner for PR #306's tree, against 38:33 uninstrumented on the same runner. **Before that**, 611 in 45:37 on the GitHub runner for PR #305's tree, against 38:15 uninstrumented on the same runner. **Before that**, 611 in 46:35 on the GitHub runner for PR #304's tree, against 38:23 uninstrumented on the same runner. **Before that**, 611 in 44:35 on the GitHub runner for PR #301's tree, against 38:20 uninstrumented on the same runner. **Before that**, 611 in 45:59 on the GitHub runner for PR #300's tree, against 38:27 uninstrumented on the same runner. **Before that**, 611 in 47:04 on the GitHub runner for PR #299's tree, against 38:18 uninstrumented on the same runner. **Before that**, 611 in 46:38 on the GitHub runner for PR #298's tree, against 38:24 uninstrumented on the same runner. **Before that**, 611 in 45:47 on the GitHub runner for PR #297's tree, against 38:10 uninstrumented on the same runner. **Before that**, 611 in 46:27 on the GitHub runner for PR #296's tree, against 38:24 uninstrumented on the same runner. **Before that**, 609 in 46:27 on the GitHub runner for PR #295's tree, against 38:24 uninstrumented on the same runner. **Before that**, 609 in 46:25 on the GitHub runner for PR #292's tree, against 38:13 uninstrumented on the same runner. **Before that**, 607 in 46:02 on the GitHub runner for PR #290's tree, against 37:45 uninstrumented on the same runner. **Before that**, 607 in 46:16 on the GitHub runner for PR #287's tree, against 38:11 uninstrumented on the same runner. **Before that**, 598 in 46:02 on the GitHub runner for PR #280's tree, against 37:40 uninstrumented on the same runner. **Before that**, `493 passed in 44:17` on the GitHub runner for PR #225's tree, against **36:34** uninstrumented on the same runner. **Before that**, `493 passed in 44:21` on the GitHub runner for PR #224's tree, against **36:09** uninstrumented on the same runner. **Before that**, `488 passed in 44:06` on the GitHub runner for PR #223's tree, against **36:13** uninstrumented on the same runner. **Before that**, `487 passed in 44:17` on the GitHub runner for PR #222's tree, against **36:03** uninstrumented on the same runner. **Before that**, `487 passed in 44:48` on the GitHub runner for PR #221's tree, against **36:31** uninstrumented on the same runner. **Before that**, `487 passed in 45:01` on the GitHub runner for PR #220's tree, against **36:52** uninstrumented on the same runner. **Before that**, `487 passed in 44:38` on the GitHub runner for PR #185's tree, against **36:08** uninstrumented on the same runner. **Before that**, `487 passed in 44:08` on the GitHub runner for PR #219's tree, against **36:51** uninstrumented on the same runner. **Before that**, `476 passed in 44:07` on the GitHub runner for PR #218's tree, against **36:31** uninstrumented on the same runner. **Before that**, `476 passed in 43:53` on the GitHub runner for PR #217's tree, against **36:37** uninstrumented on the same runner. **Before that**, `471 passed in 44:25` on the GitHub runner for PR #216's tree, against **35:51** uninstrumented on the same runner. **Before that**, `471 passed in 44:15` on the GitHub runner for PR #215's tree, against **36:12** uninstrumented on the same runner. **Before that**, `467 passed in 44:28` on the GitHub runner for PR #214's tree, against **35:45** uninstrumented on the same runner. **Before that**, `463 passed in 43:45` on the GitHub runner for PR #213's tree, against **35:46** uninstrumented on the same runner. **Before that**, `460 passed in 42:30` on the GitHub runner for PR #212's tree, against **34:52** uninstrumented on the same runner. **Before that**, `452 passed in 43:44` on the GitHub runner for PR #211's tree, against **35:45** uninstrumented on the same runner. **Before that**, `452 passed in 43:42` on the GitHub runner for PR #210's tree, against **35:04** uninstrumented on the same runner. **Before that**, `452 passed in 42:58` on the GitHub runner for PR #209's tree, against **35:25** uninstrumented on the same runner. **Before that**, `452 passed in 43:12` on the GitHub runner for PR #208's tree, against **35:26** uninstrumented on the same runner. **Before that**, `452 passed in 43:11` on the GitHub runner for PR #207's tree, against **34:48** uninstrumented on the same runner. **Before that**, `444 passed in 42:42` on the GitHub runner for PR #206's tree, against **35:07** uninstrumented on the same runner. **Before that**, `444 passed in 42:13` on the GitHub runner for PR #205's tree, against **34:26** uninstrumented on the same runner. **Before that**, `441 passed in 41:43` on the GitHub runner for PR #204's tree, against **34:24** uninstrumented on the same runner. **Before that**, `436 passed in 42:17` on the GitHub runner for PR #203's tree, against **33:37** uninstrumented on the same runner. **Before that**, `435 passed in 41:49` on the GitHub runner for PR #202's tree, against **33:50** uninstrumented on the same runner. **Before that**, `430 passed in 41:17` on the GitHub runner for PR #201's tree, against **33:18** uninstrumented on the same runner. **Before that**, `429 passed in 41:25` on the GitHub runner for PR #200's tree, against **33:49** uninstrumented on the same runner — that PR's second run; its first was cancelled at the job's 45-minute limit with most of the battery passed, and the limit is 60 minutes since. **Before that**, `429 passed in 41:25` on PR #199's tree, against 33:39 uninstrumented. **Before that**, `429 passed in 41:04` on PR #198's tree, against 33:10 uninstrumented. **Before that**, `418 passed in 40:40` on PR #197's tree, against 32:44 uninstrumented. **Before that**, `418 passed in 40:36` on PR #196's tree, against 33:12 uninstrumented. **Before that**, `417 passed, 1 xfailed in 39:41` on PR #195's tree, against 33:04 uninstrumented. **Before that**, `417 passed, 1 xfailed in 39:36` on PR #194's tree, against 32:56 uninstrumented. **Before that**, `416 passed, 1 xfailed in 39:41` on PR #193's tree, against 34:36 uninstrumented. **Before that**, `415 passed, 1 xfailed in 40:17` on PR #192's tree, against 32:25 uninstrumented — that PR's second run; its first passed the same 415 and failed on the shutdown race of pitfall 493. **Before that**, `413 passed, 3 xfailed in 40:19` on PR #191's tree, against 33:33 uninstrumented. **Before that**, `411 passed, 4 xfailed in 40:48` on PR #188's tree, against 32:55 uninstrumented. **Before that**, `407 passed, 5 xfailed in 39:44` on PR #187's tree, against 33:28 uninstrumented. **Before that**, `405 passed in 36:04` on PR #186's tree, against 29:23 uninstrumented. **Before that**, `400 passed in 36:10` on PR #184's tree, against 29:08 uninstrumented. **Before that**, `393 passed in 35:50` on PR #183's tree, against 28:56 uninstrumented. **Before that**, `381 passed in 32:09` on PR #180's tree, against 25:15 uninstrumented. **Before that**, `378 passed in 32:41` on PR #179's tree, against 25:45 uninstrumented. **Before that**, `378 passed in 32:09` on PR #178's tree, against 25:05 uninstrumented. **Before that**, `372 passed in 32:04` on PR #177's tree, against 25:25 uninstrumented — instrumentation's cost is the difference between two runs on one machine. **Before that**, `364 passed in 31:35` on PR #176's tree, and `363 passed in 31:15` on PR #175's tree, and `360 passed in 30:48` on PR #174's tree, and `345 passed in 30:13` on PR #173's tree, and `340 passed in 29:39` on PR #172's tree, and `330 passed in 29:56` on PR #169's tree, and before that `327 passed in 29:28`, and before that `299 passed in 29:18`, and before that all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 2282 | **2282 on PR #334's tree**, measured by CI - 7 more than PR #333's, #285's (PR #334). **Before that**, 2275 on PR #333's tree, measured by CI - as many as PR #332's. **Before that**, 2275 on PR #332's tree, measured by CI - 5 more than PR #331's, #283's (PR #332). **Before that**, 2270 on PR #331's tree, measured by CI - as many as PR #330's. **Before that**, 2270 on PR #330's tree, measured by CI - 1 more than PR #329's, #282's (PR #330). **Before that**, 2269 on PR #329's tree, measured by CI - as many as PR #328's. **Before that**, 2269 on PR #328's tree, measured by CI - 5 more than PR #327's, #278's (PR #328). **Before that**, 2264 on PR #327's tree, measured by CI - 3 more than PR #326's, #277's (PR #327). **Before that**, 2261 on PR #326's tree, measured by CI - 4 more than PR #325's, #276's (PR #326). **Before that**, 2257 on PR #325's tree, measured by CI - as many as PR #324's. **Before that**, 2257 on PR #324's tree, measured by CI - 2 more than PR #323's, #272's (PR #324). **Before that**, 2255 on PR #323's tree, measured by CI - 1 more than PR #322's, #271's (PR #323). **Before that**, 2254 on PR #322's tree, measured by CI - as many as PR #321's. **Before that**, 2254 on PR #321's tree, measured by CI - 9 more than PR #320's, #270's (PR #321). **Before that**, 2245 on PR #320's tree, measured by CI - as many as PR #319's. **Before that**, 2245 on PR #319's tree, measured by CI - 4 more than PR #318's, #268's (PR #319). **Before that**, 2241 on PR #318's tree, measured by CI - 3 more than PR #317's, #267's (PR #318). **Before that**, 2238 on PR #317's tree, measured by CI - 7 more than PR #316's, #266's (PR #317). **Before that**, 2231 on PR #316's tree, measured by CI - 8 more than PR #315's, #265's (PR #316). **Before that**, 2223 on PR #315's tree, measured by CI - as many as PR #314's. **Before that**, 2223 on PR #314's tree, measured by CI - 5 more than PR #313's, #263's (PR #314). **Before that**, 2218 on PR #313's tree, measured by CI - as many as PR #312's. **Before that**, 2218 on PR #312's tree, measured by CI - 8 more than PR #311's, #260's (PR #312). **Before that**, 2210 on PR #311's tree, measured by CI - as many as PR #310's. **Before that**, 2210 on PR #310's tree, measured by CI - 1 more than PR #307's, #259's (PR #310). **Before that**, 2209 on PR #307's tree, measured by CI - 12 more than PR #306's, #257's (PR #307). **Before that**, 2197 on PR #306's tree, measured by CI - 11 more than PR #305's, #256's (PR #306). **Before that**, 2186 on PR #305's tree, measured by CI - 1 more than PR #304's, #254's (PR #305). **Before that**, 2185 on PR #304's tree, measured by CI - 4 more than PR #301's, #252's and #253's (PR #302). **Before that**, 2181 on PR #301's tree, measured by CI - 7 more than PR #300's, #251's (PR #301). **Before that**, 2174 on PR #300's tree, measured by CI - as many as PR #299's. **Before that**, 2174 on PR #299's tree, measured by CI - 1 more than PR #298's, #49's (PR #299). **Before that**, 2173 on PR #298's tree, measured by CI - as many as PR #297's. **Before that**, 2173 on PR #297's tree, measured by CI - 2 more than PR #296's, #223's (PR #297). **Before that**, 2171 on PR #296's tree, measured by CI - 5 more than PR #295's, #250's (PR #296). **Before that**, 2166 on PR #295's tree, measured by CI - 2 more than PR #292's, #223's (PR #294). **Before that**, 2164 on PR #292's tree, measured by CI - 9 more than PR #290's, #248's and #249's (PR #291, PR #292). **Before that**, 2155 on PR #290's tree, measured by CI - 1 more than PR #287's, #247's (PR #290). **Before that**, 2154 on PR #287's tree, measured by CI - 30 more than PR #280's, the tests of #246's two stages (PR #281, PR #287). **Before that**, 2124 on PR #280's tree, measured by CI - 347 more than PR #225's, over the pull requests since. **Before that**, 1777 on PR #225's tree, measured by CI — one more than the row before, in `tests/test_tls_client.cpp` — and `ctest -j1` gave **1777/1777 in 180.82 s** on the m9g.xlarge at `b659ed0`, 1777/1777 in 364.27 s on the i3-7100U at `b659ed0` and 1777/1777 in 173.97 s on the m8a.xlarge (x86-64, Ubuntu 26.04) at `0a01d50`, each the code of that head. **Before that**, 1776 on PR #224's tree, measured by CI — twenty-three more than the row before, in the new `tests/test_series_of_the_book.cpp` and `tests/test_time_buckets.cpp` — and `ctest -j1` gave **1776/1776 in 183.99 s** on the m9g.xlarge at that head and 1776/1776 in 349.78 s on the i3-7100U at that head. **Before that**, 1753 on PR #223's tree, measured by CI — eleven more than the row before, in the new `tests/test_book_at_an_instant.cpp` and `tests/test_compaction_store.cpp` — and `ctest -j1` gave **1753/1753 in 185.47 s** on the m9g.xlarge at that head and 1753/1753 in 330.84 s on the i3-7100U at `8f504fa`, the same code. **Before that**, 1742 on PR #222's tree, measured by CI — three more than the row before, in `tests/test_admission.cpp` — and `ctest -j1` gave **1742/1742 in 180.28 s** on the m9g.xlarge at that head and 1742/1742 in 333.59 s on the i3-7100U at `2ecb7c5`, the same code. **Before that**, 1739 on PR #221's tree, measured by CI — five more than the row before, in `tests/test_admission.cpp`, `tests/test_mm_pending_peers.cpp` and `tests/test_cli_config.cpp` — and `ctest -j1` gave **1739/1739 in 185.02 s** on the m9g.xlarge at that head and 1739/1739 in 328.47 s on the i3-7100U at `c51362e`, the same code. **Before that**, 1734 on PR #220's tree, measured by CI — five more than the row before, #205's, in `tests/test_lazy_flush.cpp` — and `ctest -j1` gave **1734/1734 in 185.10 s** on the m9g.xlarge at that head and 1734/1734 in 331.13 s on the i3-7100U at `e5c9379`, the same code. **Before that**, 1729 on PR #185's tree, measured by CI — unchanged, since #185 changes only CodeQL's workflow. **Before that**, 1729 on PR #219's tree, measured by CI — twenty-three more than the row before, #44 step 1's, in the new `tests/test_time_buckets.cpp` and `tests/test_c_api.cpp` — and `ctest -j1` gave **1729/1729 in 183.72 s** on the m9g.xlarge at that head and 1729/1729 in 346.14 s on the i3-7100U at `d451119`, the same tree but for the test table. **Before that**, 1706 on PR #218's tree, measured by CI — five more than the row before, #190 step 6's, in the new `tests/test_seal_sync_background.cpp` — and `ctest -j1` gave **1706/1706 in 182.76 s** on the m9g.xlarge at that head and 1706/1706 in 326.67 s on the i3-7100U. **Before that**, 1701 on PR #217's tree, measured by CI — three more than the row before, #203's, in `tests/test_cli_args.cpp` — and `ctest -j1` gave **1701/1701 in 181.40 s** on the m9g.xlarge at that head and 1701/1701 in 338.39 s on the i3-7100U. **Before that**, 1698 on PR #216's tree, measured by CI — fifteen more than the row before, #190 step 5's, in the new `tests/test_admission.cpp` and `tests/test_engine_admission.cpp` — and `ctest -j1` gave **1698/1698 in 180.03 s** on the m9g.xlarge at that head and 1698/1698 in 320.56 s on the i3-7100U. **Before that**, 1683 on PR #215's tree, measured by CI — twenty-six more than the row before, #204's, in the new `tests/test_handover_decision.cpp` and `tests/test_handover_stream.cpp` — and `ctest -j1` gave **1683/1683 in 182.60 s** on the m9g.xlarge at `d6c2b60`, the commit before the last two (a test's bound and the roadmap). **Before that**, 1657 on PR #214's tree, measured by CI — twelve more than the row before, #200's, six each in `tests/test_query_agg_execution.cpp` and `tests/test_query_conditions.cpp` — and `ctest -j1` gave **1657/1657 in 176.52 s** on the m9g.xlarge at that head. **Before that**, 1645 on PR #213's tree, measured by CI — unchanged, since #201's C++ test is in `tests/test_etcd_integration.cpp`, which ctest does not run — and `ctest -j1` gave **1645/1645 in 178.20 s** on the m9g.xlarge at that head. **Before that**, 1645 on PR #212's tree, measured by CI — thirteen more than the row before, #199's, in the new `tests/test_query_conditions.cpp` — and `ctest -j1` gave **1645/1645 in 180.23 s** on the m9g.xlarge at that head and 1645/1645 in 309.12 s on the i3-7100U the commit before. **Before that**, 1632 on PR #211's tree, measured by CI — unchanged, since #42 rewrote one test of `tests/test_version.cpp` and added none — and locally `ctest -j1` gave **1632/1632 in 336.87 s** on the i3-7100U on that branch. **Before that**, 1632 on PR #210's tree, measured by CI — ten more than the row before, #49's step 3, in the new `tests/test_query_response_builder.cpp` — and locally `ctest -j1` gave **1632/1632 in 333.94 s** on the i3-7100U on that branch. **Before that**, 1622 on PR #209's tree, measured by CI — five more than the row before, #49's step 2: four in `tests/test_columnar_store.cpp`, one in `tests/test_codec.cpp` — and locally `ctest -j1` gave **1622/1622 in 355.01 s** on the i3-7100U on that branch. **Before that**, 1617 on PR #208's tree, measured by CI — five more than the row before, #198's and #49's: four in `tests/test_codec.cpp`, one in `tests/test_columnar_store.cpp` — and locally `ctest -j1` gave **1617/1617 in 291.14 s** on the i3-7100U on that branch. **Before that**, 1612 on PR #207's tree, measured by CI — unchanged, since #56 added no C++ test — and locally `ctest -j1` gave **1612/1612 in 287.89 s** on the i3-7100U on that branch. **Before that**, 1612 on PR #206's tree, measured by CI — one more than the row before, #190's step 4, in `tests/test_backup.cpp` — and locally `ctest -j1` gave **1612/1612 in 285.56 s** on the i3-7100U on that branch. **Before that**, 1611 on PR #205's tree, measured by CI — three more than the row before, all #197's, in the new `tests/test_snapshot_lineage.cpp` — and locally `ctest -j1` gave **1611/1611 in 296.43 s** on the i3-7100U on that branch. **Before that**, 1608 on PR #204's tree, measured by CI — twenty-three more than the row before, all #34's, in the new `tests/test_backup.cpp` — and locally `ctest -j1` gave **1608/1608 in 324.75 s** on the i3-7100U on that branch. **Before that**, 1585 on PR #203's tree, measured by CI — unchanged, since #35 added no C++ test — and locally `ctest -j1` gave **1585/1585 in 287.27 s** on the i3-7100U on that branch. **Before that**, 1585 on PR #202's tree, measured by CI — three more than the row before, all #196's second part: one in `tests/test_symbol_migration.cpp` and two in `tests/test_client.cpp` — and locally `ctest -j1` gave **1585/1585 in 277.12 s** on the i3-7100U on that branch. **Before that**, 1582 on PR #201's tree, measured by CI — twenty more than the row before, all #196's first part, in the new `tests/test_symbol_migration.cpp` — and locally `ctest -j1` gave **1582/1582 in 288.06 s** on the i3-7100U on that branch. **Before that**, 1562 on PR #200's tree, measured by CI — nineteen more than the row before, all #189's: ten in `tests/test_mm_vector_changes.cpp`, seven in `tests/test_version_vector.cpp` and two in `tests/test_sequence_tracker.cpp` — and locally `ctest -j1` gave **1562/1562 in 279.20 s** on the i3-7100U on that branch. **Before that**, 1543 on PR #199's tree, measured by CI — fifteen more than the row before, all #174's: eleven in `tests/test_wal_replay_blocks.cpp` and four in `tests/test_start_reads_wal_once.cpp` — and locally `ctest -j1` gave **1543/1543 in 288.98 s** on the i3-7100U on that branch. **Before that**, 1528 on PR #198's tree, measured by CI — ten more than the row before, all #175's: five in `tests/test_coordinator_leader_read.cpp`, four in `tests/test_shard_map.cpp` and one in `tests/test_cli_config.cpp` — and locally `ctest -j1` gave **1528/1528 in 281.44 s** on the i3-7100U on that branch. **Before that**, 1518 on PR #197's tree, measured by CI — fifteen more than the row before, all #187's: ten in the new `tests/test_mm_legacy_numbering.cpp` and five in `tests/test_sequence_tracker.cpp` — and locally `ctest -j1` gave **1518/1518 in 291.48 s** on the i3-7100U on that branch. **Before that**, 1503 on PR #196's tree, measured by CI — seventeen more than the row before, all #176's in `tests/test_mm_snapshot.cpp`: three codec tests, eight from running the transfer and damage tests in both widths and six in `MMSnapshotLarge` — and locally `ctest -j1` gave **1503/1503 in 255.87 s** on the i3-7100U on that branch. **Before that**, 1486 on PR #195's tree, measured by CI — eight more than the row before, all #191's and #192's in `tests/test_mm_snapshot.cpp` — and locally `ctest -j1` gave **1486/1486 in 263.03 s** on the i3-7100U on that branch. **Before that**, 1478 on PR #194's tree, measured by CI — ten more than the row before, all #186's: seven in the new `tests/test_wal_dir.cpp`, two in `tests/test_mm_restart_origins.cpp` and one in `tests/test_cli_config.cpp` — and locally `ctest -j1` gave **1478/1478 in 262.75 s** on the i3-7100U on that branch. **Before that**, 1468 on PR #193's tree, measured by CI — ten more than the row before, all #188's in `tests/test_mm_snapshot.cpp` — and locally `ctest -j1` gave **1466/1466 in 274.24 s** on the i3-7100U on that branch, before its last two tests. **Before that**, 1458 on PR #192's tree, measured by CI — sixteen more than the row before, all #177's: eleven in `tests/test_version_vector.cpp`, two in `tests/test_mm_catchup_rounds.cpp`, two in `tests/test_mm_snapshot.cpp` and one in `tests/test_mm_restart_origins.cpp` — and locally `ctest -j1` gave **1458/1458 in 291.07 s** on the i3-7100U on that branch. **Before that**, 1442 on PR #191's tree, measured by CI — sixteen more than the row before, over two pull requests: twelve in PR #190's (#184, #185), nine in the new `tests/test_mm_per_origin_numbering.cpp` and three in `tests/test_sequence_tracker.cpp`, and four in PR #191's (#182), three in `tests/test_conflict_resolver.cpp` and one in `tests/test_mm_stats.cpp` — and locally `ctest -j1` gave **1442/1442 in 260.23 s** on the i3-7100U on #182's branch, and 1438/1438 in 264.25 s on #184's. **Before that**, 1426 on PR #188's tree, measured by CI — nineteen more than the row before: seven in the new `tests/test_mm_restart_origins.cpp`, eight in `tests/test_mm_catchup_rounds.cpp` (#183's two and part D of #180's six) and four in `tests/test_sequence_tracker.cpp` (#180) — and locally `ctest -j1` gave **1426/1426 in 246.20 s** on the i3-7100U on that branch. **Before that**, 1407 on PR #187's tree, measured by CI — seventeen more than the row before: eight in the new `tests/test_wal_cursor.cpp`, eight in the new `tests/test_mm_catchup_rounds.cpp` and two in the new `tests/test_mm_receive.cpp`, less Property 8 of `tests/test_mm_networking.cpp` (#178) — and locally `ctest -j1` gave **1407/1407 in 250.73 s** on the i3-7100U on that branch, before its last four commits, which changed no C++. **Before that**, 1390 on PR #186's tree, measured by CI — forty-two more than the row before, all of them part 2b of #165's: twenty in the new `tests/test_compaction_store.cpp`, eleven in the new `tests/test_compaction_policy.cpp` and eleven in the new `tests/test_compaction.cpp` — and locally `ctest -j1` gave **1390/1390 in 252.07 s** on the i3-7100U on that branch. **Before that**, 1348 on PR #184's tree, measured by CI — unchanged, because #172 added none — and locally `ctest -j1` passed on that branch. **Before that**, 1348 on PR #183's tree, measured by CI — forty-seven more than the row before, all of them part 2a of #165's: sixteen in the new `tests/test_row_blocks.cpp`, seventeen in the new `tests/test_lazy_flush.cpp` and fourteen in the new `tests/test_seal_epochs.cpp` — and locally `ctest -j1` gave **1348/1348 in 268.80 s** on the i3-7100U on that branch. **Before that**, 1301 on PR #180's tree, measured by CI — five more than the row before, all five in the new `tests/test_snapshot_query.cpp` (#167 and #168) — and locally `ctest -j1` gave **1301/1301 in 235.78 s** on the i3-7100U on that branch. **Before that**, 1296 on PR #179's tree, measured by CI — fourteen more than the row before, all fourteen in the new `tests/test_segment_index.cpp` (part 1 of #165) — and locally `ctest -j1` gave **1296/1296 in 226.59 s** on the i3-7100U on that branch. **Before that**, 1282 on PR #178's tree, measured by CI — eleven more than the row before, all eleven in the new `tests/test_segment_time_range.cpp` (#166) — and locally `ctest -j1` gave **1282/1282 in 231.86 s** on the i3-7100U on #166's branch. **Before that**, 1271 on PR #177's tree, and locally 1271/1271 in 256.94 s on #164's branch. **Before that**, 1249 on PR #176's tree, and locally 1249/1249 in 226.63 s on #163's branch. **Before that**, 1239 on PR #175's tree, and locally 1239/1239 in 223.84 s on #162's branch; and 1236 on PR #174's tree, and locally 1236/1236 in 223.5 s on #160's branch. **Before that**, 1236 on PR #173's tree, and locally 1236/1236 in 216.0 s on #159's branch. **Before that**, 1228 on PR #172's tree, and locally 1228/1228 in 226.7 s on #158's branch rebased onto PR #171's merge. **Before that**, 1182 on PR #169's tree. **Before that**, 1181, measured by CI on #151's tree; locally `ctest -j1` gave **1181/1181 in 262 s** on the i3-7100U on #151's branch, with the build clean and warning-free. **Before that**, 1151, and locally 1151 passed in a single `ctest -j1` run on the i3-7100U with the build clean and warning-free. **Before that**, all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 634 | **634 in 39:16** on the GitHub runner for PR #334's tree, as many as PR #333's. **Before that**, 634 in 38:35 on the GitHub runner for PR #333's tree, as many as PR #332's. **Before that**, 634 in 38:10 on the GitHub runner for PR #332's tree, as many as PR #331's. **Before that**, 634 in 38:30 on the GitHub runner for PR #331's tree, as many as PR #330's. **Before that**, 634 in 38:06 on the GitHub runner for PR #330's tree, as many as PR #329's. **Before that**, 634 in 37:31 on the GitHub runner for PR #329's tree, as many as PR #328's. **Before that**, 634 in 37:39 on the GitHub runner for PR #328's tree, as many as PR #327's. **Before that**, 634 in 38:22 on the GitHub runner for PR #327's tree, as many as PR #326's. **Before that**, 634 in 37:58 on the GitHub runner for PR #326's tree, as many as PR #325's. **Before that**, 634 in 37:06 on the GitHub runner for PR #325's tree, as many as PR #324's. **Before that**, 634 in 38:21 on the GitHub runner for PR #324's tree, as many as PR #323's. **Before that**, 634 in 37:45 on the GitHub runner for PR #323's tree, as many as PR #322's. **Before that**, 634 in 38:30 on the GitHub runner for PR #322's tree, as many as PR #321's. **Before that**, 634 in 37:18 on the GitHub runner for PR #321's tree, as many as PR #320's. **Before that**, 634 in 36:49 on the GitHub runner for PR #320's tree, as many as PR #319's. **Before that**, 634 in 36:59 on the GitHub runner for PR #319's tree, as many as PR #318's. **Before that**, 634 in 37:19 on the GitHub runner for PR #318's tree, as many as PR #317's. **Before that**, 634 in 38:33 on the GitHub runner for PR #317's tree, as many as PR #316's. **Before that**, 634 in 37:30 on the GitHub runner for PR #316's tree, 4 more than PR #315's, #265's (PR #316). **Before that**, 630 in 38:48 on the GitHub runner for PR #315's tree, as many as PR #314's. **Before that**, 630 in 38:05 on the GitHub runner for PR #314's tree, 1 more than PR #313's, #263's (PR #314). **Before that**, 629 in 39:22 on the GitHub runner for PR #313's tree, 3 more than PR #312's, #261's (PR #313). **Before that**, 626 in 38:28 on the GitHub runner for PR #312's tree, 6 more than PR #311's, #260's (PR #312). **Before that**, 620 in 37:39 on the GitHub runner for PR #311's tree, as many as PR #310's. **Before that**, 620 in 37:58 on the GitHub runner for PR #310's tree, as many as PR #307's. **Before that**, 620 in 37:46 on the GitHub runner for PR #307's tree, 2 more than PR #306's, #257's (PR #307). **Before that**, 618 in 38:33 on the GitHub runner for PR #306's tree, 7 more than PR #305's, #256's (PR #306). **Before that**, 611 in 38:15 on the GitHub runner for PR #305's tree, as many as PR #304's. **Before that**, 611 in 38:23 on the GitHub runner for PR #304's tree, as many as PR #301's. **Before that**, 611 in 38:20 on the GitHub runner for PR #301's tree, as many as PR #300's. **Before that**, 611 in 38:27 on the GitHub runner for PR #300's tree, as many as PR #299's. **Before that**, 611 in 38:18 on the GitHub runner for PR #299's tree, as many as PR #298's. **Before that**, 611 in 38:24 on the GitHub runner for PR #298's tree, as many as PR #297's. **Before that**, 611 in 38:10 on the GitHub runner for PR #297's tree, as many as PR #296's. **Before that**, 611 in 38:24 on the GitHub runner for PR #296's tree - 2 more than PR #295's, #250's in `test_mixed_versions.py` and `test_backup.py`. **Before that**, 609 in 38:24 on the GitHub runner for PR #295's tree, as many as PR #292's. **Before that**, 609 in 38:13 on the GitHub runner for PR #292's tree - 2 more than PR #290's, #249's in `test_scan_pool.py`. **Before that**, 607 in 37:45 on the GitHub runner for PR #290's tree, as many as PR #287's. **Before that**, 607 in 38:11 on the GitHub runner for PR #287's tree - 9 more than PR #280's, `test_scan_pool.py`'s. **Before that**, 598 in 37:40 on the GitHub runner for PR #280's tree - 105 more than PR #225's, over the pull requests since. **Before that**, `493 passed, 2 skipped in 36:34` on the GitHub runner for PR #225's tree — unchanged — and `486 passed, 9 skipped in 34:39` on the m9g.xlarge at `b659ed0`, the code of that head. **Before that**, `493 passed, 2 skipped in 36:09` on the GitHub runner for PR #224's tree — five more than the row before, in `tests/integration/test_time_buckets.py` — and `486 passed, 9 skipped in 34:32` on the m9g.xlarge at that head. **Before that**, `488 passed, 2 skipped in 36:13` on the GitHub runner for PR #223's tree — one more than the row before, in `tests/integration/test_snapshot_query.py` — and `481 passed, 9 skipped in 34:30` on the m9g.xlarge at that head. **Before that**, `487 passed, 2 skipped in 36:03` on the GitHub runner for PR #222's tree — unchanged — and `480 passed, 9 skipped in 34:43` on the m9g.xlarge at that head. **Before that**, `487 passed, 2 skipped in 36:31` on the GitHub runner for PR #221's tree — unchanged — and `480 passed, 9 skipped in 34:41` on the m9g.xlarge at that head. **Before that**, `487 passed, 2 skipped in 36:52` on the GitHub runner for PR #220's tree — unchanged, since #205 adds no integration test — and `479 passed, 1 failed, 9 skipped in 34:40` on the m9g.xlarge at that head, the failure #206. **Before that**, `487 passed, 2 skipped in 36:08` on the GitHub runner for PR #185's tree — unchanged. **Before that**, `487 passed, 2 skipped in 36:51` on the GitHub runner for PR #219's tree — eleven more than the row before, #44 step 1's, the new `test_time_buckets.py` and one in `test_cpp_client.py` — and `480 passed, 9 skipped in 34:25` on the m9g.xlarge at that head. **Before that**, `476 passed, 2 skipped in 36:31` on the GitHub runner for PR #218's tree — unchanged, since #190 step 6 adds no integration test — and `469 passed, 9 skipped in 34:37` on the m9g.xlarge at that head. **Before that**, `476 passed, 2 skipped in 36:37` on the GitHub runner for PR #217's tree — five more than the row before, #203's, the new `test_bind_addresses.py` — and `469 passed, 9 skipped in 34:38` on the m9g.xlarge at that head. **Before that**, `471 passed, 2 skipped in 35:51` on the GitHub runner for PR #216's tree — unchanged, since #190 step 5 adds no integration test — and `464 passed, 9 skipped in 34:37` on the m9g.xlarge at that head. **Before that**, `471 passed, 2 skipped in 36:12` on the GitHub runner for PR #215's tree — four more than the row before, #204's, `test_handover.py`'s two and two in `test_mixed_versions.py` — and `464 passed, 9 skipped in 34:27` on the m9g.xlarge at `d6c2b60`. **Before that**, `467 passed, 2 skipped in 35:45` on the GitHub runner for PR #214's tree — four more than the row before, #200's, two each in `test_aggregations.py` and `test_where_conditions.py` — and `460 passed, 9 skipped in 33:57` on the m9g.xlarge at that head. **Before that**, `463 passed, 2 skipped in 35:46` on the GitHub runner for PR #213's tree — three more than the row before, #201's, in the new `test_failover_follows_successor.py` — and `456 passed, 9 skipped in 34:10` on the m9g.xlarge at that head. **Before that**, `460 passed, 2 skipped in 34:52` on the GitHub runner for PR #212's tree — eight more than the row before, #199's, in the new `test_where_conditions.py` — and `453 passed, 9 skipped in 33:28` on the m9g.xlarge at that head. **Before that**, `452 passed, 2 skipped in 35:45` on the GitHub runner for PR #211's tree — unchanged, since #42 added no integration test — and locally `445 passed, 9 skipped in 35:22` on the i3-7100U on that branch, its second run: the first, beside another session's test suite, failed eleven tests that need the session cluster's replica. **Before that**, `452 passed, 2 skipped in 35:04` on the GitHub runner for PR #210's tree — unchanged, since #49's step 3 added no integration test — and locally `445 passed, 9 skipped in 35:57` on the i3-7100U on that branch, and `445 passed, 9 skipped in 33:06` on the m9g.xlarge. **Before that**, `452 passed, 2 skipped in 35:25` on the GitHub runner for PR #209's tree — unchanged, since #49's step 2 added no integration test — and locally `445 passed, 9 skipped in 34:51` on the i3-7100U on that branch, and `445 passed, 9 skipped in 33:01` on the m9g.xlarge, the battery's first run on ARM. **Before that**, `452 passed, 2 skipped in 35:26` on the GitHub runner for PR #208's tree — unchanged, since #198 and #49's step 1 added no integration test — and locally `445 passed, 9 skipped in 34:26` on the i3-7100U on that branch. **Before that**, `452 passed, 2 skipped in 34:48` on the GitHub runner for PR #207's tree — eight more than the row before, all #56's, in the new `test_mixed_versions.py` — and locally `445 passed, 9 skipped in 34:36` on the i3-7100U on that branch. **Before that**, `444 passed, 2 skipped in 35:07` on the GitHub runner for PR #206's tree — unchanged, since #190's step 4 added no integration test — and locally `437 passed, 9 skipped in 34:32` on the i3-7100U on that branch. **Before that**, `444 passed, 2 skipped in 34:26` on the GitHub runner for PR #205's tree — three more than the row before, all #197's, in the new `test_replica_lineage.py` — and locally `436 passed, 9 skipped in 34:08` on the i3-7100U on that branch, before its third test. **Before that**, `441 passed, 2 skipped in 34:24` on the GitHub runner for PR #204's tree — five more than the row before, all #34's, in the new `test_backup.py` — and locally `434 passed, 9 skipped in 33:31` on the i3-7100U on that branch. **Before that**, `436 passed, 2 skipped in 33:37` on the GitHub runner for PR #203's tree — one more than the row before, #35's in `test_metrics.py` — and locally only `test_metrics.py` on that branch, 11 passed. **Before that**, `435 passed, 2 skipped in 33:50` on the GitHub runner for PR #202's tree — five more than the row before, all #196's second part, in the new `test_shard_migration.py` — and locally `428 passed, 9 skipped in 33:51` on the i3-7100U on that branch. **Before that**, `430 passed, 2 skipped in 33:18` on the GitHub runner for PR #201's tree — one more than the row before, #196's adoption test in `test_shard_control_plane.py` — and locally `423 passed, 9 skipped in 32:59` on the i3-7100U on that branch. **Before that**, `429 passed, 2 skipped in 33:49` on the GitHub runner for PR #200's tree — unchanged, since #189 added no integration test — and locally `422 passed, 9 skipped in 32:44` on the i3-7100U on that branch. **Before that**, `429 passed, 2 skipped in 33:39` on the GitHub runner for PR #199's tree — unchanged, since #174 added no integration test — and locally `422 passed, 9 skipped in 33:47` on the i3-7100U on that branch. **Before that**, `429 passed, 2 skipped in 33:10` on the GitHub runner for PR #198's tree — eleven more than the row before, all #175's, in the new `test_shard_control_plane.py` — and locally `422 passed, 9 skipped in 33:33` on the i3-7100U on that branch. **Before that**, `418 passed, 2 skipped in 32:44` on the GitHub runner for PR #197's tree — unchanged, because #187's probe needs the build before #184 and is not in the battery — and locally `411 passed, 9 skipped in 32:19` on the i3-7100U on that branch. **Before that**, `418 passed, 2 skipped in 33:12` on the GitHub runner for PR #196's tree — one more than the row before, and **no xfail for the first time**: #176's `test_mm_snapshot_many_files.py` without its marker — and locally `411 passed, 9 skipped in 32:03` on the i3-7100U on that branch. **Before that**, `417 passed, 2 skipped, 1 xfailed in 33:04` on the GitHub runner for PR #195's tree — unchanged, because #191 and #192 added none — and locally `410 passed, 9 skipped, 1 xfailed in 32:09` on the i3-7100U on that branch. **Before that**, `417 passed, 2 skipped, 1 xfailed in 32:56` on the GitHub runner for PR #194's tree — one more than the row before, #186's in `test_crash_recovery.py`, a node with `--wal-dir` killed and brought back — and locally `410 passed, 9 skipped, 1 xfailed in 31:48` on the i3-7100U on that branch, the seven power-cut tests, which need root, among the skips. **Before that**, `416 passed, 2 skipped, 1 xfailed in 34:36` on the GitHub runner for PR #193's tree — one more than the row before, #188's in `test_mm_snapshot_bootstrap.py` — and locally the multi-master modules on that branch, `45 passed, 2 skipped, 1 xfailed in 9:50`. **Before that**, `415 passed, 2 skipped, 1 xfailed in 32:25` on the GitHub runner for PR #192's tree — two more than the row before, #177's two tests of `test_mm_version_vector_scale.py` without their markers, so one xfail where there were three, #176's — and locally `408 passed, 9 skipped, 1 xfailed in 33:27` on the i3-7100U on that branch, the seven power-cut tests, which need root, among the skips. **Before that**, `413 passed, 2 skipped, 3 xfailed in 33:33` on the GitHub runner for PR #191's tree — two more than the row before, both PR #190's in `test_mm_multi_writer.py`: #184's test without its marker, and #185's, a restarted node that claims nothing it did not write; PR #191 added none, and PR #190's own run gave 413 in 32:53 — and locally `413 passed, 2 skipped, 3 xfailed in 33:23` on the i3-7100U on #184's branch, with the power-cut tests on, before its rebase; #182's branch ran the multi-master modules, 42 passed, 2 skipped and 3 xfailed in 10:19. **Before that**, `411 passed, 2 skipped, 4 xfailed in 32:55` on the GitHub runner for PR #188's tree — four more than the row before: #179's and #180's tests in `test_mm_restart.py` without their markers and its third, the node back within a tick (part D of #180), and the control of the new `test_mm_multi_writer.py`, whose other test is #184's strict xfail, with #177's three beside it — and locally `411 passed, 2 skipped, 4 xfailed in 33:40` on the i3-7100U on that branch, on part D's first version; its final tree ran the nine `test_mm_*.py` modules again, 27 passed and 4 xfailed. **Before that**, `407 passed, 2 skipped, 5 xfailed in 33:28` on the GitHub runner for PR #187's tree — two more than the row before: `test_mm_catchup_ceiling.py` and the control of `test_mm_version_vector_scale.py`, with five strict xfails beside them (#176, #177, #179, #180), the first this battery has run since its skip gate was written, which is why that gate reads the report now (pitfall 471) — and locally `407 passed, 2 skipped, 5 xfailed in 33:00` on the i3-7100U on that branch. **Before that**, `405 passed, 2 skipped in 29:23` on the GitHub runner for PR #186's tree — five more than the row before, all in the new `test_compaction.py` (part 2b of #165) — and locally `405 passed, 2 skipped in 29:58` on the i3-7100U on that branch, one commit before its head, whose one C++ change was a destructor `ctest` covers. **Before that**, `400 passed, 2 skipped in 29:08` on the GitHub runner for PR #184's tree — seven more than the row before, all in the new `test_sharded_pool.py` (#172) — and locally `400 passed, 2 skipped in 30:15` on the i3-7100U on that branch. **Before that**, `393 passed, 2 skipped in 28:56` on the GitHub runner for PR #183's tree — twelve more than the row before: nine in the new `test_reply_attribution.py` (#170 and #171, PR #181) and three in the new `test_lazy_flush.py` (part 2a of #165) — and locally `393 passed, 2 skipped in 29:36` on the i3-7100U on that branch. **Before that**, `381 passed, 2 skipped in 25:15` on the GitHub runner for PR #180's tree — three more, all in the new `test_snapshot_query.py` (#167 and #168) — and locally `380 passed, 1 failed, 2 skipped in 26:24` on the i3-7100U on that branch, the failure the one #170 is about. **Before that**, `378 passed, 2 skipped in 25:45` on PR #179's tree — unchanged, because part 1 of #165 added none; its wire measurement is the soak — and locally `378 passed, 2 skipped in 25:51` on the i3-7100U on that branch. **Before that**, `378 passed, 2 skipped in 25:05` on PR #178's tree — six more, all in the new `test_segment_time_range.py` (#166) — and locally `378 passed, 2 skipped in 26:01` on the i3-7100U on #166's branch, with `OB_POWER_CUT_TESTS=1`. **Before that**, `372 passed, 2 skipped in 25:25` on PR #177's tree, and locally 372 in 26:06 on #164's branch. **Before that**, `364 passed, 2 skipped in 25:05` on PR #176's tree, and locally 364 in 24:48 on #163's branch. **Before that**, `363 passed, 2 skipped in 24:34` on PR #175's tree, and locally 363 in 24:52 on #162's branch; and `360 passed, 2 skipped in 24:15` on PR #174's tree, the six power-cut tests among them, and locally 360 in 24:35 on #160's branch. **Before that**, `345 passed, 2 skipped in 23:55` on PR #173's tree, and locally 345 in 23:51 on #159's branch. **Before that**, `340 passed, 2 skipped in 23:25` on PR #172's tree, and locally 340 in 22:55 on #158's code before its rebase. **Before that**, `330 passed, 2 skipped in 22:38` on PR #169's tree, and before that `327 passed, 2 skipped in 22:56`, and before that `299 passed, 2 skipped in 22:44`, and before that all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 634 | **634 in 45:42** on the GitHub runner for PR #334's tree, against **39:16** uninstrumented on the same runner. **Before that**, 634 in 46:54 on the GitHub runner for PR #333's tree, against 38:35 uninstrumented on the same runner. **Before that**, 634 in 46:23 on the GitHub runner for PR #332's tree, against 38:10 uninstrumented on the same runner. **Before that**, 634 in 48:07 on the GitHub runner for PR #331's tree, against 38:30 uninstrumented on the same runner. **Before that**, 634 in 46:17 on the GitHub runner for PR #330's tree, against 38:06 uninstrumented on the same runner. **Before that**, 634 in 45:33 on the GitHub runner for PR #329's tree, against 37:31 uninstrumented on the same runner. **Before that**, 634 in 47:44 on the GitHub runner for PR #328's tree, against 37:39 uninstrumented on the same runner. **Before that**, 634 in 46:04 on the GitHub runner for PR #327's tree, against 38:22 uninstrumented on the same runner. **Before that**, 634 in 45:41 on the GitHub runner for PR #326's tree, against 37:58 uninstrumented on the same runner. **Before that**, 634 in 46:11 on the GitHub runner for PR #325's tree, against 37:06 uninstrumented on the same runner. **Before that**, 634 in 47:24 on the GitHub runner for PR #324's tree, against 38:21 uninstrumented on the same runner. **Before that**, 634 in 46:30 on the GitHub runner for PR #323's tree, against 37:45 uninstrumented on the same runner. **Before that**, 634 in 45:32 on the GitHub runner for PR #322's tree, against 38:30 uninstrumented on the same runner. **Before that**, 634 in 45:36 on the GitHub runner for PR #321's tree, against 37:18 uninstrumented on the same runner. **Before that**, 634 in 46:11 on the GitHub runner for PR #320's tree, against 36:49 uninstrumented on the same runner. **Before that**, 634 in 48:00 on the GitHub runner for PR #319's tree, against 36:59 uninstrumented on the same runner. **Before that**, 634 in 48:26 on the GitHub runner for PR #318's tree, against 37:19 uninstrumented on the same runner. **Before that**, 634 in 46:57 on the GitHub runner for PR #317's tree, against 38:33 uninstrumented on the same runner. **Before that**, 634 in 45:39 on the GitHub runner for PR #316's tree, against 37:30 uninstrumented on the same runner. **Before that**, 630 in 47:23 on the GitHub runner for PR #315's tree, against 38:48 uninstrumented on the same runner. **Before that**, 630 in 47:41 on the GitHub runner for PR #314's tree, against 38:05 uninstrumented on the same runner. **Before that**, 629 in 45:30 on the GitHub runner for PR #313's tree, against 39:22 uninstrumented on the same runner. **Before that**, 626 in 46:46 on the GitHub runner for PR #312's tree, against 38:28 uninstrumented on the same runner. **Before that**, 620 in 45:44 on the GitHub runner for PR #311's tree, against 37:39 uninstrumented on the same runner. **Before that**, 620 in 46:27 on the GitHub runner for PR #310's tree, against 37:58 uninstrumented on the same runner. **Before that**, 620 in 46:28 on the GitHub runner for PR #307's tree, against 37:46 uninstrumented on the same runner. **Before that**, 618 in 45:53 on the GitHub runner for PR #306's tree, against 38:33 uninstrumented on the same runner. **Before that**, 611 in 45:37 on the GitHub runner for PR #305's tree, against 38:15 uninstrumented on the same runner. **Before that**, 611 in 46:35 on the GitHub runner for PR #304's tree, against 38:23 uninstrumented on the same runner. **Before that**, 611 in 44:35 on the GitHub runner for PR #301's tree, against 38:20 uninstrumented on the same runner. **Before that**, 611 in 45:59 on the GitHub runner for PR #300's tree, against 38:27 uninstrumented on the same runner. **Before that**, 611 in 47:04 on the GitHub runner for PR #299's tree, against 38:18 uninstrumented on the same runner. **Before that**, 611 in 46:38 on the GitHub runner for PR #298's tree, against 38:24 uninstrumented on the same runner. **Before that**, 611 in 45:47 on the GitHub runner for PR #297's tree, against 38:10 uninstrumented on the same runner. **Before that**, 611 in 46:27 on the GitHub runner for PR #296's tree, against 38:24 uninstrumented on the same runner. **Before that**, 609 in 46:27 on the GitHub runner for PR #295's tree, against 38:24 uninstrumented on the same runner. **Before that**, 609 in 46:25 on the GitHub runner for PR #292's tree, against 38:13 uninstrumented on the same runner. **Before that**, 607 in 46:02 on the GitHub runner for PR #290's tree, against 37:45 uninstrumented on the same runner. **Before that**, 607 in 46:16 on the GitHub runner for PR #287's tree, against 38:11 uninstrumented on the same runner. **Before that**, 598 in 46:02 on the GitHub runner for PR #280's tree, against 37:40 uninstrumented on the same runner. **Before that**, `493 passed in 44:17` on the GitHub runner for PR #225's tree, against **36:34** uninstrumented on the same runner. **Before that**, `493 passed in 44:21` on the GitHub runner for PR #224's tree, against **36:09** uninstrumented on the same runner. **Before that**, `488 passed in 44:06` on the GitHub runner for PR #223's tree, against **36:13** uninstrumented on the same runner. **Before that**, `487 passed in 44:17` on the GitHub runner for PR #222's tree, against **36:03** uninstrumented on the same runner. **Before that**, `487 passed in 44:48` on the GitHub runner for PR #221's tree, against **36:31** uninstrumented on the same runner. **Before that**, `487 passed in 45:01` on the GitHub runner for PR #220's tree, against **36:52** uninstrumented on the same runner. **Before that**, `487 passed in 44:38` on the GitHub runner for PR #185's tree, against **36:08** uninstrumented on the same runner. **Before that**, `487 passed in 44:08` on the GitHub runner for PR #219's tree, against **36:51** uninstrumented on the same runner. **Before that**, `476 passed in 44:07` on the GitHub runner for PR #218's tree, against **36:31** uninstrumented on the same runner. **Before that**, `476 passed in 43:53` on the GitHub runner for PR #217's tree, against **36:37** uninstrumented on the same runner. **Before that**, `471 passed in 44:25` on the GitHub runner for PR #216's tree, against **35:51** uninstrumented on the same runner. **Before that**, `471 passed in 44:15` on the GitHub runner for PR #215's tree, against **36:12** uninstrumented on the same runner. **Before that**, `467 passed in 44:28` on the GitHub runner for PR #214's tree, against **35:45** uninstrumented on the same runner. **Before that**, `463 passed in 43:45` on the GitHub runner for PR #213's tree, against **35:46** uninstrumented on the same runner. **Before that**, `460 passed in 42:30` on the GitHub runner for PR #212's tree, against **34:52** uninstrumented on the same runner. **Before that**, `452 passed in 43:44` on the GitHub runner for PR #211's tree, against **35:45** uninstrumented on the same runner. **Before that**, `452 passed in 43:42` on the GitHub runner for PR #210's tree, against **35:04** uninstrumented on the same runner. **Before that**, `452 passed in 42:58` on the GitHub runner for PR #209's tree, against **35:25** uninstrumented on the same runner. **Before that**, `452 passed in 43:12` on the GitHub runner for PR #208's tree, against **35:26** uninstrumented on the same runner. **Before that**, `452 passed in 43:11` on the GitHub runner for PR #207's tree, against **34:48** uninstrumented on the same runner. **Before that**, `444 passed in 42:42` on the GitHub runner for PR #206's tree, against **35:07** uninstrumented on the same runner. **Before that**, `444 passed in 42:13` on the GitHub runner for PR #205's tree, against **34:26** uninstrumented on the same runner. **Before that**, `441 passed in 41:43` on the GitHub runner for PR #204's tree, against **34:24** uninstrumented on the same runner. **Before that**, `436 passed in 42:17` on the GitHub runner for PR #203's tree, against **33:37** uninstrumented on the same runner. **Before that**, `435 passed in 41:49` on the GitHub runner for PR #202's tree, against **33:50** uninstrumented on the same runner. **Before that**, `430 passed in 41:17` on the GitHub runner for PR #201's tree, against **33:18** uninstrumented on the same runner. **Before that**, `429 passed in 41:25` on the GitHub runner for PR #200's tree, against **33:49** uninstrumented on the same runner — that PR's second run; its first was cancelled at the job's 45-minute limit with most of the battery passed, and the limit is 60 minutes since. **Before that**, `429 passed in 41:25` on PR #199's tree, against 33:39 uninstrumented. **Before that**, `429 passed in 41:04` on PR #198's tree, against 33:10 uninstrumented. **Before that**, `418 passed in 40:40` on PR #197's tree, against 32:44 uninstrumented. **Before that**, `418 passed in 40:36` on PR #196's tree, against 33:12 uninstrumented. **Before that**, `417 passed, 1 xfailed in 39:41` on PR #195's tree, against 33:04 uninstrumented. **Before that**, `417 passed, 1 xfailed in 39:36` on PR #194's tree, against 32:56 uninstrumented. **Before that**, `416 passed, 1 xfailed in 39:41` on PR #193's tree, against 34:36 uninstrumented. **Before that**, `415 passed, 1 xfailed in 40:17` on PR #192's tree, against 32:25 uninstrumented — that PR's second run; its first passed the same 415 and failed on the shutdown race of pitfall 493. **Before that**, `413 passed, 3 xfailed in 40:19` on PR #191's tree, against 33:33 uninstrumented. **Before that**, `411 passed, 4 xfailed in 40:48` on PR #188's tree, against 32:55 uninstrumented. **Before that**, `407 passed, 5 xfailed in 39:44` on PR #187's tree, against 33:28 uninstrumented. **Before that**, `405 passed in 36:04` on PR #186's tree, against 29:23 uninstrumented. **Before that**, `400 passed in 36:10` on PR #184's tree, against 29:08 uninstrumented. **Before that**, `393 passed in 35:50` on PR #183's tree, against 28:56 uninstrumented. **Before that**, `381 passed in 32:09` on PR #180's tree, against 25:15 uninstrumented. **Before that**, `378 passed in 32:41` on PR #179's tree, against 25:45 uninstrumented. **Before that**, `378 passed in 32:09` on PR #178's tree, against 25:05 uninstrumented. **Before that**, `372 passed in 32:04` on PR #177's tree, against 25:25 uninstrumented — instrumentation's cost is the difference between two runs on one machine. **Before that**, `364 passed in 31:35` on PR #176's tree, and `363 passed in 31:15` on PR #175's tree, and `360 passed in 30:48` on PR #174's tree, and `345 passed in 30:13` on PR #173's tree, and `340 passed in 29:39` on PR #172's tree, and `330 passed in 29:56` on PR #169's tree, and before that `327 passed in 29:28`, and before that `299 passed in 29:18`, and before that all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

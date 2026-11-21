@@ -52,6 +52,7 @@ Result<void> ShardRouter::initialize() {
     watch_thread_ = std::thread([this] {
         run_thread_body("shard_router", "watch_loop", [this] { watch_loop(); });
     });
+    name_thread(watch_thread_, "ob-router-watch");
 
     return Result<void>::ok();
 }

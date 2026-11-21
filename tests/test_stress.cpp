@@ -7,6 +7,7 @@
 #include "orderbook/engine.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -33,7 +34,6 @@ namespace fs = std::filesystem;
 
 namespace stress {
 
-static std::atomic<uint64_t> g_dir_counter{0};
 
 /// Read VmRSS from /proc/self/status (Linux). Returns KB, 0 if unavailable.
 size_t read_rss_kb() {
@@ -76,8 +76,7 @@ double percentile(std::vector<double>& values, double p) {
 struct TempDir {
     fs::path path;
     explicit TempDir(const std::string& prefix) {
-        auto tmp = fs::temp_directory_path() /
-                   (prefix + std::to_string(g_dir_counter.fetch_add(1, std::memory_order_relaxed)));
+        auto tmp = ob::test::own_temp_dir(prefix);
         fs::create_directories(tmp);
         path = tmp;
     }

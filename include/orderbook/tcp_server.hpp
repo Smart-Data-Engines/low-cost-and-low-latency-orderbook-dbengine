@@ -191,6 +191,17 @@ struct ServerConfig {
     /// client loops (#249). `boost` sets one thread per usable CPU; 0, `eco`'s and the struct's,
     /// reads every segment on the query's loop, which is what this server always did.
     uint32_t    scan_threads{0};
+    /// --large-read-threads: the threads a large `SELECT` is answered on, off the client loops
+    /// (#260), so that a loop goes on serving its other sessions while one reads millions of rows.
+    /// 0 answers every read on its loop, as this server always did.
+    uint32_t    large_read_threads{2};
+    /// --tls-handshake-threads: the threads the client port's TLS handshakes are driven on, off the
+    /// client loops (#265), so that a loop's sessions do not wait while it signs for new connections.
+    /// 0 drives each handshake on the loop its connection is dealt to, as this server always did.
+    uint32_t    tls_handshake_threads{1};
+    /// --tls-handshake-timeout-ms: how long a handshake on those threads may take before its connection
+    /// is closed and its place in --max-sessions given back (#265). A handshake on a loop has none.
+    uint32_t    tls_handshake_timeout_ms{10'000};
     /// The CPUs this process may use, as `detect_machine()` found them (#156): what a scan on the
     /// pool divides against. 0 until the command line is read, and then the client loops' count.
     uint32_t    usable_cpus{0};
@@ -651,6 +662,29 @@ private:
 ///
 /// When backups is non-null, BACKUP starts one and BACKUP STATUS reports it (#34); when it is null,
 /// BACKUP is refused and BACKUP STATUS answers `state: idle`.
+/// Where a command that would hold its loop is answered instead of the loop that runs
+/// execute_command(): a large read (#260) and a FLUSH (#261). Asked past the authentication gate and
+/// the permissions - so nothing reaches the threads off the loop that the loop would have refused - for
+/// a session that may_take(). A `SELECT` is executed with a ReadGate at kOffLoopReadRows, and one the
+/// engine hands back before reading a row is given to take_read(); a FLUSH past its refusals is given to
+/// take_flush(). The answer comes back to the loop, and execute_command() answers kAnsweredOffLoop,
+/// which the loop never queues.
+class OffLoopWork {
+public:
+    virtual ~OffLoopWork() = default;
+    /// Whether this session's commands may be answered off its loop.
+    virtual bool may_take(const Session& session) const = 0;
+    /// The read handed off, and its session paused until the answer is queued.
+    virtual void take_read(const Command& cmd, Session& session, uint64_t rows_at_most) = 0;
+    /// The FLUSH handed off (#261), and its session paused until the answer is queued.
+    virtual void take_flush(Session& session) = 0;
+};
+
+/// execute_command()'s answer to a command an OffLoopWork took: not an answer of the protocol - none
+/// begins with a NUL - and the loop's alone to see.
+inline constexpr std::string_view kAnsweredOffLoop{"\0answered off the loop",
+                                                 sizeof("\0answered off the loop") - 1};
+
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -660,7 +694,8 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord = nullptr,
                             SubscriptionHub* hub = nullptr,
                             const SecretStore* client_secrets = nullptr,
-                            BackupRunner* backups = nullptr);
+                            BackupRunner* backups = nullptr,
+                            OffLoopWork* off_loop = nullptr);
 
 /// Execute `INSERT` and `MINSERT` commands as one batch - the writes a client sent in one read.
 ///

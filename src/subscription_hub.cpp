@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cstring>
 #include <errno.h>
+#include <iterator>
+#include <string_view>
 
 namespace ob {
 
@@ -53,7 +55,7 @@ uint64_t SubscriptionHub::add(Engine& engine, int fd, uint64_t conn_id, const st
         std::lock_guard<std::mutex> lock(mtx_);
         const int already = static_cast<int>(std::count_if(
             queues_.begin(), queues_.end(),
-            [&](const SubscriberQueue& q) { return q.fd == fd && q.conn_id == conn_id; }));
+            [&](const auto& entry) { return entry.second.fd == fd && entry.second.conn_id == conn_id; }));
         if (already >= max_per_session_) {
             refused_.fetch_add(1, std::memory_order_relaxed);
             if (error) {
@@ -66,24 +68,21 @@ uint64_t SubscriptionHub::add(Engine& engine, int fd, uint64_t conn_id, const st
             return 0;
         }
         hub_id = next_id_++;
-        queues_.push_back(SubscriberQueue{hub_id, fd, conn_id, /*engine_sub_id*/ 0, "", 0, false});
+        queues_.emplace(hub_id, SubscriberQueue{hub_id, fd, conn_id, /*engine_sub_id*/ 0, "",
+                                                /*pending_rows*/ 0, /*pushed*/ 0, false});
     }
 
     // The id the callback needs is allocated above, before registering, and deliberately so. The
     // engine's own id is only known after `subscribe()` returns, and a callback capturing a slot to
     // be filled in afterwards can fire in the window between the two - the write path is another
     // thread. So the client-visible id is ours, and the engine's is recorded for cancellation.
-    const uint64_t engine_id = engine.subscribe(sql, [this, hub_id](const QueryResult& row) {
-        enqueue(hub_id, row);
+    const uint64_t engine_id = engine.subscribe_batch(sql, [this, hub_id](const SubscriptionBatch& b) {
+        enqueue_batch(hub_id, b);
     });
 
     if (engine_id == 0) {
         std::lock_guard<std::mutex> lock(mtx_);
-        queues_.erase(std::remove_if(queues_.begin(), queues_.end(),
-                                     [hub_id](const SubscriberQueue& q) {
-                                         return q.subscription_id == hub_id;
-                                     }),
-                      queues_.end());
+        queues_.erase(hub_id);
         refused_.fetch_add(1, std::memory_order_relaxed);
         if (error) *error = "query does not parse as a subscription";
         OB_LOG_WARN("subscriptions", "Refused subscription on fd=%d: query does not parse: %s",
@@ -93,12 +92,7 @@ uint64_t SubscriptionHub::add(Engine& engine, int fd, uint64_t conn_id, const st
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        for (auto& q : queues_) {
-            if (q.subscription_id == hub_id) {
-                q.engine_sub_id = engine_id;
-                break;
-            }
-        }
+        if (auto it = queues_.find(hub_id); it != queues_.end()) it->second.engine_sub_id = engine_id;
     }
     OB_LOG_INFO("subscriptions",
                 "Session fd=%d conn=%llu subscribed as %llu (engine id %llu): %s",
@@ -112,11 +106,9 @@ int SubscriptionHub::remove(Engine& engine, uint64_t id) {
     uint64_t engine_id = 0;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = std::find_if(queues_.begin(), queues_.end(), [id](const SubscriberQueue& q) {
-            return q.subscription_id == id;
-        });
+        auto it = queues_.find(id);
         if (it == queues_.end()) return 0;
-        engine_id = it->engine_sub_id;
+        engine_id = it->second.engine_sub_id;
         queues_.erase(it);
     }
     // Outside the lock: `unsubscribe()` takes the engine's own lock, and holding two locks in an
@@ -131,14 +123,12 @@ int SubscriptionHub::remove_connection(Engine& engine, int fd, uint64_t conn_id)
     std::vector<uint64_t> engine_ids;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        for (const auto& q : queues_) {
-            if (q.fd == fd && q.conn_id == conn_id) engine_ids.push_back(q.engine_sub_id);
-        }
-        queues_.erase(std::remove_if(queues_.begin(), queues_.end(),
-                                     [&](const SubscriberQueue& q) {
-                                         return q.fd == fd && q.conn_id == conn_id;
-                                     }),
-                      queues_.end());
+        std::erase_if(queues_, [&](const auto& entry) {
+            const SubscriberQueue& q = entry.second;
+            if (q.fd != fd || q.conn_id != conn_id) return false;
+            engine_ids.push_back(q.engine_sub_id);
+            return true;
+        });
     }
     for (uint64_t engine_id : engine_ids) {
         if (engine_id != 0) engine.unsubscribe(engine_id);
@@ -150,33 +140,59 @@ int SubscriptionHub::remove_connection(Engine& engine, int fd, uint64_t conn_id)
     return static_cast<int>(engine_ids.size());
 }
 
-void SubscriptionHub::enqueue(uint64_t subscription_id, const QueryResult& row) {
+void SubscriptionHub::enqueue_batch(uint64_t subscription_id, const SubscriptionBatch& batch) {
+    // The rows' text first, outside the lock: in the notification's scratch, made by the first
+    // subscription a row reaches and read by the rest, so a row pushed to a thousand subscriptions is
+    // formatted once (#263). The scratch is the notifying thread's alone.
+    NotifyScratch& scratch = batch.scratch;
+    if (scratch.offset.size() != batch.rows.size()) {
+        scratch.offset.assign(batch.rows.size(), NotifyScratch::kNone);
+        scratch.length.assign(batch.rows.size(), 0);
+    }
+    for (const uint32_t i : batch.allowed) {
+        if (scratch.offset[i] != NotifyScratch::kNone) continue;
+        char row[kPushRowRoom];
+        const char* end = format_push_row(row, std::end(row), batch.rows[i]);
+        // Bounded by the buffer as well as by the formatter: GCC 14 at -O3 cannot see the bound
+        // through a pointer another unit returns, and warns of an unbounded copy (-Wrestrict).
+        const size_t length = std::min(static_cast<size_t>(end - row), sizeof(row));
+        scratch.offset[i] = static_cast<uint32_t>(scratch.bytes.size());
+        scratch.length[i] = static_cast<uint32_t>(length);
+        scratch.bytes.append(row, length);
+    }
+    char head[kPushHeadRoom];
+    const size_t head_len = std::min(
+        static_cast<size_t>(format_push_head(head, std::end(head), subscription_id) - head), sizeof(head));
+
     bool should_wake = false;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = std::find_if(queues_.begin(), queues_.end(),
-                               [subscription_id](const SubscriberQueue& q) {
-                                   return q.subscription_id == subscription_id;
-                               });
+        auto it = queues_.find(subscription_id);
         // Gone between the notification starting and this line. Expected, not an error: a cancelled
-        // subscription may still receive one row, which `QueryEngine::unsubscribe()` documents.
+        // subscription may still receive one write, which `QueryEngine::unsubscribe()` documents.
         if (it == queues_.end()) return;
-        if (it->overflowed) return;   // already condemned; nothing to add to
+        SubscriberQueue& q = it->second;
+        if (q.overflowed) return;   // already condemned; nothing to add to
 
-        const std::string line = format_push(subscription_id, row);
-        if (it->pending.size() + line.size() > max_queue_bytes_) {
-            // Marked, not cleared. See SubscriberQueue::overflowed.
-            it->overflowed = true;
-            OB_LOG_ERROR("subscriptions",
-                         "Subscription %llu overflowed at %zu bytes of %zu on fd=%d; the session "
-                         "will be closed. The queue is left intact: taking back bytes the client "
-                         "has partly read truncates their input instead of disconnecting them.",
-                         static_cast<unsigned long long>(subscription_id), it->pending.size(),
-                         max_queue_bytes_, it->fd);
-            should_wake = true;   // the loop has to notice and close
-        } else {
-            if (it->pending.empty()) should_wake = true;
-            it->pending += line;
+        for (const uint32_t i : batch.allowed) {
+            const std::string_view text(scratch.bytes.data() + scratch.offset[i], scratch.length[i]);
+            if (q.pending.size() + head_len + text.size() > max_queue_bytes_) {
+                // Marked, not cleared, and the rest of the write is not added. See
+                // SubscriberQueue::overflowed.
+                q.overflowed = true;
+                OB_LOG_ERROR("subscriptions",
+                             "Subscription %llu overflowed at %zu bytes of %zu on fd=%d; the session "
+                             "will be closed. The queue is left intact: taking back bytes the client "
+                             "has partly read truncates their input instead of disconnecting them.",
+                             static_cast<unsigned long long>(subscription_id), q.pending.size(),
+                             max_queue_bytes_, q.fd);
+                should_wake = true;   // the loop has to notice and close
+                break;
+            }
+            if (q.pending.empty()) should_wake = true;
+            q.pending.append(head, head_len);
+            q.pending.append(text);
+            ++q.pending_rows;
         }
     }
     if (should_wake) wake();
@@ -211,16 +227,22 @@ std::vector<int> SubscriptionHub::drain(SessionManager& sessions,
     std::vector<Ready> ready;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        for (auto& q : queues_) {
+        for (auto& [id, q] : queues_) {
             if (q.overflowed) {
                 ready.push_back(Ready{q.fd, "", 0, true});
                 continue;
             }
             if (q.pending.empty()) continue;
-            const uint64_t rows =
-                static_cast<uint64_t>(std::count(q.pending.begin(), q.pending.end(), '\n'));
+            const uint64_t rows  = q.pending_rows;
+            const size_t   taken = q.pending.size();
             ready.push_back(Ready{q.fd, std::move(q.pending), rows, false});
             q.pending.clear();
+            // The bytes moved out took their room with them: room for as much again, made here on the
+            // subscriber's loop, so the writes before the next drain append into it rather than grow
+            // a string from nothing, a reallocation at a time, on the writer's thread (#263). Up to
+            // kPendingRoom, so that one burst does not leave every subscription holding its size.
+            q.pending.reserve(std::min(taken, kPendingRoom));
+            q.pending_rows = 0;
             q.pushed += rows;
         }
     }
@@ -258,7 +280,7 @@ size_t SubscriptionHub::active() const {
 size_t SubscriptionHub::queued_bytes() const {
     std::lock_guard<std::mutex> lock(mtx_);
     size_t total = 0;
-    for (const auto& q : queues_) total += q.pending.size();
+    for (const auto& [id, q] : queues_) total += q.pending.size();
     return total;
 }
 

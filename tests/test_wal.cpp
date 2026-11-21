@@ -26,6 +26,7 @@
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/wal.hpp"
+#include "test_temp_dirs.hpp"
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -33,10 +34,7 @@ namespace {
 
 // Create a unique temporary directory for each test.
 static std::filesystem::path make_temp_dir(const std::string& suffix = "") {
-    static std::atomic<uint64_t> counter{0};
-    auto base = std::filesystem::temp_directory_path() /
-                ("ob_wal_test_" + suffix + "_" +
-                 std::to_string(counter.fetch_add(1, std::memory_order_relaxed)));
+    auto base = ob::test::own_temp_dir("ob_wal_test_" + suffix + "_");
     std::filesystem::create_directories(base);
     return base;
 }

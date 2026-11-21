@@ -3,6 +3,7 @@
 
 #include "orderbook/epoch.hpp"
 #include "orderbook/wal.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -80,9 +81,7 @@ TEST(EpochProperty, MonotonicityInWALReplay) {
                           rc::gen::arbitrary<uint64_t>()));
 
                   // Create a unique temporary directory for WAL files.
-                  const auto suffix = *rc::gen::arbitrary<uint64_t>();
-                  const auto tmp = std::filesystem::temp_directory_path() /
-                                   ("test_epoch_mono_" + std::to_string(suffix));
+                  const auto tmp = ob::test::own_temp_dir("test_epoch_mono_");
                   std::filesystem::create_directories(tmp);
 
                   // Write each epoch value as an Epoch_Record.
@@ -126,9 +125,7 @@ TEST(EpochProperty, IncrementOnPromotion) {
                   RC_ASSERT(promoted.term == n + 1);
 
                   // Write the promoted epoch to WAL and replay to verify persistence.
-                  const auto suffix = *rc::gen::arbitrary<uint64_t>();
-                  const auto tmp = std::filesystem::temp_directory_path() /
-                                   ("test_epoch_promo_" + std::to_string(suffix));
+                  const auto tmp = ob::test::own_temp_dir("test_epoch_promo_");
                   std::filesystem::create_directories(tmp);
 
                   {

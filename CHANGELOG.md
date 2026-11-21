@@ -19,6 +19,45 @@ here as `#N`.
   secret, still take a restart. `ob_auth_reloads_total`, `ob_auth_reload_failures_total`,
   `ob_auth_reload_sessions_closed_total` and the `OrderbookAuthReloadFailed` alert.
 
+- **The client port's TLS handshakes are driven off the client loops** (#265), on
+  `--tls-handshake-threads N` threads (default 1, `ob-tls-N`; 0 keeps them on the loops). A loop drove
+  each new TLS session's handshake between the events of all its others, so two processes opening
+  connections back to back raised the median `PING` of a session on the same loop 31-36 times with an
+  RSA-2048 certificate. A loop is now given a session whose handshake is done: that `PING` takes
+  10.4-10.6 us at the median beside them where it took 233-336 us, and 25-39 us at p99 where 483-532
+  (m9g.xlarge and m8a.xlarge), and one thread takes about as many handshakes a second as a loop did.
+  A handshake that fails, or is not done within `--tls-handshake-timeout-ms` (default 10 000), is closed
+  on its thread and its place in `--max-sessions` given back: a client that connects and never begins
+  its handshake no longer holds one for as long as it stays.
+  `ob_tls_handshakes_total`, `ob_tls_handshake_failures_total`, `ob_tls_handshake_timeouts_total`,
+  `ob_tls_handshakes_in_flight` and `ob_tls_handshake_seconds`.
+
+- **A large `SELECT` is answered off its client loop** (#260), on `--large-read-threads N` threads
+  (default 2, `ob-read-N`). A client loop ran a read to its last byte before it served another
+  session, so every session on it - its `PING`, its writes - waited for as long as the read took: a
+  `SELECT` of a million rows held a loop for 12-25 ms, and 55-59 ms in an LZ4 session (m9g.xlarge).
+  The engine hands a read back once it is parsed and before a row is read when the index puts its scan
+  at 100 000 rows or more - a row query with no price, side or level condition by its `LIMIT`, others
+  and time buckets by the rows in their range - and its loop goes on serving its other sessions. The
+  session waits for its answer, its later commands and its socket with it, so its answers come in the
+  order it asked; a session in rings is answered on its loop. A read below the threshold pays a
+  comparison with its `LIMIT`, or a walk of the index under its shared lock. The longest `PING` on the
+  same loop while a million rows were read and sent: 0.13-0.41 ms on the m9g.xlarge and 0.08-0.26 ms on
+  the m8a.xlarge, where 11.9-24.6 and 14.0-18.3 ms; a `MINSERT` beside it 0.46-0.64 and 0.19-2.05 ms at
+  the longest - no longer than the same writer meets with no read beside it - where 12.5-20.5 and
+  13.3-16.4 ms.
+  `ob_off_loop_reads_total`, `ob_off_loop_reads_in_flight` and `ob_off_loop_read_wait_seconds`.
+
+- **A FLUSH is answered off its client loop** (#261), on the threads of `--large-read-threads`. It
+  wrote the rows waiting into segments on its loop, and every session of the loop waited for as long
+  as that took: a `PING` beside a FLUSH of 500 000 rows in 1 000 books waited 141-149 ms on the
+  m9g.xlarge and 147-182 ms on the m8a.xlarge, and 24-31 us and 30-147 us now. Past its refusals - a
+  read-only node, a replica, a bootstrap, which answer on the loop as they did - its session waits for
+  its answer, and a read sent after it sees what it wrote. A FLUSH with nothing waiting pays for the
+  hand to the thread and back, 19.5-19.6 us at p50 where it took 14.1-15.8 (m9g.xlarge), and 10.1-10.9
+  where 7.0-8.9 (m8a.xlarge).
+  `ob_off_loop_flushes_total`, `ob_off_loop_flushes_in_flight` and `ob_off_loop_flush_wait_seconds`.
+
 - Segment format 4, written where `segment-format = 4` (`--segment-format 4`) asks (#250): format 3's
   file with one more encoding a column may be in, runs of equal values each written as its step from
   the run before. A book's timestamps and sequence numbers are such runs, and as a seal writes them a
@@ -166,6 +205,127 @@ here as `#N`.
 
 ### Changed
 
+- **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
+  seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
+  before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
+  summary; the summaries and their best tracks are byte for byte the same. Under a pipelined ingest the flush thread
+  takes 11-20% less CPU a level on both test hosts (medians of six rounds), and the m9g.xlarge's p999 batch latency
+  is about halved. `ob_book_summaries_from_sealed_rows_total` counts the summaries composed so.
+
+- **A drain's block and a store's columns grow without being zeroed first** (#284). #281 grew them by `resize()`,
+  which zeroes what it adds before the rows are written into it, and glibc's memset took 1.0-1.5% of the node's
+  samples on the flush thread under a pipelined ingest. Each row is now constructed where it stays: the flush
+  thread takes 3-6% less CPU a level on both test hosts (medians of six rounds).
+
+- **Every thread the node starts has a name of its own** (#283). The flush thread, the seal's sync, the WAL's
+  removal, replication, the mesh, failover, the coordinator, metrics, snapshots, backups and the client pool's
+  health check started their threads unnamed, and each carried the name of the thread that started it -
+  `ob_tcp_server` for the flush thread and its neighbours - so `top -H` and a profile could not tell them apart.
+  They are `ob-flush`, `ob-seal-sync`, `ob-wal-removal`, `ob-repl-primary` and so on now, listed in
+  `docs/operations.md`.
+
+- **A row's way from the pending queue into a store's columns costs less** (#281). A seal wrote a block's rows
+  into the store's seven columns a `push_back` at a time, and a drain pushed each row into its pair's block and
+  updated the block's range and flags through a pointer, each paying for its bookkeeping in memory for every row;
+  a block that outgrew its reservation copied every row it held. The seal now writes a tile of rows at a time, a
+  drain takes a run of one pair's rows in one step, and a block is reserved by the size of the take. Under a
+  pipelined ingest the flush thread takes 2-3% less CPU a level on both test hosts (medians of six rounds).
+
+- **A snapshot lists the segments of its cut alone** (#282). A snapshot - what a replica bootstraps from, a mesh
+  peer joins with, and a backup is - took its WAL position and sealed every row up to it, then listed its files
+  without holding the flush's lock, so a FLUSH or a flush tick in between could seal rows written after that
+  position into a segment the snapshot then listed. A replica bootstrapped so held those rows twice: from the
+  snapshot and again from the stream sent from its position. The snapshot now lists only the segments the index
+  held at its cut.
+
+- **A book summary stays true when a seal puts an instant's rows in another order** (#278). A tie on a timestamp
+  goes to the row a scan delivers last, and a seal of a block with a late row (a client's event time, #105) can
+  give a segment that starts before one indexed already: at an instant the two share, the rows change places. A
+  book summary and its best track composed before the seal kept the old order, so a read from them answered
+  differently than a composition of the rows, and the next summary composed from them wrote another track. Such a
+  seal now removes the summaries and tracks from its segment's first row, as a late row's publication does. The
+  embedded engine's flush (C API) indexed rows no block had published and removed no summary at all; it removes
+  those at or after a new segment's first row now. Which row wins such a tie is open item #279.
+
+- **The WAL files retention lets go are removed off the flush thread** (#277). The flush tick unlinked them
+  itself, and a 512 MB file took it 34-37 ms on ext4 and 16-17 ms on XFS, twice in a round of a pipelined
+  ingest, while the writers filled half the pending queue in 32-36 ms: most of the writes that still waited at
+  the queue's ceiling waited during one. A thread of their own removes them now; `close()` returns once the
+  removals asked for are done. Under the same ingest the flush thread takes 4-6% less CPU a level, and of the
+  writes that waited at the ceiling after a round's first 400 ms, six rounds had 0 where they had 4
+  (m9g.xlarge) and 1 where 11 (m8a.xlarge). The m8a.xlarge's batch p99 is 10-20% higher, the direction #276
+  found there; see the roadmap.
+
+- **A flush is asked for when half the pending queue's ceiling is queued** (#276). Writers asked for a tick only
+  when the queue's million rows were full, so a node written faster than its interval drains - 12-16 M levels a
+  second against the default 100 ms - stopped its writers at nearly every tick: 42-50 waits in a round of about
+  3 s, each for a tick to take the queue, sync its WAL and drain it. The row that brings the queue to half its
+  ceiling now asks for the tick, which runs while the writers fill the other half: under a pipelined ingest the
+  batches' p999 is 0.56-1.5 ms where it was 8.2-8.9 ms (m9g.xlarge) and 2.2-2.5 ms where 9.4-10.3 ms
+  (m8a.xlarge), with 2-8% more levels a second (medians of six rounds). On the m8a.xlarge, whose WAL is on
+  ext4, the p99 doubled (0.55-0.77 ms where 0.26-0.39 ms): its WAL appends are slow more often while the WAL is
+  synced, which the writers now write through rather than wait out at the ceiling; see the roadmap.
+
+- **A drain looks a pair's store up once** (#275). The thread that drains the pending queue built and hashed
+  `symbol.exchange` for every run of one pair's rows; it now remembers each pair's slot for the drain. The
+  lookup's 0.5-1.4% of a node's samples under a pipelined ingest is gone, about half of it spent again on the
+  map that remembers.
+
+- **A book composed from a summary reads only the rows after the summary's time** (#272). A composition
+  started at the summary's time, which took the segment the summary was made at: the summary a seal writes
+  read the previous segment in full - and decoded it again - for the rows of its last instant, which the
+  summary holds. Composing a summary costs 28.6-28.9 ns a row where it cost 31.6-31.9 (m9g.xlarge) and
+  22.7-22.8 where 25.3 (m8a.xlarge), and under a pipelined ingest a round decodes half as many columns.
+
+- **A book summary writes each row it composes where the row stays** (#271). Composing the summary a seal
+  writes built each row on the stack and copied it twice, once into the book's label and once into its side,
+  with loads a processor cannot forward from its store buffer: seven a level on the thread that drains and
+  seals, counted on the m8a.xlarge, and two now. The composition's share of the node's samples under a
+  pipelined ingest fell from 5.3-6.5% to 4.3-5.6% on both hosts, and with sides 500 levels deep that thread
+  takes 45.6-46.9 ns of
+  CPU a level where it took 48.3-51.1 (m8a.xlarge); elsewhere the difference is within the rounds' spread.
+
+- **A write queues its rows for the flush without building two strings a level** (#270). Every level of
+  every write is queued on its client loop for the columnar flush. The queue's entry carried the symbol and
+  the exchange as two strings, built again for every level, in an entry put together on the stack and
+  copied in - where a wide load of what narrow stores had just written stalled. An entry now carries a
+  pointer to a name made once per pair, and is written in its place: 64 bytes where it was 120, so at its
+  ceiling of a million rows the queue holds 64 MB of entries where it held 120. Under a pipelined ingest
+  the client loops take 148.3-149.7 ns of CPU a level where they took 166.7-167.5 (m9g.xlarge) and
+  107.8-109.7 where 121.9-124.2 (m8a.xlarge). A node then takes 11.27-11.41 million levels a second where it
+  took 10.30-10.43, and 13.44-13.88 where 12.46-12.64, with a batch's median at 153.9-155.2 us where it was
+  171.2-172.1 and 112.9-114.6 where 126.7-128.6.
+
+- **A write finds its level in a book side by halves** (#268). Every level of every write looked for its
+  price from the front of its side, and a new price looked again for where it goes: on a side of
+  Binance's diff stream, 269 levels at the median and a thousand at the 90th percentile, most of what
+  applying a level cost. One search by halves finds the same slots. A level of that stream takes 26.6-27.2
+  ns where it took 140.2-141.1 (m9g.xlarge) and 23.6-23.7 where 108.6-109.4 (m8a.xlarge, the release
+  packages' target). A pipelined writer on books 500 levels deep pushes 9.8-10.1 million levels a second
+  where it pushed 6.3, with a batch's median at 177-179 us where it was 298-300 (m9g.xlarge). The books are
+  the ones the search from the front kept, held by a test against a copy of it.
+
+- **A seal encodes its columns into the same bytes for 26-41% less** (#267). After #266, encoding
+  a segment's columns was the largest item of the flush thread - the one every writer's rows go through -
+  in the node's profile under a pipelined ingest. The transforms divide as they find their divisor, in
+  one pass where they took three or four. Simple8b starts at the first selector the word's first value
+  fits, and judges a selector's window eight widths at a time. Runs are found without a branch a value,
+  and blocks are packed through a 64-bit accumulator. A seal's encoding of the Binance recordings takes
+  20.5-20.8 ns a row where it took 33.7-34.5 and 11.8-12.6 where 16.6-17.6 (m8a.xlarge), and 23.5-23.8
+  where 37.8-38.0 and 14.3-14.7 where 23.6-24.4 (m9g.xlarge). Under the ingest, encoding's share of the
+  node's samples fell from 8.4-8.7% to 6.2-6.4% and from 9.0-9.1% to 5.5-5.7%. Every block and every choice
+  is the one the encoder before it made, held by a test against a copy of that encoder.
+
+- **A book summary at a seal costs half of what it did** (#266). After a seal of a busy symbol the
+  flush thread - the one every writer's rows go through - composes the book as of the segment's end
+  (#233), and in the node's profile under a pipelined ingest that was a quarter to a third of the
+  thread's time. A composition keeps its prices in a table rather than a `std::map`, and reads a span
+  whose segments come in time order one after another as it decodes them, rather than through runs and a
+  merge. Composing a summary of 65 536 rows takes 29.7-29.9 ns a row where 63.6-72.9 (m8a.xlarge) and
+  33.0-33.3 where 74.2-77.9 (m9g.xlarge); under the ingest the summary's share of the node's samples fell
+  from 9.1-9.3% to 5.1-5.5% and from 10.7-10.9% to 5.3-5.5%. The files are the bytes they were, and every
+  book read by price composes through the same code.
+
 - **Breaking: a listener with no secret listens on 127.0.0.1 unless told where** (#256). The client
   port without `--auth-secret-file` and `--bind`, and the replication and multi-master ports without
   `--cluster-secret-file` and their own bind flags, listened on every interface - which is what the
@@ -175,6 +335,12 @@ here as `#N`.
   interface of both families - the way back - and a node announced through a coordinator at another
   host, with a port it needs on loopback by this rule, does not start. `--print-config` and the
   startup log say where each listener listens and why. `docs/upgrading.md` has what to change.
+
+- **One flush sends a megabyte at most** (#260), on the socket and through TLS, and the loop serves its
+  other sessions before the next: a client reading a large answer as fast as the loop sent it never
+  filled its socket, and the loop sent the whole answer in one pass - every other session on the loop
+  waited 4.7-10.3 ms while 45 MB went out (m9g.xlarge). The answer's bytes are the same, and a
+  million rows take as long to read.
 
 - **A session's large answers are written where its last one was** (#253): a row answer is written in
   the session's send buffer's room, lent to it when nothing is pending and taken back with the answer,
@@ -302,6 +468,19 @@ here as `#N`.
 
 ### Fixed
 
+- **A write paid for every subscriber of its book, on its own thread, and more for each one** (#263).
+  Its notification reached each subscription once a row, and the server took the hub's lock, searched
+  every queue of the hub for the subscription's, and formatted the row anew for each - on the writer's
+  client loop. With 1 000 sessions subscribed to one book a `MINSERT` of 20 levels cost its writer
+  4.6-4.7 ms on the m9g.xlarge and 3.7-3.8 ms on the m8a.xlarge with four client loops, a push 229-234
+  and 183-190 ns. Now a write reaches each subscription once, its queue by id, and a row is formatted
+  once a write and shared: 0.91-0.94 and 0.62-0.69 ms, 45-46 and 31-34 ns a push, and the subscribers
+  are sent four to six times the writes in the same time. With no subscriber a write costs what it
+  did; the pushes are the bytes they were.
+- **The documentation showed a `SUBSCRIBE` no version accepts** (#263): `SUBSCRIBE 'SYM'.'EXCH'`, in the
+  README, the query language's wire example and the roadmap. The form is `SUBSCRIBE * FROM
+  'SYM'.'EXCH'` - or a select list, which a push ignores.
+
 - **An answer past what a session may be sent is refused where it passes it, not after its last row**
   (#257). Since #152 such an answer was refused and the session kept - but built in full first: on
   the m9g.xlarge a `SELECT *` of eight million rows formatted 367 MB, took the node's resident memory
@@ -312,6 +491,13 @@ here as `#N`.
   as the rows come, so text past the ceiling in a frame under it is still an answer. The refusal says
   how many rows were within it: `ERR answer is larger than the 67108864 bytes a session may have
   queued, past its first N rows; narrow the query or add LIMIT`, where it said the answer's size.
+
+- **The C++ client's `compress` option is refused by name** (#259). Its LZ4 path could not compress a
+  session in any build: the client waited for an answer to `COMPRESS LZ4` that the server never sends,
+  so the connection failed as `server does not support LZ4 compression`, and nothing it sent or read
+  was framed. `ClientConfig::compress` and `PoolConfig::compress` set to `true` are refused by
+  `connect()` before a socket is opened, naming the Python client's `compress=True` as the way to an
+  LZ4 session; the `OB_CLIENT_LZ4` CMake option, which built the dead path, is gone.
 
 - **A read on a node being demoted or promoted no longer reaches a replication client being built or
   destroyed** (#254). Every `SELECT`, `FLUSH`, write and backup asks whether the node is installing a

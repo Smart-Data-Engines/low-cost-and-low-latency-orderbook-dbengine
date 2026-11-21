@@ -23,7 +23,7 @@ from conftest import cpp_client_binary_path, free_port, patience, server_binary_
 pytestmark = pytest.mark.smoke
 
 SUBCOMMANDS = ("ping", "insert_query", "minsert", "query_agg", "query_buckets", "query_named",
-               "large_select")
+               "large_select", "large_read")
 
 
 @pytest.fixture(scope="module")
@@ -118,6 +118,11 @@ def test_every_subcommand_runs_through_rings(harness, workdir, spin_us):
             expected = len(SUBCOMMANDS) if label == "rings" else 0
             assert moved == expected, f"{moved} sessions moved through the {label}, not {expected}"
             assert node.metric("ob_ring_sessions_total") == expected
+            # large_read's read is at the threshold of #260: off the loop through the socket, and on
+            # it through rings, whose events the loop makes itself.
+            off_loop = node.metric("ob_off_loop_reads_total")
+            assert off_loop == (0 if label == "rings" else 1), f"{off_loop} read(s) off the loop " \
+                                                               f"through the {label}"
             # Every session closed, and its memory with it.
             deadline = time.monotonic() + patience(10)
             while node.metric("ob_ring_bytes") != 0 and time.monotonic() < deadline:

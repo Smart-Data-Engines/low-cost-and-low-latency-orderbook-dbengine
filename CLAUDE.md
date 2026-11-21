@@ -4679,6 +4679,116 @@ Learned the hard way. Check here before debugging.
      cache, and reading the scan's parts at DEBUG put most of it in the answer's own last doubling:
      32 MiB copied into a string of 64, both held. Measure warm and cold apart, and read the layout the
      code took, before changing anything for memory.
+641. **`clang++ -fsyntax-only` does not report a private field nobody reads.** `-Wunused-private-field`
+     is decided when Clang compiles, and a syntax-only pass stops before: #258's branch removed the
+     last read of `Reactor::secrets_`, passed the local check of pitfall 635 run with `-fsyntax-only`,
+     and went red in CI's `clang-build` and `CodeQL` - a strict `master` and a round of CI lost (PR
+     #309). The check compiles: `clang++-18 -std=c++20 -Wall -Wextra -Werror -c -o /dev/null
+     -Iinclude '-DOB_VERSION="0"' <file>`.
+642. **A round trip timed by a thread of the process that reads a large answer measures the
+     interpreter.** `test_large_answer_isolation.py` first sent its `PING`s from a thread beside the
+     reader, which held Python's lock while it took 26 MB in: the thread measured 18.7 ms beside a read
+     off the loop that the node answered beside in 0.05-0.18 ms, from a process of their own (#260). A
+     latency beside a heavy client is measured from another process, and the samples kept are the ones
+     sent while what is measured was happening.
+643. **Edge-triggered `EPOLLOUT` reports a socket that became writable, not one that is.** A flush that
+     stops by its own choice with the socket still taking bytes gets no event: #260's slice has the loop
+     arm `EPOLLOUT` again, an `EPOLL_CTL_MOD` that reports the socket's state on the next pass. The
+     first version of #260's resume had the same hole from the other side - the resumed session's
+     `receive()` said it wanted to read, nothing armed `EPOLLOUT` for what the socket had not taken,
+     and the answer stopped (`e46d108`). Every path that leaves bytes queued arms `EPOLLOUT` itself.
+644. **A change after the last full run is checked by the full run, not by the tests of what it changed.**
+     #260's last change to the loop put `!resume_.empty()` into `epoll_wait`'s timeout, and the
+     targeted runs after it - the module's battery, `test_off_loop_reads`, the slice tests - passed;
+     the full ctest failed on `IoWait.TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral`, which
+     reads every `epoll_wait`'s arguments up to their first `)` for `wait_ms` and found the condition's
+     parenthesis first. A test that reads the source as text belongs to no feature's targeted set.
+645. **GCC 14 at `-O3` warns of an unbounded copy where clang and GCC 12 and 15 see none.** #263's
+     hub appends a pushed row's text with a length taken from the pointer `format_push_row()`, in
+     another unit, returns: the ARM host's Release build (`gcc14-g++`, `-O3 -Werror`) failed on
+     `-Wrestrict` in `std::string::append` - "accessing 9223372036854775808 or more bytes" - while the
+     laptop's clang 18, GCC 15 and GCC 12 compiled it clean, Debug and `-O3` alike. A length that
+     comes back through a call the optimiser cannot see into is bounded by its buffer as well
+     (`std::min(end - buf, sizeof(buf))`), and the ARM Release build is the check that reaches
+     GCC 14 - the packages are built with GCC 12, CI with the runner's.
+
+646. **A retry fixes noise, not a weakness of the setup: before adding attempts, ask what every attempt
+     meets.** #269 gave the handshake storm test three attempts because one CI run saw its control's loop
+     held two times where the hosts see twenty-five, and read that as a runner spoiling one run. The next
+     failure (#273) was 2.2-2.4 in all three attempts: on that runner the storm, two Python processes and
+     RSA-2048, kept the loop busy less than half the time, and a PING every half millisecond samples the
+     loop in time, so its median did not move far. Attempts multiply a probability; they do nothing for a
+     margin. The fix was the margin: RSA-4096, seventy times on the hosts.
+647. **Where an annotation puts its samples is not what an instruction costs: count the event it points
+     at.** #271's annotation put 91% of a function's samples on the instruction after a load that could
+     not be forwarded from the store buffer, which read as a stall worth most of the function. The change
+     that removed the load removed 76-79% of the flush thread's failed forwards - 7 a level, counted with
+     `perf stat -e ls_bad_status2.stli_other` on Zen 5 - and the thread's CPU fell by a few percent, not
+     by nine tenths: an out-of-order core keeps working while such a load waits, and the sample lands on
+     the instruction that waits last. Before estimating a gain from an annotation, count the event; the
+     counter is free and its answer is the same on every run.
+648. **A change can move the cost of a thread it does not touch, and that is layout, not work.** Marking
+     `fill_row()` `[[gnu::always_inline]]` changed the flush thread's code only, and on the m8a.xlarge's
+     deep shape the client loops took 4% more CPU a level - in every round and both positions - while
+     the micro-benchmark of the code changed was no faster. Compare every thread's CPU, not only the one
+     the change is for; a variant that helps nowhere and moves something it does not touch is not kept.
+649. **A test that says something did not happen has to wait for what could make it happen to be over.**
+     #276's tests read the tick counter 200 ms after the queue was drained to say no second tick was asked
+     for. A tick holds the flush through its seals - over a second in a Debug build - and a tick asked for
+     while it ran begins only after it, so two mutants that asked again passed: the window closed while the
+     first tick was still sealing. They take the flush's lock first, which the running tick holds to its
+     end, and then give the window.
+650. **Do not commit in a worktree while a mutation table runs in it.** A scratch branch made in #276's
+     worktree, with `git commit -a`, took in the mutant the table had just written to a header, and the
+     checkout back put the source under the table's build: that mutant's verdict was void and the scratch
+     commit carried it. A scratch build gets a worktree of its own; and the table's own log says which
+     mutant was in the tree when.
+651. **`perf sched timehist` shows `[unknown]` for the kernel's frames to a user who cannot read its
+     symbols, and as root refuses a data file another user owns.** #276's first off-CPU run printed no
+     stack at all; the second, as root on a file chowned to the user, printed nothing and said "not owned
+     by current user or root (use -f to override)". Read the data as root, on the file root wrote.
+652. **A test that holds a lock and waits for a thread must be able to let the lock go before it waits for
+     that thread to end.** #277's tests hold the removal thread's lock and check that a tick returns. The
+     first waited for the tick through a `std::future` declared after the hold: a failed assertion destroyed
+     the future first, whose destructor waited for a tick that waited for the hold. The second ran the tick
+     on the very thread that held the lock. Both hung rather than failed under the mutant that made the tick
+     wait. Declare what waits for the other thread before the hold, run what may block on a thread of its
+     own, and bound the wait.
+653. **A property that compares a cache with its oracle only when it writes an entry finds a stale one by luck.**
+     #278's defect - a book summary a later seal had made stale - hid in a property that compared a summary with
+     the oracle when the store wrote one: it was found only if a later summary composed from the stale one, once
+     in CI on the fifteenth case of a seed, and in none of 2 000 cases on four other seeds. Assert the invariant
+     itself after every step (every summary the store holds is the book a composition gives at its time), and
+     draw the shape the defect needs - here few prices, late rows often, a block published before every summary.
+654. **A RapidCheck seed reproduces with the case count it ran with, not alone.** CI runs most properties at
+     `max_success=25` (`tests/CMakeLists.txt`). Seed `14180367816294839680` fails #278's property at 25 cases,
+     "after 15 tests and 143 shrinks" as in CI, and passes at 500: the cases a seed gives depend on the count as
+     well. Rerun a CI failure with both, or with the `reproduce=` string RapidCheck prints.
+655. **A cut taken under a lock and a list of what it holds made after the lock is let go name two moments.**
+     A snapshot took its WAL position and sealed every row up to it under `flush_mtx_`, then listed its files by
+     walking the directory without it. Its pin kept a merge and retention from moving a file, and nothing kept a
+     FLUSH from sealing rows written after the cut into a new directory the walk then listed: a replica held them
+     twice (#282). Take what the cut holds - here the index's segment directories - while the lock is still
+     held, and let the slow work after it touch nothing else.
+656. **`resize()` on a buffer about to be written zeroes it first.** #281 grew a drain's block and a seal's column
+     tiles by `resize()` and wrote the rows through pointers into them: value-initialisation is a memset, which
+     glibc does on the m9g.xlarge with its generic loop - 1.10-1.52% of the node's samples on the flush thread,
+     0.98-1.27% on the m8a.xlarge, where `perf` could not name it (libc without symbols there: `objdump` the
+     address on the host). Grow by `insert()` from an iterator over the source, and every value is constructed
+     where it stays (#284).
+657. **A test's temporary directory named the same in every run is the next run's after a crash.** A counter that
+     starts at 0 in every process, `std::rand()` without a seed and a fixed name all hand the next run of the binary
+     the directory a crashed run left, and the test opens that run's data as its own: a mutant of #284 crashed
+     `test_pending_row_names`, and the next run - the table's next mutant, a control - stored every row twice and
+     was reported killed. Name temporary paths through `tests/test_temp_dirs.hpp`, which
+     `test_temp_dir_discipline` holds every test to (#285), and give each run of a mutation table a `TMPDIR` of its
+     own.
+658. **Where work sits relative to an asynchronous sync matters as much as how much of it there is.** #286's first
+     version moved the summaries' composition from after the tick asks for the segments' background `syncfs` to
+     before it: the flush thread's CPU fell, and the next tick's WAL sync met the `syncfs` more often - ticks whose
+     WAL sync took 12 ms or more went from 13 to 73 - and writers waited for room in the queue twice as often. A CPU
+     profile cannot show it. A diagnostic build with the slow-tick warning at 15 ms (it names the tick's phases),
+     and the writers' waits and p999 a round, did. Compare those, not the CPU alone.
 
 ## Current state and open problems
 
@@ -4692,8 +4802,9 @@ because commit messages and specs cite these numbers.
 [docs/roadmap.md](docs/roadmap.md). Both suites run in CI on every pull request, the whole integration
 battery a second time under ThreadSanitizer, with an unexpected skip failing the job. The CLI and
 C++ client harness are built alongside the selected server in both integration jobs. Clang builds
-and tests the tree too. **Fourteen checks are required** on `master`: #38 added `fuzz`, #147
-took `io-uring-build` away with the transport it built, and #42 added `package-arm64`. The exact contexts
+and tests the tree too. **Fifteen checks are required** on `master`: #38 added `fuzz`, #147
+took `io-uring-build` away with the transport it built, #42 added `package-arm64`, and #264
+`build-and-test-arm64`, the C++ suite on aarch64. The exact contexts
 live in `.github/rulesets/master.json`, and `check_contexts.py` now derives that number and checks
 **this sentence** against it as well as the one in `docs/github-security.md` — it said "Thirteen"
 for one item, which is pitfall 223 happening in the second document its own mechanism did not

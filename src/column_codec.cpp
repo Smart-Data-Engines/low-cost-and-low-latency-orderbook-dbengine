@@ -86,39 +86,28 @@ void put_u64_words(std::string& out, const std::vector<uint64_t>& words) {
 /// than everything else a column's transform does.
 struct Divisor {
     unsigned k{0};
+    uint64_t low{0};   ///< the k low bits: a multiple has none of them set
     uint64_t inverse{1};
     uint64_t limit{std::numeric_limits<uint64_t>::max()};
 
     explicit Divisor(uint64_t g) {
         k = static_cast<unsigned>(__builtin_ctzll(g));
+        low = (uint64_t{1} << k) - 1;
         const uint64_t o = g >> k;
         uint64_t inv = o;   // right in 3 bits for any odd o; each step doubles them
         for (int i = 0; i < 5; ++i) inv *= 2 - o * inv;
         inverse = inv;
         limit = std::numeric_limits<uint64_t>::max() / o;
     }
-    bool divides(uint64_t x) const {
-        if (k != 0 && (x & ((uint64_t{1} << k) - 1)) != 0) return false;
-        return (x >> k) * inverse <= limit;
-    }
+    bool divides(uint64_t x) const { return ((x & low) == 0) & ((x >> k) * inverse <= limit); }
     uint64_t quotient(uint64_t x) const { return (x >> k) * inverse; }   // x a multiple
-};
-
-/// The greatest common divisor of `v`: 0 when all are zero.
-uint64_t common_divisor(const std::vector<uint64_t>& v) {
-    size_t i = 0;
-    uint64_t g = 0;
-    while (i < v.size() && g == 0) g = v[i++];
-    if (g <= 1) return g;
-    Divisor d(g);
-    for (; i < v.size(); ++i) {
-        if (d.divides(v[i])) continue;
-        g = std::gcd(g, v[i]);
-        if (g == 1) return 1;
-        d = Divisor(g);
+    /// divides() and quotient() from one product: the quotient into `q`, which is `x / g` when this
+    /// says `x` is a multiple. One test, so that a column of multiples takes one branch a value.
+    bool divide(uint64_t x, uint64_t& q) const {
+        q = (x >> k) * inverse;
+        return ((x & low) == 0) & (q <= limit);
     }
-    return g;
-}
+};
 
 /// A transform's output: the values to pack, the anchor and the divisor.
 struct Stream {
@@ -129,18 +118,120 @@ struct Stream {
     std::vector<uint64_t> values;
 };
 
+/// A zigzagged value's magnitude and sign, as zigzag() made it from them: 2m for a value of m, 2m - 1 for
+/// one of -m - where 2^63's is UINT64_MAX, so (z + 1) / 2 would wrap and this does not.
+uint64_t magnitude_of(uint64_t z) { return (z >> 1) + (z & 1); }
+bool negative_of(uint64_t z) { return (z & 1) != 0; }
+
+/// A transform's values divided by their greatest common divisor as the divisor is found, in the pass
+/// that makes them (#267): `magnitude(i)` gives the i-th value's magnitude and sign, and `out[i]` gets
+/// its quotient - zigzagged when `Signed`. Returns the divisor: the greatest common divisor of the
+/// magnitudes, and 1 when it is 1 or every magnitude is zero - what the transforms before this found in
+/// a pass of their own after the magnitudes, and every quotient the one dividing by it afterwards gave.
+///
+/// The divisor is the first magnitude that is not zero and then the greatest common divisor of it and
+/// each that follows. A value it does not divide makes it smaller, and the quotients written so far
+/// are taken to the new one by multiplying by the old over the new: m/g' = (m/g)(g/g'), never past m.
+/// Each such correction at least halves the divisor, and a column of a client's values could make
+/// them late and many - up to 63 passes over what came before. So corrections may rewrite as many
+/// values as the column holds, once, and past that the rest is written undivided while its common
+/// divisor is found, and one last pass takes every value to the divisor of the whole: three passes at
+/// worst, as many as the transforms before this took every time.
+template <bool Signed, typename Magnitude>
+uint64_t divide_as_found(size_t n, Magnitude&& magnitude, uint64_t* __restrict out) {
+    const auto put = [](bool negative, uint64_t m) { return Signed ? zigzag(negative, m) : m; };
+    // Corrections rewrite the quotients written so far.
+    const auto rescale = [&](size_t upto, uint64_t factor) {
+        for (size_t j = 0; j < upto; ++j) {
+            out[j] = Signed ? zigzag(negative_of(out[j]), magnitude_of(out[j]) * factor) : out[j] * factor;
+        }
+    };
+    size_t i = 0;
+    // Zeros until the first magnitude that is not: a quotient of zero whatever the divisor.
+    for (; i < n; ++i) {
+        const auto [m, negative] = magnitude(i);
+        if (m != 0) break;
+        out[i] = put(negative, 0);
+    }
+    if (i == n) return 1;
+    uint64_t g = magnitude(i).first;
+    out[i] = put(magnitude(i).second, 1);
+    ++i;
+    size_t budget = n;   // the values corrections may still rewrite
+    if (g > 1) {
+        Divisor d(g);
+        for (; i < n; ++i) {
+            const auto [m, negative] = magnitude(i);
+            uint64_t q;
+            const bool multiple = d.divide(m, q);
+            out[i] = put(negative, q);   // written again below when it is not a multiple
+            if (multiple) [[likely]] continue;
+            const uint64_t h = std::gcd(g, m);
+            if (i > budget) {
+                // Past the budget: the rest undivided, their divisor found with the one so far, and
+                // one pass to the divisor of the whole.
+                uint64_t whole = h;
+                Divisor dw(whole > 1 ? whole : 1);
+                for (size_t j = i; j < n; ++j) {
+                    const auto [mj, nj] = magnitude(j);
+                    out[j] = put(nj, mj);
+                    if (whole > 1 && !dw.divides(mj)) {
+                        whole = std::gcd(whole, mj);
+                        if (whole > 1) dw = Divisor(whole);
+                    }
+                }
+                const uint64_t factor = g / whole;
+                const Divisor dd(whole > 1 ? whole : 1);
+                for (size_t j = 0; j < n; ++j) {
+                    const uint64_t mj = Signed ? magnitude_of(out[j]) : out[j];
+                    const uint64_t to = j < i ? mj * factor : (whole > 1 ? dd.quotient(mj) : mj);
+                    out[j] = Signed ? zigzag(negative_of(out[j]), to) : to;
+                }
+                return whole > 1 ? whole : 1;
+            }
+            budget -= i;
+            rescale(i, g / h);
+            g = h;
+            if (g == 1) {
+                out[i] = put(negative, m);
+                break;
+            }
+            d = Divisor(g);
+            out[i] = put(negative, d.quotient(m));
+        }
+        if (g > 1) return g;
+        ++i;   // past the value at which the divisor came to 1, written above
+    }
+    // No divisor: the rest as they are.
+    for (; i < n; ++i) {
+        const auto [m, negative] = magnitude(i);
+        out[i] = put(negative, m);
+    }
+    return 1;
+}
+
 void transform_for(std::span<const uint64_t> v, Stream& s) {
     s.transform = Transform::kFor;
     s.count = v.size();
-    s.anchor = v.empty() ? 0 : *std::min_element(v.begin(), v.end());
-    s.values.resize(v.size());
-    for (size_t i = 0; i < v.size(); ++i) s.values[i] = v[i] - s.anchor;
-    const uint64_t g = common_divisor(s.values);
-    s.scale = g > 1 ? g : 1;
-    if (s.scale > 1) {
-        const Divisor d(s.scale);
-        for (uint64_t& x : s.values) x = d.quotient(x);
+    // The minimum first, in four chains side by side - one chain was a compare and a move a value, each
+    // waiting on the one before - and then one pass of differences, divided as their divisor is found
+    // (#267). It was four passes: the minimum, the differences, their divisor, the quotients.
+    uint64_t lowest = v.empty() ? 0 : v[0];
+    {
+        uint64_t m[4] = {lowest, lowest, lowest, lowest};
+        size_t i = 0;
+        for (; i + 4 <= v.size(); i += 4) {
+            for (size_t k = 0; k < 4; ++k) m[k] = std::min(m[k], v[i + k]);
+        }
+        for (; i < v.size(); ++i) m[0] = std::min(m[0], v[i]);
+        lowest = std::min(std::min(m[0], m[1]), std::min(m[2], m[3]));
     }
+    s.anchor = lowest;
+    s.values.resize(v.size());
+    const uint64_t* in = v.data();
+    s.scale = divide_as_found<false>(
+        v.size(), [in, lowest](size_t i) { return std::pair<uint64_t, bool>{in[i] - lowest, false}; },
+        s.values.data());
 }
 
 void transform_delta(std::span<const uint64_t> v, Stream& s) {
@@ -148,48 +239,80 @@ void transform_delta(std::span<const uint64_t> v, Stream& s) {
     s.count = v.size();
     s.anchor = v.empty() ? 0 : v[0];
     const size_t n = v.empty() ? 0 : v.size() - 1;
-    // Magnitudes first, the signs taken again below: the divisor is of the magnitudes, and the
-    // differences are taken in wrapping arithmetic, as encode_prices() takes them.
+    // One pass: each difference, in wrapping arithmetic as encode_prices() takes it, its sign and its
+    // magnitude - the divisor is of the magnitudes - divided as the divisor is found and zigzagged
+    // (#267). It was three: the magnitudes, their divisor, then the signs again and the quotients.
     s.values.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-        const uint64_t d = v[i + 1] - v[i];
-        s.values[i] = static_cast<int64_t>(d) < 0 ? 0 - d : d;
-    }
-    const uint64_t g = common_divisor(s.values);
-    s.scale = g > 1 ? g : 1;
-    const Divisor div(s.scale);
-    for (size_t i = 0; i < n; ++i) {
-        const bool negative = static_cast<int64_t>(v[i + 1] - v[i]) < 0;
-        const uint64_t m = s.scale > 1 ? div.quotient(s.values[i]) : s.values[i];
-        s.values[i] = zigzag(negative, m);
-    }
+    const uint64_t* in = v.data();
+    s.scale = divide_as_found<true>(
+        n,
+        [in](size_t i) {
+            const uint64_t d = in[i + 1] - in[i];
+            const bool negative = static_cast<int64_t>(d) < 0;
+            return std::pair<uint64_t, bool>{negative ? 0 - d : d, negative};
+        },
+        s.values.data());
 }
 
 /// The runs payload: how many, the words of their values, those words, then the words of their
-/// lengths less one - each in Simple8b.
-void put_runs(const std::vector<uint64_t>& values, const std::vector<uint64_t>& lengths, std::string& out) {
-    const auto value_words = encode_simple8b(values).words;
-    const auto length_words = encode_simple8b(lengths).words;
+/// lengths less one - each in Simple8b, packed into this thread's buffers (#267).
+void put_runs(std::span<const uint64_t> values, std::span<const uint64_t> lengths, std::string& out) {
+    thread_local std::vector<uint64_t> value_words, length_words;
+    encode_simple8b_into(values, value_words);
+    encode_simple8b_into(lengths, length_words);
     put_varint(out, values.size());
     put_varint(out, value_words.size());
     put_u64_words(out, value_words);
     put_u64_words(out, length_words);
+    keep_small(value_words);
+    keep_small(length_words);
+}
+
+/// The runs of equal values in `v`: each run's value into `values` and its length less one into
+/// `lengths`, their first `runs` slots, which it returns. Both vectors only ever grow here, so a
+/// thread's are not zeroed again for every column.
+///
+/// Without a branch a value (#267): the loop it replaces asked of every value whether it ended a run,
+/// and where runs are a value or two long that answer cannot be predicted. Here each value writes the
+/// run that would start at it and the run count moves by whether one does; and eight values none of
+/// which starts a run - the inside of a long run - are passed over by one test.
+size_t find_runs(std::span<const uint64_t> v, std::vector<uint64_t>& values, std::vector<uint64_t>& lengths) {
+    const size_t n = v.size();
+    if (n == 0) return 0;
+    if (values.size() < n) values.resize(n);
+    if (lengths.size() < n) lengths.resize(n);
+    const uint64_t* in = v.data();
+    uint64_t* value = values.data();
+    uint64_t* start = lengths.data();   // each run's first position, made its length at the end
+    size_t r = 0;
+    value[0] = in[0];
+    start[0] = 0;
+    // A run that would start at `i` is written one past the last, and counted if it does start there:
+    // until then the next value writes over it. r + 1 <= i < n, so it stays inside the vectors.
+    const auto step = [&](size_t i) {
+        value[r + 1] = in[i];
+        start[r + 1] = i;
+        r += static_cast<size_t>(in[i] != in[i - 1]);
+    };
+    size_t i = 1;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t differs = 0;
+        for (size_t k = 0; k < 8; ++k) differs |= in[i + k] ^ in[i + k - 1];
+        if (differs == 0) continue;
+        for (size_t k = 0; k < 8; ++k) step(i + k);
+    }
+    for (; i < n; ++i) step(i);
+    const size_t runs = r + 1;
+    for (size_t k = 0; k + 1 < runs; ++k) start[k] = start[k + 1] - start[k] - 1;
+    start[runs - 1] = n - start[runs - 1] - 1;
+    return runs;
 }
 
 /// Returns how many runs it packed.
 size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
     thread_local std::vector<uint64_t> values, lengths;
-    values.clear();
-    lengths.clear();
-    for (size_t i = 0; i < v.size();) {
-        size_t j = i + 1;
-        while (j < v.size() && v[j] == v[i]) ++j;
-        values.push_back(v[i]);
-        lengths.push_back(j - i - 1);
-        i = j;
-    }
-    put_runs(values, lengths, out);
-    const size_t runs = values.size();
+    const size_t runs = find_runs(v, values, lengths);
+    put_runs(std::span<const uint64_t>(values.data(), runs), std::span<const uint64_t>(lengths.data(), runs), out);
     keep_small(values);
     keep_small(lengths);
     return runs;
@@ -202,35 +325,26 @@ size_t pack_runs(const std::vector<uint64_t>& v, std::string& out) {
 /// book's sequence numbers, would be one run of that output, and decode as one step. Fills `s`'s
 /// header fields and its values, one a run; returns how many runs it packed.
 size_t pack_steps(std::span<const uint64_t> v, Stream& s, std::string& out) {
-    thread_local std::vector<uint64_t> raw, lengths;
-    raw.clear();
-    lengths.clear();
+    thread_local std::vector<uint64_t> values, lengths;
     s.transform = Transform::kSteps;
     s.count = v.size();
     s.anchor = v.empty() ? 0 : v[0];
-    uint64_t before = s.anchor;
-    for (size_t i = 0; i < v.size();) {
-        size_t j = i + 1;
-        while (j < v.size() && v[j] == v[i]) ++j;
-        raw.push_back(v[i] - before);
-        lengths.push_back(j - i - 1);
-        before = v[i];
-        i = j;
-    }
-    // Magnitudes first, the signs taken again below, as transform_delta() takes them: the divisor is
-    // of the magnitudes.
-    s.values.resize(raw.size());
-    for (size_t r = 0; r < raw.size(); ++r) s.values[r] = static_cast<int64_t>(raw[r]) < 0 ? 0 - raw[r] : raw[r];
-    const uint64_t g = common_divisor(s.values);
-    s.scale = g > 1 ? g : 1;
-    const Divisor div(s.scale);
-    for (size_t r = 0; r < raw.size(); ++r) {
-        const uint64_t m = s.scale > 1 ? div.quotient(s.values[r]) : s.values[r];
-        s.values[r] = zigzag(static_cast<int64_t>(raw[r]) < 0, m);
-    }
-    put_runs(s.values, lengths, out);
-    const size_t runs = raw.size();
-    keep_small(raw);
+    const size_t runs = find_runs(v, values, lengths);
+    // Each run's step from the one before, the first's from the anchor - zero - divided as their
+    // divisor is found, as transform_delta() divides its differences (#267).
+    s.values.resize(runs);
+    const uint64_t* value = values.data();
+    const uint64_t anchor = s.anchor;
+    s.scale = divide_as_found<true>(
+        runs,
+        [value, anchor](size_t r) {
+            const uint64_t d = value[r] - (r == 0 ? anchor : value[r - 1]);
+            const bool negative = static_cast<int64_t>(d) < 0;
+            return std::pair<uint64_t, bool>{negative ? 0 - d : d, negative};
+        },
+        s.values.data());
+    put_runs(s.values, std::span<const uint64_t>(lengths.data(), runs), out);
+    keep_small(values);
     keep_small(lengths);
     return runs;
 }
@@ -251,25 +365,35 @@ size_t blocks_bytes(const std::vector<uint64_t>& v) {
 }
 
 void pack_blocks(const std::vector<uint64_t>& v, std::string& out) {
-    // Each value ORed into the eight bytes at its first bit, and the ninth when it reaches past
-    // them, in a buffer padded for that ninth byte.
-    thread_local std::vector<unsigned char> buf;
+    // Each block's values gathered in a 64-bit accumulator, the lowest bit first, and written a whole
+    // word at a time (#267). Each value was ORed into the eight bytes at its first bit, which the
+    // value before had just written - a load waiting on a store that overlaps it, for every value -
+    // in a buffer zeroed first, and then copied.
     for (size_t i = 0; i < v.size(); i += kBlockValues) {
         const size_t n = std::min(kBlockValues, v.size() - i);
         const unsigned w = block_width(v.data() + i, n);
         out.push_back(static_cast<char>(w));
         if (w == 0) continue;
         const size_t need = (n * w + 7) / 8;
-        buf.assign(need + 9, 0);
+        const size_t at = out.size();
+        out.resize(at + need + 8);   // room for the last word's eight bytes, cut back below
+        unsigned char* o = reinterpret_cast<unsigned char*>(out.data() + at);
+        uint64_t acc = 0;
+        unsigned filled = 0;   // the accumulator's bits taken, under 64 between values
+        const uint64_t* x = v.data() + i;
         for (size_t k = 0; k < n; ++k) {
-            const size_t bit = k * w;
-            const unsigned shift = static_cast<unsigned>(bit & 7);
-            unsigned char* p = buf.data() + (bit >> 3);
-            const uint64_t x = v[i + k];
-            store64(p, load64(p) | (x << shift));
-            if (shift + w > 64) p[8] = static_cast<unsigned char>(p[8] | (x >> (64 - shift)));
+            acc |= x[k] << filled;
+            filled += w;
+            if (filled >= 64) {
+                store64(o, acc);
+                o += 8;
+                filled -= 64;
+                // The bits of this value past the word, if any: shifting by w itself would be by 64.
+                acc = filled == 0 ? 0 : x[k] >> (w - filled);
+            }
         }
-        out.append(reinterpret_cast<const char*>(buf.data()), need);
+        if (filled > 0) store64(o, acc);
+        out.resize(at + need);
     }
 }
 
@@ -374,9 +498,17 @@ bool compress(Compressor c, const std::string& in, int zstd_level, std::string& 
     return c == Compressor::kZstd ? zstd_compress(in, zstd_level, out) : lz4_compress(in, out);
 }
 
+/// The Simple8b words of `values` appended to `out`, packed in this thread's buffer.
+void put_simple8b(const std::vector<uint64_t>& values, std::string& out) {
+    thread_local std::vector<uint64_t> words;
+    encode_simple8b_into(values, words);
+    put_u64_words(out, words);
+    keep_small(words);
+}
+
 void pack(const Stream& s, Packing p, unsigned width, std::string& out) {
     switch (p) {
-    case Packing::kSimple8b: put_u64_words(out, encode_simple8b(s.values).words); return;
+    case Packing::kSimple8b: put_simple8b(s.values, out); return;
     case Packing::kRuns:     pack_runs(s.values, out); return;
     case Packing::kBlocks:   pack_blocks(s.values, out); return;
     case Packing::kNarrow:   pack_narrow(s.values, width, out); return;
@@ -979,11 +1111,21 @@ bool get_varint(std::span<const char> in, size_t& at, uint64_t& v) {
 
 size_t encode_as(std::span<const uint64_t> values, const Encoding& encoding, int zstd_level,
                  std::string& out) {
-    Stream s;
+    // This thread's stream rather than a fresh one: a fresh one's values were allocated and zeroed
+    // for every column of every seal, and then written over (#267).
+    thread_local Stream s;
+    struct KeepSmall {
+        Stream& s;
+        ~KeepSmall() { keep_small(s.values); }
+    } keep{s};
     switch (encoding.transform) {
     case Transform::kNone:
+        // Every field, the anchor and the scale too: the stream is the last column's until here, and
+        // a scale left over is written into the header (the equivalence test found it).
         s.transform = Transform::kNone;
         s.count = values.size();
+        s.anchor = 0;
+        s.scale = 1;
         s.values.assign(values.begin(), values.end());
         break;
     case Transform::kFor:   transform_for(values, s); break;
@@ -1054,7 +1196,7 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     for (int t = 0; t < 2; ++t) {
         const Stream& s = streams[t];
         s8b[t].clear();
-        put_u64_words(s8b[t], encode_simple8b(s.values).words);
+        put_simple8b(s.values, s8b[t]);
         runs[t].clear();
         run_count[t] = pack_runs(s.values, runs[t]);
         const size_t b_s8b = header_bytes(s, Packing::kSimple8b, Compressor::kNone, 0) + s8b[t].size();

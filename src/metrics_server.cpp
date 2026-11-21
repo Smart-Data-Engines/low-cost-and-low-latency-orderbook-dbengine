@@ -39,6 +39,7 @@ void MetricsServer::start() {
     thread_ = std::thread([this] {
         run_thread_body("metrics", "run_loop", [this] { run_loop(); });
     });
+    name_thread(thread_, "ob-metrics");
 
     OB_LOG_INFO("metrics", "MetricsServer started on port %u", port_);
 }

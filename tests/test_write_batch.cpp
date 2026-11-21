@@ -16,6 +16,7 @@
 #include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
 #include "test_ports.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -31,14 +32,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
-std::atomic<uint64_t> g_dir_counter{0};
 std::atomic<uint16_t> g_port{ob::test::kPortsWriteBatch};
 
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& prefix) {
-        auto p = fs::temp_directory_path() /
-                 (prefix + std::to_string(g_dir_counter.fetch_add(1, std::memory_order_relaxed)));
+        auto p = ob::test::own_temp_dir(prefix);
         fs::create_directories(p);
         path = p.string();
     }
@@ -603,14 +602,21 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
            "to reach their stores (11 ms at p99.9 with only the sync outside, measured)";
 
     // And the deleting the tick does after its segments: an unlink of a 512 MB WAL file, or of every
-    // file of every expired segment, decided under the lock and done without it.
-    for (const char* unlink : {"wal_.truncate_before(safe_truncate)",
+    // file of every expired segment, decided under the lock and done without it - the WAL's files on a
+    // thread of their own since #277, which the tick asks without the lock.
+    for (const char* unlink : {"ask_wal_removal(safe_truncate)",
                                "combined_store_.delete_expired_segments(cutoff_ns)"}) {
         const std::size_t at = tick.find(unlink);
         ASSERT_NE(at, std::string::npos) << unlink << " moved; this test would check nothing";
         EXPECT_FALSE(locked(tick, at))
             << unlink << " deletes files with the engine's lock held, so every writer waits for it";
     }
+    const std::string removal = definition_body(src, "void Engine::wal_removal_loop(");
+    ASSERT_FALSE(removal.empty()) << "Engine::wal_removal_loop moved; this test would check nothing";
+    const std::size_t removes = removal.find("wal_.truncate_before(before)");
+    ASSERT_NE(removes, std::string::npos) << "the removal thread removes the WAL's files some other way";
+    EXPECT_FALSE(locked(removal, removes))
+        << "the WAL's files are removed with the engine's lock held, so every writer waits for it";
     const std::size_t floor = tick.find("safe_truncate = retention_floor_.file_index");
     ASSERT_NE(floor, std::string::npos) << "the truncation no longer reads the retention floor";
     EXPECT_TRUE(locked(tick, floor))

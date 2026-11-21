@@ -329,6 +329,29 @@ TEST(ClientUnit, MinsertTooManyLevelsReturnsInvalidArg) {
     EXPECT_EQ(result.error_code(), ob::OB_ERR_INVALID_ARG);
 }
 
+// #259: the C++ client's LZ4 path could not compress a session in any build - it waited for an
+// answer to `COMPRESS LZ4` the server never sends, and framed nothing it sent or read - so asking for
+// it is refused by name, before a socket is opened: nothing listens on the port it is given.
+TEST(ClientUnit, CompressIsRefusedByNameBeforeAnythingIsOpened) {
+    ob::ClientConfig config;
+    config.host = "127.0.0.1";
+    config.port = 1;
+    config.compress = true;
+    ob::OrderbookClient client(config);
+    auto result = client.connect();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error_code(), ob::OB_ERR_INVALID_ARG) << result.error_message();
+    EXPECT_NE(result.error_message().find("Python client"), std::string::npos) << result.error_message();
+    EXPECT_FALSE(client.connected());
+
+    // The control: the same client without it is refused by the port, not by the option.
+    config.compress = false;
+    ob::OrderbookClient plain(config);
+    auto dialled = plain.connect();
+    ASSERT_FALSE(dialled.has_value());
+    EXPECT_NE(dialled.error_code(), ob::OB_ERR_INVALID_ARG) << dialled.error_message();
+}
+
 TEST(ClientUnit, DisconnectOnInactiveConnectionIsNoop) {
     ob::OrderbookClient client;
     EXPECT_FALSE(client.connected());

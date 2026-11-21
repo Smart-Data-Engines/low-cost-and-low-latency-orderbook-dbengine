@@ -182,6 +182,11 @@ ob_add_soa_test(test_soa_buffer
     test_soa_buffer.cpp
 )
 
+# ── #268: a side's levels against insert_level() before its search by halves ──
+ob_add_soa_test(test_book_level_search
+    test_book_level_search.cpp
+)
+
 # ── Tasks 3.2–3.5: WAL property and unit tests ────────────────────────────────
 # How many CPUs this process can use (stage 3 of using the whole machine): the affinity mask and
 # the tightest cgroup CPU limit, as a pure function of what the process sees, plus the real reader.
@@ -240,6 +245,24 @@ endfunction()
 ob_add_columnar_test(test_column_codec
     test_column_codec.cpp
 )
+
+# ── #267: the encoder against the one it replaced, byte for byte ─────────────
+# column_codec_reference.hpp calls LZ4 and ZSTD itself, as the encoder it copies does.
+ob_add_columnar_test(test_column_codec_equivalence
+    test_column_codec_equivalence.cpp
+)
+if(TARGET PkgConfig::LZ4)
+    target_link_libraries(test_column_codec_equivalence PRIVATE PkgConfig::LZ4)
+else()
+    target_link_libraries(test_column_codec_equivalence PRIVATE ${LZ4_LIBRARY})
+    target_include_directories(test_column_codec_equivalence PRIVATE ${LZ4_INCLUDE_DIR})
+endif()
+if(TARGET PkgConfig::ZSTD)
+    target_link_libraries(test_column_codec_equivalence PRIVATE PkgConfig::ZSTD)
+else()
+    target_link_libraries(test_column_codec_equivalence PRIVATE ${ZSTD_LIBRARY})
+    target_include_directories(test_column_codec_equivalence PRIVATE ${ZSTD_INCLUDE_DIR})
+endif()
 
 # ── #139: column identities, spellings and read sets ─────────────────────────
 ob_add_columnar_test(test_query_columns
@@ -379,6 +402,13 @@ ob_add_query_test(test_scan_parts
 )
 target_link_libraries(test_scan_parts PRIVATE orderbook_tcp_server_lib)
 
+# #260: a large read answered off the client loop - the index's estimate of a scan, the threads and
+# the mailbox its answer comes back through.
+ob_add_query_test(test_off_loop_reads
+    test_off_loop_reads.cpp
+)
+target_link_libraries(test_off_loop_reads PRIVATE orderbook_tcp_server_lib)
+
 # #257: a row answer measured against what its session may be sent while it is built, and the scan
 # stopped where it passed - on one thread and on the pool, in text and as an LZ4 frame.
 ob_add_query_test(test_answer_ceiling
@@ -440,6 +470,17 @@ target_include_directories(test_chunked_queue PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 target_link_libraries(test_chunked_queue PRIVATE GTest::gtest_main rapidcheck rapidcheck_gtest)
 gtest_discover_tests(test_chunked_queue PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
+# Rows of several pairs, queued between each other and across chunks, stored under their own pair
+# (#270, whose drain finds a run of one pair by the pointer to its name).
+ob_add_engine_test(test_pending_row_names
+    test_pending_row_names.cpp
+)
+
+# The names a pending row carries by pointer (#270): one per pair, at an address that does not move.
+add_executable(test_row_names test_row_names.cpp)
+target_link_libraries(test_row_names PRIVATE orderbook_row_names GTest::gtest_main rapidcheck rapidcheck_gtest)
+gtest_discover_tests(test_row_names PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+
 ob_add_engine_test(test_sequence_numbers
     test_sequence_numbers.cpp
 )
@@ -479,6 +520,20 @@ ob_add_engine_test(test_best_track
     test_best_track.cpp
 )
 target_link_libraries(test_best_track PRIVATE rapidcheck rapidcheck_gtest)
+
+# The bytes of a book summary and its best track, whatever composes them (#266): a store's files after
+# any sequence of publishes, seals, late rows, summaries and restarts, against an oracle's.
+ob_add_engine_test(test_book_summary_equivalence
+    test_book_summary_equivalence.cpp
+)
+target_link_libraries(test_book_summary_equivalence PRIVATE rapidcheck rapidcheck_gtest)
+
+# One side of a book composed by price (#266): a table from price to row and a heap of the best,
+# against the std::map it replaces.
+ob_add_engine_test(test_price_side
+    test_price_side.cpp
+)
+target_link_libraries(test_price_side PRIVATE rapidcheck rapidcheck_gtest)
 
 # The WAL archive of point-in-time recovery (#34): closed files copied and checked, a file with other
 # contents refused and never overwritten, and the retention floor never above a file the archive
@@ -640,6 +695,15 @@ ob_add_engine_test(test_port_discipline
     test_port_discipline.cpp
 )
 
+# A test's temporary directories and files are its process's own (#285): a directory named the same in
+# every run is given what a crashed run of the same binary left there, and its data read as the test's.
+ob_add_engine_test(test_temp_dir_discipline
+    test_temp_dir_discipline.cpp
+)
+target_compile_definitions(test_temp_dir_discipline
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── Whole-engine static checks ─────────────────────────────────────────────────
 # Every thread body goes through an exception boundary (#112). Reads `src/` rather than naming
 # threads, because the list of threads is exactly what a hand-written check got wrong: counted by
@@ -662,6 +726,14 @@ ob_add_engine_test(test_field_usage
 # the defect it guards is a thread that stops, and a test that stops with it reports nothing.
 ob_add_engine_test(test_pending_backpressure
     test_pending_backpressure.cpp
+)
+
+# The WAL files retention lets go are removed off the flush thread (#277).
+ob_add_engine_test(test_wal_removal
+    test_wal_removal.cpp
+)
+ob_add_engine_test(test_thread_names
+    test_thread_names.cpp
 )
 target_compile_definitions(test_field_usage
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
@@ -1275,6 +1347,12 @@ target_compile_definitions(test_tls_context
 # cannot force a partial SSL_write over loopback.
 ob_add_tcp_test(test_tls_session
     test_tls_session.cpp
+)
+
+# The client port's TLS handshakes on their own threads, off the client loops (#265): a handshake done
+# and handed to its loop, one that fails, one past its deadline, one under way when the pool stops.
+ob_add_tcp_test(test_tls_handshake_pool
+    test_tls_handshake_pool.cpp
 )
 
 # TLS on the node links: mutual verification, the peer-name allowlist, and the two static tests

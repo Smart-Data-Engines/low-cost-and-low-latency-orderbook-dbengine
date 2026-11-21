@@ -455,16 +455,22 @@ TEST(SoABuffer, GapDetectionConsecutive) {
 // many: what this races is the label against the copies, not the copies against the writer.
 TEST(SoABuffer, TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt) {
     auto buf = make_buffer();
+    // The reads go on until the writer has made kUpdates updates and they have seen the label move
+    // more than kMoves times, not until a number of updates: on the Graviton host's Debug build
+    // 2 000 000 updates were over after 200-740 moves in 16 runs of 20, and the control below failed on
+    // a race that had not been run (#262). The writer writes until the reads are done.
     constexpr uint64_t kUpdates = 2'000'000;
-    std::atomic<bool> done{false};
+    constexpr size_t kMoves = 1000;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> written{0};
     std::thread writer([&] {
-        for (uint64_t k = 1; k <= kUpdates; ++k) {
+        for (uint64_t k = 1; !stop.load(std::memory_order_acquire); ++k) {
             ob::Level lv{1000LL, k, 1U, 0U};
             ob::DeltaUpdate upd = make_update(k % 2 == 0 ? ob::SIDE_BID : ob::SIDE_ASK, k, 1);
             bool gap = false;
             ob::apply_delta(*buf, upd, &lv, gap);
+            written.store(k, std::memory_order_relaxed);
         }
-        done.store(true, std::memory_order_release);
     });
 
     size_t reads = 0;
@@ -473,7 +479,9 @@ TEST(SoABuffer, TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt) {
     size_t moves = 0;
     uint64_t previous = 0;
     ob::SoASide bid{}, ask{};
-    while (!done.load(std::memory_order_acquire)) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while ((written.load(std::memory_order_relaxed) < kUpdates || moves <= kMoves) &&
+           std::chrono::steady_clock::now() < deadline) {
         const ob::SnapshotLabel label = ob::read_snapshot(*buf, bid, ask);
         const uint64_t s = label.sequence_number;
         if (label.timestamp_ns != s * 1000ULL) ++unpaired;
@@ -485,6 +493,7 @@ TEST(SoABuffer, TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt) {
         previous = s;
         ++reads;
     }
+    stop.store(true, std::memory_order_release);
     writer.join();
 
     EXPECT_EQ(behind, 0u) << behind << " sides of " << reads
@@ -492,7 +501,9 @@ TEST(SoABuffer, TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt) {
     EXPECT_EQ(unpaired, 0u) << unpaired << " of " << reads
                             << " labels paired one update's number with another's timestamp";
     // The control: the label moved under the reads, so they raced the writer.
-    EXPECT_GT(moves, 1000u) << "the label moved " << moves << " times in " << reads << " reads";
+    EXPECT_GT(moves, kMoves) << "the label moved " << moves << " times in " << reads
+                             << " reads in a minute";
+    EXPECT_GE(written.load(), kUpdates) << "the writer made fewer updates than the race is for";
 }
 
 // #239: the label is not read while an update is under way. A writer stores the pair inside its

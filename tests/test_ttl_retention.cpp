@@ -7,6 +7,7 @@
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/tcp_server.hpp"
 #include "orderbook/wall_clock.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
@@ -84,8 +85,7 @@ static void create_test_segment(const std::string& dir,
 // ── TTLDeleteExpired: create segments with known timestamps, delete with cutoff
 // Validates: Requirements 6.2, 6.5
 TEST(TTLDeletion, TTLDeleteExpired) {
-    auto tmp = fs::temp_directory_path() / "ttl_delete_expired_test";
-    fs::remove_all(tmp);
+    auto tmp = ob::test::own_temp_dir("ttl_delete_expired_test_");
 
     ob::ColumnarStore store(tmp.string());
 
@@ -122,8 +122,7 @@ TEST(TTLDeletion, TTLDeleteExpired) {
 // ── TTLDeleteOldestFirst: create segments out of order, verify chronological deletion
 // Validates: Requirement 6.3
 TEST(TTLDeletion, TTLDeleteOldestFirst) {
-    auto tmp = fs::temp_directory_path() / "ttl_delete_oldest_test";
-    fs::remove_all(tmp);
+    auto tmp = ob::test::own_temp_dir("ttl_delete_oldest_test_");
 
     ob::ColumnarStore store(tmp.string());
 
@@ -157,8 +156,7 @@ TEST(TTLDeletion, TTLDeleteFailure) {
     // Skip on root (permissions don't apply)
     if (geteuid() == 0) GTEST_SKIP() << "Skipping permission test as root";
 
-    auto tmp = fs::temp_directory_path() / "ttl_delete_failure_test";
-    fs::remove_all(tmp);
+    auto tmp = ob::test::own_temp_dir("ttl_delete_failure_test_");
 
     ob::ColumnarStore store(tmp.string());
 
@@ -190,8 +188,7 @@ TEST(TTLDeletion, TTLDeleteFailure) {
 // ── TTLDisabledNoDelete: run with ttl_hours=0, verify no segments deleted
 // Validates: Requirement 5.2
 TEST(TTLDeletion, TTLDisabledNoDelete) {
-    auto tmp = fs::temp_directory_path() / "ttl_disabled_test";
-    fs::remove_all(tmp);
+    auto tmp = ob::test::own_temp_dir("ttl_disabled_test_");
 
     ob::ColumnarStore store(tmp.string());
 
@@ -234,9 +231,7 @@ RC_GTEST_PROP(TTLProperty, ExpiredSegmentDeletionCorrectness, ()) {
     uint64_t cutoff = *rc::gen::inRange<uint64_t>(1, 15000);
 
     // Create temp directory and segments
-    static std::atomic<uint64_t> counter{0};
-    auto unique_tmp = fs::temp_directory_path() / ("ttl_prop2_" + std::to_string(counter.fetch_add(1)));
-    fs::remove_all(unique_tmp);
+    auto unique_tmp = ob::test::own_temp_dir("ttl_prop2_");
 
     ob::ColumnarStore store(unique_tmp.string());
 
@@ -290,9 +285,7 @@ RC_GTEST_PROP(TTLProperty, TTLZeroPreservesAllSegments, ()) {
     // Generate 1–20 segments with random timestamps
     auto seg_count = *rc::gen::inRange(1, 21);
 
-    static std::atomic<uint64_t> counter5{0};
-    auto unique_tmp = fs::temp_directory_path() / ("ttl_prop5_" + std::to_string(counter5.fetch_add(1)));
-    fs::remove_all(unique_tmp);
+    auto unique_tmp = ob::test::own_temp_dir("ttl_prop5_");
 
     ob::ColumnarStore store(unique_tmp.string());
 
@@ -504,7 +497,7 @@ TEST(TTLSweep, ARestartWithARetentionLongerThanTheMachineHasBeenUpKeepsWhatIsNew
     const uint64_t ttl_hours = static_cast<uint64_t>(std::ceil(up / 3600.0)) + 1;
     ASSERT_GT(static_cast<double>(ttl_hours) * 3600.0, up);
 
-    const SweepOutcome o = sweep_after_restart(fs::temp_directory_path() / "ttl_sweep_uptime",
+    const SweepOutcome o = sweep_after_restart(ob::test::own_temp_dir("ttl_sweep_uptime_"),
                                                ttl_hours, ttl_hours + 2, 50);
     // The sweep ran: the rows older than the retention are the ones it was asked to expire...
     EXPECT_GE(o.segments_deleted, 1u);
@@ -520,7 +513,7 @@ TEST(TTLSweep, TheFirstSweepRunsAtTheFirstTickWhateverTheInterval) {
     // one there is none: counted from the monotonic clock's zero - this machine's boot - instead,
     // the first sweep of a node on a machine up for less than its interval would wait out the rest
     // of it, and a node restarted after a long stop would keep its expired rows that long.
-    const SweepOutcome o = sweep_after_restart(fs::temp_directory_path() / "ttl_sweep_first_tick", 1,
+    const SweepOutcome o = sweep_after_restart(ob::test::own_temp_dir("ttl_sweep_first_tick_"), 1,
                                                3, 50, 1'000'000'000ULL);
     EXPECT_GE(o.segments_deleted, 1u) << "no sweep ran within ten seconds of starting";
     EXPECT_EQ(o.old_rows, 0);
@@ -532,7 +525,7 @@ TEST(TTLSweep, RowsOlderThanTheRetentionExpireAndNewerOnesStay) {
     // an hour, its cutoff was an hour into 1970 and nothing expired; up for less, it wrapped and
     // everything did.
     const SweepOutcome o =
-        sweep_after_restart(fs::temp_directory_path() / "ttl_sweep_one_hour", 1, 3, 50);
+        sweep_after_restart(ob::test::own_temp_dir("ttl_sweep_one_hour_"), 1, 3, 50);
     EXPECT_GE(o.segments_deleted, 1u) << "no sweep deleted anything within ten seconds";
     EXPECT_EQ(o.old_rows, 0);
     EXPECT_EQ(o.fresh_rows, 50);

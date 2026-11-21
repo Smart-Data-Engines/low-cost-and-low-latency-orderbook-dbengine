@@ -294,9 +294,11 @@ void MultiMasterManager::start() {
     io_thread_ = std::thread([this] {
         run_thread_body("mm", "io_loop", [this] { io_loop(); });
     });
+    name_thread(io_thread_, "ob-mm-io");
     reconnect_thread_ = std::thread([this] {
         run_thread_body("mm", "reconnect_loop", [this] { reconnect_loop(); });
     });
+    name_thread(reconnect_thread_, "ob-mm-reconnect");
 
     OB_LOG_INFO("mm", "MultiMasterManager started: node_id=%u port=%u",
                 config_.node_id, config_.replication_port);

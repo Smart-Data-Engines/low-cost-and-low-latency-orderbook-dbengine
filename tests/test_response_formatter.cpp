@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <sstream>
@@ -115,6 +116,19 @@ std::string to_string_row(const ob::QueryResult& r) {
            std::to_string(r.sequence_number);
 }
 
+/// The QueryResult notify_subscribers() gives a row callback for this row.
+ob::QueryResult row_of(const ob::SnapshotRow& s) {
+    ob::QueryResult r{};
+    r.timestamp_ns    = s.timestamp_ns;
+    r.sequence_number = s.sequence_number;
+    r.price           = s.price;
+    r.quantity        = s.quantity;
+    r.order_count     = s.order_count;
+    r.side            = s.side;
+    r.level           = s.level_index;
+    return r;
+}
+
 /// A value of `digits` digits, 1 to 20, uniformly within them.
 uint64_t of_length(std::mt19937_64& gen, int digits) {
     uint64_t lo = 1;
@@ -149,6 +163,34 @@ TEST(ResponseFormatter, RowsOfEveryLengthAreTheBytesToStringWrote) {
         ASSERT_EQ(ls[2 + i], to_string_row(rows[i])) << "row " << i;
         ASSERT_EQ(ob::format_push(i, rows[i]),
                   "PUSH " + std::to_string(i) + "\t" + to_string_row(rows[i]) + "\n") << "row " << i;
+    }
+}
+
+// A push is written in two pieces where a write reaches many subscriptions (#263): its head once a
+// subscription, its row once a write. Together they are format_push()'s bytes, for rows with every
+// field at every length and ids of every length, from the SnapshotRow the write path holds.
+TEST(ResponseFormatter, APushsHeadAndRowPiecesAreFormatPushsBytes) {
+    std::mt19937_64 gen(263);
+    for (int i = 0; i < 4000; ++i) {
+        ob::SnapshotRow s{};
+        s.timestamp_ns    = of_length(gen, 1 + i % 20);
+        const auto price  = static_cast<int64_t>(std::min<uint64_t>(
+            of_length(gen, 1 + (i / 20) % 19), std::numeric_limits<int64_t>::max()));
+        s.price           = (i / 7) % 2 == 0 ? price : -price;
+        s.quantity        = of_length(gen, 1 + (i / 3) % 20);
+        s.order_count     = static_cast<uint32_t>(of_length(gen, 1 + i % 10));
+        s.side            = static_cast<uint8_t>(gen());
+        s.level_index     = static_cast<uint16_t>(gen());
+        s.sequence_number = of_length(gen, 1 + (i / 11) % 20);
+        const uint64_t id = of_length(gen, 1 + (i / 13) % 20);
+
+        char head[ob::kPushHeadRoom];
+        char row[ob::kPushRowRoom];
+        const std::string pieces =
+            std::string(head, ob::format_push_head(head, std::end(head), id)) +
+            std::string(row, ob::format_push_row(row, std::end(row), s));
+        const ob::QueryResult r = row_of(s);
+        ASSERT_EQ(pieces, ob::format_push(id, r)) << "row " << i;
     }
 }
 

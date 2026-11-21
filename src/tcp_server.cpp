@@ -1,4 +1,6 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/off_loop_reads.hpp"
+#include "orderbook/tls_handshake_pool.hpp"
 #include "orderbook/net.hpp"
 
 #include "orderbook/backup.hpp"
@@ -959,54 +961,68 @@ std::string answer_too_large(uint64_t rows_within) {
 }
 
 /// A read's answer - `SELECT` and `BOOK` - with what both do around the engine's call: the refusal
-/// during a snapshot bootstrap, the rows formatted as the engine hands them over, and the latency
-/// and counters every read shares. `read` makes the call with the row callback it is given and
-/// returns the engine's refusal, empty when there is none.
+/// during a snapshot bootstrap, the rows formatted as the engine hands them over, measured against what
+/// the session may be sent (#257), and the latency and the registry's count every read shares. `read`
+/// makes the call with the row callback it is given and returns the engine's refusal, empty when there
+/// is none. No session in it (#260): a thread off the client loop builds a large read's answer here as
+/// the loop builds the others, and the caller does the session's part.
 ///
 /// Refused during a bootstrap because a replica installing a snapshot is replacing the store under
 /// itself (#142), and an answer composed across that is an answer about two trees. Each row is
 /// formatted as it arrives (#49 step 3), not collected first: the vector of rows that was replaced
 /// was three quarters of a turned-over heap's page faults, so the latency includes formatting.
+struct ReadAnswer {
+    std::string answer;
+    bool        framed{false};      ///< an LZ4 frame already (#257)
+    uint64_t    text_bytes{0};      ///< the text a frame holds
+    bool        counted{false};     ///< a query that ran, which the session and the server count
+    bool        taken_away{false};  ///< no answer: the engine's ReadGate handed it back (#260)
+};
+
 template <typename Read>
-std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
-                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
-    session.increment_commands();
-    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+ReadAnswer build_read_answer(const char* what, int fd, Engine& engine, MetricsRegistry* registry,
+                             QueryShape& shape, std::string room, AnswerCeiling ceiling, Read&& read) {
+    ReadAnswer out;
+    if (engine.is_bootstrapping()) {
+        out.answer = format_error("bootstrapping");
+        return out;
+    }
     const auto started = std::chrono::steady_clock::now();
-    // Written in the session's send buffer's room, which take_answer() gives back with the reply
-    // (#253): a session's large answers are written where the last one was. Measured against what
-    // the session may be sent as it is built (#257) - its frame, where the session compresses - so
-    // that an answer past it stops being read and formatted there, rather than at its last row.
-    QueryResponseBuilder reply(shape, session.lend_room(),
-                               AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()});
+    QueryResponseBuilder reply(shape, std::move(room), ceiling);
     try {
         // The builder twice: as a row callback for whatever arrives one result at a time, and as
         // the place a row answer's batches go (OB-12).
         const std::string err = read([&](const QueryResult& r) { reply.add(r); },
                                      static_cast<RowAnswer&>(reply));
+        if (err == kReadTakenAway) {
+            out.taken_away = true;
+            return out;
+        }
         if (!err.empty()) {
-            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, session.fd(),
+            OB_LOG_DEBUG("tcp_server", "%s from fd=%d refused: %s", what, fd,
                          sanitise_for_log(err, 256).c_str());
-            return format_error(err);
+            out.answer = format_error(err);
+            return out;
         }
     } catch (const std::exception& e) {
-        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, session.fd(),
-                     sanitise_for_log(e.what(), 256).c_str());
-        return format_error(e.what());
+        OB_LOG_DEBUG("tcp_server", "%s from fd=%d threw: %s", what, fd, sanitise_for_log(e.what(), 256).c_str());
+        out.answer = format_error(e.what());
+        return out;
     }
     if (reply.full()) {
         // No client could be sent this however fast it reads: refused as #152 refuses it, with the
         // session left open - but now where it passed the ceiling, not after its last row (#257).
         OB_LOG_INFO("tcp_server", "%s from fd=%d passed its answer's ceiling of %zu bytes after %llu "
                     "row(s), %zu byte(s) built (%s): refused, the first %llu row(s) within it", what,
-                    session.fd(), Session::max_queued_bytes(),
-                    static_cast<unsigned long long>(reply.rows_taken()), reply.bytes_built(),
-                    reply.framed() ? "an LZ4 frame" : "text",
+                    fd, ceiling.bytes, static_cast<unsigned long long>(reply.rows_taken()),
+                    reply.bytes_built(), reply.framed() ? "an LZ4 frame" : "text",
                     static_cast<unsigned long long>(reply.rows_within()));
-        return format_error(answer_too_large(reply.rows_within()));
+        out.answer = format_error(answer_too_large(reply.rows_within()));
+        return out;
     }
-    std::string answer = reply.finish();
-    if (reply.framed()) session.next_answer_framed(reply.text_bytes());
+    out.answer     = reply.finish();
+    out.framed     = reply.framed();
+    out.text_bytes = reply.text_bytes();
     if (registry) {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -1016,9 +1032,46 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
         registry->observe_histogram("ob_query_latency_seconds", secs);
         registry->increment_counter("ob_total_queries");
     }
-    session.increment_queries();
-    stats.total_queries.fetch_add(1, std::memory_order_relaxed);
-    return answer;
+    out.counted = true;
+    return out;
+}
+
+/// build_read_answer() on the loop, with the session's part: its command and query counted, the
+/// answer written in its send buffer's room (#253), and a frame marked for take_answer() (#257).
+template <typename Read>
+std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
+                        MetricsRegistry* registry, QueryShape& shape, Read&& read) {
+    session.increment_commands();
+    // Before the room is lent, so that a refused read leaves the session the room it had.
+    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+    ReadAnswer r = build_read_answer(what, session.fd(), engine, registry, shape, session.lend_room(),
+                                     AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()},
+                                     std::forward<Read>(read));
+    if (r.taken_away) return std::string(kAnsweredOffLoop);
+    if (r.framed) session.next_answer_framed(r.text_bytes);
+    if (r.counted) {
+        session.increment_queries();
+        stats.total_queries.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::move(r.answer);
+}
+
+/// FLUSH's work and its answer, on the loop or off it (#261): `OK`, or the failure that stopped the
+/// flush - a WAL or segment sync that failed is the client's to know, as it always was.
+std::string flush_answer(Engine& engine, MetricsRegistry* registry) {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        engine.flush_incremental();
+    } catch (const std::exception& e) {
+        return format_error(e.what());
+    }
+    if (registry) {
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        registry->observe_histogram("ob_flush_latency_seconds", secs);
+        registry->increment_counter("ob_total_flushes");
+    }
+    return format_ok();
 }
 
 /// `STATUS`, from a snapshot taken for this answer rather than from the `ServerStats` every
@@ -1123,7 +1176,8 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord,
                             SubscriptionHub* hub,
                             const SecretStore* client_secrets,
-                            BackupRunner* backups) {
+                            BackupRunner* backups,
+                            OffLoopWork* off_loop) {
     // ── Authentication gate ───────────────────────────────────────────────────
     //
     // Before the switch, not as a branch inside each case. A per-case check means the next command
@@ -1201,10 +1255,20 @@ std::string execute_command(const Command& cmd,
         // client while the engine computed them correctly. The engine fills `shape` in as it
         // parses the query.
         QueryShape shape;
-        return answer_read("SELECT", engine, session, stats, registry, shape,
-                           [&](auto row, RowAnswer& rows) {
-                               return engine.execute(cmd.raw_sql, row, shape, &rows);
-                           });
+        // A read the index puts at kOffLoopReadRows or more goes to the threads off the loop, and
+        // the loop goes on with its other sessions (#260). The engine hands it back once it has
+        // parsed the query and before it reads a row, so a small read pays for the question alone.
+        ReadGate gate{kOffLoopReadRows, 0};
+        ReadGate* const asked = off_loop != nullptr && off_loop->may_take(session) ? &gate : nullptr;
+        std::string answer = answer_read("SELECT", engine, session, stats, registry, shape,
+                                         [&](auto row, RowAnswer& rows) {
+                                             return engine.execute(cmd.raw_sql, row, shape, &rows,
+                                                                   asked);
+                                         });
+        if (asked != nullptr && answer == kAnsweredOffLoop) {
+            off_loop->take_read(cmd, session, gate.rows_at_most);
+        }
+        return answer;
     }
 
     case CommandType::BOOK: {
@@ -1234,18 +1298,14 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        auto t0_flush = std::chrono::steady_clock::now();
-        try {
-            engine.flush_incremental();
-        } catch (const std::exception& e) {
-            return format_error(e.what());
+        // Writing the segments held the loop, and every session on it, for as long as they took:
+        // 112-180 ms of 500 000 rows in 1 000 books on the ARM host. Past its refusals, a FLUSH is
+        // the threads' off the loop (#261), and its session waits for its answer.
+        if (off_loop != nullptr && off_loop->may_take(session)) {
+            off_loop->take_flush(session);
+            return std::string(kAnsweredOffLoop);
         }
-        if (registry) {
-            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_flush).count();
-            registry->observe_histogram("ob_flush_latency_seconds", secs);
-            registry->increment_counter("ob_total_flushes");
-        }
-        return format_ok();
+        return flush_answer(engine, registry);
     }
 
     case CommandType::PING:
@@ -1537,6 +1597,9 @@ const std::vector<std::string>& known_flags() {
         "io-spin-us",
         "io-threads",
         "scan-threads",
+        "large-read-threads",
+        "tls-handshake-threads",
+        "tls-handshake-timeout-ms",
         "handover-grace-seconds",
         "log-level",
         "max-query-buckets",
@@ -1640,6 +1703,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
         {"scan-threads", {"<N>", "Threads a query's segments are read on, 0 to 64 (default: 0 under every profile). A query whose rows in range are many and spread over two segments or more divides them among these, about twice as fast alone on four cores; beside writes it costs them, so 0 reads every segment on the query's loop"}},
+        {"large-read-threads", {"<N>", "Threads a large SELECT is answered on, off the client loops, 0 to 64 (default: 2; 0 answers every read on its loop): a read whose scan the index puts at 100000 rows or more, while the loop serves its other sessions (#260)"}},
+        {"tls-handshake-threads", {"<N>", "Threads the client port's TLS handshakes are driven on, off the client loops, 0 to 64 (default: 1; 0 drives each handshake on the loop its connection is dealt to): a loop's sessions do not wait while it signs for new connections (#265)"}},
+        {"tls-handshake-timeout-ms", {"<MS>", "How long a TLS handshake on those threads may take before the connection is closed and its place in --max-sessions given back, 100 to 600000 (default: 10000) (#265)"}},
         {"profile", {"<name>", "boost (default: one client event loop per usable CPU, and a 10 us spin where it cannot starve anything) or eco (one loop, blocking between events). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
@@ -2215,6 +2281,12 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.io_threads = cursor.value_as<uint32_t>();
         } else if (arg == "--scan-threads") {
             config.scan_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--large-read-threads") {
+            config.large_read_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--tls-handshake-threads") {
+            config.tls_handshake_threads = cursor.value_as<uint32_t>();
+        } else if (arg == "--tls-handshake-timeout-ms") {
+            config.tls_handshake_timeout_ms = cursor.value_as<uint32_t>();
         } else if (arg == "--profile") {
             config.profile = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
@@ -2281,6 +2353,31 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                      "Error: --scan-threads (%u) must be between 0 and %u. It is the number of "
                      "threads a query's segments are read on; 0 reads them on the query's loop.\n",
                      config.scan_threads, kMaxScanThreads);
+        std::exit(1);
+    }
+    // The threads off the loops (#260): 0 answers every read on its loop; past the cap is a typo.
+    if (config.large_read_threads > kMaxScanThreads) {
+        std::fprintf(stderr,
+                     "Error: --large-read-threads (%u) must be between 0 and %u. It is the number of "
+                     "threads a large SELECT is answered on, off the client loops; 0 answers every "
+                     "read on its loop.\n",
+                     config.large_read_threads, kMaxScanThreads);
+        std::exit(1);
+    }
+    // The TLS handshake threads (#265): 0 drives each handshake on its loop; past the cap is a typo.
+    if (config.tls_handshake_threads > kMaxScanThreads) {
+        std::fprintf(stderr,
+                     "Error: --tls-handshake-threads (%u) must be between 0 and %u. It is the number "
+                     "of threads the client port's TLS handshakes are driven on, off the client loops; "
+                     "0 drives each on its loop.\n",
+                     config.tls_handshake_threads, kMaxScanThreads);
+        std::exit(1);
+    }
+    if (config.tls_handshake_timeout_ms < 100 || config.tls_handshake_timeout_ms > 600'000) {
+        std::fprintf(stderr,
+                     "Error: --tls-handshake-timeout-ms (%u) must be between 100 and 600000: how long "
+                     "a TLS handshake on its threads may take before the connection is closed.\n",
+                     config.tls_handshake_timeout_ms);
         std::exit(1);
     }
 
@@ -2560,6 +2657,9 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("io-spin-us", std::to_string(c.io_spin_us));
     line("io-threads", std::to_string(c.io_threads));
     line("scan-threads", std::to_string(c.scan_threads));
+    line("large-read-threads", std::to_string(c.large_read_threads));
+    line("tls-handshake-threads", std::to_string(c.tls_handshake_threads));
+    line("tls-handshake-timeout-ms", std::to_string(c.tls_handshake_timeout_ms));
     line("profile", c.profile);
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
@@ -2940,9 +3040,16 @@ struct ReactorShared {
 
     /// Which reactors are serving events, now or a moment ago, for a scan that could divide (#249).
     LoopLoad*                loop_load;
+
+    /// The threads large reads are answered on, off the loops (#260); null with --large-read-threads 0.
+    OffLoopPool*             off_loop_pool;
+
+    /// The threads the client port's TLS handshakes are driven on (#265); null without TLS on the
+    /// client port, or with --tls-handshake-threads 0.
+    TlsHandshakePool*        tls_handshakes;
 };
 
-class Reactor {
+class Reactor final : public OffLoopWork {
 public:
     /// `listen_fd` is the server's listening socket for the reactor that accepts, and a descriptor
     /// of -1 for any other; `unix_listen_fd` the same for the Unix socket (#52), -1 without one. A
@@ -2963,14 +3070,18 @@ public:
     /// `Session` belongs to the thread that serves it from its first byte.
     /// `local`: the connection came through the Unix socket (#52), which has no TLS.
     void hand_off(int fd, uint64_t conn_id, bool local);
+    /// Give this reactor a TLS connection whose handshake a thread of the pool did (#265): adopted as
+    /// hand_off()'s are, its session reading and writing through `ssl` from the first event.
+    void hand_off_established(int fd, uint64_t conn_id, std::shared_ptr<ssl_st> ssl);
 
     int index() const { return index_; }
 
 private:
     /// Take ownership of an accepted connection: session, epoll registration, TLS, banner. The
     /// session count was taken at accept, so every failure here gives it back. A `local` connection,
-    /// from the Unix socket, is plaintext whatever the client port's TLS says (#52).
-    void adopt(int fd, uint64_t conn_id, bool local);
+    /// from the Unix socket, is plaintext whatever the client port's TLS says (#52). `done`: the SSL of a
+    /// handshake the pool did (#265); without it the loop starts the handshake, as it always did.
+    void adopt(int fd, uint64_t conn_id, bool local, std::shared_ptr<ssl_st> done = nullptr);
 
     /// Every connection waiting on a listening socket: refused while draining, otherwise counted
     /// against --max-sessions and dealt to a reactor. `local` for the Unix socket (#52).
@@ -2996,6 +3107,23 @@ private:
     /// What execute_command() checks an AUTH and a permission against: null without client
     /// authentication.
     const SecretStore* client_store() const { return clients_->empty() ? nullptr : clients_.get(); }
+    /// A session whose large reads may go off the loop (#260): one the loop can pause - not one in
+    /// rings, whose events the loop makes itself - on a node with threads to answer them.
+    bool may_take(const Session& session) const override;
+    /// A large read handed to the threads off the loop, which the engine gave back before its scan
+    /// (#260), and its session paused.
+    void take_read(const Command& cmd, Session& session, uint64_t rows_at_most) override;
+    /// A FLUSH handed to the threads off the loop (#261), and its session paused.
+    void take_flush(Session& session) override;
+    /// The answers that came back off the loop, each queued on its session, and the session put in
+    /// `resume_`.
+    void take_off_loop_answers();
+    /// The sessions in `resume_` - an answer of theirs came back off the loop (#260), or they were
+    /// adopted with their TLS handshake done off it (#265) - each an event as if readable and writable
+    /// appended to the `nfds` of this pass, so that what is queued is flushed, the commands held behind
+    /// it run and the socket is read again. Returns the events now in the pass; a session that does not
+    /// fit is resumed on the next.
+    int append_resumed(int nfds);
 
     /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
     ///
@@ -3022,6 +3150,14 @@ private:
     /// This loop's copy of the client store in force, and its generation (#258).
     std::shared_ptr<const SecretStore> clients_;
     uint64_t                 clients_generation_{0};
+    /// The threads large reads are answered on (#260), the mailbox their answers come back to - shared
+    /// with every read handed out, so that one finishing after this loop has gone writes to a mailbox
+    /// nobody reads - and the sessions resumed past the events one pass could take.
+    OffLoopPool*             off_loop_pool_;
+    /// The client port's TLS handshake threads (#265); null when the loops drive the handshakes.
+    TlsHandshakePool*        tls_handshakes_;
+    std::shared_ptr<OffLoopMailbox> mailbox_;
+    std::vector<int>         resume_;
     std::atomic<bool>&       running_;
     std::atomic<bool>&       draining_;
     ServerStats&             stats_;
@@ -3037,9 +3173,10 @@ private:
     int                      wake_fd_{-1};
     std::mutex               handoff_mtx_;
     struct HandedOff {
-        int      fd;
-        uint64_t conn_id;
-        bool     local;
+        int                     fd;
+        uint64_t                conn_id;
+        bool                    local;
+        std::shared_ptr<ssl_st> ssl;   ///< the handshake done off the loop (#265), or null
     };
     std::vector<HandedOff>   handoff_;   ///< under handoff_mtx_
 
@@ -3113,6 +3250,8 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
     , engine_(&shared.engine)
     , tls_(shared.tls)
     , credentials_(shared.credentials)
+    , off_loop_pool_(shared.off_loop_pool)
+    , tls_handshakes_(shared.tls_handshakes)
     , running_(shared.running)
     , draining_(shared.draining)
     , stats_(shared.stats)
@@ -3183,6 +3322,21 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd, int& un
         throw std::runtime_error("epoll_ctl() failed for reactor " + std::to_string(index_) +
                                  "'s wake descriptor: " + why);
     }
+    if (off_loop_pool_ != nullptr) {
+        // Where the answers of the reads this loop hands off come back (#260).
+        mailbox_ = std::make_shared<OffLoopMailbox>();
+        struct epoll_event mail_ev{};
+        mail_ev.events  = EPOLLIN | EPOLLET;
+        mail_ev.data.fd = mailbox_->event_fd();
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, mailbox_->event_fd(), &mail_ev) < 0) {
+            const std::string why = std::strerror(errno);
+            ::close(wake_fd_);
+            ::close(epoll_fd_);
+            wake_fd_ = epoll_fd_ = -1;
+            throw std::runtime_error("epoll_ctl() failed for reactor " + std::to_string(index_) +
+                                     "'s off-loop mailbox: " + why);
+        }
+    }
     OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, wake fd=%d, accepts=%s%s", index_,
                  epoll_fd_, wake_fd_, listen_fd_ >= 0 ? "yes" : "no",
                  unix_listen_fd_ >= 0 ? ", and on the unix socket" : "");
@@ -3237,6 +3391,137 @@ void Reactor::refresh_credentials() {
     if (closed > 0) engine_->registry().increment_counter("ob_auth_reload_sessions_closed_total", closed);
     clients_            = now.store;
     clients_generation_ = now.generation;
+}
+
+bool Reactor::may_take(const Session& session) const {
+    return off_loop_pool_ != nullptr && !session.in_rings();
+}
+
+void Reactor::take_read(const Command& cmd, Session& session, uint64_t rows_at_most) {
+    const int fd = session.fd();
+    const uint64_t conn_id = session.conn_id();
+    const AnswerCeiling ceiling{Session::max_queued_bytes(), session.is_compressed()};
+    Engine* engine = engine_;
+    MetricsRegistry* registry = &engine_->registry();
+    std::shared_ptr<OffLoopMailbox> mailbox = mailbox_;
+    const int index = index_;
+    const auto handed = std::chrono::steady_clock::now();
+    off_loop_pool_->submit([fd, conn_id, ceiling, engine, registry, mailbox, index, handed,
+                            sql = cmd.raw_sql] {
+        registry->observe_histogram(
+            "ob_off_loop_read_wait_seconds",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
+        // The answer as the loop builds it, in a buffer of the read's own: a session is the loop's.
+        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false, false};
+        try {
+            QueryShape shape;
+            ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::string(),
+                                             ceiling, [&](auto row, RowAnswer& rows) {
+                                                 return engine->execute(sql, row, shape, &rows);
+                                             });
+            out.answer     = std::move(r.answer);
+            out.framed     = r.framed;
+            out.text_bytes = r.text_bytes;
+            out.counted    = r.counted;
+        } catch (const std::exception& e) {
+            // The session is paused until an answer comes, so one comes whatever fails: a failure
+            // past the engine's call - the answer's buffer, its frame - answers as a refusal does.
+            OB_LOG_ERROR("tcp_server", "reactor %d: a read off the loop for fd=%d failed past the "
+                         "engine's call: %s", index, fd, e.what());
+            out = OffLoopAnswer{fd, conn_id, format_error(e.what()), false, 0, false, false};
+        }
+        OB_LOG_DEBUG("tcp_server", "reactor %d: an answer off the loop for fd=%d, %zu byte(s)%s", index,
+                     fd, out.answer.size(), out.framed ? " in an LZ4 frame" : "");
+        mailbox->post(std::move(out));
+    });
+    session.set_waiting_off_loop(true);
+    engine_->registry().increment_counter("ob_off_loop_reads_total");
+    engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", 1);
+    OB_LOG_DEBUG("tcp_server", "reactor %d: SELECT from fd=%d answered off the loop: the index puts %llu "
+                 "row(s) or more in its scan", index_, fd, static_cast<unsigned long long>(rows_at_most));
+}
+
+void Reactor::take_flush(Session& session) {
+    const int fd = session.fd();
+    const uint64_t conn_id = session.conn_id();
+    Engine* engine = engine_;
+    MetricsRegistry* registry = &engine_->registry();
+    std::shared_ptr<OffLoopMailbox> mailbox = mailbox_;
+    const int index = index_;
+    const auto handed = std::chrono::steady_clock::now();
+    off_loop_pool_->submit([fd, conn_id, engine, registry, mailbox, index, handed] {
+        registry->observe_histogram(
+            "ob_off_loop_flush_wait_seconds",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
+        OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false, true};
+        try {
+            out.answer = flush_answer(*engine, registry);
+        } catch (const std::exception& e) {
+            // The session is paused until an answer comes, so one comes whatever fails.
+            OB_LOG_ERROR("tcp_server", "reactor %d: a FLUSH off the loop for fd=%d failed past the "
+                         "engine's call: %s", index, fd, e.what());
+            out.answer = format_error(e.what());
+        }
+        OB_LOG_DEBUG("tcp_server", "reactor %d: a FLUSH off the loop for fd=%d answered: %s", index, fd,
+                     sanitise_for_log(out.answer, 160).c_str());
+        mailbox->post(std::move(out));
+    });
+    session.set_waiting_off_loop(true);
+    engine_->registry().increment_counter("ob_off_loop_flushes_total");
+    engine_->registry().increment_gauge("ob_off_loop_flushes_in_flight", 1);
+    OB_LOG_DEBUG("tcp_server", "reactor %d: FLUSH from fd=%d answered off the loop", index_, fd);
+}
+
+void Reactor::take_off_loop_answers() {
+    for (OffLoopAnswer& a : mailbox_->take()) {
+        engine_->registry().increment_gauge(
+            a.flush ? "ob_off_loop_flushes_in_flight" : "ob_off_loop_reads_in_flight", -1);
+        Session* s = sessions_.get_session(a.fd);
+        if (s == nullptr || s->conn_id() != a.conn_id) {
+            // Closed while its read was answered - and the descriptor maybe another's since.
+            OB_LOG_DEBUG("tcp_server", "reactor %d: an answer off the loop for fd=%d conn_id=%llu, whose "
+                         "session has gone: dropped", index_, a.fd,
+                         static_cast<unsigned long long>(a.conn_id));
+            continue;
+        }
+        s->set_waiting_off_loop(false);
+        // Its command was counted when the loop asked the engine: only the query is counted here.
+        if (a.counted) {
+            s->increment_queries();
+            stats_.total_queries.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (a.framed) s->next_answer_framed(a.text_bytes);
+        const Session::Queued queued = s->take_answer(std::move(a.answer));
+        if (queued == Session::Queued::TooLargeAlone) {
+            const std::string refusal = format_error(answer_too_large(0));
+            if (!s->queue_response(refusal)) {
+                close_session(a.fd, "send failed");
+                continue;
+            }
+        } else if (queued == Session::Queued::CapExceeded) {
+            close_session(a.fd, "send failed");
+            continue;
+        }
+        // Armed here, as the end of a read's batch arms it: an answer larger than the socket takes in
+        // one send is finished by EPOLLOUT, and the read the resumed session makes next would leave
+        // nothing armed to finish it - its receive() says it wants to read.
+        if (s->has_pending_output()) arm_epollout(a.fd);
+        resume_.push_back(a.fd);
+    }
+}
+
+int Reactor::append_resumed(int nfds) {
+    // As if readable and writable: the answer flushed, the commands held behind it run, and the socket
+    // read to EAGAIN - which, edge-triggered, it would not report again for what came while it waited.
+    size_t taken = 0;
+    while (taken < resume_.size() && nfds < MAX_EVENTS) {
+        events_[nfds].events  = EPOLLIN | EPOLLOUT;
+        events_[nfds].data.fd = resume_[taken];
+        ++nfds;
+        ++taken;
+    }
+    resume_.erase(resume_.begin(), resume_.begin() + static_cast<std::ptrdiff_t>(taken));
+    return nfds;
 }
 
 void Reactor::close_session(int fd, const char* reason) {
@@ -3345,7 +3630,7 @@ void Reactor::serve_ring_output(Session& s) {
 void Reactor::hand_off(int fd, uint64_t conn_id, bool local) {
     {
         std::lock_guard<std::mutex> lock(handoff_mtx_);
-        handoff_.push_back(HandedOff{fd, conn_id, local});
+        handoff_.push_back(HandedOff{fd, conn_id, local, nullptr});
     }
     const uint64_t one = 1;
     const ssize_t wr = ::write(wake_fd_, &one, sizeof(one));
@@ -3359,6 +3644,21 @@ void Reactor::hand_off(int fd, uint64_t conn_id, bool local) {
                  static_cast<unsigned long long>(conn_id), index_);
 }
 
+void Reactor::hand_off_established(int fd, uint64_t conn_id, std::shared_ptr<ssl_st> ssl) {
+    {
+        std::lock_guard<std::mutex> lock(handoff_mtx_);
+        handoff_.push_back(HandedOff{fd, conn_id, /*local=*/false, std::move(ssl)});
+    }
+    const uint64_t one = 1;
+    const ssize_t wr = ::write(wake_fd_, &one, sizeof(one));
+    if (wr != static_cast<ssize_t>(sizeof(one))) {
+        OB_LOG_WARN("tcp_server", "Reactor %d: wake write for fd=%d returned %zd: %s", index_, fd,
+                    wr, std::strerror(errno));
+    }
+    OB_LOG_DEBUG("tcp_server", "Handed fd=%d (conn_id=%llu), its TLS handshake done, to reactor %d", fd,
+                 static_cast<unsigned long long>(conn_id), index_);
+}
+
 void Reactor::adopt_handed_off() {
     uint64_t counter = 0;
     const ssize_t rd = ::read(wake_fd_, &counter, sizeof(counter));
@@ -3368,12 +3668,12 @@ void Reactor::adopt_handed_off() {
         std::lock_guard<std::mutex> lock(handoff_mtx_);
         taken.swap(handoff_);
     }
-    for (const HandedOff& h : taken) {
-        adopt(h.fd, h.conn_id, h.local);
+    for (HandedOff& h : taken) {
+        adopt(h.fd, h.conn_id, h.local, std::move(h.ssl));
     }
 }
 
-void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
+void Reactor::adopt(int fd, uint64_t conn_id, bool local, std::shared_ptr<ssl_st> done) {
     // Every failure below gives back the place in the session count the accepting reactor took.
     const auto give_back = [&] {
         stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
@@ -3382,9 +3682,15 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
 
     if (!sessions_.add_session(fd, conn_id)) {
         // Not the global limit, which the accepting reactor applied: this reactor's own table.
+        // Not to a session whose TLS handshake is done (#265): it reads records, not this in the
+        // clear, and is told by the close.
         const char* msg = "ERR server full\n";
-        auto wr = ::send(fd, msg, std::strlen(msg), MSG_NOSIGNAL);
-        (void)wr;
+        if (!done) {
+            auto wr = ::send(fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+            (void)wr;
+        }
+        OB_LOG_WARN("tcp_server", "Reactor %d: no room for fd=%d (conn_id=%llu) in its session table; "
+                    "closed", index_, fd, static_cast<unsigned long long>(conn_id));
         ::close(fd);
         give_back();
         return;
@@ -3404,7 +3710,13 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
 
     Session* s = sessions_.get_session(fd);
     if (s) s->set_local(local, config_.rings ? config_.ring_bytes : 0);
-    if (s && tls_.client_port && !local) {
+    if (s && done) {
+        // The handshake a thread of the pool did (#265). What the client sent behind its Finished is in
+        // the socket, and the registration above reported it: without read-ahead, which no context
+        // here turns on, OpenSSL reads a record at a time. With it, those bytes would be in the SSL's
+        // buffer, where this loop's epoll does not see them, so the session is resumed below anyway.
+        s->enable_tls_done(std::move(done));
+    } else if (s && tls_.client_port && !local) {
         // Wrap before anything is written: the banner is application data and must not precede
         // the handshake. It is queued here and goes out with the first flush after the handshake
         // completes, which is what send_response() on a handshaking session does - the bytes sit in
@@ -3434,7 +3746,9 @@ void Reactor::adopt(int fd, uint64_t conn_id, bool local) {
     if (s) {
         static const std::string banner =
             "OK ob_tcp_server v" + std::string(version()) + "\n\n";
+        const bool handshake_done = s->tls_enabled() && !s->tls_handshaking();
         s->send_response(banner);
+        if (handshake_done) resume_.push_back(fd);
     }
 }
 
@@ -3499,7 +3813,13 @@ void Reactor::accept_from(int listen_fd, bool local) {
         // Dealt in turn, so four connections on four reactors are one each, and a
         // connection stays where it is dealt for its whole life.
         const uint64_t conn_id = next_conn_id_++;
-        Reactor* target = (*reactors_)[next_reactor_++ % reactors_->size()];
+        const size_t   dealt   = next_reactor_++ % reactors_->size();
+        Reactor* target = (*reactors_)[dealt];
+        if (tls_handshakes_ != nullptr && tls_.client_port && !local) {
+            // Its handshake on a thread of the pool, and then to the loop it is dealt to (#265).
+            tls_handshakes_->submit(client_fd, conn_id, dealt);
+            continue;
+        }
         if (target == this) {
             adopt(client_fd, conn_id, local);
         } else {
@@ -3565,7 +3885,9 @@ void Reactor::run_loop() {
         // Waiting is not serving: a scan deciding whether to divide counts the loops serving, or
         // that served within ScanPool::kLoopRecent (#249).
         loop_load_->stopped(static_cast<size_t>(index_));
-        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, ring_filled ? 0 : wait_ms);
+        // Sessions resumed past the events one pass could take (#260) do not wait for the next event.
+        const int pass_wait_ms = ring_filled || !resume_.empty() ? 0 : wait_ms;
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, pass_wait_ms);
         if (nfds > 0) loop_load_->serving(static_cast<size_t>(index_));
         if (rings_told) {
             for (const auto& [sfd, rs] : ring_sessions_) rs->ring_woke();
@@ -3579,6 +3901,13 @@ void Reactor::run_loop() {
                     ++nfds;
                 }
             }
+        }
+        // The answers of the reads handed off, and their sessions resumed (#260).
+        // The answers of the reads handed off (#260), and the sessions resumed - by an answer that came
+        // back, or adopted with their TLS handshake done off the loop (#265).
+        if (nfds >= 0) {
+            if (mailbox_) take_off_loop_answers();
+            nfds = append_resumed(nfds);
         }
         if (nfds > 0) last_event_at_ = std::chrono::steady_clock::now();
         if (nfds < 0) {
@@ -3653,6 +3982,8 @@ void Reactor::run_loop() {
                     adopt_handed_off();
                     continue;
                 }
+                // Read at the start of the pass, with the answers it carried (#260).
+                if (mailbox_ && fd == mailbox_->event_fd()) continue;
 
                 // Sessions in rings (#52, step 2): a bell, or a ring the loop polled, stands for the
                 // session's socket being readable and writable at once. The socket itself carries
@@ -3717,6 +4048,11 @@ void Reactor::run_loop() {
                             const bool wants_write = session->io_want() == IoWant::Write;
                             if (!session->has_pending_output() || !wants_write) {
                                 disarm_epollout(fd);
+                            } else if (session->send_yielded()) {
+                                // The flush spent its slice with the socket maybe still writable
+                                // (#260), and no edge would say so: armed again, which reports it
+                                // on the next pass - after this pass's other sessions.
+                                arm_epollout(fd);
                             }
                             if (!session->has_pending_output() && session->close_requested()) {
                                 close_session(fd, "quit after flush");
@@ -3778,36 +4114,48 @@ void Reactor::run_loop() {
                     while (true) {
                         Session* session = sessions_.get_session(fd);
                         if (!session) break;
+                        // A command of this session is being answered off the loop (#260, #261):
+                        // nothing more of it is read until its answer is queued. The socket keeps
+                        // the rest, and TCP tells the client to wait.
+                        if (session->waiting_off_loop()) break;
 
-                        size_t got = 0;
-                        const Session::IoResult r = session->receive(buf, sizeof(buf), got);
-                        if (r == Session::IoResult::Closed) {
-                            close_session(fd, "peer closed");
-                            break;
-                        }
-                        if (r == Session::IoResult::Error) {
-                            close_session(fd, "read error");
-                            break;
-                        }
-                        if (r == Session::IoResult::Again) {
-                            // Nothing more now. With TLS this can mean OpenSSL wants to *write*, so
-                            // arm what it asked for rather than assuming readability.
-                            if (session->io_want() == IoWant::Write) arm_epollout(fd);
-                            break;
-                        }
+                        std::vector<std::string> lines;
+                        if (session->has_held_lines()) {
+                            // The commands that came behind a large read, now that its answer is
+                            // queued (#260): run before anything more is read from the socket.
+                            lines = session->take_held_lines();
+                        } else {
+                            size_t got = 0;
+                            const Session::IoResult r = session->receive(buf, sizeof(buf), got);
+                            if (r == Session::IoResult::Closed) {
+                                close_session(fd, "peer closed");
+                                break;
+                            }
+                            if (r == Session::IoResult::Error) {
+                                close_session(fd, "read error");
+                                break;
+                            }
+                            if (r == Session::IoResult::Again) {
+                                // Nothing more now. With TLS this can mean OpenSSL wants to *write*,
+                                // so arm what it asked for rather than assuming readability.
+                                if (session->io_want() == IoWant::Write) arm_epollout(fd);
+                                break;
+                            }
 
-                        auto lines = session->feed(buf, got);
+                            lines = session->feed(buf, got);
 
-                        // Outside the loop below, and that is the whole point: a client that never
-                        // sends a newline produces **no lines**, so every check written per line —
-                        // including `max_line_length` directly under here — never runs for it, and
-                        // the session accumulates for ever. Measured before this: 227 MiB on one
-                        // unauthenticated connection took the server to 257 MiB resident (#143).
-                        if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
-                            engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
-                            session->send_response(format_error("unparsed input too long"));
-                            close_session(fd, "unparsed input too long");
-                            goto next_event;
+                            // Outside the loop below, and that is the whole point: a client that
+                            // never sends a newline produces **no lines**, so every check written per
+                            // line — including `max_line_length` directly under here — never runs for
+                            // it, and the session accumulates for ever. Measured before this: 227 MiB
+                            // on one unauthenticated connection took the server to 257 MiB resident
+                            // (#143).
+                            if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
+                                engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
+                                session->send_response(format_error("unparsed input too long"));
+                                close_session(fd, "unparsed input too long");
+                                goto next_event;
+                            }
                         }
 
                         {
@@ -3827,6 +4175,8 @@ void Reactor::run_loop() {
                             const char* close_after_flush = nullptr;
                             bool        quit              = false;
                             bool        queue_refused     = false;
+                            // A large read handed off (#260): the rest of the batch waits for it.
+                            bool        off_loop_paused   = false;
                             // RINGS as the read's last command (#52, step 2): its size and its
                             // answer, for after the flush.
                             uint64_t    rings_bytes       = 0;
@@ -3905,8 +4255,19 @@ void Reactor::run_loop() {
                                 // caller at a time, and released before the answer is queued.
                                 std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
                                 if (serialised_across_reactors(cmd.type)) alone.lock();
-                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, client_store(), backups_);
+                                std::string response = execute_command(cmd, *engine_, *session, stats_, engine_->read_only(), &engine_->registry(), shard_coord_, &hub_, client_store(), backups_, off_loop_pool_ != nullptr ? this : nullptr);
                                 if (alone.owns_lock()) alone.unlock();
+
+                                if (response == kAnsweredOffLoop) {
+                                    // Answered off the loop (#260): what came after it in this read
+                                    // runs once its answer is queued, and the socket waits with it.
+                                    const auto next = static_cast<size_t>(&line - lines.data()) + 1;
+                                    session->hold_lines(std::vector<std::string>(
+                                        std::make_move_iterator(lines.begin() + static_cast<std::ptrdiff_t>(next)),
+                                        std::make_move_iterator(lines.end())));
+                                    off_loop_paused = true;
+                                    break;
+                                }
 
                                 if (response.empty()) {
                                     quit = true;
@@ -4013,6 +4374,12 @@ void Reactor::run_loop() {
                                 if (!session->has_pending_output()) {
                                     close_session(fd, "close requested after flush");
                                 }
+                                goto next_event;
+                            }
+
+                            if (off_loop_paused) {
+                                // Its answer resumes it (#260): the commands held and the socket are
+                                // read then, through this path.
                                 goto next_event;
                             }
                         }
@@ -4242,9 +4609,33 @@ void TcpServer::run() {
     // address on this frame's stack that the engine holds; the engine holds it only while the
     // reactors run.
     loop_load_ = std::make_unique<LoopLoad>(config_.io_threads);
-    ReactorShared shared{config_,    *engine_, tls_,  credentials_, running_,
+    // The threads large reads are answered on, off the loops (#260). Made before the loops and
+    // gone before the engine: a read finishing after its loop posts to a mailbox it shares.
+    std::unique_ptr<OffLoopPool> off_loop_pool;
+    if (config_.large_read_threads > 0) {
+        off_loop_pool = std::make_unique<OffLoopPool>(config_.large_read_threads);
+    }
+    // The client port's TLS handshakes, off the loops (#265). Made before the loops, because the one
+    // that accepts submits to it, and stopped once they have stopped and before they are gone: a
+    // handshake completed after that would be handed to a loop that no longer exists. `dealt_to` is
+    // filled as the loops are made, before any of them runs.
+    std::unique_ptr<TlsHandshakePool> tls_handshakes;
+    if (tls_.client_port && config_.tls_handshake_threads > 0) {
+        tls_handshakes = std::make_unique<TlsHandshakePool>(
+            config_.tls_handshake_threads, std::chrono::milliseconds(config_.tls_handshake_timeout_ms),
+            tls_.client_port, &engine_->registry(),
+            [&dealt_to](size_t loop, TlsHandshakePool::Done done) {
+                dealt_to[loop]->hand_off_established(done.fd, done.conn_id, std::move(done.ssl));
+            },
+            [this, &stats] {
+                stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                engine_->registry().increment_gauge("ob_active_sessions", -1);
+            });
+    }
+        ReactorShared shared{config_,    *engine_, tls_,  credentials_,      running_,
                          draining_,  stats, shard_coord.get(), metrics_server_.get(),
-                         &dealt_to, admin_mtx, backups.get(), loop_load_.get()};
+                         &dealt_to, admin_mtx, backups.get(), loop_load_.get(),
+                         off_loop_pool.get(), tls_handshakes.get()};
     const unsigned cpus = config_.usable_cpus > 0 ? config_.usable_cpus : config_.io_threads;
     engine_->set_loop_load(loop_load_.get(), cpus);
     struct Unload {
@@ -4262,6 +4653,12 @@ void TcpServer::run() {
     // and never changes while it is read.
     int no_listener = -1;
     std::vector<std::unique_ptr<Reactor>> reactors;
+    // Whichever way this function is left, the handshake threads stop before the loops they hand
+    // sessions to are gone (#265): declared after `reactors`, this is destroyed before them.
+    struct StopHandshakesFirst {
+        std::unique_ptr<TlsHandshakePool>& pool;
+        ~StopHandshakesFirst() { pool.reset(); }
+    } stop_handshakes_first{tls_handshakes};
     reactors.reserve(config_.io_threads);
     for (uint32_t i = 0; i < config_.io_threads; ++i) {
         reactors.push_back(std::make_unique<Reactor>(static_cast<int>(i), shared,
@@ -4326,6 +4723,10 @@ void TcpServer::run() {
         // Reactor 0 returned, so the server is stopping: a finished drain, a deadline, a fatal
         // error, or another reactor's failure. The block's end stops and joins the others.
     }
+    // The handshake threads before the loops they hand sessions to (#265): what they still hold is
+    // closed with its place given back, and what they handed on is in the loops' queues, which the
+    // next line closes.
+    tls_handshakes.reset();
     reactors.clear();   // closes every reactor's descriptors, and anything still handed off
 
     // listen_fd_ may already be closed by the reactor during drain, and unix_listen_fd_ with it.

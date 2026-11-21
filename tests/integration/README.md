@@ -82,6 +82,8 @@ tests/integration/
 ├── test_edge_cases.py                # input the server should refuse
 ├── test_large_response.py            # responses larger than the socket send buffer
 ├── test_answer_ceiling.py            # an answer past the session's ceiling refused where it passed it (#257)
+├── test_large_answer_isolation.py    # a large read answered off the client loop, the sessions beside it served (#260)
+├── test_flush_isolation.py           # a FLUSH answered off the client loop, the sessions beside it served (#261)
 ├── test_compression.py               # LZ4 session compression, negotiated and lossless
 ├── test_cli_tool.py                  # the interactive CLI refuses what it does not understand (#110)
 ├── test_cpp_client.py                # the native C++ client against a running server
@@ -163,6 +165,7 @@ tests/integration/
 ├── test_access_control.py            # permissions per identity (#31)
 ├── test_tls.py                       # TLS on the client port, chain and name (#30)
 ├── test_tls_cluster.py               # TLS on the replication link and the mesh (#30)
+├── test_tls_handshake_isolation.py   # TLS handshakes off the client loop, their deadline (#265)
 ├── test_tls_reload.py                # SIGHUP reads the certificate again, on every surface (#238)
 ├── test_credential_reload.py         # SIGHUP reads the client secrets and permissions again (#258)
 │

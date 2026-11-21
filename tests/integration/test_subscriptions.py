@@ -13,12 +13,14 @@ that the two can interleave.
 from __future__ import annotations
 
 import socket
+import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
-from conftest import patience
+from conftest import free_port, patience, server_binary_path
 
 pytestmark = pytest.mark.subscriptions
 
@@ -430,3 +432,87 @@ def test_a_book_taken_after_subscribing_resumes_the_stream_without_a_loss(cluste
     assert not behind, (f"{len(behind)} of {len(books)} books did not hold the update they were "
                         f"labelled with: (number, quantity shown, quantity of that update) "
                         f"{behind[:5]}")
+
+
+@pytest.mark.subscriptions
+def test_two_hundred_subscribers_of_one_book_each_get_every_row_in_order(tmp_path: Path) -> None:
+    """A write reaches each subscription of its book in one lookup, with the row's text made once and
+    shared (#263). Two hundred sessions on two client loops subscribe to one book, a writer sends
+    twenty writes of five levels, and every session is given the hundred rows under its own id, in
+    the order they were written, and the same text as every other session.
+
+    A node of its own: two hundred sessions are past the default `--max-sessions`, and past what the
+    shared cluster should be asked to hold for the tests after this one."""
+    symbol, exchange = "FANSYM", "FANEX"
+    port = free_port()
+    log = open(tmp_path / "node.log", "w", encoding="utf-8")
+    node = subprocess.Popen([server_binary_path(), "--port", str(port), "--data-dir", str(tmp_path / "data"),
+                             "--io-threads", "2", "--max-sessions", "400", "--log-level", "WARN"],
+                            stdout=log, stderr=subprocess.STDOUT)
+    subscribers: list[tuple[WireClient, int]] = []
+    writer = None
+    try:
+        deadline = time.monotonic() + patience(30)
+        while True:
+            assert node.poll() is None, f"the node exited with {node.returncode}"
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    break
+            except OSError:
+                assert time.monotonic() < deadline, "the node never accepted a connection"
+                time.sleep(0.1)
+
+        for _ in range(200):
+            client = WireClient(port, timeout=patience(8))
+            client.send(f"SUBSCRIBE * FROM '{symbol}'.'{exchange}'")
+            until = time.monotonic() + patience(8)
+            while b"\n\n" not in client.buf:
+                assert time.monotonic() < until, f"no answer to SUBSCRIBE: {client.buf[:80]!r}"
+                client.read_more(0.2)
+            answer, _, rest = client.buf.partition(b"\n\n")
+            assert answer.startswith(b"OK SUB "), answer
+            client.buf = rest
+            subscribers.append((client, int(answer.split()[2])))
+        # An id is its client loop's hub's, so two sessions on two loops may hold the same one: what
+        # tells their pushes apart is the connection they come on.
+
+        writer = WireClient(port, timeout=patience(8))
+        for write in range(20):
+            minsert(writer, "bid", [(1000 + write * 5 + i, 10 + i, 1) for i in range(5)],
+                    symbol=symbol, exchange=exchange)
+        until = time.monotonic() + patience(15)
+        while writer.buf.count(b"OK\n\n") < 20:
+            assert time.monotonic() < until, f"the writes were not all answered: {writer.buf[-120:]!r}"
+            writer.read_more(0.2)
+        assert b"ERR" not in writer.buf, writer.buf[:200]
+
+        written = [1000 + k for k in range(100)]
+        first: list[str] | None = None
+        until = time.monotonic() + patience(30)
+        for client, sid in subscribers:
+            while len(client.pushes()) < 100 and time.monotonic() < until:
+                client.read_more(0.2)
+            lines = client.pushes()
+            assert len(lines) == 100, f"subscription {sid} was given {len(lines)} rows of 100"
+            texts = []
+            for line in lines:
+                head, _, row = line.partition("\t")
+                assert head == f"PUSH {sid}", f"subscription {sid} was given {line!r}"
+                texts.append(row)
+            assert [int(row.split("\t")[1]) for row in texts] == written, \
+                f"subscription {sid}'s rows are not the prices written, in order"
+            if first is None:
+                first = texts
+            assert texts == first, f"subscription {sid} was given other text for the same rows"
+    finally:
+        for client, _ in subscribers:
+            client.close()
+        if writer is not None:
+            writer.close()
+        node.terminate()
+        try:
+            node.wait(timeout=patience(30))
+        except subprocess.TimeoutExpired:
+            node.kill()
+            node.wait()
+        log.close()

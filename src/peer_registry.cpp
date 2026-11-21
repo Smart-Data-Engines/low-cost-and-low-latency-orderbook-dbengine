@@ -458,11 +458,13 @@ void PeerRegistry::start_watch(TopologyChangeCallback cb) {
     watch_thread_ = std::thread([this] {
         run_thread_body("peer_registry", "watch_loop", [this] { watch_loop(); });
     });
+    name_thread(watch_thread_, "ob-peers-watch");
 
     // Start lease keep-alive thread.
     lease_thread_ = std::thread([this] {
         run_thread_body("peer_registry", "lease_loop", [this] { lease_loop(); });
     });
+    name_thread(lease_thread_, "ob-peers-lease");
 
     OB_LOG_INFO("peer_registry", "Started watch for node %u", local_node_id_);
 }

@@ -287,6 +287,15 @@ std::string format_agg_response(const std::vector<AggValue>& values);
 /// two framings.
 std::string format_push(uint64_t subscription_id, const QueryResult& row);
 
+/// What format_push() writes, in its two pieces (#263): "PUSH <id>\t", once a subscription and write,
+/// and a row's seven columns with the line's end, once a row - the piece every subscription the row is
+/// pushed to shares. Each returns the end of what it wrote into `out`, which holds kPushHeadRoom and
+/// kPushRowRoom bytes respectively.
+inline constexpr size_t kPushHeadRoom = 64;
+inline constexpr size_t kPushRowRoom  = 160;
+char* format_push_head(char* out, char* end, uint64_t subscription_id);
+char* format_push_row(char* out, char* end, const SnapshotRow& row);
+
 /// Format an error response.
 /// Returns "ERR <message>\n"
 std::string format_error(std::string_view message);

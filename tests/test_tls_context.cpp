@@ -6,6 +6,7 @@
 // is a large response that silently stops making progress.
 
 #include "orderbook/tls.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -32,7 +33,7 @@ struct KeyPair {
 /// The tool rather than the library: this fixture is about what the engine does with files on disk,
 /// and generating them the way an operator does is what `docs/operations.md` will tell them.
 KeyPair generate(const std::string& tag) {
-    const auto dir = fs::temp_directory_path() / ("ob_tls_" + tag + std::to_string(std::rand()));
+    const auto dir = ob::test::own_temp_dir("ob_tls_" + tag + "_");
     fs::create_directories(dir);
     const std::string cert = (dir / "cert.pem").string();
     const std::string key  = (dir / "key.pem").string();
@@ -45,7 +46,7 @@ KeyPair generate(const std::string& tag) {
 }
 
 std::string write_file(const std::string& tag, const std::string& contents, mode_t mode = 0600) {
-    const auto p = fs::temp_directory_path() / ("ob_tls_f_" + tag + std::to_string(std::rand()));
+    const auto p = ob::test::own_temp_file("ob_tls_f_" + tag + "_");
     { std::ofstream out(p, std::ios::trunc); out << contents; }
     ::chmod(p.c_str(), mode);
     return p.string();
@@ -126,8 +127,7 @@ TEST(TlsContext, RefusesAnEmptyFileAndADirectory) {
     const auto empty = write_file("empty", "");
     EXPECT_THROW(ob::TlsContext::server(empty, kp.key), std::runtime_error);
 
-    const auto dir = fs::temp_directory_path() / "ob_tls_dir";
-    fs::create_directories(dir);
+    const auto dir = ob::test::own_temp_dir("ob_tls_dir_");
     EXPECT_THROW(ob::TlsContext::server(dir.string(), kp.key), std::runtime_error);
 
     fs::remove(empty);

@@ -33,6 +33,7 @@
 #include <fstream>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,7 @@ namespace {
 struct Construction {
     int         line;
     std::string span;   // from `std::thread(` to its matching `)`
+    size_t      end{0};   // the offset just past that `)` in the file
 };
 
 /// Every `std::thread(...)` in `text` that is handed a callable.
@@ -74,7 +76,7 @@ std::vector<Construction> constructions(const std::string& text) {
             else if (text[j] == ')') --depth;
         }
         const int line = 1 + static_cast<int>(std::count(text.begin(), text.begin() + static_cast<long>(at), '\n'));
-        out.push_back({line, text.substr(at, j - at)});
+        out.push_back({line, text.substr(at, j - at), j});
         at = j;
     }
     return out;
@@ -82,6 +84,23 @@ std::vector<Construction> constructions(const std::string& text) {
 
 bool guarded(const Construction& c) {
     return c.span.find("run_thread_body") != std::string::npos;
+}
+
+/// Whether the thread a construction starts is named where it is started (#283): `name_thread(` - or
+/// `pthread_setname_np(`, which the sites named before #283 call - in the statement after the
+/// construction, or inside its body for a thread that names itself.
+bool named(const std::string& text, const Construction& c) {
+    const auto names = [](std::string_view s) {
+        return s.find("name_thread(") != std::string_view::npos ||
+               s.find("pthread_setname_np(") != std::string_view::npos;
+    };
+    if (names(c.span)) return true;
+    // The construction's own statement ends at the first `;` after its span; the naming is the statement
+    // after that one.
+    const size_t end = text.find(';', c.end);
+    if (end == std::string::npos) return false;
+    const size_t next = text.find(';', end + 1);
+    return names(std::string_view(text).substr(end + 1, (next == std::string::npos ? text.size() : next) - end));
 }
 
 std::string read_file(const std::filesystem::path& p) {
@@ -136,6 +155,38 @@ TEST(ThreadBoundariesRule, AConstructionSpanningLinesIsFoundWhole) {
         "});\n");
     ASSERT_EQ(found.size(), 1u);
     EXPECT_TRUE(guarded(found[0])) << "the span stopped short of the boundary on the third line";
+}
+
+TEST(ThreadNamesRule, ItSeesANamedThreadAndAnUnnamedOneDifferently) {
+    const std::string bare = "t_ = std::thread([this] { run_thread_body(\"c\", \"loop\", [this] { loop(); }); });\nf();\n";
+    const auto b = constructions(bare);
+    ASSERT_EQ(b.size(), 1u);
+    EXPECT_FALSE(named(bare, b[0])) << "the rule cannot tell the two apart, so it proves nothing";
+
+    const std::string after =
+        "t_ = std::thread([this] { run_thread_body(\"c\", \"loop\", [this] { loop(); }); });\n"
+        "name_thread(t_, \"ob-loop\");\n";
+    const auto a = constructions(after);
+    ASSERT_EQ(a.size(), 1u);
+    EXPECT_TRUE(named(after, a[0]));
+}
+
+TEST(ThreadNamesRule, ANameTwoStatementsLaterIsNotTheThreadsOwn) {
+    const std::string later =
+        "t_ = std::thread([this] { run_thread_body(\"c\", \"loop\", [this] { loop(); }); });\n"
+        "log(\"started\");\n"
+        "name_thread(other_, \"ob-other\");\n";
+    const auto c = constructions(later);
+    ASSERT_EQ(c.size(), 1u);
+    EXPECT_FALSE(named(later, c[0]));
+}
+
+TEST(ThreadNamesRule, AThreadThatNamesItselfIsNamed) {
+    const std::string itself =
+        "t_ = std::thread([this] { pthread_setname_np(pthread_self(), \"ob-x\"); run_thread_body(\"c\", \"x\", [] {}); });\n";
+    const auto c = constructions(itself);
+    ASSERT_EQ(c.size(), 1u);
+    EXPECT_TRUE(named(itself, c[0]));
 }
 
 // ── The tree ─────────────────────────────────────────────────────────────────
@@ -242,6 +293,9 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
         {"Engine::seal_sync_loop",
          "no seal's sync completes again, so no checkpoint is appended, WAL retention stops and a "
          "FLUSH waits for it for good (#190)"},
+        {"Engine::wal_removal_loop",
+         "no WAL file retention lets go is removed again, so the log grows on its device until the "
+         "device is full; guarded per removal, a file it could not unlink going with the next (#277)"},
         {"FailoverManager::monitor_loop",
          "the node never learns about a role change (#82's shape), and a half-finished promotion "
          "leaves it a replica of itself (#130)"},
@@ -273,6 +327,10 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
          "same problem as the others from the other side (#131)"},
         {"OrderbookPool::health_check_loop",
          "a client pool stops noticing dead connections; the only one outside the server (#131)"},
+        {"TlsHandshakeWorker::run_loop",
+         "the connections dealt to this thread wait for a handshake nobody drives, each holding its "
+         "place in --max-sessions until its client gives up; guarded per event, one connection closed "
+         "for what fails on it (#265)"},
         {"ScanPool::worker_loop",
          "the pool has one thread fewer to read a query's segments on; the queries still run every "
          "part no thread took, on their own loops, so they slow down and do not stop (#246)"},
@@ -342,4 +400,36 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
                 << "asserting about nothing. Fix the row rather than leaving it";
         }
     }
+}
+
+TEST(ThreadNames, EveryThreadIsNamedWhereItIsStarted) {
+    // #283: a thread nobody named carried the name of the one that started it, so `top -H` and a
+    // profile showed the flush thread, the seal's sync and the WAL's removal as one `ob_tcp_server`.
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(std::filesystem::path(OB_SOURCE_DIR) / "src")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".cpp") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    ASSERT_FALSE(files.empty()) << "no sources were read, so this test measured nothing";
+    std::vector<std::string> unnamed;
+    int total = 0;
+    for (const auto& file : files) {
+        const std::string text = read_file(file);
+        for (const auto& c : constructions(text)) {
+            ++total;
+            if (!named(text, c)) {
+                unnamed.push_back(
+                    std::filesystem::relative(file, std::filesystem::path(OB_SOURCE_DIR)).string() + ":" +
+                    std::to_string(c.line));
+            }
+        }
+    }
+    EXPECT_GE(total, 15) << "far fewer thread constructions than this tree has; the rule has probably stopped "
+                            "matching";
+    EXPECT_TRUE(unnamed.empty()) << "threads started without a name: " << [&] {
+        std::string list;
+        for (const auto& u : unnamed) list += "\n  " + u;
+        return list;
+    }();
 }

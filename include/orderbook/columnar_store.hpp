@@ -216,10 +216,15 @@ struct PartsScan {
 /// The fewest rows in range a scan is divided at: below it a scan is read on its query's thread.
 inline constexpr uint64_t kScanDivideMinRows = 32'768;
 
-/// Row `i` of a batch as the row scan hands it over: the fields of the columns the batch holds,
-/// zero in every field whose column it does not.
-inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
-    SnapshotRow row{};
+/// Row `i` of a batch as the row scan hands it over, written into `row`: the fields of the columns the
+/// batch holds, zero in every field whose column it does not.
+///
+/// For a reader that keeps the row, written where it keeps it (#271). Built on the stack and copied, as
+/// row_of() and an assignment do, the copy reads the row with wide loads of what narrow stores had just
+/// written, which a processor does not forward from its store buffer: composing a book summary waited
+/// on that for 91% of the time it spent applying a row.
+inline void fill_row(SnapshotRow& row, const RowBatch& b, uint32_t i) {
+    row = SnapshotRow{};
     row.timestamp_ns = b.ts[i];
     if (!b.seq.empty())   row.sequence_number = static_cast<uint64_t>(b.seq[i]);
     if (!b.side.empty())  row.side            = b.side[i];
@@ -227,6 +232,12 @@ inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
     if (!b.price.empty()) row.price           = b.price[i];
     if (!b.qty.empty())   row.quantity        = b.qty[i];
     if (!b.cnt.empty())   row.order_count     = b.cnt[i];
+}
+
+/// Row `i` of a batch as the row scan hands it over (fill_row()).
+inline SnapshotRow row_of(const RowBatch& b, uint32_t i) {
+    SnapshotRow row;
+    fill_row(row, b, i);
     return row;
 }
 
@@ -763,6 +774,14 @@ public:
     /// use the scan is `scan_batches()` through `how.direct`. The blocks no seal has written yet are
     /// the last part, read here. Every part handed out is finished or dropped before this returns,
     /// when a part throws as well, and the throw then leaves through here.
+    /// The rows a scan of this range may read, at most: each candidate's rows in range read from its
+    /// metadata as scan_parts() reads them - as if spread evenly over its time - and every unsealed
+    /// block's rows. The index alone, under its shared lock and with nothing copied, and the count
+    /// stops once it reaches `enough` (#260): what a client loop's ReadGate asks before a query
+    /// reads a row.
+    uint64_t rows_in_range_at_most(uint64_t start_ns, uint64_t end_ns, std::string_view symbol,
+                                   std::string_view exchange, uint64_t enough = UINT64_MAX) const;
+
     ScanCost scan_parts(uint64_t start_ns, uint64_t end_ns,
                         std::string_view symbol, std::string_view exchange,
                         ColumnSet columns, const RowFilter& filter,
@@ -848,9 +867,17 @@ public:
         size_t track_entries{0};
         size_t track_bytes{0};
         std::string track_why_not;
+        /// Composed from the rows of the blocks its seal wrote (#286), not by reading the segment back; or
+        /// why not.
+        bool from_sealed_rows{false};
+        std::string sealed_rows_why_not;
     };
-    SummaryWrite write_book_summary(std::string_view symbol, std::string_view exchange,
-                                    const std::string& dir);
+    /// With `sealed` - the blocks a seal of `dir`'s segment wrote it from, in their order - the summary is
+    /// composed from their rows rather than by reading the segment back, when the index shows they are all
+    /// the rows a composition would apply: the newest summary before `as_of`, then that one segment, and no
+    /// published block with a row in the span. Otherwise, and when its rows go back in time, as without.
+    SummaryWrite write_book_summary(std::string_view symbol, std::string_view exchange, const std::string& dir,
+                                    std::span<const std::shared_ptr<const RowBlock>> sealed = {});
 
     /// The times of a symbol's summaries, oldest first: what a read can start from.
     std::vector<uint64_t> book_summaries(std::string_view symbol, std::string_view exchange) const;
@@ -1153,6 +1180,13 @@ private:
     /// write_book_summary() writes beside the summary. The caller sets the track's `as_of_ts`.
     PricedBook compose_by_price(uint64_t at, std::string_view symbol, std::string_view exchange,
                                 size_t depth, BestTrack* track) const;
+    /// write_book_summary()'s composition from the rows of the blocks a seal wrote: the book and, in `track`,
+    /// its best track; empty, with `why`, when the index holds more than that one segment after the newest
+    /// summary, or a block, or the rows go back in time (#286).
+    std::optional<PricedBook> compose_from_sealed_rows(uint64_t as_of, std::string_view symbol,
+                                                       std::string_view exchange, const std::string& dir,
+                                                       std::span<const std::shared_ptr<const RowBlock>> sealed,
+                                                       BestTrack& track, std::string& why) const;
     /// scan_by_time() over what gather_locked() took.
     TimeOrderedCost scan_gathered(const Gathered& g, uint64_t start_ns, uint64_t end_ns,
                                   std::string_view symbol, std::string_view exchange,
@@ -1165,6 +1199,14 @@ private:
     /// cut brings back after the rows it does not hold were sealed would be believed by the next
     /// start.
     static void remove_summary_files(const std::vector<std::string>& files, std::string_view why);
+    /// The same, and an INFO line counting the summaries and tracks and saying why they went.
+    static void report_falsified(const std::vector<std::string>& files, std::string_view why);
+    /// Whether `added`, a sealed segment just put in `si`, can put the rows of an instant in another
+    /// order than a read delivered them in before it went in (#278). A tie on a timestamp goes to the
+    /// row delivered last - segments by start, then blocks - and its rows were a block's, delivered
+    /// after every segment: they keep their place unless a segment delivered after it now has a range
+    /// that reaches into its own. Caller holds the lock.
+    static bool reorders_locked(const SymbolIndex& si, const SegmentMeta& added);
     /// The summaries in an indexed segment's directory, put in its symbol's map. Caller holds the lock.
     void register_summaries_locked(const SegmentMeta& meta);
     /// The summaries whose files are in `dir`, out of `si`: the segment they are in is leaving the

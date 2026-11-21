@@ -423,7 +423,7 @@ Send the same statement as a command and the server pushes matching rows to that
 the subscription is cancelled or the connection closes:
 
 ```
-C: SUBSCRIBE 'BTC-USD'.'BINANCE'
+C: SUBSCRIBE * FROM 'BTC-USD'.'BINANCE'
 S: OK SUB 1
 
 S: PUSH 1	1756640400000000000	7845812	1500	3	0	0	91823

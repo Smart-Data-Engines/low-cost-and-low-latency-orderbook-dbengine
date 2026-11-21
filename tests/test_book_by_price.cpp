@@ -277,6 +277,35 @@ TEST(BookByPriceWithSummaries, ASealWritesThemAndAReadStartsFromTheNewest) {
     ASSERT_TRUE(book.from_summary.has_value());
     EXPECT_EQ(*book.from_summary, summaries.back());
     EXPECT_EQ(book_at(*engine, ts), live_book(*engine));
+    // Every summary after the first starts from the one before it, and its seal's rows are all it applies:
+    // each is composed from the rows of the blocks the seal wrote (#286). The first has none to start from.
+    const uint64_t written = engine->registry().counter_value("ob_book_summaries_written_total");
+    EXPECT_EQ(written, summaries.size());
+    EXPECT_EQ(engine->registry().counter_value("ob_book_summaries_from_sealed_rows_total"), written - 1);
+    engine->close();
+}
+
+TEST(BookByPriceWithSummaries, EachSummaryButTheFirstIsComposedFromTheRowsItsSealWrote) {
+    // A summary is due after 32 rows a price the last held, so two prices and seventy rows a seal make one
+    // due at every seal. Each but the first starts from the one before it and applies its seal's rows alone,
+    // and is composed from the rows of the blocks the seal wrote (#286).
+    TempDir dir("ob_bbp_sum_seal_");
+    auto engine = open_engine(dir.path);
+    engine->set_book_summary_rows(1);
+    uint64_t ts = kT0;
+    for (int seal = 0; seal < 5; ++seal) {
+        for (int i = 0; i < 70; ++i) {
+            const bool bid = i % 2 == 0;
+            ASSERT_EQ(write(*engine, bid ? ob::SIDE_BID : ob::SIDE_ASK,
+                            {level(bid ? 100 : 110, static_cast<uint64_t>(1 + (seal * 70 + i) % 9))}, ++ts, false),
+                      ob::OB_OK);
+        }
+        engine->flush_incremental();
+    }
+    EXPECT_EQ(engine->registry().counter_value("ob_book_summaries_written_total"), 5u);
+    EXPECT_EQ(engine->registry().counter_value("ob_book_summaries_from_sealed_rows_total"), 4u);
+    EXPECT_EQ(engine->store().book_summaries("BBP", "EX").size(), 5u);
+    EXPECT_EQ(book_at(*engine, ts), live_book(*engine));
     engine->close();
 }
 
@@ -348,5 +377,7 @@ RC_GTEST_PROP(BookByPriceProperty, WithSummariesHistoryAtEachWriteIsStillTheLive
     }
     engine->flush_incremental();
     for (const auto& [at, live] : seen) RC_ASSERT(book_at(*engine, at) == live);
+    RC_CLASSIFY(engine->registry().counter_value("ob_book_summaries_from_sealed_rows_total") > 0,
+                "a summary composed from the rows its seal wrote");
     engine->close();
 }

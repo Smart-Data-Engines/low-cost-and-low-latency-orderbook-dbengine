@@ -325,8 +325,11 @@ What does matter:
 
 ### CPU placement
 
-The hot path is the client event loops (`--io-threads`, named `ob-io-0` …), one flush thread, and
-in multi-master one more io loop. By default there is **one client loop per CPU the node may use**
+The hot path is the client event loops (`--io-threads`, named `ob-io-0` …), one flush thread
+(`ob-flush`), and in multi-master one more io loop (`ob-mm-io`). Beside them the seal's sync
+(`ob-seal-sync`) and the removal of the WAL files retention lets go (`ob-wal-removal`) work in the
+background, and every other thread of the node has an `ob-` name of its own too (#283), so `top -H`
+says which of them takes the CPU. By default there is **one client loop per CPU the node may use**
 and each spins for 10 µs after an event where there is a CPU to spare — the `boost` profile, sized
 at startup to the mask and the cgroup limit it finds (`docs/cli.md`, "Profiles"). On a host the
 engine shares with other work, `--profile eco` is one loop blocking between events, the engine as it
@@ -340,6 +343,16 @@ connections asking at once answer as many queries as with no pool, and a writer 
 the pool keeps 95% of its rate or more on both test hosts (#248) - measured in `docs/cli.md`, "A
 query on several cores". A node taking writes and nothing else can give its CPUs to its loops alone with
 `--scan-threads 0`.
+
+A large read is answered off its client loop (#260; `--large-read-threads N`, default 2, threads named
+`ob-read-0` …): a `SELECT` whose scan the index puts at 100 000 rows or more, so an analyst's query of
+millions of rows no longer holds the feed writing on the same loop. The threads sleep while there is
+no such read, and each builds one answer at a time, within the session's 64 MiB. A read waiting for a
+thread holds its session with it: `ob_off_loop_read_wait_seconds` is how long reads waited, and a wait
+that grows is every thread busy - a reason for more threads, which take CPUs from the loops and the scan
+pool while they read. `ob_off_loop_reads_in_flight` is how many sessions wait for one now. A FLUSH is
+answered on the same threads (#261), with `ob_off_loop_flushes_in_flight` and
+`ob_off_loop_flush_wait_seconds` of its own. Measured in `docs/cli.md`, "A large read off its loop".
 
 What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
 packets does not preempt the thread applying writes. With more than one client loop,
@@ -2479,6 +2492,41 @@ deliberate: the version floor is the one setting where "configurable" means "mis
 
 **A certificate is replaced without a restart**: new files, then `SIGHUP`
 ([replacing a certificate](#replacing-a-certificate)).
+
+### TLS handshakes off the client loops
+
+A client loop that drove a new session's TLS handshake served none of its other sessions meanwhile -
+with an RSA-2048 certificate a loop took about 1 300 handshakes a second on the m9g.xlarge and 2 200 on
+the m8a.xlarge - so clients reconnecting after a failover held every session of their loops, the feed's
+writes with them, for as long as their handshakes took. The client port's
+handshakes are driven on threads of their own (#265; `--tls-handshake-threads N`, default 1, threads
+named `ob-tls-0` …), and a loop is given a session whose handshake is done. Measured with Release
+builds and one client loop, a process `PING`ing a session through the Unix socket while two processes
+opened TLS connections back to back (`docs/roadmap.md`, #265, for the method and the rest):
+
+| | m9g.xlarge before | after | m8a.xlarge before | after |
+|---|---|---|---|---|
+| `PING` p50 beside RSA-2048 handshakes | 233-248 us | 10.4-10.5 us | 333-336 us | 10.5-10.6 us |
+| its p99 | 483-497 us | 25-30 us | 524-532 us | 30-39 us |
+| `PING` p50 beside ECDSA P-256 handshakes | 112.6-113.2 us | 14.2-14.3 us | 11.4-15.5 us | 8.6-8.8 us |
+| RSA-2048 handshakes a second | 1 281-1 290 | 1 295-1 298 | 2 204-2 214 | 2 272-2 276 |
+
+A handshake that fails is closed on its thread, and so is one not done within
+`--tls-handshake-timeout-ms` (default 10 000 ms): a client that connected and never began its handshake
+held a place in `--max-sessions` for as long as it stayed connected, and gives it back now. The log says
+which, with the connection's `conn_id` and how long it took:
+
+```
+handshake failed: SSL: error:0A00009C:SSL routines::http request: fd=41 conn_id=7 after 0.1 ms on ob-tls-0; closed
+handshake timed out: fd=42 conn_id=8 after 10000.4 ms on ob-tls-0; closed
+```
+
+`ob_tls_handshakes_total`, `ob_tls_handshake_failures_total` and `ob_tls_handshake_timeouts_total` count
+them, `ob_tls_handshakes_in_flight` is how many are under way, and `ob_tls_handshake_seconds` how long
+each took on its thread - the dashboard's TLS row draws all five. One thread takes about as many
+handshakes a second as a loop took (the table). A thread works on one handshake at a time, and more
+threads take their CPUs from the loops and the scan pool. With `--tls-handshake-threads 0` each loop
+drives its handshakes, as before, with no time limit, and those counters stay at zero.
 
 ### TLS on the replication link and the mesh
 

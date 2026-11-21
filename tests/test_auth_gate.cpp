@@ -9,6 +9,7 @@
 #include "orderbook/engine.hpp"
 #include "orderbook/session.hpp"
 #include "orderbook/tcp_server.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -26,7 +27,7 @@ namespace fs = std::filesystem;
 namespace {
 
 std::string make_temp_dir(const std::string& prefix) {
-    auto tmp = fs::temp_directory_path() / (prefix + std::to_string(std::rand()));
+    auto tmp = ob::test::own_temp_dir(prefix);
     fs::create_directories(tmp);
     return tmp.string();
 }
@@ -34,8 +35,7 @@ std::string make_temp_dir(const std::string& prefix) {
 constexpr const char* kSecret = "0123456789abcdef0123456789abcdef";
 
 ob::SecretStore make_store() {
-    const auto path = fs::temp_directory_path() /
-                      ("ob_gate_secret_" + std::to_string(std::rand()));
+    const auto path = ob::test::own_temp_file("ob_gate_secret_");
     {
         std::ofstream out(path, std::ios::trunc);
         out << "alice " << kSecret << "\n";

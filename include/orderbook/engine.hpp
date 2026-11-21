@@ -16,6 +16,7 @@
 #include "orderbook/query_engine.hpp"
 #include "orderbook/snapshot.hpp"
 #include "orderbook/replication.hpp"
+#include "orderbook/row_names.hpp"
 #include "orderbook/scan_pool.hpp"
 #include "orderbook/book_arena.hpp"
 #include "orderbook/soa_buffer.hpp"
@@ -36,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -154,11 +156,24 @@ public:
         flush_tick();
         // And the checkpoint its seal's sync was for (#190): a tick leaves that sync in the
         // background, and a test of what a tick leaves wants what the next one takes in.
-        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
-        receive_seal_sync(/*wait=*/true);
+        {
+            std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+            receive_seal_sync(/*wait=*/true);
+        }
+        // And the WAL files it let go, which it leaves to their own thread (#277).
+        await_wal_removals_for_test();
     }
-    /// One tick, leaving its seal's sync in the background as the loop's does (#190).
+    /// One tick, leaving its seal's sync in the background as the loop's does (#190), and its removal
+    /// of WAL files (#277).
     void flush_tick_leaving_the_sync_for_test() { flush_tick(); }
+    /// Returns once every removal of WAL files asked for is done (#277): what a test that reads the WAL
+    /// directory after a tick waits for. Holds no engine lock.
+    void await_wal_removals_for_test();
+    /// Hold every removal of WAL files where it is about to begin, until the lock is let go (#277): a
+    /// removal the device takes long over, on a test's schedule.
+    [[nodiscard]] std::unique_lock<std::mutex> hold_wal_removals_for_test() {
+        return std::unique_lock<std::mutex>(wal_removing_mtx_);
+    }
     /// Every unsealed block as if published `by` earlier, so that a test makes stores due by age
     /// without waiting `kSealAge` (#190 step 9).
     void age_unsealed_blocks_for_test(std::chrono::steady_clock::duration by);
@@ -213,6 +228,15 @@ public:
     void while_syncing_wal_for_test(std::function<void()> hook) {
         std::lock_guard<std::mutex> no_flush(flush_mtx_);
         while_syncing_wal_for_test_ = std::move(hook);
+    }
+
+    /// Called by a snapshot between its cut and the walk over its files (#282) - `flush_mtx_` let go,
+    /// every row up to its position sealed - with no engine lock held: what a test uses to seal rows
+    /// written after the cut while the snapshot has still to list its files. Set under `flush_mtx_`,
+    /// and taken under it by the snapshot at the end of its cut.
+    void between_snapshot_cut_and_walk_for_test(std::function<void()> hook) {
+        std::lock_guard<std::mutex> no_flush(flush_mtx_);
+        between_snapshot_cut_and_walk_for_test_ = std::move(hook);
     }
 
     void skip_vector_persistence_for_test() {
@@ -270,8 +294,10 @@ public:
 
     /// As above, and report the shape of the answer in `shape` before the first row.
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
-    /// And a row answer's rows a batch at a time into `rows` (OB-12): `QueryEngine::execute()`.
-    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows);
+    /// And a row answer's rows a batch at a time into `rows` (OB-12), and a large read taken away
+    /// through `gate` (#260): `QueryEngine::execute()`.
+    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape, RowAnswer* rows,
+                        ReadGate* gate = nullptr);
 
     /// The live book for one symbol, as rows. Error string on failure, empty on success.
     ///
@@ -294,6 +320,10 @@ public:
     /// - holds every write applied before. So a book taken after subscribing, and the pushes above
     /// its sequence number, miss nothing between the two (#239).
     uint64_t subscribe(std::string_view sql, RowCallback cb);
+
+    /// The same, with a callback that takes each write's allowed rows at once (#263): the server's
+    /// subscriptions, so that what it does once a call it does once a write rather than once a row.
+    uint64_t subscribe_batch(std::string_view sql, BatchCallback cb);
 
     /// Unregister a streaming subscription.
     void unsubscribe(uint64_t id);
@@ -947,7 +977,17 @@ private:
     // install that clears this map (#92). `live_ptrs_` used to sit beside it as a raw-pointer
     // index of the same keys, populated and cleared in the same three places; one map cannot
     // disagree with itself.
-    std::unordered_map<std::string, std::shared_ptr<SoABuffer>> buffers_;
+    struct LiveBook {
+        std::shared_ptr<SoABuffer> buffer;
+        /// The name of the pair that made the book, from `row_names_` (#270): what a write of that
+        /// pair hands `RowNames::of()` as the name it expects, so that finding it hashes nothing.
+        const RowName* name{nullptr};
+    };
+    std::unordered_map<std::string, LiveBook> buffers_;
+
+    /// The names the pending rows carry (#270), one per (symbol, exchange) pair that ever had a row,
+    /// never freed while the engine lives. Made under `mtx_`; a name is read without it.
+    RowNames row_names_;
     // Where a new book's memory comes from (#51): this arena, or the heap when it is null.
     std::shared_ptr<BookArena> book_arena_ = std::make_shared<BookArena>(/*huge_pages=*/true);
 
@@ -982,6 +1022,9 @@ private:
     /// block is not grown - its rows copied again each time - on the way to its size. Under
     /// `flush_mtx_`, like `unsealed_`, and cleared wherever the stores are.
     std::unordered_map<ColumnarStore*, size_t> block_rows_hint_;
+    /// The rows the last drain that finished took, which the next scales its blocks' reservations by
+    /// (#281); 0 before the first. The drain's own, under `flush_mtx_`.
+    size_t last_drain_rows_{0};
     /// Where a sealed block's rows go back to and a drain takes them from (#165 part 2a); a
     /// drain takes about the pending queue's ceiling at most, so that is what is kept spare.
     std::shared_ptr<RowBufferPool> block_rows_pool_ = std::make_shared<RowBufferPool>(MAX_PENDING_ROWS);
@@ -1253,6 +1296,24 @@ private:
     uint64_t                     seal_sync_hold_from_{UINT64_MAX};   ///< see hold_seal_syncs_from_for_test()
     uint64_t                     seal_syncs_finished_{0};
 
+    /// The WAL files retention lets go are removed on a thread of their own (#277, wal_removal_loop()).
+    /// The unlink of a 512 MB file took the flush thread 34-37 ms on ext4 and 16-17 ms on XFS, twice in
+    /// a round of #190's ingest, while the writers filled the other half of the pending queue in 32-36 ms:
+    /// most of the steady state's writes that waited at the ceiling waited during one. A tick still
+    /// decides what may go, under mtx_, and asks; the thread removes every file below the highest index
+    /// asked for. Under wal_removal_mtx_: what was asked, what was done, whether a removal runs.
+    std::thread             wal_removal_thread_;
+    std::mutex              wal_removal_mtx_;
+    std::condition_variable wal_removal_cv_;
+    uint32_t                wal_removal_asked_{0};
+    uint32_t                wal_removal_done_{0};
+    bool                    wal_removal_running_{false};
+    bool                    wal_removal_stop_{false};
+    bool                    wal_removal_alive_{false};   ///< the loop runs
+    /// Held through every removal of WAL files - this thread's, and a new lineage's own in
+    /// begin_wal_lineage_locked() - so that two never walk the directory at once; and by a test.
+    std::mutex              wal_removing_mtx_;
+
     /// Set by a writer that has run out of room, cleared by the flush loop when it wakes.
     ///
     /// Without it a writer at the ceiling waits for `--flush-interval-ms` to elapse, because
@@ -1304,14 +1365,51 @@ private:
 
     // Pending rows for columnar flush
     struct PendingRow {
-        std::string symbol;
-        std::string exchange;
+        /// Its delta's symbol and exchange (#270). Two strings until then, built again for every
+        /// level of every write on the client loop; the name is made once per pair and stays put.
+        const RowName* name;
         SnapshotRow row;
         /// Whether this node wrote it (#184): a segment records its own rows' highest number, which
         /// a restart continues this node's counter from - every origin's highest, which is all a row
         /// could say, put holes in the stream a peer's frontier cannot pass.
-        bool own{true};
+        bool own;
     };
+    // 64 bytes where it was 120, and nothing to construct or destroy: a chunk is cleared without a
+    // walk over its rows (#270).
+    static_assert(sizeof(PendingRow) == 64, "a pending row is a name, a row and a flag");
+    static_assert(std::is_trivially_copyable_v<PendingRow> && std::is_trivially_destructible_v<PendingRow>,
+                  "a pending row owns nothing");
+
+    /// Queue the row of one level for the columnar flush, written in its slot (#270). Caller holds
+    /// `mtx_`. `level_index` is the level's index in its update, as every row has always said.
+    ///
+    /// The row that brings the queue to half its ceiling asks for the flush (#276). The queue fills
+    /// at the write rate and empties a tick at a time, and until then only a writer that found no
+    /// room asked for a tick: under #190's ingest, 10.6-13.7 M levels a second against the default
+    /// 100 ms interval, the writers reached the ceiling before the interval did, 40-48 times in a
+    /// round of about 3 s, and each waited for a tick to take the queue, sync its WAL and drain it.
+    /// Asked for at half, the tick runs while the writers fill the other half, as often as the rate
+    /// needs. Between two takes of the queue one row reaches half, so one request is made: not again
+    /// by every writer between the request and the take, and not on account of the rows a tick holds
+    /// while it syncs and drains them, which count against the ceiling but are not in the queue -
+    /// either would follow each tick with another, for whatever came in while it ran. Rows put back
+    /// by a failed sync return all at once, not a row at a time: a flush that fails with half the
+    /// ceiling queued is retried by the interval or the ceiling, as before, not by every write.
+    void queue_row(const RowName& name, const DeltaUpdate& delta, uint16_t level_index,
+                   const Level& level, bool own) {
+        PendingRow& pr = pending_rows_.emplace_back();
+        pr.name = &name;
+        pr.own = own;
+        SnapshotRow& row = pr.row;
+        row.timestamp_ns    = delta.timestamp_ns;
+        row.sequence_number = delta.sequence_number;
+        row.side            = delta.side;
+        row.level_index     = level_index;
+        row.price           = level.price;
+        row.quantity        = level.qty;
+        row.order_count     = level.cnt;
+        if (pending_rows_.size() == MAX_PENDING_ROWS / 2) [[unlikely]] request_flush();
+    }
     /// A queue of fixed-size chunks rather than a vector (stage 5 of #151): a flush tick takes
     /// every row queued so far in one short hold of mtx_, drains them without it, and gives each
     /// chunk back as it is done. `chunked_queue.hpp` says what two swapped vectors did to memory
@@ -1387,7 +1485,8 @@ private:
     }
 
     // Backpressure: maximum number of pending rows before apply_delta blocks.
-    // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
+    // A million rows of 64 bytes - 64 MB, in chunks of 256 KiB - plus the names they point at, one per
+    // pair. 120 MB before #270, whose rows carried two strings. Prevents OOM under sustained ingestion.
     static constexpr size_t MAX_PENDING_ROWS = 1'000'000;
     std::condition_variable pending_cv_;  // signalled when pending_rows_ is drained
 
@@ -1400,6 +1499,9 @@ private:
     /// write on the hottest path in the engine (roadmap #66).
     SoABuffer&     get_or_create_buffer(const std::string& key, const char* symbol,
                                         const char* exchange);
+
+    /// The same book with the name of the pair that made it (#270), for a write that queues rows.
+    LiveBook&      get_or_create_book(const std::string& key, const char* symbol, const char* exchange);
 
     /// Convenience for callers that do not have the key yet.
     SoABuffer&     get_or_create_buffer(const std::string& symbol, const std::string& exchange);
@@ -1430,6 +1532,7 @@ private:
     std::atomic<bool> skip_vector_persistence_{false};   ///< see skip_vector_persistence_for_test()
     std::function<void()> while_sealing_for_test_;       ///< see while_sealing_for_test()
     std::function<void()> while_syncing_wal_for_test_;   ///< see while_syncing_wal_for_test()
+    std::function<void()> between_snapshot_cut_and_walk_for_test_;   ///< see between_snapshot_cut_and_walk_for_test()
     /// Held ranges written down per persist. The WAL payload length is 16-bit, so this is a hard
     /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
     static constexpr std::size_t kMaxPersistedHeldRanges = 3000;
@@ -1725,6 +1828,14 @@ private:
     void seal_sync_loop();
     void stop_seal_sync();
 
+    /// Ask for the WAL files below `before_index` to be removed off the flush thread (#277); an index
+    /// no higher than one asked for already asks for nothing. Without the thread - before open(), after
+    /// close() - they are removed here.
+    void ask_wal_removal(uint32_t before_index);
+    void wal_removal_loop();
+    /// Stop the thread once every removal asked for is done.
+    void stop_wal_removal();
+
     /// flush_incremental(), and with `claim_regardless` a checkpoint whatever it sealed.
     void flush_everything(bool claim_regardless);
 
@@ -1737,6 +1848,10 @@ private:
         size_t count{0};
         size_t rows{0};
         std::vector<SegmentMeta> metas;
+        /// The blocks the seal wrote its segment from, kept for write_book_summaries() when the seal makes a
+        /// summary due (#286): their rows are the segment's, and the summary is composed from them rather
+        /// than by reading the segment back. Empty otherwise.
+        std::vector<std::shared_ptr<const RowBlock>> sealed;
     };
     /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
     /// the share of a tick that drained `drained_rows` and the seals by age `credit` allows, which it
@@ -1745,14 +1860,18 @@ private:
                                    AgeSealCredit* credit = nullptr);
     /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
     /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
-    /// `flush_mtx_`; `mtx_` or not.
-    std::exception_ptr write_seals(std::vector<Seal>& seals);
+    /// `flush_mtx_`; `mtx_` or not. `with_summaries`: the caller writes the summaries the seals make due
+    /// (write_book_summaries()), and a seal that makes one due keeps its blocks for it (#286).
+    std::exception_ptr write_seals(std::vector<Seal>& seals, bool with_summaries = false);
     /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
     /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
     size_t merge_seals_locked(const std::vector<Seal>& seals);
     /// Write the summaries a seal has made due (#233): one for each symbol that took in
     /// `book_summary_rows_` rows - more for a deep book - since its last. Without `mtx_`.
     void write_book_summaries(const std::vector<Seal>& seals);
+    /// Whether write_book_summaries() will write a summary for `s`'s symbol after it: the same rule, the
+    /// rows counted so far unchanged (#286).
+    bool summary_due_after(const Seal& s) const;
     /// Where replay starts: the drain's position, or the oldest unsealed block's start if that is
     /// earlier - claiming a waiting block's rows would lose them in a crash. **With blocks waiting
     /// this position alone does not say which segments are durable** (#165 part 2a): a seal writes

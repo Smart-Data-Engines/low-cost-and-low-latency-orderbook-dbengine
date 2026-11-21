@@ -494,10 +494,14 @@ target_link_libraries(orderbook_compaction PUBLIC orderbook_core)
 add_library(orderbook_admission STATIC src/admission.cpp src/sync_budget.cpp)
 target_link_libraries(orderbook_admission PUBLIC orderbook_core)
 
+# ── The names a pending row carries (#270) ────────────────────────────────────
+add_library(orderbook_row_names STATIC src/row_names.cpp)
+target_link_libraries(orderbook_row_names PUBLIC orderbook_core orderbook_logger)
+
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/engine_compaction.cpp src/replication.cpp
             src/book_arena.cpp src/wal_archive.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission orderbook_net)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction orderbook_admission orderbook_net orderbook_row_names)
 
 # ── Backup and restore (#34) ──────────────────────────────────────────────────
 # The server's BACKUP and the offline ob_restore: engine-side, and nothing of the client, whose
@@ -584,6 +588,8 @@ endif()
 # ── TCP Server library (testable components) ──────────────────────────────────
 add_library(orderbook_tcp_server_lib STATIC
     src/tcp_server.cpp
+    src/off_loop_reads.cpp
+    src/tls_handshake_pool.cpp
     src/command_parser.cpp
     src/response_formatter.cpp
     src/session.cpp
@@ -598,11 +604,6 @@ add_library(orderbook_client STATIC src/client.cpp)
 # null registry.
 target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics orderbook_query_columns orderbook_net)
 
-option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
-if(OB_CLIENT_LZ4)
-    target_compile_definitions(orderbook_client PUBLIC OB_CLIENT_LZ4)
-    target_link_libraries(orderbook_client PUBLIC orderbook_compression)
-endif()
 
 # ── TCP Server executable ─────────────────────────────────────────────────────
 add_executable(ob_tcp_server tools/ob_tcp_server.cpp)

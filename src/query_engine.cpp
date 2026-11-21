@@ -1229,8 +1229,29 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     return execute(sql, std::move(cb), shape, nullptr);
 }
 
+namespace {
+
+/// A ReadGate's question (#260), asked once a query that scans the store is parsed and found and
+/// before it reads a row: true takes it away. `cap` bounds the scan beside its range - the LIMIT of
+/// a row query with no condition on its rows - and decides a small read without the index.
+bool taken_away(ReadGate& gate, const ColumnarStore& store, const QueryAST& ast, uint64_t cap) {
+    if (cap < gate.take_from) return false;
+    const uint64_t at_most = std::min(
+        cap, store.rows_in_range_at_most(ast.ts_start_ns.value_or(0), ast.ts_end_ns.value_or(UINT64_MAX),
+                                         ast.symbol, ast.exchange, gate.take_from));
+    if (at_most < gate.take_from) return false;
+    gate.rows_at_most = at_most;
+    OB_LOG_DEBUG("query", "SELECT %s.%s taken away before its scan: the index puts %llu row(s) or more "
+                 "in it, the gate %llu", ast.symbol.c_str(), ast.exchange.c_str(),
+                 static_cast<unsigned long long>(at_most),
+                 static_cast<unsigned long long>(gate.take_from));
+    return true;
+}
+
+}  // namespace
+
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShape& shape,
-                                 RowAnswer* rows) {
+                                 RowAnswer* rows, ReadGate* gate) {
     QueryAST ast;
     if (auto err = parse(sql, ast); !err.empty()) return err;
 
@@ -1265,7 +1286,13 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     // Before the live book's checks: these aggregates read rows, so a condition on time, price,
     // side or level narrows what they read rather than being refused as it is beside a function
     // of the book.
-    if (ast.bucket_ns.has_value()) return execute_buckets(ast, cb, shape);
+    if (ast.bucket_ns.has_value()) {
+        // A bucket query reads every row of its range, whatever its LIMIT, which counts buckets.
+        if (gate != nullptr && taken_away(*gate, store_, ast, UINT64_MAX)) {
+            return std::string(kReadTakenAway);
+        }
+        return execute_buckets(ast, cb, shape);
+    }
 
     // ── Determine if any select_expr is an aggregation call ──────────────────
     bool has_agg = false;
@@ -1603,6 +1630,14 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
 
     // LIMIT 0 asks for no row, and reads none (#47 step 2).
     if (lim == 0) return {};
+    // A large read is the client loop's to hand off, before a row is read (#260). A condition on the
+    // rows reads the range to find them, so only a query with none is bounded by its LIMIT.
+    const bool conditions = ast.price_lo.has_value() || ast.price_hi.has_value() ||
+                            ast.side_lo.has_value() || ast.side_hi.has_value() ||
+                            ast.level_lo.has_value() || ast.level_hi.has_value();
+    if (gate != nullptr && taken_away(*gate, store_, ast, conditions ? UINT64_MAX : lim)) {
+        return std::string(kReadTakenAway);
+    }
     // A batch at a time (OB-12). The scan hands over only the rows within the range and the
     // conditions - `filter_of()` and the time are its own checks - so nothing here checks a row
     // again; what is left is LIMIT. The answer is whole at LIMIT rows and the scan opens nothing
@@ -2744,6 +2779,15 @@ void QueryEngine::compact_locked() {
 }
 
 uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
+    return register_subscription(sql, std::move(cb), BatchCallback{});
+}
+
+uint64_t QueryEngine::subscribe_batch(std::string_view sql, BatchCallback cb) {
+    return register_subscription(sql, RowCallback{}, std::move(cb));
+}
+
+uint64_t QueryEngine::register_subscription(std::string_view sql, RowCallback cb,
+                                            BatchCallback batch_cb) {
     QueryAST ast;
     std::string err = parse(sql, ast);
     if (!err.empty()) {
@@ -2754,10 +2798,12 @@ uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
     std::unique_lock<std::shared_mutex> lock(subs_mtx_);
     compact_locked();
 
-    auto sub  = std::make_unique<Subscription>();
-    sub->id   = next_sub_id_++;
-    sub->ast  = std::move(ast);
-    sub->cb   = std::move(cb);
+    auto sub      = std::make_unique<Subscription>();
+    sub->id       = next_sub_id_++;
+    sub->ast      = std::move(ast);
+    sub->cb       = std::move(cb);
+    sub->batch_cb = std::move(batch_cb);
+    const bool a_write_at_a_time = static_cast<bool>(sub->batch_cb);
     const uint64_t id     = sub->id;
     const std::string sym = sub->ast.symbol;
     const std::string exc = sub->ast.exchange;
@@ -2766,9 +2812,10 @@ uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
     // what is actually there across a compaction.
     live_.store(count_live_locked(), std::memory_order_relaxed);
 
-    OB_LOG_INFO("query", "Subscription %llu registered for %s.%s (%zu live)",
+    OB_LOG_INFO("query", "Subscription %llu registered for %s.%s (%zu live)%s",
                 static_cast<unsigned long long>(id), sym.c_str(), exc.c_str(),
-                static_cast<size_t>(live_.load(std::memory_order_relaxed)));
+                static_cast<size_t>(live_.load(std::memory_order_relaxed)),
+                a_write_at_a_time ? ", a write at a time" : "");
     return id;
 }
 
@@ -2825,6 +2872,10 @@ void QueryEngine::notify_subscribers(const std::string& symbol,
     static constexpr size_t kBatch = 32;
     const Subscription* matched[kBatch];
     size_t index = 0;
+    // For the subscriptions that take a write at a time (#263): the rows each one's conditions allow,
+    // and a scratch every one of them shares - the server formats a row there once for all of them.
+    NotifyScratch         scratch;
+    std::vector<uint32_t> allowed;
 
     while (true) {
         size_t found = 0;
@@ -2846,6 +2897,14 @@ void QueryEngine::notify_subscribers(const std::string& symbol,
         for (size_t i = 0; i < found; ++i) {
             const Subscription& sub = *matched[i];
             const QueryAST& ast     = sub.ast;
+            if (sub.batch_cb) {
+                allowed.clear();
+                for (size_t r = 0; r < rows.size(); ++r) {
+                    if (row_allowed(ast, rows[r])) allowed.push_back(static_cast<uint32_t>(r));
+                }
+                if (!allowed.empty()) sub.batch_cb(SubscriptionBatch{rows, allowed, scratch});
+                continue;
+            }
             for (const SnapshotRow& row : rows) {
                 if (!row_allowed(ast, row)) continue;
                 // Build QueryResult and invoke callback

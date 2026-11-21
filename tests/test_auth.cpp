@@ -8,6 +8,7 @@
 //     secret material.
 
 #include "orderbook/auth.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -26,7 +27,7 @@ namespace {
 /// refusals is *about* the mode, and a helper that always chmods 600 could not reach it.
 std::string write_secret_file(const std::string& name, const std::string& contents,
                               mode_t mode = 0600) {
-    const auto path = std::filesystem::temp_directory_path() / ("ob_auth_" + name);
+    const auto path = ob::test::own_temp_file("ob_auth_" + name + "_");
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         out << contents;
@@ -247,8 +248,7 @@ TEST(SecretStoreClient, RefusesAMissingFileAndNamesIt) {
 }
 
 TEST(SecretStoreClient, RefusesADirectory) {
-    const auto dir = std::filesystem::temp_directory_path() / "ob_auth_dir";
-    std::filesystem::create_directories(dir);
+    const auto dir = ob::test::own_temp_dir("ob_auth_dir_");
     EXPECT_THROW(SecretStore::load_client_file(dir.string()), std::runtime_error);
     std::filesystem::remove(dir);
 }

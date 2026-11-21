@@ -11,6 +11,7 @@
 #include "orderbook/engine.hpp"
 #include "orderbook/multi_master.hpp"
 #include "orderbook/replication.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -36,14 +37,13 @@ namespace {
 constexpr const char* kClusterSecret = "0123456789abcdef0123456789abcdef-cluster";
 
 std::string temp_dir(const std::string& prefix) {
-    auto p = fs::temp_directory_path() / (prefix + std::to_string(std::rand()));
+    auto p = ob::test::own_temp_dir(prefix);
     fs::create_directories(p);
     return p.string();
 }
 
 ob::SecretStore cluster_store(const std::string& secret = kClusterSecret) {
-    const auto path = fs::temp_directory_path() /
-                      ("ob_cluster_secret_" + std::to_string(std::rand()));
+    const auto path = ob::test::own_temp_file("ob_cluster_secret_");
     {
         std::ofstream out(path, std::ios::trunc);
         out << secret << "\n";

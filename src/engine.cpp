@@ -23,10 +23,12 @@
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
+#include <compare>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -180,7 +182,7 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
           [this](const std::string& key) -> std::shared_ptr<SoABuffer> {
               std::lock_guard<std::mutex> lock(mtx_);
               auto it = buffers_.find(key);
-              return (it == buffers_.end()) ? nullptr : it->second;
+              return (it == buffers_.end()) ? nullptr : it->second.buffer;
           },
           agg_))
     , repl_config_(std::move(repl_config))
@@ -207,8 +209,14 @@ void install_live_book(SoABuffer& buf, const ColumnarStore::PricedBook& book) {
         level.cnt   = r.order_count;
         (r.side == SIDE_BID ? bids : asks).push_back(level);
     }
-    install_book(buf, bids.data(), bids.size(), asks.data(), asks.size(),
-                 book.as_of->sequence_number, book.as_of->timestamp_ns);
+    // A book composed by price is in each side's order with each price once; install_book() puts in
+    // one that is not level by level, which keeps the order its search by halves needs (#268).
+    if (!install_book(buf, bids.data(), bids.size(), asks.data(), asks.size(), book.as_of->sequence_number,
+                      book.as_of->timestamp_ns)) {
+        OB_LOG_WARN("engine", "live book of %s.%s restored from levels out of a side's order or with a price "
+                              "twice: put in level by level, from %zu bid and %zu ask level(s)",
+                    buf.symbol, buf.exchange, bids.size(), asks.size());
+    }
 }
 
 }  // namespace
@@ -256,6 +264,14 @@ void Engine::restore_live_books_locked() {
     OB_LOG_INFO("engine", "live books restored from the store installed: %zu symbol(s)", restored);
 }
 
+bool Engine::summary_due_after(const Seal& s) const {
+    if (book_summary_rows_ == 0 || s.metas.empty()) return false;
+    const auto it = summary_progress_.find(s.store->symbol() + std::string(1, '\0') + s.store->exchange());
+    const uint64_t rows   = (it == summary_progress_.end() ? 0 : it->second.rows) + s.rows;
+    const size_t   prices = it == summary_progress_.end() ? 0 : it->second.prices;
+    return rows >= std::max<uint64_t>(book_summary_rows_, kBookSummaryRowsPerPrice * prices);
+}
+
 void Engine::write_book_summaries(const std::vector<Seal>& seals) {
     if (book_summary_rows_ == 0) return;
     for (const Seal& s : seals) {
@@ -269,20 +285,22 @@ void Engine::write_book_summaries(const std::vector<Seal>& seals) {
         if (p.rows < due) continue;
         const auto started = std::chrono::steady_clock::now();
         const ColumnarStore::SummaryWrite w =
-            combined_store_.write_book_summary(symbol, exchange, s.metas.back().dir_path);
+            combined_store_.write_book_summary(symbol, exchange, s.metas.back().dir_path, s.sealed);
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started).count();
         if (w.written) {
             p.rows = 0;
             p.prices = w.prices;
             registry_.increment_counter("ob_book_summaries_written_total");
+            if (w.from_sealed_rows) registry_.increment_counter("ob_book_summaries_from_sealed_rows_total");
             registry_.increment_counter("ob_book_summary_bytes_total", w.bytes);
             registry_.increment_counter("ob_best_track_bytes_total", w.track_bytes);
             OB_LOG_DEBUG("engine", "book summary %s.%s: %zu price(s) as of %llu, %zu bytes, from %llu "
-                                   "row(s) read, in %.2f ms; best track: %s",
+                                   "row(s) %s, in %.2f ms; best track: %s",
                          symbol.c_str(), exchange.c_str(), w.prices,
                          static_cast<unsigned long long>(w.as_of_ts), w.bytes,
-                         static_cast<unsigned long long>(w.rows_read), ms,
+                         static_cast<unsigned long long>(w.rows_read),
+                         w.from_sealed_rows ? "of the blocks its seal wrote" : "read back", ms,
                          w.track_why_not.empty()
                              ? (std::to_string(w.track_entries) + " entr" +
                                 (w.track_entries == 1 ? "y, " : "ies, ") +
@@ -575,6 +593,7 @@ void Engine::open() {
         seal_sync_thread_ = std::thread([this]() {
             run_thread_body("engine", "seal_sync_loop", [this] { seal_sync_loop(); });
         });
+        name_thread(seal_sync_thread_, "ob-seal-sync");
     }
 
     // The WAL archive (#34), before the flush thread whose retention waits for it. Its lineage is the
@@ -603,11 +622,25 @@ void Engine::open() {
         query_engine_->set_scan_pool(scan_pool_.get());
     }
 
+    // The removal of the WAL files retention lets go (#277), before the flush thread whose ticks ask
+    // for it; under every policy, since `none` lets files go as well.
+    if (!wal_removal_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+            wal_removal_stop_ = false;
+        }
+        wal_removal_thread_ = std::thread([this]() {
+            run_thread_body("engine", "wal_removal_loop", [this] { wal_removal_loop(); });
+        });
+        name_thread(wal_removal_thread_, "ob-wal-removal");
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+    name_thread(flush_thread_, "ob-flush");
 }
 
 void Engine::set_loop_load(const LoopLoad* load, unsigned cpus) {
@@ -682,6 +715,9 @@ void Engine::close() {
     if (flush_thread_.joinable()) {
         flush_thread_.join();
     }
+    // The removals the last ticks asked for, done before close() returns (#277): a WAL directory left
+    // as a stop before #277 left it.
+    stop_wal_removal();
     // The archive's thread after the retention that read it.
     if (wal_archiver_) wal_archiver_->stop();
 
@@ -1147,7 +1183,12 @@ void Engine::begin_wal_lineage_locked(const char* why) {
                          old_dir.c_str(), wal_archiver_->archived_before(), pass.failure.c_str());
         }
     }
-    const size_t removed = wal_.truncate_before(first.file_index);
+    size_t removed = 0;
+    {
+        // Not beside the removal thread (#277): one walk of the directory at a time.
+        std::lock_guard<std::mutex> removing(wal_removing_mtx_);
+        removed = wal_.truncate_before(first.file_index);
+    }
     if (wal_archiver_) wal_archiver_->set_lineage(fresh);
     if (const int err = sync_directory(wal_dir_); err != 0) {
         OB_LOG_WARN("engine", "The WAL directory %s could not be synced after the old lineage's files "
@@ -1684,8 +1725,8 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
         const size_t removed = plan_side_replacements(
             writes, s, [this](const std::string& key, uint8_t side) -> const SoASide* {
                 const auto it = buffers_.find(key);
-                if (it == buffers_.end() || !it->second) return nullptr;
-                return side == SIDE_BID ? &it->second->bid : &it->second->ask;
+                if (it == buffers_.end() || !it->second.buffer) return nullptr;
+                return side == SIDE_BID ? &it->second.buffer->bid : &it->second.buffer->ask;
             });
         if (removed != 0) {
             registry_.increment_counter("ob_replace_side_removed_levels_total", removed);
@@ -1853,9 +1894,9 @@ void Engine::broadcast_to_replicas(const DeltaUpdate& delta, const Level* levels
 ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& delta,
                                     const Level* levels) {
     // Apply to SoA buffer using seqlock writer protocol.
-    SoABuffer& buf = get_or_create_buffer(key, delta.symbol, delta.exchange);
+    LiveBook& book = get_or_create_book(key, delta.symbol, delta.exchange);
     bool gap_detected = false;   // unused: gaps are decided per origin in observe_sequence()
-    const ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
+    const ob_status_t status = ob::apply_delta(*book.buffer, delta, levels, gap_detected);
 
     // Enqueue SnapshotRows for background columnar flush + collect them for subscribers.
     //
@@ -1866,19 +1907,13 @@ ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& d
     // `has_subscribers()` is one relaxed atomic read and it is checked first because zero
     // subscriptions is the case in every deployment that does not use them: nothing below runs and
     // no lock is taken. It may read high for a moment and never low, so a row is never dropped.
+    //
+    // A row carries its pair's name by pointer (#270), found once per update - the book's, compared
+    // and not hashed, unless another pair shares the book's key.
     const size_t rows_before = pending_rows_.size();
-
+    const RowName& name = row_names_.of(delta.symbol, delta.exchange, book.name);
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
-        pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/true});
+        queue_row(name, delta, i, levels[i], /*own=*/true);
     }
 
     // Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
@@ -2036,7 +2071,8 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     // 4. Apply winning levels to SoA buffer.
     if (!winning_levels.empty()) {
-        SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
+        LiveBook& book = get_or_create_book(symbol_key, delta.symbol, delta.exchange);
+        SoABuffer& buf = *book.buffer;
 
         // Build a filtered DeltaUpdate + Level array for winning levels only.
         if (winning_levels.size() == static_cast<size_t>(delta.n_levels)) {
@@ -2070,18 +2106,9 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
         // that subscribed from another thread is notified from here. That is what made the
         // unsynchronised subscription list a live race rather than a latent one.
         const size_t rows_before = pending_rows_.size();
-
+        const RowName& name = row_names_.of(delta.symbol, delta.exchange, book.name);
         for (uint16_t idx : winning_levels) {
-            SnapshotRow row{};
-            row.timestamp_ns    = delta.timestamp_ns;
-            row.sequence_number = delta.sequence_number;
-            row.side            = delta.side;
-            row.level_index     = idx;
-            row.price           = levels[idx].price;
-            row.quantity        = levels[idx].qty;
-            row.order_count     = levels[idx].cnt;
-
-            pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/false});
+            queue_row(name, delta, idx, levels[idx], /*own=*/false);
         }
 
         if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
@@ -2115,8 +2142,8 @@ std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& sh
 }
 
 std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& shape,
-                            RowAnswer* rows) {
-    return query_engine_->execute(sql, std::move(cb), shape, rows);
+                            RowAnswer* rows, ReadGate* gate) {
+    return query_engine_->execute(sql, std::move(cb), shape, rows, gate);
 }
 
 std::string Engine::read_book(const std::string& symbol, const std::string& exchange,
@@ -2141,6 +2168,15 @@ uint64_t Engine::subscribe(std::string_view sql, RowCallback cb) {
     // returns. A client that subscribes and then takes the book misses nothing in between.
     { std::lock_guard<std::mutex> in_force(mtx_); }
     OB_LOG_DEBUG("engine", "Subscription %llu in force for every write from here",
+                 static_cast<unsigned long long>(id));
+    return id;
+}
+
+uint64_t Engine::subscribe_batch(std::string_view sql, BatchCallback cb) {
+    const uint64_t id = query_engine_->subscribe_batch(sql, std::move(cb));
+    // In force for every write after this returns, as subscribe()'s is (#239).
+    { std::lock_guard<std::mutex> in_force(mtx_); }
+    OB_LOG_DEBUG("engine", "Subscription %llu in force for every write from here, a write at a time",
                  static_cast<unsigned long long>(id));
     return id;
 }
@@ -2321,6 +2357,8 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
     // exactly the rows the first hold drained - every row up to the position it captured, and no
     // other - and the vector it exported describes them.
     double sync_ms = 0.0, seals_ms = 0.0;
+    std::function<void()> between_hook;
+    std::unordered_set<std::string> cut_dirs;   // the segment directories of the cut (#282)
     {
         // flush_mtx_ before mtx_: this path writes segments, so it must not run
         // alongside flush_loop() or a client FLUSH.
@@ -2376,7 +2414,18 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                                  std::chrono::steady_clock::now() - t_merge).count();
         }
         if (failure) std::rethrow_exception(failure);
+        // The segments of this cut (#282): what the index holds now, still under flush_mtx_ - every row
+        // up to its position, and none after it, since nothing drains while flush_mtx_ is held. The pin
+        // keeps a merge and retention from moving them; it does not keep a FLUSH or a tick from sealing
+        // rows written after the cut into a new segment while the walk below runs, and the walk took any
+        // segment it found: a replica held that segment's rows from the snapshot and again from the
+        // stream that starts at the cut's position (CI's battery under ThreadSanitizer on PR #329).
+        for (const SegmentMeta& m : combined_store_.index()) {
+            cut_dirs.insert(fs::path(m.dir_path).lexically_normal().string());
+        }
+        between_hook = between_snapshot_cut_and_walk_for_test_;
     }
+    if (between_hook) between_hook();
 
     // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
     //
@@ -2394,6 +2443,7 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
 
     size_t total_bytes = 0;
     size_t total_rows = 0;
+    size_t after_the_cut = 0;
 
     // Walk the data directory for segment files.
     if (fs::exists(base_dir_)) {
@@ -2410,6 +2460,12 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                     (!replaced.empty() &&
                      replaced.count(entry.path().lexically_normal().string()) != 0)) {
                     it.disable_recursion_pending();
+                } else if (it.depth() == ColumnarStore::kSegmentDepth &&
+                           cut_dirs.count(entry.path().lexically_normal().string()) == 0) {
+                    // A segment sealed after the cut (#282): its rows come after the position the
+                    // manifest names, and whoever catches up from there is sent them again.
+                    it.disable_recursion_pending();
+                    ++after_the_cut;
                 }
                 continue;
             }
@@ -2533,6 +2589,11 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
 
     manifest.total_bytes = total_bytes;
     manifest.total_rows  = total_rows;
+    if (after_the_cut > 0) {
+        OB_LOG_INFO("engine", "Snapshot at %u:%zu: %zu segment directory(ies) sealed after its cut left out - "
+                              "their rows come after its position, and are sent from it",
+                    manifest.wal_file_index, manifest.wal_byte_offset, after_the_cut);
+    }
 
     // Write snapshot_manifest.json (at-most-one policy: overwrite previous), replaced whole.
     //
@@ -3564,8 +3625,13 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
 
 SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symbol,
                                         const char* exchange) {
+    return *get_or_create_book(key, symbol, exchange).buffer;
+}
+
+Engine::LiveBook& Engine::get_or_create_book(const std::string& key, const char* symbol,
+                                             const char* exchange) {
     auto it = buffers_.find(key);
-    if (it != buffers_.end()) return *it->second;
+    if (it != buffers_.end()) return it->second;
 
     auto buf = book_arena_ ? std::allocate_shared<SoABuffer>(BookArenaAllocator<SoABuffer>(book_arena_))
                            : std::make_shared<SoABuffer>();
@@ -3578,8 +3644,11 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
     std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
 
-    auto& ref = *buf;
-    buffers_[key] = std::move(buf);
+    // The name its rows will carry, made now with the book: a write of this pair then finds it by
+    // comparing two strings rather than hashing them (#270).
+    const RowName& name = row_names_.of(symbol, exchange);
+    LiveBook& ref = buffers_[key];
+    ref = LiveBook{std::move(buf), &name};
 
     // Update gauge: symbol count after adding new symbol.
     registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
@@ -3941,7 +4010,8 @@ void Engine::flush_tick() {
         // without it (stage 5 of #151). An unlink of a 512 MB WAL file, or of every file of every
         // expired segment, is I/O no writer ever needed to wait for - and both only read what they
         // are handed: `truncate_before()` touches nothing of the writer but its directory's name,
-        // and the combined store has its own lock, which queries take and writers do not.
+        // and the combined store has its own lock, which queries take and writers do not. The WAL's
+        // files are removed off this thread as well (#277): the next tick does not wait for them.
         uint32_t safe_truncate = 0;
         {
             TimedLock timed(mtx_, "flush tick: what retention may remove");
@@ -3984,7 +4054,7 @@ void Engine::flush_tick() {
             }
         }
         if (safe_truncate > 0) {
-            wal_.truncate_before(safe_truncate);
+            ask_wal_removal(safe_truncate);
         }
         if (wal_archiver_) publish_wal_archive_gauges();
 
@@ -4191,6 +4261,45 @@ void Engine::flush_drain_pending() {
     drain_batch(batch, wal_.current_position(), /*mtx_held=*/true);
 }
 
+namespace {
+
+/// The rows of a run of pending rows, as an iterator `vector::insert()` takes (#284): the drain's block grows by
+/// them, each constructed where it stays. A template, so that the drain instantiates it with the engine's own
+/// pending row.
+template <typename Pending>
+class RowsOf {
+public:
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type        = SnapshotRow;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = const SnapshotRow*;
+    using reference         = const SnapshotRow&;
+
+    RowsOf() = default;
+    explicit RowsOf(const Pending* p) : p_(p) {}
+
+    reference operator*() const { return p_->row; }
+    pointer operator->() const { return &p_->row; }
+    reference operator[](difference_type n) const { return p_[n].row; }
+    RowsOf& operator++() { ++p_; return *this; }
+    RowsOf operator++(int) { RowsOf was = *this; ++p_; return was; }
+    RowsOf& operator--() { --p_; return *this; }
+    RowsOf operator--(int) { RowsOf was = *this; --p_; return was; }
+    RowsOf& operator+=(difference_type n) { p_ += n; return *this; }
+    RowsOf& operator-=(difference_type n) { p_ -= n; return *this; }
+    friend RowsOf operator+(RowsOf i, difference_type n) { return i += n; }
+    friend RowsOf operator+(difference_type n, RowsOf i) { return i += n; }
+    friend RowsOf operator-(RowsOf i, difference_type n) { return i -= n; }
+    friend difference_type operator-(const RowsOf& a, const RowsOf& b) { return a.p_ - b.p_; }
+    friend bool operator==(const RowsOf& a, const RowsOf& b) { return a.p_ == b.p_; }
+    friend auto operator<=>(const RowsOf& a, const RowsOf& b) { return a.p_ <=> b.p_; }
+
+private:
+    const Pending* p_{nullptr};
+};
+
+}  // namespace
+
 void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool mtx_held) {
     // `covered` is what `flush_drain_pending()` explains: a position every row here has its record
     // at or before, and that a sync has reached. From the flush tick it is the sync ticket's
@@ -4231,6 +4340,9 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     };
     std::vector<Collected> drained;
     std::unordered_map<ColumnarStore*, size_t> slot_of;
+    // The slot of each name's store, found once a drain (#275): a name stands for one pair, and a pair's
+    // store cannot change while this drain holds `flush_mtx_`. Two names under one store key share it.
+    std::unordered_map<const RowName*, size_t> slot_of_name;
     const auto publish = [&] {
         std::vector<std::shared_ptr<const RowBlock>> blocks;
         blocks.reserve(drained.size());
@@ -4263,55 +4375,105 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         }
         drained.clear();
         slot_of.clear();
+        slot_of_name.clear();
         unsealed_rows_.fetch_add(rows, std::memory_order_relaxed);
         combined_store_.publish_blocks(blocks);
     };
 
+    // The store is resolved per **run of one pair**, not per row. Pending rows arrive an update at a
+    // time and an update is one pair's levels, so consecutive rows almost always share a pair - and
+    // `get_or_create_store()` builds `symbol + "." + exchange` and hashes it on every call. Measured
+    // before this: `get_or_create_store` was **5.06%** of the server's CPU under a pipelining
+    // client, all of it inside this loop, for a lookup whose answer had just been computed. Same
+    // shape as #66, which found the write path building one symbol key four times.
+    //
+    // A run is the rows of one name, compared by pointer (#270), and it goes on across chunks: a
+    // name is not in a chunk. Until then a row carried two strings, the run compared both of them on
+    // every row, and it started again at each chunk because the strings it pointed at were cleared
+    // with their chunk.
+    // A store's block is reserved to the rows of its last one, an eighth more, scaled by the rows this
+    // drain took against the last (#281). A block that outgrows its buffer copies every row it holds into
+    // one twice as big - a tenth of drain_batch()'s samples on the m8a.xlarge under #190's ingest - and a
+    // tick takes whatever was queued when it woke, so one take is larger than the last as often as not.
+    const size_t batch_rows = batch.rows();
+    // Both a block and a take are at most the pending queue's ceiling, a million rows, so the product
+    // fits; and no block of this drain holds more rows than it took.
+    const auto reserve_for = [&](size_t last_block) -> size_t {
+        if (last_block == 0) return 0;
+        const size_t want = last_block + last_block / 8;
+        const size_t scaled = last_drain_rows_ == 0 ? want : want * batch_rows / last_drain_rows_;
+        return std::clamp<size_t>(scaled, 1, std::max<size_t>(batch_rows, 1));
+    };
+    const RowName* run_name = nullptr;
+    Collected* current      = nullptr;
     size_t appended = 0;
     for (size_t k = 0; k < batch.chunks.size(); ++k) {
         PendingQueue::Chunk& chunk = *batch.chunks[k];
         const size_t rows_here = chunk.size();
-
-        // The store is resolved per **run of one symbol**, not per row. Pending rows arrive an
-        // update at a time and an update is one symbol's levels, so consecutive rows almost always
-        // share a symbol — and `get_or_create_store()` builds `symbol + "." + exchange` and hashes
-        // it on every call. Measured before this: `get_or_create_store` was **5.06%** of the
-        // server's CPU under a pipelining client, all of it inside this loop, for a lookup whose
-        // answer had just been computed. Same shape as #66, which found the write path building one
-        // symbol key four times.
-        //
-        // A run starts again at each chunk: the pointers below point into this chunk's rows, and
-        // the chunk is cleared before the next one is read - so a run carried across would compare
-        // the next row with a destroyed string. It costs one lookup per chunk of 4096 rows.
-        const std::string* run_symbol   = nullptr;
-        const std::string* run_exchange = nullptr;
-        Collected* current              = nullptr;
         try {
-            for (; chunk.first < chunk.rows.size(); ++chunk.first) {
-                const PendingRow& pr = chunk.rows[chunk.first];
-                if (current == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
-                    ColumnarStore* store = &get_or_create_store(pr.symbol, pr.exchange, mtx_held);
-                    run_symbol   = &pr.symbol;
-                    run_exchange = &pr.exchange;
-                    auto [at, fresh] = slot_of.try_emplace(store, drained.size());
-                    if (fresh) {
-                        const auto hint = block_rows_hint_.find(store);
-                        drained.push_back(Collected{
-                            store,
-                            block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
-                            pr.row.timestamp_ns, pr.row.timestamp_ns, 0, true});
+            const PendingRow* const rows = chunk.rows.data();
+            const size_t end = chunk.rows.size();
+            while (chunk.first < end) {
+                const PendingRow& head = rows[chunk.first];
+                if (head.name != run_name) {
+                    // A run of another name: its slot, looked up in the stores only the first time this
+                    // drain meets the name (#275). get_or_create_store() builds `symbol.exchange` and
+                    // hashes it, and every run - a few updates of one pair under #190's ingest - paid for
+                    // that again.
+                    const auto known = slot_of_name.find(head.name);
+                    size_t slot = 0;
+                    if (known != slot_of_name.end()) {
+                        slot = known->second;
+                    } else {
+                        ColumnarStore* store = &get_or_create_store(head.name->symbol, head.name->exchange, mtx_held);
+                        auto [at, fresh] = slot_of.try_emplace(store, drained.size());
+                        if (fresh) {
+                            const auto hint = block_rows_hint_.find(store);
+                            drained.push_back(Collected{
+                                store,
+                                block_rows_pool_->take(reserve_for(hint == block_rows_hint_.end() ? 0 : hint->second)),
+                                head.row.timestamp_ns, head.row.timestamp_ns, 0, true});
+                        }
+                        slot = at->second;
+                        slot_of_name.emplace(head.name, slot);
                     }
-                    current = &drained[at->second];
+                    run_name = head.name;
+                    current = &drained[slot];
                 }
-                current->rows.push_back(pr.row);
-                current->min_ts_ns = std::min(current->min_ts_ns, pr.row.timestamp_ns);
-                current->max_ts_ns = std::max(current->max_ts_ns, pr.row.timestamp_ns);
-                if (pr.own) {
-                    current->max_own_seq = std::max(current->max_own_seq, pr.row.sequence_number);
-                } else {
-                    current->all_own = false;
+                // The run's rows in this chunk, taken in one step (#281). A push_back() a row loaded
+                // and stored the block's end, its range and its flags through `current` - the char
+                // members of the row it copied keeping the compiler from holding any of them in a
+                // register - and that was most of drain_batch()'s samples under #190's ingest. Here the
+                // block grows once a run and the range and flags are counted in locals. A throw leaves
+                // `chunk.first` at the run's first row, which is not taken, as a throw on any of its rows
+                // did.
+                const PendingRow* const from = rows + chunk.first;
+                size_t n = 1;
+                while (chunk.first + n < end && from[n].name == run_name) ++n;
+                // Inserted rather than resized and written (#284): resize() zeroed the rows first, and on the
+                // m9g.xlarge glibc zeroes with its generic memset.
+                std::vector<SnapshotRow>& out = current->rows;
+                out.insert(out.end(), RowsOf<PendingRow>(from), RowsOf<PendingRow>(from + n));
+                uint64_t lo      = current->min_ts_ns;
+                uint64_t hi      = current->max_ts_ns;
+                uint64_t own_max = current->max_own_seq;
+                bool all_own     = current->all_own;
+                for (size_t i = 0; i < n; ++i) {
+                    const PendingRow& pr = from[i];
+                    lo = std::min(lo, pr.row.timestamp_ns);
+                    hi = std::max(hi, pr.row.timestamp_ns);
+                    if (pr.own) {
+                        own_max = std::max(own_max, pr.row.sequence_number);
+                    } else {
+                        all_own = false;
+                    }
                 }
-                ++appended;
+                current->min_ts_ns   = lo;
+                current->max_ts_ns   = hi;
+                current->max_own_seq = own_max;
+                current->all_own     = all_own;
+                appended += n;
+                chunk.first += n;
             }
         } catch (...) {
             // Since #165 part 2a a drain writes nothing - rows go to blocks, and a seal writes - so
@@ -4340,8 +4502,9 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
             throw;
         }
 
-        // Cleared, given back and released from the ceiling, all without mtx_ - destroying 4096
-        // rows is work no writer should wait behind, and the spare chunks have a lock of their own.
+        // Cleared, given back and released from the ceiling, all without mtx_ - the spare chunks have
+        // a lock of their own. Clearing destroyed 4096 rows, two strings each, until #270; a row
+        // owns nothing now, so it destroys none.
         // Taking mtx_ here instead starved the drain at four pipelining connections: ~250
         // acquisitions a tick, each behind every writer, and 10.6 -> 9.0 M levels/s (m9g.xlarge).
         // Given back **before** it leaves the ceiling, so a writer the release lets on finds the
@@ -4356,6 +4519,10 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     }
     batch.chunks.clear();
     publish();
+    // What the next drain scales its blocks' reservations by (#281). A drain that threw left the last.
+    last_drain_rows_ = appended;
+    OB_LOG_DEBUG("engine", "drained %zu row(s) of the %zu taken into %zu block(s)", appended, batch_rows,
+                 slot_of.size());
 
     // And kept for what this flush will say it covered once its segments are written (#159): the
     // checkpoint must claim these rows and nothing appended after them, and the WAL files before
@@ -4487,7 +4654,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     for (const SealPick& p : picks) {
         ColumnarStore* store = by_age[p.index].second;
         const Unsealed& u = unsealed_.at(store);
-        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}});
+        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}, {}});
         sealed_rows += u.rows;
         if (p.why == SealReason::kRows) ++by_rows;
         if (p.why == SealReason::kAge) ++by_age_count;
@@ -4532,7 +4699,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     return seals;
 }
 
-std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
+std::exception_ptr Engine::write_seals(std::vector<Seal>& seals, bool with_summaries) {
     if (while_sealing_for_test_ && !seals.empty()) while_sealing_for_test_();
     std::exception_ptr failure;
     std::vector<Seal> written;
@@ -4562,6 +4729,14 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
             if (meta.has_value()) s.metas.push_back(std::move(meta.value()));
             s.store->swap_buffers(seal_buffers_);
             lent = false;
+            // The blocks of a seal that makes a summary due, kept until write_book_summaries() composes it
+            // from their rows (#286) - a few milliseconds past the merge that would have let them go - so
+            // the summary does not read the segment back. After the background sync is asked, as the
+            // composition was before: it runs while the sync does.
+            if (with_summaries && s.metas.size() == 1 && summary_due_after(s)) {
+                s.sealed.reserve(s.count);
+                for (size_t i = 0; i < s.count; ++i) s.sealed.push_back(u.blocks[i].block);
+            }
             written.push_back(std::move(s));
         } catch (const std::exception& e) {
             s.store->abandon_active();
@@ -4652,7 +4827,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
     using SealClock = std::chrono::steady_clock;
     const auto started = SealClock::now();
     std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows, credit);
-    const std::exception_ptr write_failure = write_seals(seals);
+    const std::exception_ptr write_failure = write_seals(seals, /*with_summaries=*/true);
     const auto written = SealClock::now();
 
     if (seals.empty() && !claim_regardless) {
@@ -5045,6 +5220,96 @@ void Engine::stop_seal_sync() {
     if (seal_sync_thread_.joinable()) seal_sync_thread_.join();
 }
 
+void Engine::ask_wal_removal(uint32_t before_index) {
+    // Caller holds no engine lock: the flush tick asks after it has decided, under mtx_, what may go.
+    bool here = false;
+    {
+        std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+        if (before_index <= wal_removal_asked_) return;   // asked for already, or done
+        wal_removal_asked_ = before_index;
+        here = !wal_removal_alive_;
+    }
+    if (!here) {
+        wal_removal_cv_.notify_all();
+        OB_LOG_DEBUG("engine", "The WAL files below %u are asked to be removed off the flush thread",
+                     before_index);
+        return;
+    }
+    // No thread to hand them to - before open(), after close() - so removed here, as before #277.
+    std::lock_guard<std::mutex> removing(wal_removing_mtx_);
+    const size_t removed = wal_.truncate_before(before_index);
+    {
+        std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+        wal_removal_done_ = std::max(wal_removal_done_, before_index);
+    }
+    wal_removal_cv_.notify_all();
+    OB_LOG_DEBUG("engine", "The WAL files below %u removed on the asking thread, the removal thread not "
+                           "running: %zu file(s)",
+                 before_index, removed);
+}
+
+void Engine::wal_removal_loop() {
+    std::unique_lock<std::mutex> lock(wal_removal_mtx_);
+    wal_removal_alive_ = true;
+    OB_LOG_DEBUG("engine", "WAL removal thread started");
+    for (;;) {
+        wal_removal_cv_.wait(lock, [this] {
+            return wal_removal_stop_ || wal_removal_asked_ > wal_removal_done_;
+        });
+        // Asked for before it was stopped, done before it stops: close() leaves the directory as a
+        // tick that removed its files itself did.
+        if (wal_removal_asked_ <= wal_removal_done_) break;
+        const uint32_t before = wal_removal_asked_;
+        wal_removal_running_ = true;
+        lock.unlock();
+
+        // Guarded as the seal sync is: a removal that throws - a file the process may not unlink - is
+        // said and the loop goes on, and the next index a tick asks for removes it with the rest, since
+        // every file below an index goes. Ended, no file would be removed again for the life of the node.
+        size_t removed = 0;
+        double took = 0;
+        try {
+            std::lock_guard<std::mutex> removing(wal_removing_mtx_);
+            const auto began = std::chrono::steady_clock::now();
+            removed = wal_.truncate_before(before);
+            took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began)
+                       .count();
+        } catch (const std::exception& e) {
+            OB_LOG_WARN("engine", "Removing the WAL files below %u failed (%s); the next file retention "
+                                  "lets go removes them with it",
+                        before, e.what());
+        }
+        if (removed > 0) {
+            OB_LOG_DEBUG("engine", "WAL files below %u removed off the flush thread: %zu file(s) in %.1f ms",
+                         before, removed, took);
+        }
+
+        lock.lock();
+        wal_removal_running_ = false;
+        wal_removal_done_ = std::max(wal_removal_done_, before);
+        wal_removal_cv_.notify_all();   // await_wal_removals_for_test(), stop_wal_removal()
+    }
+    wal_removal_alive_ = false;
+    wal_removal_cv_.notify_all();
+    OB_LOG_DEBUG("engine", "WAL removal thread stopped, files below %u removed", wal_removal_done_);
+}
+
+void Engine::stop_wal_removal() {
+    {
+        std::lock_guard<std::mutex> lock(wal_removal_mtx_);
+        wal_removal_stop_ = true;
+    }
+    wal_removal_cv_.notify_all();
+    if (wal_removal_thread_.joinable()) wal_removal_thread_.join();
+}
+
+void Engine::await_wal_removals_for_test() {
+    std::unique_lock<std::mutex> lock(wal_removal_mtx_);
+    wal_removal_cv_.wait(lock, [this] {
+        return (!wal_removal_running_ && wal_removal_asked_ <= wal_removal_done_) || !wal_removal_alive_;
+    });
+}
+
 void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels, bool own) {
     // Caller holds mtx_, and has seeded the record's number under the origin that wrote it
     // (#179) - replay_wal_tail() does, for the records it skips as stored too - and says whether
@@ -5056,21 +5321,13 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels,
     // would append a second GAP for the same hole on every restart.
     const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
 
-    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
+    LiveBook& book = get_or_create_book(symbol_key, delta.symbol, delta.exchange);
     bool gap_detected = false;
-    (void)ob::apply_delta(buf, delta, levels, gap_detected);
+    (void)ob::apply_delta(*book.buffer, delta, levels, gap_detected);
 
+    const RowName& name = row_names_.of(delta.symbol, delta.exchange, book.name);
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
-        pending_rows_.push_back({delta.symbol, delta.exchange, row, own});
+        queue_row(name, delta, i, levels[i], own);
     }
 }
 

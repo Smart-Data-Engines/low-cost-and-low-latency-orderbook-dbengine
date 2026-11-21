@@ -11,6 +11,7 @@
 #include "orderbook/engine.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
@@ -31,7 +32,7 @@ namespace fs = std::filesystem;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 static std::string make_temp_dir(const std::string& prefix) {
-    auto tmp = fs::temp_directory_path() / (prefix + std::to_string(std::rand()));
+    auto tmp = ob::test::own_temp_dir(prefix);
     fs::create_directories(tmp);
     return tmp.string();
 }

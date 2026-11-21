@@ -12,6 +12,7 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
 #include "orderbook/wal.hpp"
+#include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
 
@@ -29,11 +30,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-static std::atomic<uint64_t> g_dir_counter{0};
 
 std::string make_temp_dir(const std::string& prefix) {
-    auto tmp = fs::temp_directory_path() /
-               (prefix + std::to_string(g_dir_counter.fetch_add(1, std::memory_order_relaxed)));
+    auto tmp = ob::test::own_temp_dir(prefix);
     fs::create_directories(tmp);
     return tmp.string();
 }
