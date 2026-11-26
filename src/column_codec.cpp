@@ -1158,11 +1158,10 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
     // transform's anchor, divisor and widths are the whole column's, worked out by encode_as(), so
     // the sample chooses only the encoding's name.
     if (options.sample > 0 && values.size() > options.sample) {
-        EncodeOptions whole = options;
-        whole.sample = 0;
+        // The sample is no longer than `sample`, so this search takes it whole.
         thread_local std::string sample_block;   // the sample's block, never written
         sample_block.clear();
-        const Encoding chosen = encode(values.first(options.sample), whole, sample_block).encoding;
+        const Encoding chosen = encode(values.first(options.sample), options, sample_block).encoding;
         keep_small(sample_block);
         Choice choice;
         choice.encoding = chosen;
