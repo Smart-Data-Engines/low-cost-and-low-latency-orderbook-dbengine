@@ -146,6 +146,9 @@ MetricsRegistry::MetricsRegistry() {
                                      "Columns queries read from a segment's file and decoded"));
     counters_.push_back(make_counter("ob_decoded_columns_evictions_total",
                                      "Segments whose held columns were evicted to make room"));
+    // A read of held columns passes over a run of rows none of whose timestamps is in its range (#288).
+    counters_.push_back(make_counter("ob_decoded_columns_chunks_passed_total",
+                                     "Runs of 2048 held rows reads passed over by their timestamps"));
     counters_.push_back(make_counter("ob_decoded_columns_arena_fallbacks_total",
                                      "Held columns decoded on the heap: no slot under the arena's cap (#223)"));
     // A scan's candidates read on the pool's threads, and by the query that waited for them (#246,

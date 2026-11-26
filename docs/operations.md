@@ -2255,6 +2255,10 @@ pace with hits on a node whose queries repeat say the budget is smaller than wha
 and what of it no column holds, `ob_decoded_columns_arena_regions` its regions, and
 `ob_decoded_columns_arena_fallbacks_total` the columns decoded on the heap for want of room under
 it - a count that keeps growing says the slack is short of the columns the queries read at once.
+`ob_decoded_columns_chunks_passed_total` counts the runs of 2048 held rows that reads passed over
+without looking at their rows, because none of their timestamps was in the range asked (#288): a held
+timestamp column keeps the least and the greatest time of each run, so a query of a narrow range reads
+the runs it can have rows in rather than the whole segment.
 
 ## Stopping a node
 

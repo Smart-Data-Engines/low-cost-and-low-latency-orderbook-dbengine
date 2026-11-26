@@ -1805,6 +1805,25 @@ enum class ColumnsLoad { kOk, kMissing, kBad };
 /// its CRC32C and decoded to exactly `rows` values. kBad, and the reason, for a file that is not
 /// what the store writes - a reader holds a format-3 segment to what it says of itself, since a
 /// Simple8b word decodes into other numbers without a sound.
+/// The least and the greatest of each run of `kTimeRangeRows` timestamps, two a run and in order, the last
+/// run shorter (#288): a held timestamp column's ranges, worked out once where it is decoded to be held.
+std::vector<uint64_t> time_ranges_of(std::span<const uint64_t> ts) {
+    std::vector<uint64_t> ranges;
+    ranges.reserve(2 * ((ts.size() + kTimeRangeRows - 1) / kTimeRangeRows));
+    for (size_t from = 0; from < ts.size(); from += kTimeRangeRows) {
+        const size_t to = std::min(ts.size(), from + kTimeRangeRows);
+        uint64_t lo = ts[from];
+        uint64_t hi = ts[from];
+        for (size_t k = from + 1; k < to; ++k) {
+            lo = std::min(lo, ts[k]);
+            hi = std::max(hi, ts[k]);
+        }
+        ranges.push_back(lo);
+        ranges.push_back(hi);
+    }
+    return ranges;
+}
+
 ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet columns,
                             SegmentReadBuffers& b, std::string& why,
                             std::array<DecodedColumns::Column, kColumns>* fresh = nullptr,
@@ -1873,6 +1892,9 @@ ColumnsLoad load_columns_v3(const std::string& dir, uint64_t rows, ColumnSet col
             case 5:  ok = into(uint16_t{}); break;
             default: ok = into(int64_t{}); break;
             }
+            // The timestamps' ranges, from the values just decoded (#288): what a read of this held
+            // column passes over runs of rows by.
+            if (ok && c == 0) values->time_ranges = time_ranges_of(values->as<uint64_t>());
             if (ok) (*fresh)[c] = std::move(values);
         } else {
             switch (c) {
@@ -1989,7 +2011,7 @@ void ColumnarStore::set_decoded_columns_budget(size_t bytes) {
 DecodedColumnsBudget::Stats ColumnarStore::decoded_columns_stats() const {
     std::shared_lock<std::shared_mutex> lock(index_mtx_);
     return decoded_budget_ ? decoded_budget_->stats()
-                           : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0, ColumnArena::Stats{0, 0, 0, 0}};
+                           : DecodedColumnsBudget::Stats{0, 0, 0, 0, 0, 0, ColumnArena::Stats{0, 0, 0, 0}};
 }
 
 namespace {
@@ -2009,6 +2031,8 @@ struct RowColumns {
 
 /// Rows the selection pass marks at a time (#225), which is the most rows a batch holds (OB-12).
 constexpr size_t kSelectChunk = kScanBatchRows;
+static_assert(kSelectChunk == kTimeRangeRows,
+              "a held timestamp column's ranges (#288) are of the rows emit_batches() takes at a time");
 
 /// AND into `mask` whether each of `len` values from `v` is within [lo, hi]: one loop with no branch
 /// and no bounds check, which the compiler vectorizes.
@@ -2027,8 +2051,14 @@ void select_within(const T* v, size_t len, T lo, T hi, uint8_t* mask) {
 /// the reader stops at a row, the count is the rows the filter failed before it, as the row-by-row
 /// loop this replaced counted them (#47 step 2). The one loop every read emits through - a pooled
 /// read, a held one and the unsealed blocks - so none of them can answer differently.
+///
+/// `ranges`, when given, are the timestamps' least and greatest of each chunk, two a chunk (#288): a chunk
+/// none of whose rows can be in [start_ns, end_ns] is passed over without its rows, and counted into
+/// `*passed`. Its rows would all have been out of the range, so nothing else changes - not the batches,
+/// not `filtered`. Given, they are exactly two a chunk of `n` rows; the caller checks that.
 bool emit_batches(size_t n, const RowColumns& c, uint64_t start_ns, uint64_t end_ns,
-                  const RowFilter& filter, const BatchReader& read, uint64_t& filtered) {
+                  const RowFilter& filter, const BatchReader& read, uint64_t& filtered,
+                  std::span<const uint64_t> ranges = {}, uint64_t* passed = nullptr) {
     const bool check = !filter.empty();
     const int64_t  price_lo = filter.price_lo.value_or(std::numeric_limits<int64_t>::min());
     const int64_t  price_hi = filter.price_hi.value_or(std::numeric_limits<int64_t>::max());
@@ -2042,6 +2072,13 @@ bool emit_batches(size_t n, const RowColumns& c, uint64_t start_ns, uint64_t end
     RowBatch batch{c.ts, c.price, c.qty, c.cnt, c.side, c.level, c.seq, {}};
     for (size_t from = 0; from < n; from += kSelectChunk) {
         const size_t len = std::min(kSelectChunk, n - from);
+        if (!ranges.empty()) {
+            const size_t z = from / kSelectChunk;
+            if (ranges[2 * z + 1] < start_ns || ranges[2 * z] > end_ns) {
+                if (passed != nullptr) ++*passed;
+                continue;
+            }
+        }
         const uint64_t* ts = c.ts.data() + from;
         size_t ranged = 0;
         for (size_t k = 0; k < len; ++k) {
@@ -2321,8 +2358,27 @@ ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
                          why.c_str());
             return SegmentRead::kUnreadable;
         }
+        if (fresh[0]) {
+            OB_LOG_DEBUG("columnar", "segment %s: its timestamps decoded with %zu ranges of %zu rows",
+                         dir.c_str(), fresh[0]->time_ranges.size() / 2, kTimeRangeRows);
+        }
         for (size_t c = 0; c < kColumns; ++c) {
             if (fresh[c]) held[c] = slot.put(c, std::move(fresh[c]), dir);
+        }
+    }
+
+    // The timestamps' ranges, which pass over the chunks a narrow range has no row in (#288): two a
+    // chunk of the segment's rows, or none - a column decoded before it had ranges - and then every
+    // chunk is looked at, as before.
+    const auto rows = static_cast<size_t>(meta.row_count);
+    std::span<const uint64_t> ranges;
+    if (held[0]) {
+        const std::vector<uint64_t>& r = held[0]->time_ranges;
+        if (r.size() == 2 * ((rows + kSelectChunk - 1) / kSelectChunk)) {
+            ranges = r;
+        } else if (!r.empty()) {
+            OB_LOG_WARN("columnar", "segment %s: %zu timestamp ranges for %zu rows; every chunk is read",
+                        dir.c_str(), r.size() / 2, rows);
         }
     }
 
@@ -2333,12 +2389,14 @@ ColumnarStore::SegmentRead ColumnarStore::read_held_columns(
         return held[c] ? held[c]->as<T>() : std::span<const T>{};
     };
     uint64_t failed = 0;
+    uint64_t passed = 0;
     const bool going = emit_batches(
-        static_cast<size_t>(meta.row_count),
+        rows,
         RowColumns{column(0, uint64_t{}), column(1, int64_t{}), column(2, uint64_t{}),
                    column(3, uint32_t{}), column(4, uint8_t{}), column(5, uint16_t{}),
                    column(6, int64_t{})},
-        start_ns, end_ns, filter, read, failed);
+        start_ns, end_ns, filter, read, failed, ranges, &passed);
+    slot.count_passed(passed);
     if (filtered != nullptr) *filtered += failed;
     if (stopped != nullptr) *stopped = !going;
     return SegmentRead::kRead;
