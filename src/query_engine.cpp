@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace ob {
 
@@ -1732,6 +1733,27 @@ inline __int128 price_times_quantity(int64_t px, uint64_t qty) {
     return static_cast<__int128>(px) * static_cast<__int128>(qty);
 }
 
+/// The columns of a batch that a run of a bucket's rows reads (#290). A column the scan did not read is not
+/// in the batch and reads as zero, as a built row's field did: through a one-element array, every row sent
+/// to it by its mask - no branch a row.
+struct RunColumns {
+    const uint32_t* rows;
+    const uint64_t* ts;
+    const int64_t*  px;
+    uint32_t        px_mask;
+    const uint64_t* qty;
+    uint32_t        qty_mask;
+};
+constexpr int64_t  kNoPrice[1] = {0};
+constexpr uint64_t kNoQuantity[1] = {0};
+RunColumns run_columns(const RowBatch& b) {
+    const bool priced = !b.price.empty();
+    const bool sized = !b.qty.empty();
+    return RunColumns{b.rows.data(), b.ts.data(),
+                      priced ? b.price.data() : kNoPrice, priced ? ~uint32_t{0} : uint32_t{0},
+                      sized ? b.qty.data() : kNoQuantity, sized ? ~uint32_t{0} : uint32_t{0}};
+}
+
 struct BucketState {
     uint64_t count{0};
     uint64_t first_ts{0}, last_ts{0};
@@ -1745,82 +1767,126 @@ struct BucketState {
     bool     px_qty_overflow{false};
 
     /// The rows `from` to `to` of a batch's chosen rows, every one of them in this bucket, in the order the
-    /// scan delivered them, kept in the parts `needs` names (#290). Each part is worked out in registers
-    /// over the run and stored once: a row at a time through the bucket, each row waited for the last
-    /// one's store. A column the scan did not read is not in the batch and reads as zero, as a built
-    /// row's field did. The same as a row at a time in every part: FIRST keeps the earlier row unless
-    /// this one's time is strictly earlier, LAST takes this one at an equal time or a later one, and a
-    /// sum of products that leaves 128 bits refuses VWAP for good, the sum going on as it went.
-    void add_run(const RowBatch& b, size_t from, size_t to, uint8_t needs) {
-        const uint32_t* const rows = b.rows.data();
-        const uint64_t* const ts = b.ts.data();
-        const int64_t* const px = b.price.empty() ? nullptr : b.price.data();
-        const uint64_t* const qty = b.qty.empty() ? nullptr : b.qty.data();
-        const auto price_of = [px](uint32_t i) -> int64_t { return px != nullptr ? px[i] : 0; };
-        const auto qty_of = [qty](uint32_t i) -> uint64_t { return qty != nullptr ? qty[i] : 0; };
-        if (needs & kNeedEnds) {
-            size_t k = from;
-            if (count == 0) {
-                const uint32_t i = rows[k++];
-                first_ts = last_ts = ts[i];
-                first_price = last_price = price_of(i);
-                first_qty = last_qty = qty_of(i);
-            }
-            uint64_t fts = first_ts, lts = last_ts;
-            int64_t fpx = first_price, lpx = last_price;
-            uint64_t fq = first_qty, lq = last_qty;
-            for (; k < to; ++k) {
-                const uint32_t i = rows[k];
-                const uint64_t t = ts[i];
-                if (t < fts) {
-                    fts = t; fpx = price_of(i); fq = qty_of(i);
-                }
-                if (t >= lts) {
-                    lts = t; lpx = price_of(i); lq = qty_of(i);
-                }
-            }
-            first_ts = fts; first_price = fpx; first_qty = fq;
-            last_ts = lts; last_price = lpx; last_qty = lq;
-        }
-        if (needs & kNeedExtremes) {
-            size_t k = from;
-            if (count == 0) {
-                const uint32_t i = rows[k++];
-                min_price = max_price = price_of(i);
-                min_qty = max_qty = qty_of(i);
-            }
-            int64_t lo_px = min_price, hi_px = max_price;
-            uint64_t lo_q = min_qty, hi_q = max_qty;
-            for (; k < to; ++k) {
-                const uint32_t i = rows[k];
-                lo_px = std::min(lo_px, price_of(i)); hi_px = std::max(hi_px, price_of(i));
-                lo_q  = std::min(lo_q, qty_of(i));    hi_q  = std::max(hi_q, qty_of(i));
-            }
-            min_price = lo_px; max_price = hi_px; min_qty = lo_q; max_qty = hi_q;
-        }
-        if (needs & kNeedQtySum) {
-            unsigned __int128 sum = sum_qty;
-            for (size_t k = from; k < to; ++k) sum += qty_of(rows[k]);
-            sum_qty = sum;
-        }
-        if (needs & kNeedPriceSum) {
-            __int128 sum = sum_price;
-            for (size_t k = from; k < to; ++k) sum += price_of(rows[k]);
-            sum_price = sum;
-        }
-        if (needs & kNeedWeighted) {
-            __int128 sum = sum_px_qty;
-            bool overflow = px_qty_overflow;
-            for (size_t k = from; k < to; ++k) {
-                const uint32_t i = rows[k];
-                if (__builtin_add_overflow(sum, price_times_quantity(price_of(i), qty_of(i)), &sum)) overflow = true;
-            }
-            sum_px_qty = sum;
-            px_qty_overflow = overflow;
-        }
-        count += to - from;
-    }
+    /// scan delivered them, kept in the parts `needs` names (#290): one pass over the run, every part in
+    /// registers and stored once - a row at a time through the bucket, each row waited for the last one's
+    /// store. As a row at a time in every part: FIRST keeps the earlier row unless this one's time is
+    /// strictly earlier, LAST takes this one at an equal time or a later one, and a sum of products that
+    /// leaves 128 bits refuses VWAP for good, the sum going on as it went.
+    void add_run(const RunColumns& c, size_t from, size_t to, uint8_t needs);
 };
+
+/// add_run() for one set of needs, compiled for it (#290): a part the query does not read is not in the loop,
+/// and with `Sizes` the sum of the products' sizes a pool's part keeps is too, from the same product.
+template <uint8_t Needs, bool Sizes>
+void add_run_as(BucketState& s, const RunColumns& c, size_t from, size_t to, unsigned __int128* sizes,
+                bool* sizes_overflow) {
+    constexpr bool ends     = (Needs & kNeedEnds) != 0;
+    constexpr bool extremes = (Needs & kNeedExtremes) != 0;
+    constexpr bool qty_sum  = (Needs & kNeedQtySum) != 0;
+    constexpr bool px_sum   = (Needs & kNeedPriceSum) != 0;
+    constexpr bool weighted = (Needs & kNeedWeighted) != 0;
+    uint64_t fts = s.first_ts, lts = s.last_ts;
+    int64_t fpx = s.first_price, lpx = s.last_price;
+    uint64_t fq = s.first_qty, lq = s.last_qty;
+    int64_t lo_px = s.min_price, hi_px = s.max_price;
+    uint64_t lo_q = s.min_qty, hi_q = s.max_qty;
+    unsigned __int128 sum_q = s.sum_qty;
+    __int128 sum_p = s.sum_price;
+    __int128 sum_pq = s.sum_px_qty;
+    bool overflow = s.px_qty_overflow;
+    unsigned __int128 sz = 0;
+    bool sz_overflow = false;
+    if constexpr (Sizes) {
+        sz = *sizes;
+        sz_overflow = *sizes_overflow;
+    }
+    if (s.count == 0) {
+        // The bucket's first row is its first and last and its extremes; the loop below takes it again,
+        // which changes none of them, and adds it to the sums once.
+        const uint32_t i = c.rows[from];
+        const int64_t p = c.px[i & c.px_mask];
+        const uint64_t q = c.qty[i & c.qty_mask];
+        if constexpr (ends) {
+            fts = lts = c.ts[i];
+            fpx = lpx = p;
+            fq = lq = q;
+        }
+        if constexpr (extremes) {
+            lo_px = hi_px = p;
+            lo_q = hi_q = q;
+        }
+    }
+    for (size_t k = from; k < to; ++k) {
+        const uint32_t i = c.rows[k];
+        const int64_t p = c.px[i & c.px_mask];
+        const uint64_t q = c.qty[i & c.qty_mask];
+        if constexpr (ends) {
+            const uint64_t t = c.ts[i];
+            if (t < fts) {
+                fts = t; fpx = p; fq = q;
+            }
+            if (t >= lts) {
+                lts = t; lpx = p; lq = q;
+            }
+        }
+        if constexpr (extremes) {
+            lo_px = std::min(lo_px, p); hi_px = std::max(hi_px, p);
+            lo_q  = std::min(lo_q, q);  hi_q  = std::max(hi_q, q);
+        }
+        if constexpr (qty_sum) sum_q += q;
+        if constexpr (px_sum) sum_p += p;
+        if constexpr (weighted || Sizes) {
+            // |p| <= 2^63 and q < 2^64, so the product and its negation are inside 128 bits.
+            const __int128 product = price_times_quantity(p, q);
+            if constexpr (weighted) {
+                if (__builtin_add_overflow(sum_pq, product, &sum_pq)) overflow = true;
+            }
+            if constexpr (Sizes) {
+                const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
+                if (__builtin_add_overflow(sz, size, &sz)) sz_overflow = true;
+            }
+        }
+    }
+    if constexpr (ends) {
+        s.first_ts = fts; s.first_price = fpx; s.first_qty = fq;
+        s.last_ts = lts; s.last_price = lpx; s.last_qty = lq;
+    }
+    if constexpr (extremes) {
+        s.min_price = lo_px; s.max_price = hi_px; s.min_qty = lo_q; s.max_qty = hi_q;
+    }
+    if constexpr (qty_sum) s.sum_qty = sum_q;
+    if constexpr (px_sum) s.sum_price = sum_p;
+    if constexpr (weighted) {
+        s.sum_px_qty = sum_pq;
+        s.px_qty_overflow = overflow;
+    }
+    if constexpr (Sizes) {
+        *sizes = sz;
+        *sizes_overflow = sz_overflow;
+    }
+    s.count += to - from;
+}
+
+/// One add_run_as() for each set of needs, chosen once a run: the bucket's own, and a pool's part's, which keeps
+/// the products' sizes where VWAP is asked.
+using RunAdder = void (*)(BucketState&, const RunColumns&, size_t, size_t, unsigned __int128*, bool*);
+constexpr size_t kNeedSets = 32;
+static_assert(kNeedEnds + kNeedExtremes + kNeedPriceSum + kNeedQtySum + kNeedWeighted == kNeedSets - 1,
+              "the needs are five bits, every set of them a table's entry");
+template <size_t... N>
+constexpr std::array<RunAdder, sizeof...(N)> bucket_run_adders(std::index_sequence<N...>) {
+    return {&add_run_as<static_cast<uint8_t>(N), false>...};
+}
+template <size_t... N>
+constexpr std::array<RunAdder, sizeof...(N)> part_run_adders(std::index_sequence<N...>) {
+    return {&add_run_as<static_cast<uint8_t>(N), (N & kNeedWeighted) != 0>...};
+}
+constexpr auto kBucketRunAdders = bucket_run_adders(std::make_index_sequence<kNeedSets>{});
+constexpr auto kPartRunAdders = part_run_adders(std::make_index_sequence<kNeedSets>{});
+
+void BucketState::add_run(const RunColumns& c, size_t from, size_t to, uint8_t needs) {
+    kBucketRunAdders[needs & (kNeedSets - 1)](*this, c, from, to, nullptr, nullptr);
+}
 
 /// What `aggs` read of each row (#290). A series function reads no row state.
 uint8_t bucket_needs(const std::vector<BucketAgg>& aggs) {
@@ -1941,29 +2007,10 @@ struct PartBucket {
     unsigned __int128 abs_px_qty{0};
     bool abs_overflow{false};
 
-    void add_run(const RowBatch& b, size_t from, size_t to, uint8_t needs) {
-        // The product once, for the sum and for its size (#290), and only where VWAP is asked.
-        state.add_run(b, from, to, static_cast<uint8_t>(needs & ~kNeedWeighted));
-        if ((needs & kNeedWeighted) == 0) return;
-        const uint32_t* const rows = b.rows.data();
-        const int64_t* const px = b.price.empty() ? nullptr : b.price.data();
-        const uint64_t* const qty = b.qty.empty() ? nullptr : b.qty.data();
-        __int128 sum = state.sum_px_qty;
-        bool overflow = state.px_qty_overflow;
-        unsigned __int128 sizes = abs_px_qty;
-        bool sizes_overflow = abs_overflow;
-        for (size_t k = from; k < to; ++k) {
-            const uint32_t i = rows[k];
-            // |px| <= 2^63 and qty < 2^64, so the product and its negation are inside 128 bits.
-            const __int128 product = price_times_quantity(px != nullptr ? px[i] : 0, qty != nullptr ? qty[i] : 0);
-            if (__builtin_add_overflow(sum, product, &sum)) overflow = true;
-            const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
-            if (__builtin_add_overflow(sizes, size, &sizes)) sizes_overflow = true;
-        }
-        state.sum_px_qty = sum;
-        state.px_qty_overflow = overflow;
-        abs_px_qty = sizes;
-        abs_overflow = sizes_overflow;
+    void add_run(const RunColumns& c, size_t from, size_t to, uint8_t needs) {
+        // In one pass with the bucket's own parts: the product once, for the sum and for its size, and only
+        // where VWAP is asked (#290).
+        kPartRunAdders[needs & (kNeedSets - 1)](state, c, from, to, &abs_px_qty, &abs_overflow);
     }
 
     /// This part's rows after those `into` holds, as one bucket: what adding them one by one in
@@ -2043,8 +2090,9 @@ struct BucketFiller {
     bool too_many{false};
 
     BatchVerdict take(const RowBatch& b) {
-        const uint32_t* const chosen = b.rows.data();
-        const uint64_t* const ts = b.ts.data();
+        const RunColumns columns = run_columns(b);
+        const uint32_t* const chosen = columns.rows;
+        const uint64_t* const ts = columns.ts;
         const size_t n = b.rows.size();
         size_t k = 0;
         while (k < n) {
@@ -2072,7 +2120,7 @@ struct BucketFiller {
             // The run of rows from `k` that this bucket holds, added together (#290).
             size_t end = k + 1;
             while (end < n && ts[chosen[end]] - last_start < width) ++end;
-            last->add_run(b, k, end, needs);
+            last->add_run(columns, k, end, needs);
             k = end;
         }
         rows += n;
