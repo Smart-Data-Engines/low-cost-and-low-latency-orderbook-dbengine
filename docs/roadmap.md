@@ -2930,7 +2930,7 @@ connections; the answer's digits are the largest part of a BOOK now (`put_field`
 
 **Tests.** Each bucket of the exposition is exactly the observations at or below its bound, and the +Inf bucket their
 count (RapidCheck); four observations are in one bucket each; seven, three of them observed together, are exposed line
-for line as before. ctest passed 2291 of 2291 on the i3-7100U (Debug): #286's 2290 and the new one.
+for line as before. ctest passed 2291 of 2291 on the m9g.xlarge and the i3-7100U (Debug): #286's 2290 and the new one.
 
 **Mutation table** (`mutations/` in the evidence, the i3-7100U): six mutants killed - an observation added to every
 bucket at or above it, as before; the exposition's buckets not added up; `cumulative()` reading its own bucket alone;
