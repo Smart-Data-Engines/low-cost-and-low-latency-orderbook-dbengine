@@ -178,10 +178,20 @@ RC_GTEST_PROP(ScanPartsProperty, BucketsOnThePoolAreTheBucketsOfOneThread, ()) {
     Store s;
     const uint64_t last = fill(s, *rc::gen::inRange(2, 6), *rc::gen::arbitrary<bool>());
     const auto width = *rc::gen::element<std::string>("7ms", "50ms", "1s", "1m");
+    // Every aggregate, or a part of them: a bucket keeps only what its query's aggregates read (#290),
+    // so a part's state and its merge are tried with each part of the state missing.
+    const std::vector<std::string> all = {"COUNT(*)", "FIRST(price)", "LAST(price)", "FIRST(quantity)",
+                                          "LAST(quantity)", "MIN(price)", "MAX(price)", "MIN(quantity)",
+                                          "MAX(quantity)", "SUM(quantity)", "AVG(price)", "AVG(quantity)",
+                                          "VWAP(price)"};
+    std::string list;
+    const bool every = *rc::gen::arbitrary<bool>();
+    for (const std::string& agg : all) {
+        if (every || *rc::gen::arbitrary<bool>()) list += (list.empty() ? "" : ", ") + agg;
+    }
+    if (list.empty()) list = *rc::gen::elementOf(all);
     const std::string sql =
-        "SELECT COUNT(*), FIRST(price), LAST(price), FIRST(quantity), LAST(quantity), MIN(price), "
-        "MAX(price), MIN(quantity), MAX(quantity), SUM(quantity), AVG(price), AVG(quantity), "
-        "VWAP(price) FROM 'BK'.'EX'" + conditions(last) + " GROUP BY TIME_BUCKET(" + width + ")" +
+        "SELECT " + list + " FROM 'BK'.'EX'" + conditions(last) + " GROUP BY TIME_BUCKET(" + width + ")" +
         (*rc::gen::arbitrary<bool>() ? " LIMIT " + std::to_string(*rc::gen::inRange(1, 50)) : "");
     ob::ScanPool one(1, nullptr), four(4, nullptr);
     const std::string alone = s.reply(sql, nullptr);
