@@ -627,14 +627,11 @@ void MetricsRegistry::observe_histogram(std::string_view name, double seconds, u
 
     auto& d = h->data;
 
-    // Increment matching buckets (cumulative: all buckets >= observation)
-    for (size_t i = 0; i < kNumBuckets; ++i) {
-        if (seconds <= kLatencyBuckets[i]) {
-            d.buckets[i].fetch_add(count, std::memory_order_relaxed);
-        }
-    }
-    // +Inf bucket always incremented
-    d.buckets[kNumBuckets].fetch_add(count, std::memory_order_relaxed);
+    // The one bucket the value is in: the first whose boundary it does not pass, or +Inf - where a NaN
+    // goes too, as it went only into +Inf before (#289). The exposition adds the buckets up.
+    size_t i = 0;
+    while (i < kNumBuckets && !(seconds <= kLatencyBuckets[i])) ++i;
+    d.buckets[i].fetch_add(count, std::memory_order_relaxed);
 
     d.count.fetch_add(count, std::memory_order_relaxed);
 
@@ -697,18 +694,22 @@ std::string MetricsRegistry::serialize() const {
         out << "# HELP " << h->name << " " << h->help << "\n";
         out << "# TYPE " << h->name << " histogram\n";
 
-        // Bucket lines
+        // Bucket lines, cumulative as Prometheus reads them: each bucket holds its own observations
+        // alone (#289), so each line adds its bucket to the lines before it.
+        uint64_t at_or_below = 0;
         for (size_t i = 0; i < kNumBuckets; ++i) {
             char le_buf[32]{};
             std::snprintf(le_buf, sizeof(le_buf), "%.6g", kLatencyBuckets[i]);
+            at_or_below += d.buckets[i].load(std::memory_order_relaxed);
             out << h->name << "_bucket{node_role=\"" << role
                 << "\",le=\"" << le_buf << "\"} "
-                << d.buckets[i].load(std::memory_order_relaxed) << "\n";
+                << at_or_below << "\n";
         }
         // +Inf bucket
+        at_or_below += d.buckets[kNumBuckets].load(std::memory_order_relaxed);
         out << h->name << "_bucket{node_role=\"" << role
             << "\",le=\"+Inf\"} "
-            << d.buckets[kNumBuckets].load(std::memory_order_relaxed) << "\n";
+            << at_or_below << "\n";
 
         // Sum (convert nanoseconds back to seconds with high precision)
         double sum_sec = static_cast<double>(d.sum_ns.load(std::memory_order_relaxed)) / 1e9;

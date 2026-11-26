@@ -21,12 +21,26 @@ inline constexpr double kLatencyBuckets[] = {
 inline constexpr size_t kNumBuckets = sizeof(kLatencyBuckets) / sizeof(double);
 
 // ── HistogramData ─────────────────────────────────────────────────────────────
-// Lock-free histogram storage. Each bucket counts observations <= boundary.
-// The last bucket (index kNumBuckets) is the +Inf bucket.
-struct HistogramData {
-    std::atomic<uint64_t> buckets[kNumBuckets + 1]{}; // +1 for +Inf
+// Lock-free histogram storage. Each bucket counts the observations in it alone - above the boundary
+// before it, at or below its own - and the last one (index kNumBuckets) those above every boundary;
+// the exposition adds them up into Prometheus's cumulative buckets (#289). An observation is one add
+// to its bucket, where it was one to every bucket at or above it: up to twelve atomic adds, on lines
+// every client loop writes, a query each.
+//
+// The count and the sum come first, on one cache line with the first six buckets, so an observation
+// of under 5 ms touches one line.
+struct alignas(64) HistogramData {
     std::atomic<uint64_t> count{};
     std::atomic<int64_t>  sum_ns{};  // sum in nanoseconds for precision
+    std::atomic<uint64_t> buckets[kNumBuckets + 1]{}; // +1 for +Inf
+
+    /// Bucket `i` as the exposition says it: the observations at or below its boundary - every one,
+    /// for i == kNumBuckets, the +Inf bucket.
+    uint64_t cumulative(size_t i) const {
+        uint64_t sum = 0;
+        for (size_t k = 0; k <= i && k <= kNumBuckets; ++k) sum += buckets[k].load(std::memory_order_relaxed);
+        return sum;
+    }
 };
 
 // ── Entry types ───────────────────────────────────────────────────────────────
