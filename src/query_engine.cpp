@@ -1744,40 +1744,81 @@ struct BucketState {
     __int128 sum_px_qty{0};
     bool     px_qty_overflow{false};
 
-    /// One row: its time, its price and its quantity, the last two zero where the scan did not
-    /// read their column - as a built row's were - kept in the parts `needs` names (#290).
-    void add(uint64_t ts, int64_t px, uint64_t qty, uint8_t needs) {
+    /// The rows `from` to `to` of a batch's chosen rows, every one of them in this bucket, in the order the
+    /// scan delivered them, kept in the parts `needs` names (#290). Each part is worked out in registers
+    /// over the run and stored once: a row at a time through the bucket, each row waited for the last
+    /// one's store. A column the scan did not read is not in the batch and reads as zero, as a built
+    /// row's field did. The same as a row at a time in every part: FIRST keeps the earlier row unless
+    /// this one's time is strictly earlier, LAST takes this one at an equal time or a later one, and a
+    /// sum of products that leaves 128 bits refuses VWAP for good, the sum going on as it went.
+    void add_run(const RowBatch& b, size_t from, size_t to, uint8_t needs) {
+        const uint32_t* const rows = b.rows.data();
+        const uint64_t* const ts = b.ts.data();
+        const int64_t* const px = b.price.empty() ? nullptr : b.price.data();
+        const uint64_t* const qty = b.qty.empty() ? nullptr : b.qty.data();
+        const auto price_of = [px](uint32_t i) -> int64_t { return px != nullptr ? px[i] : 0; };
+        const auto qty_of = [qty](uint32_t i) -> uint64_t { return qty != nullptr ? qty[i] : 0; };
         if (needs & kNeedEnds) {
+            size_t k = from;
             if (count == 0) {
-                first_ts = last_ts = ts;
-                first_price = last_price = px;
-                first_qty = last_qty = qty;
-            } else {
-                if (ts < first_ts) {
-                    first_ts = ts; first_price = px; first_qty = qty;
+                const uint32_t i = rows[k++];
+                first_ts = last_ts = ts[i];
+                first_price = last_price = price_of(i);
+                first_qty = last_qty = qty_of(i);
+            }
+            uint64_t fts = first_ts, lts = last_ts;
+            int64_t fpx = first_price, lpx = last_price;
+            uint64_t fq = first_qty, lq = last_qty;
+            for (; k < to; ++k) {
+                const uint32_t i = rows[k];
+                const uint64_t t = ts[i];
+                if (t < fts) {
+                    fts = t; fpx = price_of(i); fq = qty_of(i);
                 }
-                if (ts >= last_ts) {
-                    last_ts = ts; last_price = px; last_qty = qty;
+                if (t >= lts) {
+                    lts = t; lpx = price_of(i); lq = qty_of(i);
                 }
             }
+            first_ts = fts; first_price = fpx; first_qty = fq;
+            last_ts = lts; last_price = lpx; last_qty = lq;
         }
         if (needs & kNeedExtremes) {
+            size_t k = from;
             if (count == 0) {
-                min_price = max_price = px;
-                min_qty = max_qty = qty;
-            } else {
-                min_price = std::min(min_price, px);   max_price = std::max(max_price, px);
-                min_qty   = std::min(min_qty, qty);    max_qty   = std::max(max_qty, qty);
+                const uint32_t i = rows[k++];
+                min_price = max_price = price_of(i);
+                min_qty = max_qty = qty_of(i);
             }
+            int64_t lo_px = min_price, hi_px = max_price;
+            uint64_t lo_q = min_qty, hi_q = max_qty;
+            for (; k < to; ++k) {
+                const uint32_t i = rows[k];
+                lo_px = std::min(lo_px, price_of(i)); hi_px = std::max(hi_px, price_of(i));
+                lo_q  = std::min(lo_q, qty_of(i));    hi_q  = std::max(hi_q, qty_of(i));
+            }
+            min_price = lo_px; max_price = hi_px; min_qty = lo_q; max_qty = hi_q;
         }
-        ++count;
-        if (needs & kNeedQtySum) sum_qty += qty;
-        if (needs & kNeedPriceSum) sum_price += px;
-        if (needs & kNeedWeighted) add_product(price_times_quantity(px, qty));
-    }
-    /// A row's price times its quantity into the sum VWAP reads; a sum that leaves 128 bits refuses VWAP.
-    void add_product(__int128 product) {
-        if (__builtin_add_overflow(sum_px_qty, product, &sum_px_qty)) px_qty_overflow = true;
+        if (needs & kNeedQtySum) {
+            unsigned __int128 sum = sum_qty;
+            for (size_t k = from; k < to; ++k) sum += qty_of(rows[k]);
+            sum_qty = sum;
+        }
+        if (needs & kNeedPriceSum) {
+            __int128 sum = sum_price;
+            for (size_t k = from; k < to; ++k) sum += price_of(rows[k]);
+            sum_price = sum;
+        }
+        if (needs & kNeedWeighted) {
+            __int128 sum = sum_px_qty;
+            bool overflow = px_qty_overflow;
+            for (size_t k = from; k < to; ++k) {
+                const uint32_t i = rows[k];
+                if (__builtin_add_overflow(sum, price_times_quantity(price_of(i), qty_of(i)), &sum)) overflow = true;
+            }
+            sum_px_qty = sum;
+            px_qty_overflow = overflow;
+        }
+        count += to - from;
     }
 };
 
@@ -1900,15 +1941,29 @@ struct PartBucket {
     unsigned __int128 abs_px_qty{0};
     bool abs_overflow{false};
 
-    void add(uint64_t ts, int64_t px, uint64_t qty, uint8_t needs) {
+    void add_run(const RowBatch& b, size_t from, size_t to, uint8_t needs) {
         // The product once, for the sum and for its size (#290), and only where VWAP is asked.
-        state.add(ts, px, qty, static_cast<uint8_t>(needs & ~kNeedWeighted));
+        state.add_run(b, from, to, static_cast<uint8_t>(needs & ~kNeedWeighted));
         if ((needs & kNeedWeighted) == 0) return;
-        // |px| <= 2^63 and qty < 2^64, so the product and its negation are inside 128 bits.
-        const __int128 product = price_times_quantity(px, qty);
-        state.add_product(product);
-        const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
-        if (__builtin_add_overflow(abs_px_qty, size, &abs_px_qty)) abs_overflow = true;
+        const uint32_t* const rows = b.rows.data();
+        const int64_t* const px = b.price.empty() ? nullptr : b.price.data();
+        const uint64_t* const qty = b.qty.empty() ? nullptr : b.qty.data();
+        __int128 sum = state.sum_px_qty;
+        bool overflow = state.px_qty_overflow;
+        unsigned __int128 sizes = abs_px_qty;
+        bool sizes_overflow = abs_overflow;
+        for (size_t k = from; k < to; ++k) {
+            const uint32_t i = rows[k];
+            // |px| <= 2^63 and qty < 2^64, so the product and its negation are inside 128 bits.
+            const __int128 product = price_times_quantity(px != nullptr ? px[i] : 0, qty != nullptr ? qty[i] : 0);
+            if (__builtin_add_overflow(sum, product, &sum)) overflow = true;
+            const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
+            if (__builtin_add_overflow(sizes, size, &sizes)) sizes_overflow = true;
+        }
+        state.sum_px_qty = sum;
+        state.px_qty_overflow = overflow;
+        abs_px_qty = sizes;
+        abs_overflow = sizes_overflow;
     }
 
     /// This part's rows after those `into` holds, as one bucket: what adding them one by one in
@@ -1988,38 +2043,39 @@ struct BucketFiller {
     bool too_many{false};
 
     BatchVerdict take(const RowBatch& b) {
-        const bool priced = !b.price.empty();
-        const bool sized = !b.qty.empty();
-        for (size_t k = 0; k < b.rows.size(); ++k) {
-            const uint32_t i = b.rows[k];
-            const uint64_t ts = b.ts[i];
-            const int64_t px = priced ? b.price[i] : 0;
-            const uint64_t qty = sized ? b.qty[i] : 0;
-            if (last != nullptr && ts - last_start < width) {
-                last->add(ts, px, qty, needs);
-                continue;
-            }
-            const uint64_t start = ts - ts % width;
-            if (last == nullptr || start != last_start) {
-                auto it = buckets.find(start);
-                if (it == buckets.end()) {
-                    // Rows do not arrive in time order - segments by their start, a segment's rows
-                    // as appended, and a client's own event times anywhere (#105) - so LIMIT cannot
-                    // end the scan early. The ceiling can (#47 step 2): past it the query is
-                    // refused, whatever the rest of the range holds.
-                    if (buckets.size() >= ceiling) {
-                        too_many = true;
-                        rows += k;
-                        return {true, k};
+        const uint32_t* const chosen = b.rows.data();
+        const uint64_t* const ts = b.ts.data();
+        const size_t n = b.rows.size();
+        size_t k = 0;
+        while (k < n) {
+            const uint64_t t = ts[chosen[k]];
+            if (last == nullptr || t - last_start >= width) {
+                const uint64_t start = t - t % width;
+                if (last == nullptr || start != last_start) {
+                    auto it = buckets.find(start);
+                    if (it == buckets.end()) {
+                        // Rows do not arrive in time order - segments by their start, a segment's rows
+                        // as appended, and a client's own event times anywhere (#105) - so LIMIT cannot
+                        // end the scan early. The ceiling can (#47 step 2): past it the query is
+                        // refused, whatever the rest of the range holds.
+                        if (buckets.size() >= ceiling) {
+                            too_many = true;
+                            rows += k;
+                            return {true, k};
+                        }
+                        it = buckets.emplace(start, State{}).first;
                     }
-                    it = buckets.emplace(start, State{}).first;
+                    last = &it->second;
+                    last_start = start;
                 }
-                last = &it->second;
-                last_start = start;
             }
-            last->add(ts, px, qty, needs);
+            // The run of rows from `k` that this bucket holds, added together (#290).
+            size_t end = k + 1;
+            while (end < n && ts[chosen[end]] - last_start < width) ++end;
+            last->add_run(b, k, end, needs);
+            k = end;
         }
-        rows += b.rows.size();
+        rows += n;
         return {};
     }
 };
