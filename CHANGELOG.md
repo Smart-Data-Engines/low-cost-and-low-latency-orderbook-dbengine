@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A latency histogram's observation is one add to its bucket** (#289). Every read observes
+  `ob_query_latency_seconds`, and the histogram kept its buckets cumulative, so a fast query's observation was an
+  atomic add to each of twelve buckets, its count and its sum, on cache lines every client loop writes. A bucket
+  holds its own observations alone now and the exposition adds them up, so `/metrics` reads byte for byte as before.
+  On the m9g.xlarge a BOOK query costs the node 541 ns of CPU instead of 575, and 2.88 million are answered a second
+  over two connections instead of 2.75 million (medians of six rounds).
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
