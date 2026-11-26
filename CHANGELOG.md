@@ -197,6 +197,14 @@ here as `#N`.
 
 ### Changed
 
+- **A query of a narrow time range reads only the runs of a held segment that its range can reach** (#288). A read
+  of a segment whose decoded columns are held between queries (#220) worked out, for every row of the segment,
+  whether its time was in the range asked. The held timestamps now keep the least and the greatest time of each run
+  of 2048 rows, and a read passes over a run its range misses; the answer is the same, rows out of time order
+  included. On the m9g.xlarge a query of one second of BTCUSDT's top 20 levels answers in 30.4 us at the median
+  instead of 65.1 us, at 17.6 us of the node's CPU instead of 49.1 (six rounds). `ob_decoded_columns_chunks_passed_total`
+  counts the runs passed over.
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
