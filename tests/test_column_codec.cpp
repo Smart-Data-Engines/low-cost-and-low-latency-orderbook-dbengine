@@ -1087,3 +1087,104 @@ TEST(ColumnCodec, VarintsGoBothWaysAndRefuseWhatIsNotOne) {
     at = 0;
     EXPECT_FALSE(get_varint(bytes(past), at, v));
 }
+
+namespace {
+
+/// 16 384 quantities of up to 20 bits, then 100 000 of one value that is not the least: over its first
+/// 16 384 values the column is smallest in blocks or Simple8b, and as a whole as runs - the tail is one
+/// run, and in any other uncompressed packing its value less the least takes 20 bits a row (#287).
+std::vector<uint64_t> random_head_then_one_value() {
+    std::vector<uint64_t> column;
+    uint64_t x = 0x2545F4914F6CDD1DULL;
+    for (int i = 0; i < 16'384; ++i) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        column.push_back((x >> 40) & ((uint64_t{1} << 20) - 1));
+    }
+    column.insert(column.end(), 100'000, (uint64_t{1} << 19) + 12'345);
+    return column;
+}
+
+}  // namespace
+
+RC_GTEST_PROP(ColumnCodec, ASearchOverASampleGivesBackAnyColumnInWhatTheSampleChose, ()) {
+    // #287: the candidates weighed over the column's first `sample` values, and the column written in
+    // the one chosen - what a search of those values alone chooses. A sample no shorter than the column
+    // is the whole column: the block a search without one writes.
+    const auto column = *rc::gen::oneOf(
+        rc::gen::arbitrary<std::vector<uint64_t>>(),
+        rc::gen::container<std::vector<uint64_t>>(rc::gen::inRange<uint64_t>(0, 4)),
+        rc::gen::map(rc::gen::arbitrary<std::vector<uint16_t>>(), [](const std::vector<uint16_t>& v) {
+            std::vector<uint64_t> out;
+            uint64_t acc = 1'700'000'000'000'000'000ULL;
+            for (uint16_t x : v) out.push_back(acc += uint64_t{x} * 1'000'000ULL);
+            return out;
+        }));
+    const size_t sample = *rc::gen::inRange<size_t>(1, column.size() + 3);
+    EncodeOptions options;
+    options.steps = *rc::gen::arbitrary<bool>();
+    options.sample = sample;
+    std::string block;
+    const Choice c = encode(column, options, block);
+    RC_ASSERT(c.bytes == block.size());
+    std::vector<uint64_t> back;
+    std::string why;
+    RC_ASSERT(decode(bytes(block), column.size(), back, &why));
+    RC_ASSERT(back == column);
+
+    EncodeOptions whole = options;
+    whole.sample = 0;
+    if (sample < column.size()) {
+        std::string of_the_sample;
+        const Choice s = encode(std::span<const uint64_t>(column).first(sample), whole, of_the_sample);
+        RC_ASSERT(c.encoding == s.encoding);
+        std::string as_chosen;
+        encode_as(column, s.encoding, whole.zstd_level, as_chosen);
+        RC_ASSERT(block == as_chosen);
+    } else {
+        std::string searched;
+        const Choice w = encode(column, whole, searched);
+        RC_ASSERT(c.encoding == w.encoding);
+        RC_ASSERT(block == searched);
+    }
+}
+
+TEST(ColumnCodec, ASearchOverASampleChoosesForTheColumnsFirstValues) {
+    const std::vector<uint64_t> column = random_head_then_one_value();
+    // By size alone and without ZSTD, so that the whole column's choice is plainly runs.
+    EncodeOptions whole;
+    whole.runs_charge_pct = 0;
+    whole.zstd_level = 0;
+    std::string searched;
+    const Choice w = encode(column, whole, searched);
+    ASSERT_EQ(w.encoding.packing, Packing::kRuns)
+        << w.encoding.name() << ": the whole column is not smallest as runs, so this column tests nothing";
+
+    EncodeOptions sampled = whole;
+    sampled.sample = 16'384;
+    std::string block;
+    const Choice s = encode(column, sampled, block);
+    EXPECT_NE(s.encoding.packing, Packing::kRuns) << s.encoding.name();
+    EXPECT_EQ(s.bytes, block.size());
+    std::vector<uint64_t> back;
+    std::string why;
+    ASSERT_TRUE(decode(bytes(block), column.size(), back, &why)) << why;
+    EXPECT_EQ(back, column);
+}
+
+TEST(ColumnCodec, AHintIsWrittenInWhateverTheSample) {
+    // A hint searches nothing, so a sample changes nothing.
+    const std::vector<uint64_t> column = random_head_then_one_value();
+    for (const Encoding& e : all_encodings()) {
+        SCOPED_TRACE(e.name());
+        EncodeOptions options;
+        options.steps = true;
+        options.hint = &e;
+        std::string hinted;
+        const Choice h = encode(column, options, hinted);
+        options.sample = 16'384;
+        std::string hinted_and_sampled;
+        const Choice hs = encode(column, options, hinted_and_sampled);
+        EXPECT_EQ(hs.encoding, h.encoding);
+        EXPECT_EQ(hinted_and_sampled, hinted);
+    }
+}
