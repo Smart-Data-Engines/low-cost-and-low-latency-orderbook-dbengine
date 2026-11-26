@@ -8,6 +8,7 @@
 // would pass against a store that held nothing.
 
 #include <gtest/gtest.h>
+#include <rapidcheck/gtest.h>
 
 #include <algorithm>
 #include <atomic>
@@ -695,4 +696,193 @@ TEST(DecodedColumnsArena, ReadsFromColumnsInTheArenaAnswerAsReadsWithoutHolding)
     EXPECT_GT(s.hits, 0u);
     EXPECT_GT(s.arena.mapped_bytes - s.arena.free_bytes, 0u)
         << "the control: the columns compared were the arena's, not the heap's";
+}
+
+// ── The time ranges of a held segment's rows (#288) ─────────────────────────────────────
+
+namespace {
+
+/// What a read handed over, a batch at a time: each batch's rows, as the rows it chose.
+struct Delivered {
+    std::vector<size_t> batch_sizes;
+    std::vector<ob::SnapshotRow> rows;
+};
+
+Delivered batches_of(const ob::ColumnarStore& store, uint64_t lo, uint64_t hi, const ob::RowFilter& filter,
+                     ob::ColumnarStore::ScanCost* cost = nullptr) {
+    Delivered d;
+    const auto c = store.scan_batches(lo, hi, "A", "EX", ob::ColumnSet::all(), filter,
+                                      [&](const ob::RowBatch& b) -> ob::BatchVerdict {
+        d.batch_sizes.push_back(b.rows.size());
+        for (const uint32_t i : b.rows) {
+            ob::SnapshotRow r{};
+            r.timestamp_ns    = b.ts[i];
+            r.price           = b.price[i];
+            r.quantity        = b.qty[i];
+            r.order_count     = b.cnt[i];
+            r.side            = b.side[i];
+            r.level_index     = b.level[i];
+            r.sequence_number = static_cast<uint64_t>(b.seq[i]);
+            d.rows.push_back(r);
+        }
+        return {};
+    });
+    if (cost != nullptr) *cost = c;
+    return d;
+}
+
+constexpr uint64_t kMs = 1'000'000ULL;
+
+/// `n` rows from `t0`, a millisecond apart - inside one segment's hour, where `rows_from()`'s seconds
+/// would run past it - priced from `price0`, out of time order where `shuffled` says.
+std::vector<ob::SnapshotRow> rows_ms(uint64_t t0, size_t n, int64_t price0, bool shuffled = false) {
+    std::vector<ob::SnapshotRow> rows;
+    rows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        rows.push_back(row_at(t0 + i * kMs, price0 + static_cast<int64_t>(i), static_cast<uint16_t>(i % 20)));
+    }
+    if (shuffled) {
+        for (size_t i = 0; i + 3 < rows.size(); i += 5) std::swap(rows[i], rows[i + 3]);
+    }
+    return rows;
+}
+
+bool same_cost(const ob::ColumnarStore::ScanCost& a, const ob::ColumnarStore::ScanCost& b) {
+    return a.compared == b.compared && a.candidates == b.candidates && a.blocks == b.blocks &&
+           a.segments_read == b.segments_read && a.skipped_by_price == b.skipped_by_price &&
+           a.skipped_by_levels == b.skipped_by_levels && a.rows_filtered == b.rows_filtered &&
+           a.stopped == b.stopped;
+}
+
+}  // namespace
+
+// A read of a held segment passes over the runs of rows its range cannot reach, and answers what a
+// read of the file answers: the same batches of the same rows, the same rows the filter failed -
+// whatever order the rows' times are in, whatever the range and the filter.
+RC_GTEST_PROP(DecodedColumnsStore, AHeldReadOfAnyRangeAndFilterAnswersAsAReadOfTheFile, ()) {
+    // Four cases in five of more than one run of 2048 rows, where there is a run to pass over.
+    const size_t n = *rc::gen::weightedOneOf<size_t>({{1, rc::gen::inRange<size_t>(1, 2049)},
+                                                       {4, rc::gen::inRange<size_t>(2049, 12'000)}});
+    // Times a millisecond apart, some runs of them out of order - late rows, a client's own times.
+    const int spread = *rc::gen::inRange(0, 4);
+    std::vector<ob::SnapshotRow> rows;
+    rows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t t = kBase + i * 1'000'000ULL;
+        if (spread > 0 && i % 97 < static_cast<size_t>(spread)) t -= (i % 5000) * 3'000'000ULL;
+        rows.push_back(row_at(t, 100 + static_cast<int64_t>(i % 300), static_cast<uint16_t>(i % 20)));
+    }
+    TempDir dir;
+    written(dir.str(), rows);
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    ob::ColumnarStore holding(dir.str());
+    holding.set_decoded_columns_budget(64 * kMiB);
+    holding.open_existing();
+
+    // A range from a second before the rows to a second after them, at most a third of their span wide.
+    const uint64_t span = n * kMs;
+    const uint64_t lo = kBase - kSec + *rc::gen::inRange<uint64_t>(0, span + 2 * kSec);
+    const uint64_t hi = lo + *rc::gen::inRange<uint64_t>(0, span / 3 + 1);
+    ob::RowFilter filter;
+    if (*rc::gen::arbitrary<bool>()) filter.price_lo = 100 + *rc::gen::inRange<int64_t>(0, 300);
+    if (*rc::gen::arbitrary<bool>()) filter.side_lo = filter.side_hi = static_cast<uint8_t>(*rc::gen::inRange(0, 2));
+    if (*rc::gen::arbitrary<bool>()) filter.level_hi = static_cast<uint16_t>(*rc::gen::inRange(0, 20));
+
+    ob::ColumnarStore::ScanCost plain_cost, first_cost, held_cost;
+    const Delivered expected = batches_of(plain, lo, hi, filter, &plain_cost);
+    // The first read decodes the columns and holds them, the second reads what is held; both pass
+    // over by the held timestamps' ranges.
+    const Delivered first = batches_of(holding, lo, hi, filter, &first_cost);
+    const Delivered held = batches_of(holding, lo, hi, filter, &held_cost);
+    // A range that reaches the segment reads it, the second time from what is held.
+    RC_ASSERT(plain_cost.segments_read == 0u || holding.decoded_columns_stats().hits > 0u);
+    for (const Delivered* d : {&first, &held}) {
+        RC_ASSERT(d->batch_sizes == expected.batch_sizes);
+        RC_ASSERT(same_rows(d->rows, expected.rows));
+    }
+    RC_ASSERT(same_cost(first_cost, plain_cost));
+    RC_ASSERT(same_cost(held_cost, plain_cost));
+    // How often a case passes over a run at all, said with the run: a property that never does
+    // compares two reads that both looked at every row.
+    RC_CLASSIFY(holding.decoded_columns_stats().chunks_passed > 0, "passed over a run");
+}
+
+TEST(DecodedColumnsStore, ANarrowRangeOfAHeldSegmentPassesOverTheRunsOutsideIt) {
+    TempDir dir;
+    // 10 000 rows a millisecond apart, in one segment: five runs of 2048 rows, the last one of 1808.
+    written(dir.str(), rows_ms(kBase, 10'000, 100));
+    ob::ColumnarStore plain(dir.str());
+    plain.set_decoded_columns_budget(0);
+    plain.open_existing();
+    ob::ColumnarStore holding(dir.str());
+    holding.set_decoded_columns_budget(64 * kMiB);
+    holding.open_existing();
+    const ob::RowFilter keep{};
+
+    // Rows 5000 to 5100 are in the third run alone: the other four are passed over, on the read that
+    // decodes the columns and on the one that reads them held.
+    const uint64_t lo = kBase + 5000 * kMs, hi = kBase + 5100 * kMs;
+    const Delivered expected = batches_of(plain, lo, hi, keep);
+    ASSERT_EQ(expected.rows.size(), 101u);
+    EXPECT_TRUE(same_rows(batches_of(holding, lo, hi, keep).rows, expected.rows));
+    EXPECT_EQ(holding.decoded_columns_stats().chunks_passed, 4u);
+    EXPECT_TRUE(same_rows(batches_of(holding, lo, hi, keep).rows, expected.rows));
+    EXPECT_EQ(holding.decoded_columns_stats().chunks_passed, 8u);
+
+    // A range across the second and the third run passes over three; the whole range, none.
+    batches_of(holding, kBase + 4000 * kMs, kBase + 4200 * kMs, keep);
+    EXPECT_EQ(holding.decoded_columns_stats().chunks_passed, 11u);
+    EXPECT_EQ(batches_of(holding, 0, UINT64_MAX, keep).rows.size(), 10'000u);
+    EXPECT_EQ(holding.decoded_columns_stats().chunks_passed, 11u);
+
+    // A range that starts at the second run's greatest time reads that run, and one that ends at the
+    // third run's least reads that one: both ends of the range are in it.
+    for (const auto& [from, to] : {std::pair{4095u, 4100u}, std::pair{4090u, 4096u}}) {
+        const uint64_t a = kBase + from * kMs, b = kBase + to * kMs;
+        const Delivered want = batches_of(plain, a, b, keep);
+        ASSERT_EQ(want.rows.size(), to - from + 1);
+        EXPECT_TRUE(same_rows(batches_of(holding, a, b, keep).rows, want.rows)) << from << ".." << to;
+    }
+    // The control: a read of the file passes over nothing it could count.
+    EXPECT_EQ(plain.decoded_columns_stats().chunks_passed, 0u);
+}
+
+TEST(DecodedColumnsStore, AHeldTimestampColumnsRangesAreEachRunsLeastAndGreatest) {
+    TempDir dir;
+    // 5000 rows, every fifth pair swapped, so the runs' least and greatest are not their first and last.
+    auto rows = rows_ms(kBase, 5000, 100, /*shuffled=*/true);
+    rows[4095].timestamp_ns = kBase + 1'500 * kSec;   // the second run's greatest, at its end
+    rows[4096].timestamp_ns = kBase - 7 * kSec;       // the third run's least, at its start: a late row
+    written(dir.str(), rows);
+    ob::ColumnarStore holding(dir.str());
+    holding.set_decoded_columns_budget(64 * kMiB);
+    holding.open_existing();
+    ASSERT_EQ(read(holding, set_of({ob::QueryColumn::TimestampNs})).size(), 5000u);
+
+    const auto segments = holding.segments_of("A.EX");
+    ASSERT_EQ(segments.size(), 1u);
+    ASSERT_NE(segments[0].decoded, nullptr);
+    const auto ts = segments[0].decoded->get(0);
+    ASSERT_NE(ts, nullptr) << "the timestamps were not held";
+    const auto values = ts->as<uint64_t>();
+    ASSERT_EQ(values.size(), 5000u);
+    ASSERT_EQ(ts->time_ranges.size(), 6u) << "two a run of 2048, the last of 904";
+    for (size_t z = 0; z < 3; ++z) {
+        const auto run = values.subspan(z * 2048, std::min<size_t>(2048, 5000 - z * 2048));
+        EXPECT_EQ(ts->time_ranges[2 * z], *std::min_element(run.begin(), run.end())) << "run " << z;
+        EXPECT_EQ(ts->time_ranges[2 * z + 1], *std::max_element(run.begin(), run.end())) << "run " << z;
+    }
+    EXPECT_EQ(ts->time_ranges[3], kBase + 1'500 * kSec);
+    EXPECT_EQ(ts->time_ranges[4], kBase - 7 * kSec);
+    // The control: no other column has ranges.
+    ASSERT_EQ(read(holding, set_of({ob::QueryColumn::TimestampNs, ob::QueryColumn::Quantity})).size(), 5000u);
+    const auto qty = holding.segments_of("A.EX")[0].decoded->get(2);
+    ASSERT_NE(qty, nullptr);
+    EXPECT_TRUE(qty->time_ranges.empty());
+    // And the ranges are counted in what the column costs the budget: the quantities are as many
+    // 64-bit values, held the same way.
+    ASSERT_EQ(qty->as<uint64_t>().size(), 5000u);
+    EXPECT_EQ(ts->bytes() - qty->bytes(), ts->time_ranges.capacity() * sizeof(uint64_t));
 }
