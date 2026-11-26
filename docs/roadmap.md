@@ -2940,7 +2940,7 @@ rows, their times in or out of order, any range and any filter (RapidCheck, four
 narrow range of a held segment passes over the runs outside it, the counter says how many, and a range that starts at a
 run's greatest time or ends at a run's least reads that run; a held timestamp column's ranges are each run's least and
 greatest, no other column has any, and they are in what the column costs the budget. ctest passed 2293 of 2293 on the
-i3-7100U (Debug): #286's 2290 and these three.
+m9g.xlarge and the i3-7100U (Debug): #286's 2290 and these three.
 
 **Mutation table** (`mutations/` in the evidence, the i3-7100U): seven mutants killed - the runs never passed over,
 a run whose greatest time is the range's start passed over, one whose least time is the range's end, each run's
