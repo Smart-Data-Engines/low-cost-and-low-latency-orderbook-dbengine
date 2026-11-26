@@ -1716,6 +1716,22 @@ namespace {
 /// The sums cannot overflow but one: a quantity is below 2^64 and a price's magnitude at most 2^63,
 /// so 2^64 rows of either stay inside 128 bits, and so does one row's price times quantity - but a
 /// sum of those products can leave them, and then `px_qty_overflow` says so and VWAP is refused.
+/// What a query's aggregates read of each row (#290): the parts of a bucket's state that add() keeps for it.
+/// COUNT is kept always. The parts no aggregate of the query reads are left as they start, and nothing reads
+/// them - bucket_value() reads only its own aggregate's.
+enum BucketNeed : uint8_t {
+    kNeedEnds     = 1,    ///< FIRST and LAST: the earliest and the latest row's time, price and quantity
+    kNeedExtremes = 2,    ///< MIN and MAX
+    kNeedPriceSum = 4,    ///< AVG(price)
+    kNeedQtySum   = 8,    ///< SUM(quantity), AVG(quantity), and VWAP's weights
+    kNeedWeighted = 16,   ///< VWAP: the sum of price times quantity
+};
+
+/// A price times a quantity, inside 128 bits: |px| <= 2^63 and qty < 2^64.
+inline __int128 price_times_quantity(int64_t px, uint64_t qty) {
+    return static_cast<__int128>(px) * static_cast<__int128>(qty);
+}
+
 struct BucketState {
     uint64_t count{0};
     uint64_t first_ts{0}, last_ts{0};
@@ -1729,29 +1745,64 @@ struct BucketState {
     bool     px_qty_overflow{false};
 
     /// One row: its time, its price and its quantity, the last two zero where the scan did not
-    /// read their column - as a built row's were.
-    void add(uint64_t ts, int64_t px, uint64_t qty) {
-        if (count == 0) {
-            first_ts = last_ts = ts;
-            first_price = last_price = min_price = max_price = px;
-            first_qty = last_qty = min_qty = max_qty = qty;
-        } else {
-            if (ts < first_ts) {
-                first_ts = ts; first_price = px; first_qty = qty;
+    /// read their column - as a built row's were - kept in the parts `needs` names (#290).
+    void add(uint64_t ts, int64_t px, uint64_t qty, uint8_t needs) {
+        if (needs & kNeedEnds) {
+            if (count == 0) {
+                first_ts = last_ts = ts;
+                first_price = last_price = px;
+                first_qty = last_qty = qty;
+            } else {
+                if (ts < first_ts) {
+                    first_ts = ts; first_price = px; first_qty = qty;
+                }
+                if (ts >= last_ts) {
+                    last_ts = ts; last_price = px; last_qty = qty;
+                }
             }
-            if (ts >= last_ts) {
-                last_ts = ts; last_price = px; last_qty = qty;
+        }
+        if (needs & kNeedExtremes) {
+            if (count == 0) {
+                min_price = max_price = px;
+                min_qty = max_qty = qty;
+            } else {
+                min_price = std::min(min_price, px);   max_price = std::max(max_price, px);
+                min_qty   = std::min(min_qty, qty);    max_qty   = std::max(max_qty, qty);
             }
-            min_price = std::min(min_price, px);   max_price = std::max(max_price, px);
-            min_qty   = std::min(min_qty, qty);    max_qty   = std::max(max_qty, qty);
         }
         ++count;
-        sum_qty   += qty;
-        sum_price += px;
-        const __int128 product = static_cast<__int128>(px) * static_cast<__int128>(qty);
+        if (needs & kNeedQtySum) sum_qty += qty;
+        if (needs & kNeedPriceSum) sum_price += px;
+        if (needs & kNeedWeighted) add_product(price_times_quantity(px, qty));
+    }
+    /// A row's price times its quantity into the sum VWAP reads; a sum that leaves 128 bits refuses VWAP.
+    void add_product(__int128 product) {
         if (__builtin_add_overflow(sum_px_qty, product, &sum_px_qty)) px_qty_overflow = true;
     }
 };
+
+/// What `aggs` read of each row (#290). A series function reads no row state.
+uint8_t bucket_needs(const std::vector<BucketAgg>& aggs) {
+    uint8_t needs = 0;
+    for (const BucketAgg& agg : aggs) {
+        switch (agg.fn) {
+        case BucketFn::First:
+        case BucketFn::Last:  needs |= kNeedEnds; break;
+        case BucketFn::Min:
+        case BucketFn::Max:   needs |= kNeedExtremes; break;
+        case BucketFn::Sum:   needs |= kNeedQtySum; break;
+        case BucketFn::Avg:   needs |= agg.column == QueryColumn::Price ? kNeedPriceSum : kNeedQtySum; break;
+        case BucketFn::Vwap:  needs |= kNeedQtySum | kNeedWeighted; break;
+        case BucketFn::Count:
+        case BucketFn::Open:
+        case BucketFn::High:
+        case BucketFn::Low:
+        case BucketFn::Close:
+        case BucketFn::Twap:  break;
+        }
+    }
+    return needs;
+}
 
 constexpr int64_t kBucketScale = 1'000'000;   // AVG and VWAP, as the live book's VWAP
 
@@ -1849,10 +1900,13 @@ struct PartBucket {
     unsigned __int128 abs_px_qty{0};
     bool abs_overflow{false};
 
-    void add(uint64_t ts, int64_t px, uint64_t qty) {
-        state.add(ts, px, qty);
+    void add(uint64_t ts, int64_t px, uint64_t qty, uint8_t needs) {
+        // The product once, for the sum and for its size (#290), and only where VWAP is asked.
+        state.add(ts, px, qty, static_cast<uint8_t>(needs & ~kNeedWeighted));
+        if ((needs & kNeedWeighted) == 0) return;
         // |px| <= 2^63 and qty < 2^64, so the product and its negation are inside 128 bits.
-        const __int128 product = static_cast<__int128>(px) * static_cast<__int128>(qty);
+        const __int128 product = price_times_quantity(px, qty);
+        state.add_product(product);
         const auto size = static_cast<unsigned __int128>(product < 0 ? -product : product);
         if (__builtin_add_overflow(abs_px_qty, size, &abs_px_qty)) abs_overflow = true;
     }
@@ -1927,6 +1981,7 @@ struct BucketFiller {
     uint64_t width;
     size_t ceiling;
     std::unordered_map<uint64_t, State>& buckets;
+    uint8_t needs;   ///< what the query's aggregates read of a row (#290)
     State* last{nullptr};
     uint64_t last_start{0};
     uint64_t rows{0};
@@ -1941,7 +1996,7 @@ struct BucketFiller {
             const int64_t px = priced ? b.price[i] : 0;
             const uint64_t qty = sized ? b.qty[i] : 0;
             if (last != nullptr && ts - last_start < width) {
-                last->add(ts, px, qty);
+                last->add(ts, px, qty, needs);
                 continue;
             }
             const uint64_t start = ts - ts % width;
@@ -1962,7 +2017,7 @@ struct BucketFiller {
                 last = &it->second;
                 last_start = start;
             }
-            last->add(ts, px, qty);
+            last->add(ts, px, qty, needs);
         }
         rows += b.rows.size();
         return {};
@@ -1974,7 +2029,7 @@ struct BucketFiller {
 /// own ends the scan as the query's map past it would.
 class BucketPart final : public ScanPart {
 public:
-    BucketPart(uint64_t width, size_t ceiling) : filler_{width, ceiling, buckets} {}
+    BucketPart(uint64_t width, size_t ceiling, uint8_t needs) : filler_{width, ceiling, buckets, needs} {}
     BatchVerdict take(const RowBatch& batch) override { return filler_.take(batch); }
     uint64_t rows() const override { return filler_.rows; }
     bool too_many() const { return filler_.too_many; }
@@ -2012,7 +2067,15 @@ bool bucket_rows(const ColumnarStore& store, ScanPool* pool, bool divide_small, 
     if (ast.side_lo.has_value() || ast.side_hi.has_value()) to_read.add(QueryColumn::Side);
     if (ast.level_lo.has_value() || ast.level_hi.has_value()) to_read.add(QueryColumn::Level);
 
-    BucketFiller<BucketState> here{width, ceiling, buckets};
+    // The parts of a bucket's state the aggregates read, worked out once (#290).
+    const uint8_t needs = bucket_needs(ast.bucket_aggs);
+    OB_LOG_DEBUG("query", "GROUP BY %s.%s: each bucket keeps its count%s%s%s%s%s", ast.symbol.c_str(),
+                 ast.exchange.c_str(), (needs & kNeedEnds) ? ", first and last" : "",
+                 (needs & kNeedExtremes) ? ", least and greatest" : "",
+                 (needs & kNeedPriceSum) ? ", sum of prices" : "",
+                 (needs & kNeedQtySum) ? ", sum of quantities" : "",
+                 (needs & kNeedWeighted) ? ", sum of price times quantity" : "");
+    BucketFiller<BucketState> here{width, ceiling, buckets, needs};
     const BatchReader direct = [&here](const RowBatch& b) { return here.take(b); };
     if (pool == nullptr || pool->threads() == 0) {
         store.scan_batches(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast), direct);
@@ -2027,8 +2090,8 @@ bool bucket_rows(const ColumnarStore& store, ScanPool* pool, bool divide_small, 
     how.pool = pool;
     how.divide_small = divide_small;
     how.direct = direct;
-    how.make_part = [width, ceiling]() -> std::unique_ptr<ScanPart> {
-        return std::make_unique<BucketPart>(width, ceiling);
+    how.make_part = [width, ceiling, needs]() -> std::unique_ptr<ScanPart> {
+        return std::make_unique<BucketPart>(width, ceiling, needs);
     };
     how.fold = [&](ScanPart& p) {
         auto& part = static_cast<BucketPart&>(p);
@@ -2057,7 +2120,7 @@ bool bucket_rows(const ColumnarStore& store, ScanPool* pool, bool divide_small, 
                              "read again on one thread",
                     ast.symbol.c_str(), ast.exchange.c_str());
         buckets.clear();
-        BucketFiller<BucketState> again{width, ceiling, buckets};
+        BucketFiller<BucketState> again{width, ceiling, buckets, needs};
         store.scan_batches(from, to, ast.symbol, ast.exchange, to_read, filter_of(ast),
                            [&again](const RowBatch& b) { return again.take(b); });
         rows += again.rows;
