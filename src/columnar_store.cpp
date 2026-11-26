@@ -1362,10 +1362,17 @@ void ColumnarStore::write_columns_v3(const std::string& dir) {
     for (std::string& block : blocks) keep_small(block);
     write_file_checked(dir + "/" + kColumnsV3File, file.data(), file.size());
 
+    // How the encodings were chosen: as the last segment's, by a search, or by one over the columns'
+    // first values (#287).
+    char searched[64] = "searched";
+    const size_t sample = segment_format_.search.sample;
+    if (search && sample > 0 && n > sample) {
+        std::snprintf(searched, sizeof searched, "searched over the first %zu values", sample);
+    }
     OB_LOG_DEBUG("columnar",
                  "Segment %s: %zu rows in %zu bytes of columns (%s): ts %s %zu, price %s %zu, "
                  "qty %s %zu, cnt %s %zu, side %s %zu, level %s %zu, seq %s %zu",
-                 dir.c_str(), n, file.size(), search ? "searched" : "as the last segment",
+                 dir.c_str(), n, file.size(), search ? searched : "as the last segment",
                  chosen[0].encoding.name().c_str(), chosen[0].bytes, chosen[1].encoding.name().c_str(),
                  chosen[1].bytes, chosen[2].encoding.name().c_str(), chosen[2].bytes,
                  chosen[3].encoding.name().c_str(), chosen[3].bytes, chosen[4].encoding.name().c_str(),

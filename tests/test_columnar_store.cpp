@@ -1236,6 +1236,7 @@ TEST(ColumnarStoreFormat, AStoreNotToldOtherwiseSealsAsTheServerDoesWithoutZstd)
     ob::ColumnarStore store(tmp.str());
     EXPECT_EQ(store.segment_format().search.zstd_level, 0);
     EXPECT_EQ(store.segment_format().search_every, 16u);
+    EXPECT_EQ(store.segment_format().search.sample, ob::ColumnarStore::kSealSearchSample);
     fill_repeating_snapshots(store);
     const auto meta = store.flush_segment();
     ASSERT_TRUE(meta.has_value());
@@ -1319,6 +1320,57 @@ TEST(ColumnarStoreFormat, ASealChargesRunsForTheirRunsAndAMergeKeepsTheSmallest)
     ASSERT_TRUE(merged_meta.has_value());
     EXPECT_EQ(block_encodings(merged_meta->dir_path)[kQuantityColumn] & kPackingMask, kRunsPacking)
         << "the merge's format did not write the smallest";
+}
+
+TEST(ColumnarStoreFormat, ASealSearchesEachColumnsFirstValuesAndAMergeTheWhole) {
+    // #287: a seal weighs the candidates over a column's first kSealSearchSample values and writes the
+    // whole column in the one chosen; a merge weighs them over the whole. Quantities of up to 20 bits
+    // for the first 16 384 rows, then 300 000 of one value that is not the least: the first values are
+    // smallest in blocks or Simple8b, the whole as runs - even charged for its runs, which are one
+    // value in twenty. The same seal told to search the whole column writes runs, which is what says
+    // the column tests something.
+    constexpr uint8_t kPackingMask = 0x18;
+    constexpr uint8_t kRunsPacking = 0x08;
+    constexpr size_t kSample = ob::ColumnarStore::kSealSearchSample;
+    constexpr uint64_t kTail = (uint64_t{1} << 19) + 12'345;
+    const auto seal = ob::ColumnarStore::SegmentFormat::seal();
+    EXPECT_EQ(seal.search.sample, kSample);
+    EXPECT_EQ(ob::ColumnarStore::SegmentFormat::merge().search.sample, 0u);
+    std::vector<uint64_t> head;
+    uint64_t x = 0x2545F4914F6CDD1DULL;
+    for (size_t i = 0; i < kSample; ++i) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        head.push_back((x >> 40) & ((uint64_t{1} << 20) - 1));
+    }
+    const auto fill = [&head](ob::ColumnarStore& store) {
+        uint64_t i = 0;
+        for (; i < kSample; ++i) store.append(make_row(1'000'000'000ULL + i * 1'000ULL, 6'000'000'000LL, head[i]));
+        for (; i < kSample + 300'000; ++i) store.append(make_row(1'000'000'000ULL + i * 1'000ULL, 6'000'000'000LL, kTail));
+    };
+    const auto quantity_packing = [&](const ob::ColumnarStore::SegmentFormat& format, const char* name) -> uint8_t {
+        TempDir dir(name);
+        ob::ColumnarStore store(dir.str());
+        store.set_segment_format(format);
+        fill(store);
+        const auto meta = store.flush_segment();
+        EXPECT_TRUE(meta.has_value());
+        if (!meta) return 0xFF;
+        const auto rows = scan_all(store);
+        EXPECT_EQ(rows.size(), kSample + 300'000);
+        if (rows.size() == kSample + 300'000) {
+            for (size_t i : {size_t{0}, kSample / 2, kSample - 1}) EXPECT_EQ(rows[i].quantity, head[i]) << i;
+            EXPECT_EQ(rows[kSample].quantity, kTail);
+            EXPECT_EQ(rows.back().quantity, kTail);
+        }
+        return static_cast<uint8_t>(block_encodings(meta->dir_path)[kQuantityColumn] & kPackingMask);
+    };
+    EXPECT_NE(quantity_packing(seal, "format_seal_sample"), kRunsPacking) << "the seal searched past its sample";
+    auto whole = seal;
+    whole.search.sample = 0;
+    EXPECT_EQ(quantity_packing(whole, "format_seal_whole"), kRunsPacking)
+        << "the whole column is not smallest as runs, so this column tests nothing";
+    EXPECT_EQ(quantity_packing(ob::ColumnarStore::SegmentFormat::merge(), "format_merge_whole"), kRunsPacking)
+        << "the merge searched a sample";
 }
 
 TEST(ColumnarStoreReadBuffers, AFormat3ReadsDecodingScratchIsCountedInWhatThePoolKeeps) {

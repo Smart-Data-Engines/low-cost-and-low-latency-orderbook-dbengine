@@ -1154,6 +1154,21 @@ Choice encode(std::span<const uint64_t> values, const EncodeOptions& options, st
         choice.uncompressed_bytes = choice.bytes;
         return choice;
     }
+    // The search over the column's first values, and the column in what it chose (#287): the
+    // transform's anchor, divisor and widths are the whole column's, worked out by encode_as(), so
+    // the sample chooses only the encoding's name.
+    if (options.sample > 0 && values.size() > options.sample) {
+        // The sample is no longer than `sample`, so this search takes it whole.
+        thread_local std::string sample_block;   // the sample's block, never written
+        sample_block.clear();
+        const Encoding chosen = encode(values.first(options.sample), options, sample_block).encoding;
+        keep_small(sample_block);
+        Choice choice;
+        choice.encoding = chosen;
+        choice.bytes = encode_as(values, chosen, options.zstd_level, out);
+        choice.uncompressed_bytes = choice.bytes;
+        return choice;
+    }
     // Design §3: both transforms; uncompressed Simple8b and runs of each, blocks of `for`; and, under
     // LZ4 and under ZSTD where these options try them, runs and narrow of each. With `steps` (#250),
     // steps/runs too, uncompressed and under each compressor tried. Each payload is packed once and
