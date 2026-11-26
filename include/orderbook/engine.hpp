@@ -1729,6 +1729,7 @@ private:
     uint64_t published_decoded_hits_{0};
     uint64_t published_decoded_misses_{0};
     uint64_t published_decoded_evictions_{0};
+    uint64_t published_decoded_chunks_passed_{0};   ///< #288
     uint64_t published_decoded_arena_fallbacks_{0};
     /// The decoded columns' counters and gauges, from the store's totals; after every flush tick.
     void publish_decoded_columns();

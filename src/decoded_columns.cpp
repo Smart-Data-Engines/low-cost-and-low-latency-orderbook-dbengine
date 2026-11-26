@@ -16,14 +16,16 @@ constexpr const char* kSlotNames[DecodedColumns::kSlots] = {"ts",   "price", "qt
 } // namespace
 
 size_t ColumnValues::bytes() const {
-    if (block) return sizeof(*this) + block.bytes();
+    // The timestamp column's ranges (#288) are held with it, a 128th of its values.
+    const size_t ranges = time_ranges.capacity() * sizeof(uint64_t);
+    if (block) return sizeof(*this) + block.bytes() + ranges;
     const size_t held = std::visit(
         [](const auto& v) {
             using T = typename std::decay_t<decltype(v)>::value_type;
             return v.capacity() * sizeof(T);
         },
         values);
-    return sizeof(*this) + held;
+    return sizeof(*this) + held + ranges;
 }
 
 // ── DecodedColumns ──────────────────────────────────────────────────────────────
@@ -91,6 +93,10 @@ DecodedColumns::Column DecodedColumns::put(size_t slot, Column values, std::stri
 
 ColumnArena* DecodedColumns::arena() const { return budget_ ? budget_->arena() : nullptr; }
 
+void DecodedColumns::count_passed(uint64_t chunks) const {
+    if (budget_ && chunks > 0) budget_->count_passed(chunks);
+}
+
 size_t DecodedColumns::bytes() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return bytes_;
@@ -123,7 +129,8 @@ DecodedColumnsBudget::DecodedColumnsBudget(size_t limit_bytes)
 
 DecodedColumnsBudget::Stats DecodedColumnsBudget::stats() const {
     return Stats{hits_.load(std::memory_order_relaxed), misses_.load(std::memory_order_relaxed),
-                 evictions_.load(std::memory_order_relaxed), held(), limit_, arena_->stats()};
+                 evictions_.load(std::memory_order_relaxed), chunks_passed_.load(std::memory_order_relaxed),
+                 held(), limit_, arena_->stats()};
 }
 
 bool DecodedColumnsBudget::charge(size_t bytes, const DecodedColumns* charging) {

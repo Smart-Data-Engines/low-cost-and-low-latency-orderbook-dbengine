@@ -15,6 +15,10 @@
 
 namespace ob {
 
+/// The rows a held timestamp column's ranges each cover (#288): a read's chunk, `kScanBatchRows`, which
+/// `src/columnar_store.cpp` checks this against.
+inline constexpr size_t kTimeRangeRows = 2048;
+
 /// One column of a format-3 segment, decoded (#220), in the type the read path reads it as: in a
 /// slot of the store's column arena (#223), or - a column too small for the arena's classes, or one
 /// that found no room under its cap - in a vector of its own.
@@ -30,6 +34,10 @@ struct ColumnValues {
     /// The slot the values are in, when they are the arena's, and how many there are.
     ArenaBlock block;
     size_t count{0};
+    /// The timestamp column's: the least and the greatest value of each run of `kTimeRangeRows` values,
+    /// two a run and in order, the last run shorter (#288) - what lets a read pass over a run none of
+    /// whose rows is in its range without looking at them. Empty for every other column.
+    std::vector<uint64_t> time_ranges;
 
     /// What holding it costs: the slot's class or the vector's allocation, and this object.
     size_t bytes() const;
@@ -78,6 +86,10 @@ public:
     /// The arena a column of this segment is decoded into to be held (#223).
     ColumnArena* arena() const;
 
+    /// `chunks` runs of this segment's held rows a read passed over by their times (#288), for the
+    /// budget's count.
+    void count_passed(uint64_t chunks) const;
+
 private:
     friend class DecodedColumnsBudget;
 
@@ -121,6 +133,7 @@ public:
         uint64_t hits;        ///< columns a read took from memory
         uint64_t misses;      ///< columns a read had to read and decode
         uint64_t evictions;   ///< segments whose columns were evicted to make room
+        uint64_t chunks_passed;   ///< runs of held rows reads passed over by their times (#288)
         size_t   held_bytes;
         size_t   limit_bytes;
         ColumnArena::Stats arena;   ///< the memory the columns are held in (#223)
@@ -131,6 +144,7 @@ public:
 
     void count_hit()  { hits_.fetch_add(1, std::memory_order_relaxed); }
     void count_miss() { misses_.fetch_add(1, std::memory_order_relaxed); }
+    void count_passed(uint64_t chunks) { chunks_passed_.fetch_add(chunks, std::memory_order_relaxed); }
 
 private:
     friend class DecodedColumns;
@@ -150,7 +164,7 @@ private:
     size_t hand_{0};
     std::atomic<size_t> held_{0};
     const size_t limit_;
-    std::atomic<uint64_t> hits_{0}, misses_{0}, evictions_{0};
+    std::atomic<uint64_t> hits_{0}, misses_{0}, evictions_{0}, chunks_passed_{0};
     std::shared_ptr<ColumnArena> arena_;
 };
 

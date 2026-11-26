@@ -3694,6 +3694,8 @@ void Engine::publish_decoded_columns() {
     publish_counter_delta("ob_decoded_columns_misses_total", s.misses, published_decoded_misses_);
     publish_counter_delta("ob_decoded_columns_evictions_total", s.evictions,
                           published_decoded_evictions_);
+    publish_counter_delta("ob_decoded_columns_chunks_passed_total", s.chunks_passed,
+                          published_decoded_chunks_passed_);
     registry_.set_gauge("ob_decoded_columns_bytes", static_cast<int64_t>(s.held_bytes));
     registry_.set_gauge("ob_decoded_columns_budget_bytes", static_cast<int64_t>(s.limit_bytes));
     publish_counter_delta("ob_decoded_columns_arena_fallbacks_total", s.arena.fallbacks,
