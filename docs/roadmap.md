@@ -2926,10 +2926,12 @@ for it - seals cut to a size, and a sample):
 | seals of 131 072 rows: encoding | -29% / -38% | -26% / -34% | -21% / -28% |
 | seals of 131 072 rows: bytes | +0.65% / +0.46% | +0.25% / +0.27% | +0.21% / +0.21% |
 
-binance-diff's segments chose exactly as their whole columns. Searching every 64th segment instead saved about as
-much on top20 (19%) and let a choice stand four times as long: on a stream cut into seals of 8 192 rows it cost 0.29%
-more bytes than a search at every seal, against 0.17% at sixteen. Under the sample, 64 of top20's 384 price segments
-are in `narrow+LZ4` where the whole column chose runs; what that does to a read was not measured.
+binance-diff's segments chose exactly as their whole columns in format 3; in format 4, 16 of its 160 `side` segments
+chose `steps/runs+LZ4` where the whole column chose `for/runs+LZ4`, in as many bytes a row to four decimals. Searching
+every 64th segment instead saved about as much on top20 (19%) and let a choice stand four times as long: on a stream cut
+into seals of 8 192 rows it cost 0.29% more bytes than a search at every seal, against 0.17% at sixteen. Under the
+sample, 64 of top20's 384 price segments are in `narrow+LZ4` where the whole column chose runs; what that does to a read
+was not measured.
 
 **Measured** with Release builds on the m9g.xlarge, `master` against this change, six rounds a build in each shape
 of #190's ingest (`final/arm/` in the evidence; the m8a.xlarge follows when the product session's 24-hour run frees
@@ -2944,13 +2946,13 @@ it):
 | a batch's max | 27.2 ms | 11.3 ms | 14.4 ms | 8.9 ms |
 
 The codec on the flush thread fell from 8.0-8.3% of the node's samples to 6.3-6.5% (three profiled rounds a build and
-shape). Every store's first seal searches - it has nothing to reuse - so the first wave of seals after a start was
-a search over the whole of every column, and with the sample the writers no longer wait for room in the queue in a
-node's first seconds: 16 waits in six rounds flat and 10 deep became none, and the WAL budget's 30 and 16 became 24
-and 4. What is left of that tail is the WAL budget's slow start, which is deliberate (#190). `seal_encode_cost`:
-`master`'s search and this change's with the sample set to 0 write the same bytes (one hash); with the sample,
-binance-diff encodes 13-16% faster in the same bytes, and top20 22-29% faster in 0.08-0.10% more - 27-35% at seals
-of 131 072 rows, in 0.25-0.27% more (ratios of the medians of three rounds, formats 3 and 4).
+shape). Every store's first seal searches - it has nothing to reuse - so the first wave of seals after a start was a
+search over the whole of every column, and with the sample the writers no longer wait for room in the queue in a node's
+first seconds: 16 waits in six rounds flat and 10 deep became none, and the WAL budget's 30 and 16 became 24 and 4. What
+is left of that tail is the WAL budget's slow start, which is deliberate (#190). `seal_encode_cost`: `master`'s search
+and this change's with the sample set to 0 write the same bytes (one hash); with the sample, binance-diff encodes 13-16%
+faster - in format 3 the same bytes, in format 4 as many a row to four decimals - and top20 22-29% faster in 0.08-0.10%
+more - 27-35% at seals of 131 072 rows, in 0.25-0.27% more (ratios of the medians of three rounds, formats 3 and 4).
 
 **Tests.** A search over a sample gives back any column in what a search of the sample alone chose, and a sample no
 shorter than the column is the whole search, byte for byte (RapidCheck); a column whose first values are smallest in
