@@ -197,6 +197,14 @@ here as `#N`.
 
 ### Changed
 
+- **A seal's search for its columns' encodings weighs the candidates over each column's first 16 384 values**
+  (#287). A seal reuses the encodings its store's last segment chose and searches again every sixteenth segment, and
+  that search weighed every candidate over the whole of each column - a third of what encoding a seal's columns
+  cost. It weighs them over the first 16 384 values now and writes the whole column in the one chosen; a merge still
+  searches whole columns. On the m9g.xlarge under a pipelined ingest the flush thread takes 6-11% less CPU a level,
+  the writers no longer wait for room in the queue in a node's first seconds, and the longest batch is 38-58% shorter
+  (medians of six rounds). New segments of Binance's top 20 levels take 0.1-0.3% more bytes, binance-diff's none.
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
