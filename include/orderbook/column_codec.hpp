@@ -84,6 +84,10 @@ struct EncodeOptions {
     /// Whether `steps/runs` is tried, with each compressor these options try (#250): only for a
     /// segment of format 4, which a build before it cannot read.
     bool steps{false};
+    /// When searching, the candidates are weighed over the column's first `sample` values and the
+    /// whole column is written in the one chosen (#287): the choice costs a search of the sample,
+    /// and the column one encoding. 0, or a column no longer than this, is searched whole.
+    size_t sample{0};
     /// The encoding to write in without searching - what the column's last segment chose - or
     /// null to search. One whose compressor these options leave out is searched for instead, and so
     /// is one in `steps` where these options leave steps out: a node set back to format 3 must not

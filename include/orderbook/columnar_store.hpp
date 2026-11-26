@@ -551,13 +551,20 @@ public:
     /// nothing, each column in the encoding its last segment chose and searched for again every
     /// sixteenth - so a store an embedding application makes, which no merge ever rewrites, seals as
     /// the server's do.
+    /// How many of a column's first values a seal's search weighs the candidates over (#287): the
+    /// whole column cost a third of what a seal's encoding cost, searched every sixteenth segment, and
+    /// on Binance's top 20 levels this sample costs 0.10-0.27% more bytes than the whole for 20-34%
+    /// less encoding (spec `seal-search-sample`).
+    static constexpr size_t kSealSearchSample = 16'384;
+
     struct SegmentFormat {
         uint32_t version{kColumnarFormatVersion};
-        /// The search over the candidates: which compressors it tries, and their margins.
+        /// The search over the candidates: which compressors it tries, their margins, and the sample
+        /// it weighs them over.
         column_codec::EncodeOptions search{.lz4 = true, .zstd_level = 0, .compressed_margin_pct = 0,
                                            .zstd_margin_pct = 0,
                                            .runs_charge_pct = column_codec::kRunsChargePct,
-                                           .hint = nullptr};
+                                           .sample = kSealSearchSample, .hint = nullptr};
         /// A segment reuses the encoding this store's last one chose for each column, and searches
         /// again every this many segments - and always when it has none to reuse. 1: every segment
         /// searches.
@@ -566,7 +573,8 @@ public:
         /// A seal's: what queries read most, so nothing that decodes as slowly as ZSTD, and a runs
         /// candidate charged for its runs (#223).
         static SegmentFormat seal() { return SegmentFormat{}; }
-        /// A merge's: what stays, so ZSTD(3) where it saves 10% over LZ4, and every segment searched.
+        /// A merge's: what stays, so ZSTD(3) where it saves 10% over LZ4, and every segment searched,
+        /// over the whole of each column (#287).
         /// Nothing is charged for runs: a merged column decodes at ZSTD's pace, and the charge moved
         /// its choices among candidates no faster than the ones they replaced - from blocks to ZSTD,
         /// where the runs under LZ4 it took out had kept ZSTD from its margin (#223).
@@ -575,6 +583,7 @@ public:
             f.search.zstd_level = 3;
             f.search.zstd_margin_pct = 10;
             f.search.runs_charge_pct = 0;
+            f.search.sample = 0;
             f.search_every = 1;
             return f;
         }

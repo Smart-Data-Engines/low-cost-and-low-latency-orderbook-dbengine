@@ -14,11 +14,12 @@
 //
 // Bytes in memory on both sides, so this is the codec and nothing of the disk.
 //
-// Two options ask how a seal's search could cost less (#287): `rows_per_seal` cuts each store's rows, in
-// their order, into seals of that many rows - a stream of many seals a store, in which an encoding its
-// store chose some seals ago can stop fitting, where the recording's own one to three segments a store,
-// sealed again and again, always fit their hint; and `sample_rows` makes a search choose each column's
-// encoding over its first that many values and then write the whole column in it.
+// Two options ask what a seal's search costs (#287): `rows_per_seal` cuts each store's rows, in their
+// order, into seals of that many rows - a stream of many seals a store, in which an encoding its store
+// chose some seals ago can stop fitting, where the recording's own one to three segments a store, sealed
+// again and again, always fit their hint; and `sample_rows` is how many of a column's first values a
+// search weighs the candidates over (`EncodeOptions::sample`) - the seal policy's when it is not given,
+// and 0 for the whole column, as a seal searched before #287.
 //
 // Usage: seal_encode_cost <data dir> [format: 3 or 4] [passes] [rounds] [search_every] [rows_per_seal]
 //                         [sample_rows]
@@ -37,7 +38,6 @@
 #include <fstream>
 #include <map>
 #include <optional>
-#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -189,7 +189,6 @@ Run seal_all(const std::vector<Store>& stores, unsigned format, size_t passes, u
     Run run;
     std::vector<Hints> hints(stores.size());
     std::array<std::string, 7> blocks;
-    std::string scratch;
     for (size_t p = 0; p < passes; ++p) {
         for (size_t k = 0; k < stores.size(); ++k) for (const Segment& s : stores[k].segments) {
             auto& [last_choice, has_last_choice, segments_since_search] = hints[k];
@@ -200,15 +199,7 @@ Run seal_all(const std::vector<Store>& stores, unsigned format, size_t passes, u
                 options.hint = search ? nullptr : &last_choice[c];
                 options.steps = format == 4;
                 blocks[c].clear();
-                if (search && sample_rows > 0 && s.rows > sample_rows) {
-                    // The choice over the column's first `sample_rows` values, and the column in it.
-                    scratch.clear();
-                    const cc::Encoding chosen =
-                        cc::encode(std::span<const uint64_t>(s.values[c]).first(sample_rows), options, scratch).encoding;
-                    options.hint = &chosen;
-                    last_choice[c] = cc::encode(s.values[c], options, blocks[c]).encoding;
-                    continue;
-                }
+                options.sample = sample_rows;
                 last_choice[c] = cc::encode(s.values[c], options, blocks[c]).encoding;
             }
             const auto t1 = std::chrono::steady_clock::now();
@@ -243,7 +234,8 @@ int main(int argc, char** argv) {
     const uint32_t search_every = argc > 5 ? static_cast<uint32_t>(std::strtoul(argv[5], nullptr, 10))
                                            : ob::ColumnarStore::SegmentFormat::seal().search_every;
     const size_t rows_per_seal = argc > 6 ? std::strtoull(argv[6], nullptr, 10) : 0;   // 0: as recorded
-    const size_t sample_rows = argc > 7 ? std::strtoull(argv[7], nullptr, 10) : 0;     // 0: the whole column
+    const size_t sample_rows = argc > 7 ? std::strtoull(argv[7], nullptr, 10)      // 0: the whole column
+                                        : ob::ColumnarStore::SegmentFormat::seal().search.sample;
     if ((format != 3 && format != 4) || passes == 0 || rounds <= 0 || search_every == 0) {
         std::fprintf(stderr, "format is 3 or 4, and passes, rounds and search_every are at least 1\n");
         return 2;
