@@ -14,7 +14,14 @@
 //
 // Bytes in memory on both sides, so this is the codec and nothing of the disk.
 //
-// Usage: seal_encode_cost <data dir> [format: 3 or 4] [passes] [rounds] [search_every]
+// Two options ask how a seal's search could cost less (#287): `rows_per_seal` cuts each store's rows, in
+// their order, into seals of that many rows - a stream of many seals a store, in which an encoding its
+// store chose some seals ago can stop fitting, where the recording's own one to three segments a store,
+// sealed again and again, always fit their hint; and `sample_rows` makes a search choose each column's
+// encoding over its first that many values and then write the whole column in it.
+//
+// Usage: seal_encode_cost <data dir> [format: 3 or 4] [passes] [rounds] [search_every] [rows_per_seal]
+//                         [sample_rows]
 #include "orderbook/codec.hpp"
 #include "orderbook/column_codec.hpp"
 #include "orderbook/columnar_store.hpp"
@@ -30,6 +37,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -122,6 +130,31 @@ std::vector<Store> load(const char* dir, size_t& rows) {
     return stores;
 }
 
+/// Each store's rows, in the order its segments hold them, cut into seals of `rows_per_seal` rows; the
+/// last of a store's may be shorter.
+std::vector<Store> recut(const std::vector<Store>& stores, size_t rows_per_seal) {
+    std::vector<Store> out;
+    for (const Store& st : stores) {
+        Segment all;
+        for (const Segment& s : st.segments) {
+            for (size_t c = 0; c < 7; ++c) all.values[c].insert(all.values[c].end(), s.values[c].begin(), s.values[c].end());
+            all.rows += s.rows;
+        }
+        Store cut;
+        for (size_t from = 0; from < all.rows; from += rows_per_seal) {
+            Segment s;
+            s.rows = std::min(rows_per_seal, all.rows - from);
+            for (size_t c = 0; c < 7; ++c) {
+                s.values[c].assign(all.values[c].begin() + static_cast<std::ptrdiff_t>(from),
+                                   all.values[c].begin() + static_cast<std::ptrdiff_t>(from + s.rows));
+            }
+            cut.segments.push_back(std::move(s));
+        }
+        out.push_back(std::move(cut));
+    }
+    return out;
+}
+
 /// FNV-1a over a block, folded into `h`.
 uint64_t fold(uint64_t h, const std::string& block) {
     for (unsigned char b : block) {
@@ -150,11 +183,13 @@ struct Hints {
 
 /// Every store's seals of its segments, `passes` times over, as write_columns_v3() makes them: each
 /// store with its own hints.
-Run seal_all(const std::vector<Store>& stores, unsigned format, size_t passes, uint32_t search_every) {
+Run seal_all(const std::vector<Store>& stores, unsigned format, size_t passes, uint32_t search_every,
+             size_t sample_rows) {
     const ob::ColumnarStore::SegmentFormat policy = ob::ColumnarStore::SegmentFormat::seal();
     Run run;
     std::vector<Hints> hints(stores.size());
     std::array<std::string, 7> blocks;
+    std::string scratch;
     for (size_t p = 0; p < passes; ++p) {
         for (size_t k = 0; k < stores.size(); ++k) for (const Segment& s : stores[k].segments) {
             auto& [last_choice, has_last_choice, segments_since_search] = hints[k];
@@ -165,6 +200,15 @@ Run seal_all(const std::vector<Store>& stores, unsigned format, size_t passes, u
                 options.hint = search ? nullptr : &last_choice[c];
                 options.steps = format == 4;
                 blocks[c].clear();
+                if (search && sample_rows > 0 && s.rows > sample_rows) {
+                    // The choice over the column's first `sample_rows` values, and the column in it.
+                    scratch.clear();
+                    const cc::Encoding chosen =
+                        cc::encode(std::span<const uint64_t>(s.values[c]).first(sample_rows), options, scratch).encoding;
+                    options.hint = &chosen;
+                    last_choice[c] = cc::encode(s.values[c], options, blocks[c]).encoding;
+                    continue;
+                }
                 last_choice[c] = cc::encode(s.values[c], options, blocks[c]).encoding;
             }
             const auto t1 = std::chrono::steady_clock::now();
@@ -189,8 +233,8 @@ Run seal_all(const std::vector<Store>& stores, unsigned format, size_t passes, u
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <data dir> [format: 3 or 4] [passes] [rounds] [search_every]\n",
-                     argv[0]);
+        std::fprintf(stderr, "usage: %s <data dir> [format: 3 or 4] [passes] [rounds] [search_every] "
+                     "[rows_per_seal] [sample_rows]\n", argv[0]);
         return 2;
     }
     const unsigned format = argc > 2 ? static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10)) : 3;
@@ -198,12 +242,15 @@ int main(int argc, char** argv) {
     const int rounds = argc > 4 ? std::atoi(argv[4]) : 5;
     const uint32_t search_every = argc > 5 ? static_cast<uint32_t>(std::strtoul(argv[5], nullptr, 10))
                                            : ob::ColumnarStore::SegmentFormat::seal().search_every;
+    const size_t rows_per_seal = argc > 6 ? std::strtoull(argv[6], nullptr, 10) : 0;   // 0: as recorded
+    const size_t sample_rows = argc > 7 ? std::strtoull(argv[7], nullptr, 10) : 0;     // 0: the whole column
     if ((format != 3 && format != 4) || passes == 0 || rounds <= 0 || search_every == 0) {
         std::fprintf(stderr, "format is 3 or 4, and passes, rounds and search_every are at least 1\n");
         return 2;
     }
     size_t rows = 0;
-    const std::vector<Store> stores = load(argv[1], rows);
+    const std::vector<Store> recorded = load(argv[1], rows);
+    const std::vector<Store> stores = rows_per_seal > 0 ? recut(recorded, rows_per_seal) : recorded;
     size_t segments = 0;
     for (const Store& st : stores) segments += st.segments.size();
     if (stores.empty()) {
@@ -215,7 +262,7 @@ int main(int argc, char** argv) {
     Run best;
     double best_all = 1e300, best_searched = 1e300, best_hinted = 1e300;
     for (int r = 0; r < rounds; ++r) {
-        const Run run = seal_all(stores, format, passes, search_every);
+        const Run run = seal_all(stores, format, passes, search_every, sample_rows);
         if (r > 0 && run.hash != best.hash) {
             std::fprintf(stderr, "round %d wrote other bytes than round 0: %016llx against %016llx\n", r,
                          static_cast<unsigned long long>(run.hash), static_cast<unsigned long long>(best.hash));
@@ -228,10 +275,12 @@ int main(int argc, char** argv) {
     }
     const double all_rows = static_cast<double>(rows * passes);
     std::printf("{\"rows\": %zu, \"stores\": %zu, \"segments\": %zu, \"format\": %u, \"passes\": %zu, \"rounds\": %d, "
-                "\"search_every\": %u, \"seals\": %zu, \"ns_per_row\": %.2f, \"searched_ns_per_row\": %.2f, "
+                "\"search_every\": %u, \"rows_per_seal\": %zu, \"sample_rows\": %zu, \"seals\": %zu, "
+                "\"ns_per_row\": %.2f, \"searched_ns_per_row\": %.2f, "
                 "\"hinted_ns_per_row\": %.2f, \"searched_rows\": %zu, \"hinted_rows\": %zu, "
                 "\"bytes_per_row\": %.4f, \"hash\": \"%016llx\", \"written\": {",
-                rows, stores.size(), segments, format, passes, rounds, search_every, best.seals, best_all / all_rows,
+                rows, stores.size(), segments, format, passes, rounds, search_every, rows_per_seal, sample_rows,
+                best.seals, best_all / all_rows,
                 best.searched_rows ? best_searched / static_cast<double>(best.searched_rows) : 0.0,
                 best.hinted_rows ? best_hinted / static_cast<double>(best.hinted_rows) : 0.0,
                 best.searched_rows, best.hinted_rows, static_cast<double>(best.bytes) / all_rows,
