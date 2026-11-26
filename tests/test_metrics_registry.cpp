@@ -2,6 +2,8 @@
 // Feature: observability
 
 #include <gtest/gtest.h>
+
+#include <algorithm>
 #include <rapidcheck/gtest.h>
 
 #include <cmath>
@@ -125,26 +127,34 @@ RC_GTEST_PROP(MetricsRegistryProperty, prop_histogram_invariants, ()) {
     // Generate random observation count and values
     const auto num_obs = *rc::gen::inRange<int>(1, 200);
     double expected_sum = 0.0;
+    std::vector<double> values;
 
     for (int i = 0; i < num_obs; ++i) {
         // Generate non-negative doubles via integer division
         double val = *rc::gen::inRange<int>(0, 2000000) / 1e6;
         registry.observe_histogram("ob_insert_latency_seconds", val);
         expected_sum += val;
+        values.push_back(val);
     }
 
     const ob::HistogramData* data = registry.histogram_data("ob_insert_latency_seconds");
     RC_ASSERT(data != nullptr);
 
-    // 1) Bucket monotonicity: bucket[i] <= bucket[i+1]
+    // 1) Bucket monotonicity, as the exposition says the buckets: bucket[i] <= bucket[i+1]
     for (size_t i = 0; i < ob::kNumBuckets; ++i) {
-        uint64_t curr = data->buckets[i].load(std::memory_order_relaxed);
-        uint64_t next = data->buckets[i + 1].load(std::memory_order_relaxed);
-        RC_ASSERT(curr <= next);
+        RC_ASSERT(data->cumulative(i) <= data->cumulative(i + 1));
+    }
+
+    // 1b) And each is exactly the observations at or below its boundary (#289): every bucket holds
+    //     its own alone, and the cumulative one adds them up.
+    for (size_t i = 0; i < ob::kNumBuckets; ++i) {
+        const auto at_or_below = static_cast<uint64_t>(std::count_if(
+            values.begin(), values.end(), [&](double v) { return v <= ob::kLatencyBuckets[i]; }));
+        RC_ASSERT(data->cumulative(i) == at_or_below);
     }
 
     // 2) +Inf bucket == count
-    uint64_t inf_bucket = data->buckets[ob::kNumBuckets].load(std::memory_order_relaxed);
+    uint64_t inf_bucket = data->cumulative(ob::kNumBuckets);
     uint64_t count = data->count.load(std::memory_order_relaxed);
     RC_ASSERT(inf_bucket == count);
 
@@ -295,23 +305,61 @@ TEST(MetricsRegistryUnit, HistogramObserveAndBucketDistribution) {
     EXPECT_EQ(data->count.load(), 4u);
 
     // +Inf bucket should equal count
-    EXPECT_EQ(data->buckets[ob::kNumBuckets].load(), 4u);
+    EXPECT_EQ(data->cumulative(ob::kNumBuckets), 4u);
 
     // First bucket (le=0.00001): 0.000005 fits → 1
-    EXPECT_EQ(data->buckets[0].load(), 1u);
+    EXPECT_EQ(data->cumulative(0), 1u);
 
     // Bucket le=0.0005 (index 3): 0.000005 + 0.0003 fit → 2
-    EXPECT_EQ(data->buckets[3].load(), 2u);
+    EXPECT_EQ(data->cumulative(3), 2u);
 
     // Bucket le=0.5 (index 9): 0.000005 + 0.0003 + 0.5 fit → 3
-    EXPECT_EQ(data->buckets[9].load(), 3u);
+    EXPECT_EQ(data->cumulative(9), 3u);
 
     // Bucket le=1.0 (index 10): same 3 (2.0 doesn't fit)
-    EXPECT_EQ(data->buckets[10].load(), 3u);
+    EXPECT_EQ(data->cumulative(10), 3u);
 
     // Verify monotonicity
     for (size_t i = 0; i < ob::kNumBuckets; ++i) {
-        EXPECT_LE(data->buckets[i].load(), data->buckets[i + 1].load());
+        EXPECT_LE(data->cumulative(i), data->cumulative(i + 1));
+    }
+
+    // Each observation is in one bucket alone (#289): the stored counts are 1 at 0, 3, 9 and +Inf.
+    for (size_t i = 0; i <= ob::kNumBuckets; ++i) {
+        const uint64_t own = (i == 0 || i == 3 || i == 9 || i == ob::kNumBuckets) ? 1u : 0u;
+        EXPECT_EQ(data->buckets[i].load(), own) << "bucket " << i;
+    }
+}
+
+TEST(MetricsRegistryUnit, AHistogramIsExposedInCumulativeBucketsAsBefore) {
+    // The exposition of four observations, line for line as it was when every bucket at or above a
+    // value was added to (#289): the buckets are stored apart now, and added up here.
+    ob::MetricsRegistry registry;
+    for (const double v : {0.000005, 0.0003, 0.5, 2.0}) {
+        registry.observe_histogram("ob_insert_latency_seconds", v);
+    }
+    registry.observe_histogram("ob_insert_latency_seconds", 0.00002, 3);   // three in the second bucket
+    const std::string out = registry.serialize();
+    const char* const expected[] = {
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"1e-05\"} 1\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"5e-05\"} 4\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.0001\"} 4\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.0005\"} 5\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.001\"} 5\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.005\"} 5\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.01\"} 5\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.05\"} 5\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.1\"} 5\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"0.5\"} 6\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"1\"} 6\n",
+        "ob_insert_latency_seconds_bucket{node_role=\"standalone\",le=\"+Inf\"} 7\n",
+        "ob_insert_latency_seconds_count{node_role=\"standalone\"} 7\n",
+    };
+    size_t from = 0;
+    for (const char* line : expected) {
+        const size_t at = out.find(line, from);
+        EXPECT_NE(at, std::string::npos) << "missing, or out of order: " << line;
+        if (at != std::string::npos) from = at;
     }
 }
 
