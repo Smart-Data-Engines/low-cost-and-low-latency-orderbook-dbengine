@@ -2927,11 +2927,13 @@ for it - seals cut to a size, and a sample):
 | seals of 131 072 rows: bytes | +0.65% / +0.46% | +0.25% / +0.27% | +0.21% / +0.21% |
 
 binance-diff's segments chose exactly as their whole columns in format 3; in format 4, 16 of its 160 `side` segments
-chose `steps/runs+LZ4` where the whole column chose `for/runs+LZ4`, in as many bytes a row to four decimals. Searching
-every 64th segment instead saved about as much on top20 (19%) and let a choice stand four times as long: on a stream cut
-into seals of 8 192 rows it cost 0.29% more bytes than a search at every seal, against 0.17% at sixteen. Under the
-sample, 64 of top20's 384 price segments are in `narrow+LZ4` where the whole column chose runs; what that does to a read
-was not measured.
+chose `steps/runs+LZ4` where the whole column chose `for/runs+LZ4`, in as many bytes a row to four decimals. A search
+every 64th segment instead saved about as much on top20 (19-23%) and nothing on binance-diff - in the benchmark's 16
+passes a store of it searches once at either cadence - and it does nothing for a store's first seal, which always
+searches. On these recordings cut into seals of 8 192 rows, the choices it lets stand four times as long cost top20
+0.29% more bytes than a search at every seal against 0.17% at sixteen in format 3, and 0.08% against 0.15% in format 4.
+Under the sample, 64 of top20's 384 price segments are in `narrow+LZ4` where the whole column chose runs; what that does
+to a read was not measured.
 
 **Measured** with Release builds on the m9g.xlarge, `master` against this change, six rounds a build in each shape
 of #190's ingest (`final/arm/` in the evidence; the m8a.xlarge follows when the product session's 24-hour run frees
