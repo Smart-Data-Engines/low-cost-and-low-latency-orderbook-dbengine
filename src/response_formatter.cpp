@@ -133,6 +133,37 @@ static char* put_seven(char* p, char* end, const RowBatch& b, uint32_t i) {
     return p;
 }
 
+static_assert(sizeof(RepeatedText::text) == decimal_text::kWriteRoom,
+              "a repeated field's text is copied a word store's room at a time");
+
+/// `v` and `sep` at `p`, which has a word store's room past the widest field (#251) - from the text the
+/// field wrote last when `v` is the value it wrote, written and kept there when it is not (#291). The same
+/// bytes either way: the text kept is what the writer wrote for that value and separator.
+[[gnu::always_inline]] inline char* put_repeating(char* p, uint64_t v, char sep, RepeatedText& f) {
+    if (v == f.value && f.length != 0) {
+        std::memcpy(p, f.text, sizeof f.text);
+        return p + f.length;
+    }
+    char* const end = decimal_text::put_in_room(p, v, sep);
+    std::memcpy(f.text, p, sizeof f.text);
+    f.value  = v;
+    f.length = static_cast<uint32_t>(end - p);
+    return end;
+}
+
+/// The seven of a result at `p`, with a row's room and a word store's past it: the time and the sequence
+/// number from the last row's text when they repeat it (#291), as a book's rows all do.
+static char* put_seven_repeating(char* p, const QueryResult& r, RowRepeats& rr) {
+    p = put_repeating(p, r.timestamp_ns, '\t', rr.ts);
+    p = decimal_text::put_in_room(p, r.price,       '\t');
+    p = decimal_text::put_in_room(p, r.quantity,    '\t');
+    p = decimal_text::put_in_room(p, r.order_count, '\t');
+    p = decimal_text::put_in_room(p, r.side,        '\t');
+    p = decimal_text::put_in_room(p, r.level,       '\t');
+    p = put_repeating(p, r.sequence_number, '\n', rr.seq);
+    return p;
+}
+
 static char* put_column(char* p, char* end, const RowBatch& b, uint32_t i, QueryColumn c, char sep) {
     switch (c) {
         case QueryColumn::TimestampNs:    return put_field(p, end, b.ts[i],                         sep);
@@ -431,7 +462,7 @@ void QueryResponseBuilder::add(const QueryResult& r) {
         // time-range query 31% of the server's samples were in it (#227).
         room_for_a_row();
         char* const reply = out_.data();
-        used_ = static_cast<size_t>(put_seven(reply + used_, reply + out_.size(), r) - reply);
+        used_ = static_cast<size_t>(put_seven_repeating(reply + used_, r, repeats_) - reply);
     } else if (!shape_.columns.empty()) {
         add_narrow(r);
     }
@@ -485,18 +516,21 @@ void QueryResponseBuilder::add(const QueryResult& r) {
 // past its last digit, and the rows are then written with no check a field (#251): a check a field
 // is a branch a field, and with the fallback it guards inlined beside each, a loop GCC no longer
 // inlined the digits' writer into.
-[[gnu::noinline]] static char* write_seven_rows(char* p, char* end, const RowBatch& b, size_t n) {
+[[gnu::noinline]] static char* write_seven_rows(char* p, char* end, const RowBatch& b, size_t n,
+                                                RowRepeats& rr) {
     if (end - p < static_cast<std::ptrdiff_t>(n * kMaxQueryRowBytes + decimal_text::kWriteRoom)) {
         return write_seven_rows_checked(p, end, b, n);
     }
+    // The time and the sequence number from the last row's text where they repeat it (#291): an update's
+    // levels follow one another in a segment, and each carries its time and number.
     for (const uint32_t i : b.rows.first(n)) {
-        p = decimal_text::put_in_room(p, b.ts[i],                           '\t');
+        p = put_repeating(p, b.ts[i], '\t', rr.ts);
         p = decimal_text::put_in_room(p, b.price[i],                        '\t');
         p = decimal_text::put_in_room(p, b.qty[i],                          '\t');
         p = decimal_text::put_in_room(p, b.cnt[i],                          '\t');
         p = decimal_text::put_in_room(p, b.side[i],                         '\t');
         p = decimal_text::put_in_room(p, b.level[i],                        '\t');
-        p = decimal_text::put_in_room(p, static_cast<uint64_t>(b.seq[i]), '\n');
+        p = put_repeating(p, static_cast<uint64_t>(b.seq[i]), '\n', rr.seq);
     }
     return p;
 }
@@ -505,9 +539,9 @@ void QueryResponseBuilder::add(const QueryResult& r) {
 /// row the shape can write: the seven unrolled, or a narrowed list, each out of line. The one writer
 /// of a batch's rows, so a reply built from batches and one built from parts cannot differ.
 static char* write_rows(char* p, char* end, const RowBatch& b, size_t n, bool all_seven,
-                        const std::vector<QueryColumn>& columns) {
+                        const std::vector<QueryColumn>& columns, RowRepeats& rr) {
     if (all_seven) {
-        p = write_seven_rows(p, end, b, n);
+        p = write_seven_rows(p, end, b, n, rr);
     } else if (!columns.empty()) {
         p = write_narrow_rows(p, end, b, n, columns);
     }
@@ -526,7 +560,7 @@ void QueryResponseBuilder::add_rows(const RowBatch& b) {
     char* const reply = out_.data();
     char* const end   = reply + out_.size();
     used_ = static_cast<size_t>(write_rows(reply + used_, end, b, b.rows.size(), all_seven_,
-                                           shape_.columns) - reply);
+                                           shape_.columns, repeats_) - reply);
     measure(b.rows.size());
 }
 
@@ -564,7 +598,7 @@ public:
             char* const base = c.bytes.get();
             const size_t before = c.used;
             c.used = static_cast<size_t>(
-                write_rows(base + c.used, base + c.cap, b, n, all_seven_, columns_) - base);
+                write_rows(base + c.used, base + c.cap, b, n, all_seven_, columns_, repeats_) - base);
             bytes_ += c.used - before;
         }
         rows_ += n;
@@ -628,6 +662,7 @@ private:
     size_t bytes_{0};
     std::vector<Chunk> chunks_;
     uint64_t rows_{0};
+    RowRepeats repeats_{};   ///< the time and sequence number this part's last row wrote (#291)
 };
 
 }  // namespace

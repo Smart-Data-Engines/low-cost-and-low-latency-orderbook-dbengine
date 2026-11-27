@@ -77,16 +77,22 @@ RC_GTEST_PROP(QueryResponseBuilderProperty, WritesTheBytesFormatQueryResponseWri
         {3, rc::gen::container<std::vector<ob::QueryColumn>>(column)},
     });
     const auto n = *rc::gen::inRange<size_t>(0, 200);
+    // The time and the sequence number repeat as an update's levels and a book's rows repeat them (#291):
+    // most from a pool of three, so that a value comes back after another - the field's text kept must
+    // be its value's, not merely the last one written.
+    const auto pool = *rc::gen::container<std::vector<uint64_t>>(3, rc::gen::resize(100, rc::gen::arbitrary<uint64_t>()));
+    const auto repeating = rc::gen::weightedOneOf<uint64_t>({{1, rc::gen::resize(100, rc::gen::arbitrary<uint64_t>())},
+                                                             {3, rc::gen::elementOf(pool)}});
     std::vector<ob::QueryResult> rows;
     rows.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        rows.push_back(a_row(*rc::gen::resize(100, rc::gen::arbitrary<uint64_t>()),
+        rows.push_back(a_row(*repeating,
                              *rc::gen::resize(100, rc::gen::arbitrary<int64_t>()),
                              *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>()),
                              *rc::gen::resize(100, rc::gen::arbitrary<uint32_t>()),
                              *rc::gen::resize(100, rc::gen::arbitrary<uint8_t>()),
                              *rc::gen::resize(100, rc::gen::arbitrary<uint16_t>()),
-                             *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>())));
+                             *repeating));
     }
     RC_ASSERT(built(rows, columns) == ob::format_query_response(rows, columns));
 }
@@ -110,14 +116,18 @@ RC_GTEST_PROP(QueryResponseBuilderProperty, RowsFromBatchesAreTheBytesOfTheSameR
     std::vector<uint32_t> cnt(n);
     std::vector<uint8_t> side(n);
     std::vector<uint16_t> level(n);
+    // Repeating times and sequence numbers, as in the property above (#291).
+    const auto pool = *rc::gen::container<std::vector<uint64_t>>(3, rc::gen::resize(100, rc::gen::arbitrary<uint64_t>()));
+    const auto repeating = rc::gen::weightedOneOf<uint64_t>({{1, rc::gen::resize(100, rc::gen::arbitrary<uint64_t>())},
+                                                             {3, rc::gen::elementOf(pool)}});
     for (size_t i = 0; i < n; ++i) {
-        ts[i]    = *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>());
+        ts[i]    = *repeating;
         price[i] = *rc::gen::resize(100, rc::gen::arbitrary<int64_t>());
         qty[i]   = *rc::gen::resize(100, rc::gen::arbitrary<uint64_t>());
         cnt[i]   = *rc::gen::resize(100, rc::gen::arbitrary<uint32_t>());
         side[i]  = *rc::gen::resize(100, rc::gen::arbitrary<uint8_t>());
         level[i] = *rc::gen::resize(100, rc::gen::arbitrary<uint16_t>());
-        seq[i]   = static_cast<int64_t>(*rc::gen::resize(100, rc::gen::arbitrary<uint64_t>()));
+        seq[i]   = static_cast<int64_t>(*repeating);
     }
     std::vector<uint32_t> chosen;
     for (size_t i = 0; i < n; ++i) {
