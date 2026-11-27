@@ -682,6 +682,11 @@ ob_add_tcp_test(test_tcp_server
 ob_add_tcp_test(test_unix_socket
     test_unix_socket.cpp
 )
+# #293: a large read answered off the loop is written in its session's room, on a real server in
+# this process.
+ob_add_tcp_test(test_off_loop_room
+    test_off_loop_room.cpp
+)
 # The drain rule (#106) is checked by reading the server's source: the bound has to live in one
 # place.
 target_compile_definitions(test_tcp_server
