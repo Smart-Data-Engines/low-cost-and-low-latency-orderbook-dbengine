@@ -4,6 +4,23 @@
 #include <atomic>
 #include <cstring>
 
+// ThreadSanitizer and the seqlock's copies (#292). This file is built without TSan's instrumentation -
+// TSan cannot model the fences the seqlock stands on (CMakeLists.txt) - but in a TSan build of the
+// server its memcpy and memmove still go through TSan's interceptors. So a reader's copy of a side,
+// which the seqlock checks and takes again when a write moved the version under it, is reported
+// against the write it overlapped whenever the two meet, and since a BOOK finds its book without the
+// engine's lock (#292) they meet. The reader's copies are what the seqlock guards, so in that build
+// TSan is told to ignore them; nothing else is, and the writes stay checked.
+#if defined(OB_SEQLOCK_TSAN_IGNORE_READS)
+extern "C" void AnnotateIgnoreReadsBegin(const char* file, int line);
+extern "C" void AnnotateIgnoreReadsEnd(const char* file, int line);
+#define OB_SEQLOCK_COPY_BEGIN() AnnotateIgnoreReadsBegin(__FILE__, __LINE__)
+#define OB_SEQLOCK_COPY_END() AnnotateIgnoreReadsEnd(__FILE__, __LINE__)
+#else
+#define OB_SEQLOCK_COPY_BEGIN() ((void)0)
+#define OB_SEQLOCK_COPY_END() ((void)0)
+#endif
+
 namespace ob {
 
 // ── insert_level ──────────────────────────────────────────────────────────────
@@ -221,13 +238,15 @@ SnapshotLabel read_snapshot(const SoABuffer& buf, SoASide& out_bid, SoASide& out
                 v1 = src.version.load(std::memory_order_acquire);
             } while (v1 & 1u);
 
-            // Step 2: copy data.
+            // Step 2: copy data - checked by step 3, so not by TSan (see the top of the file).
             std::atomic_thread_fence(std::memory_order_acquire);
+            OB_SEQLOCK_COPY_BEGIN();
             const uint32_t depth = src.depth;
             dst.depth = depth;
             std::memcpy(dst.prices,       src.prices,       depth * sizeof(int64_t));
             std::memcpy(dst.quantities,   src.quantities,   depth * sizeof(uint64_t));
             std::memcpy(dst.order_counts, src.order_counts, depth * sizeof(uint32_t));
+            OB_SEQLOCK_COPY_END();
 
             // Step 3: re-read version; retry if changed.
             std::atomic_thread_fence(std::memory_order_acquire);

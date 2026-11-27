@@ -506,6 +506,69 @@ TEST(SoABuffer, TheLabelIsOneUpdatesPairAndEachSideHoldsEveryUpdateUpToIt) {
     EXPECT_GE(written.load(), kUpdates) << "the writer made fewer updates than the race is for";
 }
 
+// #292: a BOOK reads its book through the seqlock without the engine's lock, beside writers whose levels
+// move memory - a level put in at the top of a side shifts every level after it, and taken out shifts
+// them back. Every snapshot is one of the two sides the writer goes between, never a mix of them. And in
+// a TSan build the reader's copies, which the seqlock checks, are not reported against the shifts they
+// overlap: soa_buffer.cpp is not instrumented, but its memcpy and memmove go through TSan's interceptors,
+// and the integration battery under TSan reported exactly this pair until the copies were annotated.
+// The test above writes one level a side in place, which moves nothing, so it could not show it.
+TEST(SoABuffer, ASnapshotBesideWritesThatShiftTheLevelsIsOneOfTheSidesWritten) {
+    auto buf = make_buffer();
+    constexpr uint32_t kDepth = 40;
+    {
+        // Bids 10 000 down to 9 961, each level's quantity its price.
+        std::vector<ob::Level> levels;
+        for (uint32_t i = 0; i < kDepth; ++i) {
+            levels.push_back(ob::Level{10'000 - static_cast<int64_t>(i), 10'000ULL - i, 1U, 0U});
+        }
+        ob::DeltaUpdate upd = make_update(ob::SIDE_BID, 1, static_cast<uint16_t>(kDepth));
+        bool gap = false;
+        ASSERT_EQ(ob::apply_delta(*buf, upd, levels.data(), gap), ob::OB_OK);
+    }
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> written{0};
+    std::thread writer([&] {
+        for (uint64_t k = 2; !stop.load(std::memory_order_acquire); ++k) {
+            // In at the top on even updates and out again on odd ones: every level after it moves.
+            ob::Level lv{10'001, k % 2 == 0 ? 10'001ULL : 0ULL, 1U, 0U};
+            ob::DeltaUpdate upd = make_update(ob::SIDE_BID, k, 1);
+            bool gap = false;
+            ob::apply_delta(*buf, upd, &lv, gap);
+            written.store(k, std::memory_order_relaxed);
+        }
+    });
+
+    size_t reads = 0;
+    size_t with_top = 0;
+    size_t without_top = 0;
+    size_t mixed = 0;
+    ob::SoASide bid{}, ask{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while ((written.load(std::memory_order_relaxed) < 200'000 || with_top < 1000 || without_top < 1000) &&
+           std::chrono::steady_clock::now() < deadline) {
+        ob::read_snapshot(*buf, bid, ask);
+        const bool top = bid.depth == kDepth + 1;
+        bool one_written = top || bid.depth == kDepth;
+        const uint32_t from = top ? 1 : 0;
+        if (one_written && top) one_written = bid.prices[0] == 10'001 && bid.quantities[0] == 10'001;
+        for (uint32_t i = 0; one_written && i < kDepth; ++i) {
+            one_written = bid.prices[from + i] == 10'000 - static_cast<int64_t>(i) &&
+                          bid.quantities[from + i] == 10'000ULL - i;
+        }
+        if (!one_written) ++mixed;
+        ++(top ? with_top : without_top);
+        ++reads;
+    }
+    stop.store(true, std::memory_order_release);
+    writer.join();
+
+    EXPECT_EQ(mixed, 0u) << mixed << " of " << reads << " snapshots were neither side the writer wrote";
+    // The control: the reads saw the side both ways, so they raced the shifts.
+    EXPECT_GE(with_top, 1000u) << "snapshots with the level in: " << with_top << " of " << reads;
+    EXPECT_GE(without_top, 1000u) << "snapshots without it: " << without_top << " of " << reads;
+}
+
 // #239: the label is not read while an update is under way. A writer stores the pair inside its
 // side's seqlock, and between its two stores the pair is half one update's and half the last one's.
 // Set up by hand: the bid side's version odd and update 2's number stored, its timestamp not yet -

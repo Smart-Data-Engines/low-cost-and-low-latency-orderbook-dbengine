@@ -255,8 +255,14 @@ add_library(orderbook_soa STATIC src/soa_buffer.cpp)
 # Discovered when #83 moved the instrumentation above the libraries. Until then this file was not
 # instrumented either — along with the other twenty-seven — so the build succeeded by accident and
 # nobody learned that TSan and this data structure are incompatible.
+#
+# Uninstrumented is not unseen: the file's memcpy and memmove go through TSan's interceptors. A seqlock
+# reader's copies met a writer's shifts once a BOOK found its book without the engine's lock (#292), and
+# the integration battery under TSan reported them; OB_SEQLOCK_TSAN_IGNORE_READS has TSan ignore those
+# copies, which the seqlock checks, and nothing else.
 if(OB_ENABLE_TSAN)
     target_compile_options(orderbook_soa PRIVATE -fno-sanitize=thread -Wno-tsan)
+    target_compile_definitions(orderbook_soa PRIVATE OB_SEQLOCK_TSAN_IGNORE_READS=1)
 endif()
 target_link_libraries(orderbook_soa PUBLIC orderbook_core)
 
