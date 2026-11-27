@@ -2940,7 +2940,7 @@ change the run's pass is 49.2% and the search for the runs 12.0%.
 
 **Tests.** The oracle of every bucket already drew a random part of the aggregates; the pool's buckets are now drawn the
 same way and held to one thread's, every aggregate or a part of them (RapidCheck). ctest passed 2290 of 2290 on the
-i3-7100U (Debug), as many as #286's: the test that changed is the pool's property.
+m9g.xlarge and the i3-7100U (Debug), as many as #286's: the test that changed is the pool's property.
 
 **Mutation table** (`mutations/` in the evidence, the i3-7100U): eleven mutants killed - FIRST and LAST asking for
 nothing, MIN and MAX asking for nothing, AVG(price) asking for the quantities' sum, VWAP without the quantities' sum, a
