@@ -190,6 +190,12 @@ public:
     /// frame, its length in front, as a compressed session sends it.
     std::string finish();
 
+    /// The room the builder was given, emptied, its capacity kept - for a read the engine hands back
+    /// before its first result (#293), so that the answer built off the loop is written where the
+    /// session's last large answer was, not in memory of its own. Empty once a result has started the
+    /// reply: what is written is the reply's, and an LZ4 answer's room is its frame.
+    std::string give_back_room();
+
     /// Whether a row answer has passed its ceiling (#257).
     bool full() const override { return full_; }
     /// The rows it may still take, at the bytes a row its rows have taken so far (#257).
