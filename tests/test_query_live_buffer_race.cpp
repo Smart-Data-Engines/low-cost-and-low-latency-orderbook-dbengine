@@ -15,6 +15,9 @@
 #include "test_temp_dirs.hpp"
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <regex>
+#include <future>
 
 #include <atomic>
 #include <cstdio>
@@ -174,7 +177,73 @@ TEST(QueryLiveBufferRaceStatic, EverySupplierOfTheLookupTakesALock) {
     for (const char* file : {"src/engine.cpp", "src/c_api.cpp"}) {
         const auto body = live_buffer_lambda(file);
         ASSERT_FALSE(body.empty()) << "no QueryEngine construction found in " << file;
-        EXPECT_NE(body.find("lock_guard"), std::string::npos)
+        // The engine's map has a lock of its own since #292, taken shared by the lookup.
+        EXPECT_TRUE(body.find("lock_guard") != std::string::npos ||
+                    body.find("shared_lock") != std::string::npos)
             << file << " supplies a live-buffer lookup that takes no lock:\n" << body;
     }
+}
+
+
+TEST(QueryLiveBufferRaceStatic, EveryChangeOfTheEnginesBooksMapTakesItsLock) {
+    // #292: a lookup holds the map's own lock, shared, and not the engine's, so a change of the map that
+    // did not take that lock - a book made, a symbol dropped, the map cleared - would rehash or free it
+    // under a read. Every change of `buffers_` in the engine takes `books_mtx_` within the three lines
+    // before it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/engine.cpp");
+    ASSERT_TRUE(in);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(in, line);) lines.push_back(line);
+    const std::regex change(R"(buffers_(\.(emplace|erase|clear|insert|try_emplace|extract|swap)\b|\s*\[))");
+    size_t changes = 0;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!std::regex_search(lines[i], change)) continue;
+        ++changes;
+        bool locked = false;
+        for (size_t k = (i >= 3 ? i - 3 : 0); k <= i; ++k) {
+            if (lines[k].find("books_mtx_") != std::string::npos) locked = true;
+        }
+        EXPECT_TRUE(locked) << "src/engine.cpp:" << i + 1 << " changes the books' map without its lock: "
+                            << lines[i];
+    }
+    // The control: the five changes are found - one made, one dropped, three cleared - so the scan
+    // reads the file it means to.
+    EXPECT_EQ(changes, 5u);
+}
+
+TEST(QueryLiveBufferRace, ABookIsReadWhileAWriterHoldsTheEnginesLock) {
+    // #292: a BOOK found its book under the engine's lock, so it waited for a writer's batch. The lock is
+    // held here as a batch holds it, and the read is answered meanwhile.
+    const std::string dir = make_temp_dir("ob_book_beside_writers");
+    ob::Engine engine(dir);
+    engine.open();
+    write_symbol(engine, 7, 1);
+    std::string error;
+    std::vector<ob::QueryResult> rows;
+    {
+        auto held = engine.hold_engine_lock_for_test();
+        auto read = std::async(std::launch::async, [&] {
+            return engine.read_book("SYM0007", "EX", 0, [&](const ob::QueryResult& r) { rows.push_back(r); });
+        });
+        const auto status = read.wait_for(std::chrono::seconds(5));
+        // Let go before the verdict, so that a read that waits for the lock ends and the test fails
+        // rather than hangs.
+        held.unlock();
+        EXPECT_EQ(status, std::future_status::ready) << "a BOOK waited for the engine's lock";
+        error = read.get();
+    }
+    EXPECT_TRUE(error.empty()) << error;
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].price, 50007);
+    // The control: a write does wait for the lock, so holding it here held what it means to.
+    {
+        auto held = engine.hold_engine_lock_for_test();
+        auto write = std::async(std::launch::async, [&] { write_symbol(engine, 8, 1); });
+        EXPECT_EQ(write.wait_for(std::chrono::milliseconds(300)), std::future_status::timeout)
+            << "a write went in while the engine's lock was held";
+        held.unlock();
+        write.get();
+    }
+    engine.close();
+    std::filesystem::remove_all(dir);
 }

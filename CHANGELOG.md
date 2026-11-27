@@ -197,6 +197,12 @@ here as `#N`.
 
 ### Changed
 
+- **A BOOK no longer waits for the writers to find its book** (#292). The lookup of a live book took the engine's
+  lock, which a writer holds for its whole batch; the map of books has a lock of its own now, which the lookup takes
+  shared and every change of the map takes exclusively under the engine's. On the m9g.xlarge a BOOK beside a
+  pipelined ingest answers at a p99 of 15.0 us instead of 69.2, and a p999 of 23.9 instead of 143.9 (medians of six
+  rounds); alone, and for the writers, nothing changed.
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
