@@ -145,6 +145,23 @@ struct AnswerCeiling {
     bool lz4 = false;
 };
 
+/// The text of the value a field of a reply's rows wrote last (#291): a row that repeats it - every row of
+/// a book, the levels of one update - copies these bytes rather than writing the value's digits again.
+/// `length` 0 is nothing written yet. The bytes past `length` are whatever the writer left there: copied
+/// with the text and written over by the next field, as a field's word stores past its last digit are (#251).
+struct RepeatedText {
+    uint64_t value  = 0;
+    uint32_t length = 0;
+    char     text[24];
+};
+
+/// A reply's row fields that repeat from row to row (#291): an update's time and sequence number, which
+/// each of its levels carries, and a book's, which each of its rows does.
+struct RowRepeats {
+    RepeatedText ts;
+    RepeatedText seq;
+};
+
 /// A row scan's reply built as the engine hands the rows over, rather than from a vector of them
 /// (#49 step 3). The server collected every row of a `SELECT` before it formatted one - 64 bytes a
 /// row, copied again each time the vector grew - and measured on a server whose heap turned over,
@@ -233,6 +250,7 @@ private:
     /// than into a buffer copied after them. finish() cuts `out_` to `used_`.
     size_t used_      = 0;
     size_t row_bytes_ = 0;      ///< the widest row this shape can write, its separators included
+    RowRepeats repeats_{};      ///< the time and sequence number the last row wrote (#291)
     bool started_   = false;
     bool aggregate_ = false;
     bool all_seven_ = false;
