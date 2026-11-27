@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A time bucket's rows are added a run at a time, keeping only what the query's aggregates read** (#290). A
+  `GROUP BY TIME_BUCKET` query added each row to every part of its bucket's state - first and last, extremes, three
+  128-bit sums - whatever it asked, one row at a time through the bucket. The rows of a bucket that follow one another
+  are now added in one pass, compiled for the aggregates asked; the answers are the same. On the m9g.xlarge a second's
+  buckets over 238 080 rows answer in 304 us instead of 778 for COUNT, 638 instead of 868 for COUNT and VWAP, and 898
+  instead of 990 for eight aggregates (medians of six rounds).
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
