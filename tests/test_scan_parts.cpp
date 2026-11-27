@@ -26,6 +26,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -215,6 +216,29 @@ TEST(ScanParts, ARowAnswerWhosePartsSpanManyChunksIsTheBytesOfOneThreads) {
         EXPECT_EQ(s.reply(sql, &two), alone) << sql;
     }
 }
+
+namespace {
+
+/// The builder, with the parts the scan asked it for counted.
+class PartsCounted final : public ob::RowAnswer {
+public:
+    explicit PartsCounted(ob::QueryResponseBuilder& reply) : reply_(reply) {}
+    void add_rows(const ob::RowBatch& batch) override { reply_.add_rows(batch); }
+    std::unique_ptr<ob::ScanPart> part(uint64_t limit) override {
+        ++parts;
+        return reply_.part(limit);
+    }
+    void add_part(ob::ScanPart& part, uint64_t n) override { reply_.add_part(part, n); }
+    bool full() const override { return reply_.full(); }
+    uint64_t rows_room() const override { return reply_.rows_room(); }
+
+    std::atomic<int> parts{0};
+
+private:
+    ob::QueryResponseBuilder& reply_;
+};
+
+}  // namespace
 
 TEST(ScanParts, ATieOnATimeAcrossTwoSegmentsGoesToTheOrderTheScanDeliversIn) {
     // Two segments sharing their boundary instant: FIRST of the later segment's rows at that time
@@ -438,6 +462,167 @@ TEST(ScanParts, WithNothingToDivideTheScanIsTheDirectReaderAndNoPartIsMade) {
         EXPECT_EQ(made.load(), 0) << "one candidate was divided";
         EXPECT_EQ(direct, 2u);
     }
+}
+
+TEST(ScanParts, TheCandidatesTheQuerysThreadReadsGoStraightIntoTheAnswerAndMakeNoPart) {
+    // #294: with every thread of the pool busy elsewhere, the query's thread reads each candidate itself,
+    // in order, as the fold needs it - and with `own_direct` each goes through the direct reader,
+    // straight into the answer, with no part of its own. The control: without it the same scan makes a
+    // part a candidate and folds them.
+    Store s;
+    ten_segments(s);
+    ob::ScanPool pool(2, nullptr);
+    for (const bool own : {true, false}) {
+        std::atomic<bool> release{false};
+        std::atomic<unsigned> busy{0};
+        std::vector<std::shared_ptr<ob::ScanPool::Task>> others;
+        for (unsigned i = 0; i < pool.threads(); ++i) {
+            others.push_back(pool.submit([&release, &busy] {
+                ++busy;
+                while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }));
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (busy.load() < pool.threads() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_EQ(busy.load(), pool.threads()) << "the premise: every thread of the pool busy";
+
+        std::atomic<int> made{0};
+        std::vector<uint64_t> times;   // each row's time as the direct reader is handed it
+        uint64_t folded = 0;
+        ob::PartsScan how;
+        how.pool = &pool;
+        how.divide_small = true;
+        how.own_direct = own;
+        how.direct = [&times](const ob::RowBatch& b) -> ob::BatchVerdict {
+            for (const uint32_t i : b.rows) times.push_back(b.ts[i]);
+            return {};
+        };
+        how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+            ++made;
+            return std::make_unique<CountingPart>(false);
+        };
+        how.fold = [&folded](ob::ScanPart& p) {
+            folded += p.rows();
+            return true;
+        };
+        const auto cost =
+            s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+        release.store(true);
+        for (const auto& t : others) pool.run_or_wait(*t);
+
+        EXPECT_EQ(cost.segments_read, 10u) << "own_direct " << own;
+        if (own) {
+            EXPECT_EQ(made.load(), 0) << "a part was made for a candidate the query's thread read";
+            EXPECT_EQ(times.size(), 5000u);
+            EXPECT_TRUE(std::is_sorted(times.begin(), times.end()))
+                << "the candidates went into the answer out of their order";
+            EXPECT_EQ(folded, 0u);
+        } else {
+            EXPECT_EQ(made.load(), 10) << "the control: a part a candidate";
+            EXPECT_EQ(folded, 5000u);
+            EXPECT_TRUE(times.empty());
+        }
+        EXPECT_EQ(g_parts_alive.load(), 0);
+    }
+}
+
+TEST(ScanParts, ARowQueryWhosePoolIsBusyWritesEachCandidateStraightIntoItsAnswer) {
+    // #294, through the query engine: with the pool's threads busy elsewhere the query's thread reads
+    // every candidate of a divided SELECT, and the engine has each go straight into the answer - no
+    // part asked of the builder - with the bytes of one thread's scan. The scan below divides (ten
+    // candidates on a pool of two, `divide_small`), so a part a candidate is what it would make else.
+    Store s;
+    ten_segments(s);
+    const std::string sql = "SELECT * FROM 'BK'.'EX'";
+    const std::string alone = s.reply(sql, nullptr);
+    ASSERT_EQ(alone.compare(0, 3, "OK\n"), 0) << alone.substr(0, 80);
+
+    ob::ScanPool pool(2, nullptr);
+    std::atomic<bool> release{false};
+    std::atomic<unsigned> busy{0};
+    std::vector<std::shared_ptr<ob::ScanPool::Task>> others;
+    for (unsigned i = 0; i < pool.threads(); ++i) {
+        others.push_back(pool.submit([&release, &busy] {
+            ++busy;
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (busy.load() < pool.threads() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(busy.load(), pool.threads()) << "the premise: every thread of the pool busy";
+
+    s.engine.set_scan_pool(&pool, /*divide_small=*/true);
+    ob::QueryShape shape;
+    ob::QueryResponseBuilder builder(shape);
+    PartsCounted counted(builder);
+    const std::string err =
+        s.engine.execute(sql, [&](const ob::QueryResult& r) { builder.add(r); }, shape, &counted);
+    s.engine.set_scan_pool(nullptr);
+    release.store(true);
+    for (const auto& t : others) pool.run_or_wait(*t);
+
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(counted.parts.load(), 0) << "the builder was asked for a part of a candidate the query read";
+    EXPECT_TRUE(builder.finish() == alone) << "the answer is not one thread's";
+}
+
+// #294: a LIMIT a candidate read straight into the answer reaches ends the scan there, as a part's
+// fold ends it: the candidates after it are not read, and their parts, handed out, are dropped.
+TEST(ScanParts, ALimitReachedInACandidateReadStraightIntoTheAnswerEndsTheScan) {
+    Store s;
+    ten_segments(s);
+    ob::ScanPool pool(2, nullptr);
+    std::atomic<bool> release{false};
+    std::atomic<unsigned> busy{0};
+    std::vector<std::shared_ptr<ob::ScanPool::Task>> others;
+    for (unsigned i = 0; i < pool.threads(); ++i) {
+        others.push_back(pool.submit([&release, &busy] {
+            ++busy;
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (busy.load() < pool.threads() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(busy.load(), pool.threads()) << "the premise: every thread of the pool busy";
+
+    // A LIMIT of 1 250: the first two candidates whole and half the third.
+    constexpr uint64_t kLimit = 1250;
+    uint64_t taken = 0;
+    std::atomic<int> made{0};
+    ob::PartsScan how;
+    how.pool = &pool;
+    how.divide_small = true;
+    how.own_direct = true;
+    how.direct = [&taken](const ob::RowBatch& b) -> ob::BatchVerdict {
+        const uint64_t room = kLimit - taken;
+        if (b.rows.size() >= room) {
+            taken = kLimit;
+            return {true, static_cast<size_t>(room - 1)};
+        }
+        taken += b.rows.size();
+        return {};
+    };
+    how.make_part = [&made]() -> std::unique_ptr<ob::ScanPart> {
+        ++made;
+        return std::make_unique<CountingPart>(false);
+    };
+    how.fold = [](ob::ScanPart&) { return true; };
+    const auto cost =
+        s.store.scan_parts(0, UINT64_MAX, "BK", "EX", ob::ColumnSet::all(), ob::RowFilter{}, how);
+    release.store(true);
+    for (const auto& t : others) pool.run_or_wait(*t);
+
+    EXPECT_TRUE(cost.stopped);
+    EXPECT_EQ(taken, kLimit);
+    EXPECT_EQ(cost.segments_read, 3u) << "the scan read on past the candidate its LIMIT ended in";
+    EXPECT_EQ(made.load(), 0);
+    EXPECT_EQ(g_parts_alive.load(), 0);
 }
 
 TEST(ScanParts, NoMorePartsAreHeldThanThePoolsThreadsAndOne) {

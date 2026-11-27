@@ -405,11 +405,17 @@ TEST(AnswerCeiling, ADividedScanStopsAtThePartThatMadeItsAnswerFull) {
         s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &offered);
     ASSERT_TRUE(err.empty()) << err;
     EXPECT_TRUE(reply.full());
-    // A part is a segment of 5000 rows: the first fits in 300 000 bytes and the second does not, so
-    // the answer took one part, was offered the second, and the scan folded no more.
-    EXPECT_EQ(reply.rows_taken(), 5000u);
-    EXPECT_EQ(reply.rows_within(), 5000u);
-    EXPECT_EQ(offered.offered, 10'000u) << "the scan folded parts past a full answer";
+    // A candidate is a segment of 5000 rows: the first fits in 300 000 bytes and the two do not. Read on
+    // the pool, the second is a part, offered whole and not taken, and the rows within the ceiling are
+    // the first segment's; read by the query's own thread, it goes straight into the answer (#294) a
+    // batch at a time, and the rows within are those before the batch that passed. Either way the
+    // ceiling was passed in the second segment, and nothing past it was offered.
+    EXPECT_GE(reply.rows_within(), 5000u);
+    EXPECT_LT(reply.rows_within(), 10'000u);
+    EXPECT_LE(reply.rows_taken() - reply.rows_within(), ob::kScanBatchRows)
+        << "more than the batch that passed the ceiling was taken";
+    EXPECT_GT(offered.offered, reply.rows_within()) << "what passed the ceiling was never offered";
+    EXPECT_LE(offered.offered, 10'000u) << "the scan offered rows past a full answer";
 
     ob::QueryShape whole_shape;
     ob::QueryResponseBuilder whole(whole_shape, std::string(), ob::AnswerCeiling{64u << 20, false});
@@ -435,7 +441,11 @@ TEST(AnswerCeiling, ADividedScanHandsOutNoMoreThanItsAnswerHasRoomFor) {
         s.engine.execute(kAll, [&](const ob::QueryResult& r) { reply.add(r); }, shape, &offered);
     ASSERT_TRUE(err.empty()) << err;
     EXPECT_TRUE(reply.full());
-    EXPECT_EQ(reply.rows_taken(), 15'000u);
+    // Three segments within it, and the fourth passed it - as a part not taken, or read straight into
+    // the answer by the query's thread (#294) and stopped at the batch that passed.
+    EXPECT_GE(reply.rows_within(), 15'000u);
+    EXPECT_LT(reply.rows_within(), 20'000u);
+    EXPECT_LE(reply.rows_taken() - reply.rows_within(), ob::kScanBatchRows);
     EXPECT_LE(offered.parts.load(), 5u) << "parts were formatted past what the answer had room for";
     s.engine.set_scan_pool(nullptr);
 }
