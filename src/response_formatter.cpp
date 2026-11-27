@@ -685,6 +685,18 @@ std::string QueryResponseBuilder::finish() {
     return std::move(out_);
 }
 
+std::string QueryResponseBuilder::give_back_room() {
+    if (started_ || frame_) {
+        OB_LOG_WARN("formatter", "a reply's room asked back after its first result: none given, the reply "
+                    "keeps it (#293)");
+        return {};
+    }
+    out_.clear();
+    OB_LOG_DEBUG("formatter", "a reply's room of %zu byte(s) given back before its first result (#293)",
+                 out_.capacity());
+    return std::move(out_);
+}
+
 // ── format_agg_response ───────────────────────────────────────────────────────
 
 std::string format_agg_response(const std::vector<AggValue>& values) {

@@ -873,6 +873,7 @@ struct ReadAnswer {
     uint64_t    text_bytes{0};      ///< the text a frame holds
     bool        counted{false};     ///< a query that ran, which the session and the server count
     bool        taken_away{false};  ///< no answer: the engine's ReadGate handed it back (#260)
+    std::string room;               ///< taken away: the room it was given, unused, for the read off the loop (#293)
 };
 
 template <typename Read>
@@ -892,6 +893,7 @@ ReadAnswer build_read_answer(const char* what, int fd, Engine& engine, MetricsRe
                                      static_cast<RowAnswer&>(reply));
         if (err == kReadTakenAway) {
             out.taken_away = true;
+            out.room       = reply.give_back_room();
             return out;
         }
         if (!err.empty()) {
@@ -933,7 +935,9 @@ ReadAnswer build_read_answer(const char* what, int fd, Engine& engine, MetricsRe
 }
 
 /// build_read_answer() on the loop, with the session's part: its command and query counted, the
-/// answer written in its send buffer's room (#253), and a frame marked for take_answer() (#257).
+/// answer written in its send buffer's room (#253), and a frame marked for take_answer() (#257). A
+/// read handed back to be answered off the loop gives the room back to the session (#293), which lends
+/// it again to that read.
 template <typename Read>
 std::string answer_read(const char* what, Engine& engine, Session& session, ServerStats& stats,
                         MetricsRegistry* registry, QueryShape& shape, Read&& read) {
@@ -943,7 +947,10 @@ std::string answer_read(const char* what, Engine& engine, Session& session, Serv
     ReadAnswer r = build_read_answer(what, session.fd(), engine, registry, shape, session.lend_room(),
                                      AnswerCeiling{Session::max_queued_bytes(), session.is_compressed()},
                                      std::forward<Read>(read));
-    if (r.taken_away) return std::string(kAnsweredOffLoop);
+    if (r.taken_away) {
+        session.return_room(std::move(r.room));
+        return std::string(kAnsweredOffLoop);
+    }
     if (r.framed) session.next_answer_framed(r.text_bytes);
     if (r.counted) {
         session.increment_queries();
@@ -3257,16 +3264,24 @@ void Reactor::take_read(const Command& cmd, Session& session, uint64_t rows_at_m
     std::shared_ptr<OffLoopMailbox> mailbox = mailbox_;
     const int index = index_;
     const auto handed = std::chrono::steady_clock::now();
+    // The session's room, which the gate gave back with the read (#293): the answer is written where
+    // the session's last large answer was, and take_answer() makes it the send buffer again. A buffer
+    // of the read's own was new memory for every read: grown by doubling from nothing, each growth a
+    // copy, and faulted in page by page - 6 785 faults for a whole SELECT of 12.5 MB on the m9g.xlarge,
+    // 2.2 times the answer's pages - while the last answer's buffer was unmapped on the loop.
+    std::string room = session.lend_room();
+    const size_t room_bytes = room.capacity();
     off_loop_pool_->submit([fd, conn_id, ceiling, engine, registry, mailbox, index, handed,
-                            sql = cmd.raw_sql] {
+                            sql = cmd.raw_sql, room = std::move(room)]() mutable {
         registry->observe_histogram(
             "ob_off_loop_read_wait_seconds",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - handed).count());
-        // The answer as the loop builds it, in a buffer of the read's own: a session is the loop's.
+        // The answer as the loop builds it, in the room the session lent: the string is the read's
+        // until it is posted, and the session is the loop's.
         OffLoopAnswer out{fd, conn_id, std::string(), false, 0, false, false};
         try {
             QueryShape shape;
-            ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::string(),
+            ReadAnswer r = build_read_answer("SELECT", fd, *engine, registry, shape, std::move(room),
                                              ceiling, [&](auto row, RowAnswer& rows) {
                                                  return engine->execute(sql, row, shape, &rows);
                                              });
@@ -3289,7 +3304,8 @@ void Reactor::take_read(const Command& cmd, Session& session, uint64_t rows_at_m
     engine_->registry().increment_counter("ob_off_loop_reads_total");
     engine_->registry().increment_gauge("ob_off_loop_reads_in_flight", 1);
     OB_LOG_DEBUG("tcp_server", "reactor %d: SELECT from fd=%d answered off the loop: the index puts %llu "
-                 "row(s) or more in its scan", index_, fd, static_cast<unsigned long long>(rows_at_most));
+                 "row(s) or more in its scan; written in the session's room of %zu byte(s)", index_, fd,
+                 static_cast<unsigned long long>(rows_at_most), room_bytes);
 }
 
 void Reactor::take_flush(Session& session) {

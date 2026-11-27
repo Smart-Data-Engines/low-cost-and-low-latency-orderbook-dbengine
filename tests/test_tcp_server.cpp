@@ -1316,6 +1316,40 @@ TEST(SessionOutput, TheSendBuffersRoomIsLentWithNothingPendingAndComesBackWithTh
     ::close(fd_server);
 }
 
+// #293: a room lent and given back unused - a read the engine handed back to be answered off the loop
+// - is the send buffer again, its memory and its capacity, so that the read can be lent it once more;
+// with bytes queued while it was lent, it is let go and the bytes stay as they were.
+TEST(SessionOutput, ARoomGivenBackUnusedIsTheSendBufferAgainUnlessBytesWereQueued) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    ASSERT_EQ(session.take_answer(std::string(200 * 1024, 'L')), ob::Session::Queued::Yes);
+    std::string got;
+    drain_into(session, fd_client, got, 200 * 1024);
+    ASSERT_FALSE(session.has_pending_output());
+
+    std::string room = session.lend_room();
+    ASSERT_GE(room.capacity(), 200u * 1024u) << "the premise: the last large answer's room is lent";
+    const char* const memory = room.data();
+    session.return_room(std::move(room));
+    EXPECT_FALSE(session.has_pending_output());
+    std::string again = session.lend_room();
+    EXPECT_EQ(again.data(), memory) << "the room given back is not the send buffer again";
+    EXPECT_GE(again.capacity(), 200u * 1024u);
+
+    ASSERT_TRUE(session.queue_response("PONG\n"));
+    session.return_room(std::move(again));
+    EXPECT_EQ(session.pending_output_bytes(), 5u) << "a room given back moved the bytes queued meanwhile";
+    got.clear();
+    drain_into(session, fd_client, got, 5);
+    EXPECT_EQ(got, "PONG\n");
+    EXPECT_LT(session.lend_room().capacity(), 200u * 1024u) << "the room was kept beside bytes queued";
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
 TEST(SessionOutput, BufferCapIsEnforced) {
     auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
     ASSERT_GE(fd_server, 0);

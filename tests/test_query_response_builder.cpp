@@ -192,6 +192,36 @@ TEST(QueryResponseBuilder, AReplyWrittenInRoomItIsGivenIsTheSameBytesAndKeepsThe
     }
 }
 
+// #293: a read the engine hands back before its first result gives the builder's room back whole -
+// emptied, its memory and its capacity the room's - in text and in LZ4 alike; and once a result has
+// started the reply, nothing is given back: the reply keeps what it wrote and answers as a builder
+// never asked does.
+TEST(QueryResponseBuilder, ItsRoomIsGivenBackWholeBeforeTheFirstResultAndNotAfter) {
+    ob::QueryShape shape;
+    shape.columns = ob::all_query_columns();
+    for (const bool lz4 : {false, true}) {
+        std::string room(100, 'r');
+        room.reserve(size_t{1} << 20);
+        const char* const memory = room.data();
+        ob::QueryResponseBuilder handed_back(shape, std::move(room), ob::AnswerCeiling{size_t{64} << 20, lz4});
+        const std::string back = handed_back.give_back_room();
+        EXPECT_TRUE(back.empty()) << "lz4 " << lz4;
+        EXPECT_GE(back.capacity(), size_t{1} << 20) << "lz4 " << lz4;
+        EXPECT_EQ(back.data(), memory) << "the room given back is not the room given, lz4 " << lz4;
+
+        const ob::QueryResult row = a_row(1'790'000'000'000'000'000ULL, -12345, 7, 3, 1, 4, 99);
+        std::string started_room;
+        started_room.reserve(size_t{1} << 20);
+        ob::QueryResponseBuilder asked(shape, std::move(started_room), ob::AnswerCeiling{size_t{64} << 20, lz4});
+        asked.add(row);
+        EXPECT_EQ(asked.give_back_room().capacity(), std::string().capacity())
+            << "a room was given back from a reply begun, lz4 " << lz4;
+        ob::QueryResponseBuilder plain(shape, std::string(), ob::AnswerCeiling{size_t{64} << 20, lz4});
+        plain.add(row);
+        EXPECT_TRUE(asked.finish() == plain.finish()) << "the reply asked for its room is not the same, lz4 " << lz4;
+    }
+}
+
 // #246, stage 2: a part of an answer formats at most its LIMIT of rows - no part of an answer of N
 // rows needs more - and stops there, and the first n of its rows copied onto a reply are the bytes
 // add_rows() writes for them.

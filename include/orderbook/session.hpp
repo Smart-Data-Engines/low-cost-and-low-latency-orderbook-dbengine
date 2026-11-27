@@ -157,6 +157,12 @@ public:
     /// last large answer needed - and an empty string otherwise. The buffer is left without room.
     std::string lend_room();
 
+    /// The room lend_room() lent, given back unused (#293): a read the engine handed back before its
+    /// first row, to be answered off the loop, which lends the room again for it. It is the send
+    /// buffer again when nothing was queued in the meantime and it has the more capacity; otherwise
+    /// it is let go.
+    void return_room(std::string room);
+
     /// The most bytes a session may hold queued, and so the largest answer it can ever be sent.
     static constexpr size_t max_queued_bytes() { return kMaxSendBuffer; }
 

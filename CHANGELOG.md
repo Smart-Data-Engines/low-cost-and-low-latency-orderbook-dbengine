@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A large read answered off the loop writes its answer in its session's buffer** (#293). A read handed to the
+  threads off the client loop (#260) took a buffer of its own there, new memory for every read - grown by doubling, each
+  growth a copy, faulted in a page at a time - while the session's send buffer, which every read on the loop writes in
+  (#253), was let go. The session's buffer now goes with the read. On the m9g.xlarge a whole read of BTCUSDT's top 20
+  levels (12.5 MB) takes 10.4 ms of the node's CPU instead of 14.2 and answers in 40.1 ms at the median instead of 46.0
+  (six rounds); the node's page faults a query fall from 6 798 to 1 897.
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last

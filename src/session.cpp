@@ -374,6 +374,19 @@ std::string Session::lend_room() {
     return room;
 }
 
+void Session::return_room(std::string room) {
+    if (!send_buf_.empty() || room.capacity() <= send_buf_.capacity()) {
+        OB_LOG_DEBUG("session", "fd=%d: a lent room of %zu byte(s) let go: the send buffer holds %zu "
+                     "byte(s) in %zu", fd_, room.capacity(), send_buf_.size(), send_buf_.capacity());
+        return;
+    }
+    room.clear();
+    send_buf_.swap(room);
+    send_off_ = 0;
+    OB_LOG_DEBUG("session", "fd=%d: a lent room of %zu byte(s) given back unused (#293)", fd_,
+                 send_buf_.capacity());
+}
+
 void Session::yield_send(size_t sent_now) {
     send_yielded_ = true;
     io_want_ = IoWant::Write;
