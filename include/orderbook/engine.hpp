@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -171,6 +172,11 @@ public:
     void await_wal_removals_for_test();
     /// Hold every removal of WAL files where it is about to begin, until the lock is let go (#277): a
     /// removal the device takes long over, on a test's schedule.
+    /// The engine's lock, held by the caller until the lock it returns goes (#292): what a writer's batch
+    /// holds, for a test of what waits for it and what does not. A test seam.
+    [[nodiscard]] std::unique_lock<std::mutex> hold_engine_lock_for_test() {
+        return std::unique_lock<std::mutex>(mtx_);
+    }
     [[nodiscard]] std::unique_lock<std::mutex> hold_wal_removals_for_test() {
         return std::unique_lock<std::mutex>(wal_removing_mtx_);
     }
@@ -984,6 +990,13 @@ private:
         const RowName* name{nullptr};
     };
     std::unordered_map<std::string, LiveBook> buffers_;
+    /// The map's own lock, for a read that finds a book without `mtx_` (#292): a BOOK took the engine's
+    /// lock to look its book up, so it waited for a writer's batch - its WAL append and its levels - and
+    /// beside a pipelined ingest its p99 was 66-72 us where a PING's was 14 (the m9g.xlarge). A book is
+    /// read through its seqlock either way; what the lookup needs is that the map does not change under
+    /// it. Every change of the map - a book made, a symbol dropped, the map cleared - holds `mtx_` and
+    /// takes this exclusively after it, never the other way; a read holding `mtx_` needs nothing more.
+    mutable std::shared_mutex books_mtx_;
 
     /// The names the pending rows carry (#270), one per (symbol, exchange) pair that ever had a row,
     /// never freed while the engine lives. Made under `mtx_`; a name is read without it.

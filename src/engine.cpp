@@ -180,7 +180,9 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
     , query_engine_(std::make_unique<QueryEngine>(
           combined_store_,
           [this](const std::string& key) -> std::shared_ptr<SoABuffer> {
-              std::lock_guard<std::mutex> lock(mtx_);
+              // The map's own lock, shared, and not the engine's (#292): a read does not wait for a
+              // writer's batch to find its book.
+              std::shared_lock<std::shared_mutex> books(books_mtx_);
               auto it = buffers_.find(key);
               return (it == buffers_.end()) ? nullptr : it->second.buffer;
           },
@@ -1040,7 +1042,10 @@ void Engine::discard_local_data_for_resync() {
     stores_.clear();
     drop_unsealed_locked();
     drop_compaction_locked();
-    buffers_.clear();
+    {
+        std::unique_lock<std::shared_mutex> books(books_mtx_);   // #292
+        buffers_.clear();
+    }
     pending_rows_.clear();
 
     // And the sequence frontier, which is not part of any of the above — this is the line without
@@ -2678,7 +2683,10 @@ void Engine::adopt_store_on_disk() {
     drop_compaction_locked();
     // A query already in flight keeps its own buffer alive through the handle it holds (#92); the
     // buffer leaves the engine here and is destroyed when that query drops it.
-    buffers_.clear();
+    {
+        std::unique_lock<std::shared_mutex> books(books_mtx_);   // #292
+        buffers_.clear();
+    }
     pending_rows_.clear();
 
     // And the sequence frontier, because the contents it described are gone.
@@ -2730,7 +2738,10 @@ bool Engine::install_snapshot(const std::string& staging_dir,
         stores_.clear();
         drop_unsealed_locked();
         drop_compaction_locked();
-        buffers_.clear();
+        {
+            std::unique_lock<std::shared_mutex> books(books_mtx_);   // #292
+            buffers_.clear();
+        }
         pending_rows_.clear();
         seq_tracker_.reset();
 
@@ -3148,7 +3159,10 @@ size_t Engine::drop_symbol(const std::string& symbol_key) {
             stores_.erase(st);
         }
     }
-    buffers_.erase(symbol_key);
+    {
+        std::unique_lock<std::shared_mutex> books(books_mtx_);   // #292
+        buffers_.erase(symbol_key);
+    }
     publish_segment_count();
     registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
     OB_LOG_INFO("engine", "Dropped %s: %zu segment(s) of %zu removed and %zu replaced input(s) of its "
@@ -3647,8 +3661,12 @@ Engine::LiveBook& Engine::get_or_create_book(const std::string& key, const char*
     // The name its rows will carry, made now with the book: a write of this pair then finds it by
     // comparing two strings rather than hashing them (#270).
     const RowName& name = row_names_.of(symbol, exchange);
-    LiveBook& ref = buffers_[key];
-    ref = LiveBook{std::move(buf), &name};
+    // Put in whole, under the map's lock (#292): a read finding books without `mtx_` sees the book with
+    // its buffer or not at all, and a rehash never under it.
+    std::unique_lock<std::shared_mutex> books(books_mtx_);
+    LiveBook& ref = buffers_.emplace(key, LiveBook{std::move(buf), &name}).first->second;
+    books.unlock();
+    OB_LOG_DEBUG("engine", "a book for %s made, %zu books", key.c_str(), buffers_.size());
 
     // Update gauge: symbol count after adding new symbol.
     registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
