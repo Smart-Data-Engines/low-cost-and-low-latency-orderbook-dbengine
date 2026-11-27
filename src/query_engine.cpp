@@ -1682,6 +1682,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
         how.limit_rows = lim;
         how.divide_small = scan_divide_small_;
         how.direct = direct;
+        how.own_direct = true;   // the candidates read on this thread go straight into the answer (#294)
         how.make_part = [rows, lim]() { return rows->part(lim); };
         how.rows_room = [rows]() { return rows->rows_room(); };
         how.fold = [&](ScanPart& part) {

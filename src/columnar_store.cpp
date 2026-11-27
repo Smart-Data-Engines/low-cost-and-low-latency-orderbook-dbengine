@@ -2653,6 +2653,8 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         uint64_t filtered{0};
         bool stopped{false};   // the part's own stop, which ends its candidate and nothing else
         bool on_pool{false};
+        bool own{false};          // read on the query's thread straight into the answer (#294)
+        uint64_t own_rows{0};     // the rows it put there
         std::shared_ptr<ScanPool::Task> task;
     };
     std::vector<Slot> slots;
@@ -2721,14 +2723,29 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
     std::atomic<bool> stop{false};
     const auto read_slot = [&](Slot& s) {
         s.on_pool = std::this_thread::get_id() != here;
-        s.part = how.make_part();
-        const BatchReader into = [&s, &stop](const RowBatch& b) -> BatchVerdict {
-            if (stop.load(std::memory_order_relaxed)) return {true, 0};
-            // On a pool thread a step at a time, so a client loop woken onto the thread's CPU waits
-            // about a microsecond rather than a batch - or the scheduler's tick, on a kernel that
-            // preempts lazily (#248).
-            return s.on_pool ? take_in_steps(*s.part, b) : s.part->take(b);
-        };
+        BatchReader into;
+        if (!s.on_pool && how.own_direct) {
+            // The query's own thread reads a candidate only when it is the one the fold needs next -
+            // its turn in run_or_wait(), or one the LIMIT kept from the pool - so a row answer's rows
+            // go straight into it through `direct`, as an undivided scan's do (#294), rather than into
+            // a part of their own: new memory every read, then copied onto the answer. `direct` counts
+            // the LIMIT and stops at the answer's ceiling, the fold's work for a part.
+            s.own = true;
+            into = [&s, &how](const RowBatch& b) -> BatchVerdict {
+                const BatchVerdict v = how.direct(b);
+                s.own_rows += v.stop ? std::min(b.rows.size(), v.at + 1) : b.rows.size();
+                return v;
+            };
+        } else {
+            s.part = how.make_part();
+            into = [&s, &stop](const RowBatch& b) -> BatchVerdict {
+                if (stop.load(std::memory_order_relaxed)) return {true, 0};
+                // On a pool thread a step at a time, so a client loop woken onto the thread's CPU
+                // waits about a microsecond rather than a batch - or the scheduler's tick, on a
+                // kernel that preempts lazily (#248).
+                return s.on_pool ? take_in_steps(*s.part, b) : s.part->take(b);
+            };
+        }
         if (s.meta != nullptr) {
             read_segment_rows(*s.meta, columns, start_ns, end_ns, filter, into, ReadMode::kQuery,
                               &s.filtered, &s.stopped);
@@ -2788,10 +2805,18 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
             if (s.meta != nullptr) ++cost.segments_read;
             cost.rows_filtered += s.filtered;
             // Whether the scan goes on is the fold's to say: a part that stops ends its own
-            // candidate - at the rows its answer can use, or at a refusal its fold then makes.
-            const bool more = how.fold(*s.part);
-            folded_rows += s.part->rows();
-            s.part.reset();   // its memory, now
+            // candidate - at the rows its answer can use, or at a refusal its fold then makes. A
+            // candidate read straight into the answer (#294) has had its fold: `direct` stopped it at
+            // the LIMIT or the ceiling, which ends the scan, or took all its rows.
+            bool more = false;
+            if (s.own) {
+                more = !s.stopped;
+                folded_rows += s.own_rows;
+            } else {
+                more = how.fold(*s.part);
+                folded_rows += s.part->rows();
+                s.part.reset();   // its memory, now
+            }
             if (!more) {
                 ended = true;
                 break;
@@ -2812,14 +2837,18 @@ ColumnarStore::ScanCost ColumnarStore::scan_parts(uint64_t start_ns, uint64_t en
         cost.skipped_by_levels = by_levels;
     }
     size_t pooled = 0;
-    for (size_t j = 0; j < std::min(n, ended ? k + 1 : n); ++j) pooled += slots[j].on_pool ? 1 : 0;
-    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu part(s), %zu on the pool, waited "
-                             "%.3f ms for parts; %zu segment(s) read, %zu left unread by price and "
-                             "%zu by levels, %llu row(s) filtered%s",
+    size_t own = 0;
+    for (size_t j = 0; j < std::min(n, ended ? k + 1 : n); ++j) {
+        pooled += slots[j].on_pool ? 1 : 0;
+        own += slots[j].own ? 1 : 0;
+    }
+    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu part(s), %zu on the pool and %zu read "
+                             "straight into the answer, waited %.3f ms for parts; %zu segment(s) read, "
+                             "%zu left unread by price and %zu by levels, %llu row(s) filtered%s",
                  static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
                  static_cast<unsigned long long>(start_ns), static_cast<unsigned long long>(end_ns),
-                 ended ? k + 1 : n, pooled,
+                 ended ? k + 1 : n, pooled, own,
                  std::chrono::duration<double, std::milli>(waited).count(), cost.segments_read,
                  cost.skipped_by_price, cost.skipped_by_levels,
                  static_cast<unsigned long long>(cost.rows_filtered),

@@ -211,6 +211,11 @@ struct PartsScan {
     /// `kScanDivideMinRows`, or most of them in one candidate - which only tests ask for, so that
     /// a small store reads the parts' path.
     bool divide_small{false};
+    /// A candidate the scan's own thread reads goes through `direct`, straight into the answer,
+    /// rather than into a part (#294). That thread reads a candidate only when the fold needs it
+    /// next, so the order holds; for a reader whose `direct` and fold write one answer the same way
+    /// - a row answer's, whose `direct` counts the LIMIT and stops at the ceiling as its fold does.
+    bool own_direct{false};
 };
 
 /// The fewest rows in range a scan is divided at: below it a scan is read on its query's thread.
