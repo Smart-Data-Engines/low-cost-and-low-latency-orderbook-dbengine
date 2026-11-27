@@ -4789,6 +4789,14 @@ Learned the hard way. Check here before debugging.
      WAL sync took 12 ms or more went from 13 to 73 - and writers waited for room in the queue twice as often. A CPU
      profile cannot show it. A diagnostic build with the slow-tick warning at 15 ms (it names the tick's phases),
      and the writers' waits and p999 a round, did. Compare those, not the CPU alone.
+659. **A file built without TSan's instrumentation is still seen through its `memcpy` and `memmove`.**
+     `soa_buffer.cpp` is compiled `-fno-sanitize=thread` (TSan cannot model the seqlock's fences), but in a TSan
+     build its libc calls go through TSan's interceptors. While every BOOK took the engine's lock for its lookup,
+     a reader's copy rarely met a writer's shift; #292 took the lock away, and the integration battery under TSan
+     reported `read_snapshot()`'s `memcpy` against a multi-master delta's `memmove` - copies the seqlock checks
+     and takes again. The unit job's concurrent test could not show it: it wrote one level in place, which moves
+     nothing. Annotate exactly the checked copies (`OB_SEQLOCK_TSAN_IGNORE_READS`, TSan build only), and race a
+     reader against writes that shift memory.
 
 ## Current state and open problems
 

@@ -2933,14 +2933,24 @@ A BOOK beside the writers now waits about as long as a PING does; alone, and for
 
 **Tests.** A BOOK is answered while the test holds the engine's lock as a writer's batch holds it, and a write in that
 time waits - the control that says the lock held is the one meant; every change of the engine's map of books takes its
-lock, a shape test of the five changes, which finds the five; the lookup's supplier takes a lock, now shared. ctest
-passed 2292 of 2292 on the m9g.xlarge and the i3-7100U (Debug): #286's 2290 and these two.
+lock, a shape test of the five changes, which finds the five; the lookup's supplier takes a lock, now shared; and a
+snapshot beside writes that shift the levels is one of the sides written (below). ctest passed 2293 of 2293 on the
+m9g.xlarge and the i3-7100U (Debug): #286's 2290 and these three.
 
 **Mutation table** (`mutations/` in the evidence, the i3-7100U): five mutants killed - the lookup under the engine's
 lock again, a new book put in without the map's lock, a symbol dropped without it, the map cleared for a resync without
 it, and the lookup without any lock. Three controls survive: the DEBUG line reworded, a new book's lock held to the end
 of its scope, and the map's lock without `mutable`. The first run killed the first mutant by the harness's bound: the
 test, failing, held the lock its read waited for; it lets go before its verdict now, and the mutant is killed by it.
+
+**The first CI run's integration battery under TSan** reported `read_snapshot()`'s `memcpy` of a side against a
+multi-master delta's `memmove` of its levels (pitfall 659). `soa_buffer.cpp` is built without TSan's instrumentation,
+which cannot model the seqlock's fences, but its libc calls go through TSan's interceptors, and the engine's lock that
+every BOOK's lookup took had kept a reader's copies and a writer's shifts apart. The seqlock checks those copies and
+takes them again when a write moved the version under them, so in the TSan build alone
+(`OB_SEQLOCK_TSAN_IGNORE_READS`) TSan is told to ignore them; the writes stay checked. A new test races snapshots
+against writes that shift every level of a side: each snapshot is one of the two sides written, and in a TSan build it
+is reported without the annotation and not with it.
 
 - Effort: S | Impact: a BOOK read while the feed writes has its p99 cut from 69 to 15 us and its p999 from 144 to 24 us
 
