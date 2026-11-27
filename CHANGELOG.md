@@ -197,6 +197,13 @@ here as `#N`.
 
 ### Changed
 
+- **A reply's rows copy a repeated time and sequence number rather than write their digits again** (#291). An
+  update's levels carry its time and sequence number, and a book's rows its label, so a reply's rows repeat both; each
+  row wrote a 19-digit time and the number's digits afresh. They are copied from the last row's text where they repeat
+  it now, in the same bytes. On the m9g.xlarge a BOOK costs the node 486 ns of CPU instead of 577 and is answered 3.12
+  million times a second over two connections instead of 2.74 million; a SELECT of every row of a symbol 14% less CPU
+  (medians of six rounds).
+
 - **A seal's book summary is composed from the rows the seal wrote** (#286). A summary falls due at nearly every
   seal of a busy symbol, and it was composed by reading back and decoding the segment the seal had written a moment
   before. It is composed from the rows of the seal's blocks now, when they are all the rows after the symbol's last
